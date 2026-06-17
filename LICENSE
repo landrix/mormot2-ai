@@ -1,0 +1,15 @@
+LandrixAI — proposed mormot.ai.* extension for the Synopse mORMot 2 framework.
+
+Intended license: the mORMot three-license
+    MPL 1.1  /  GPL 2.0  /  LGPL 2.1
+(same terms as mORMot 2 — see the mORMot LICENSE.md). This alignment is a
+prerequisite for upstream contribution.
+
+Final licensing and any Contributor terms are to be confirmed with
+Synopse Informatique (Arnaud Bouchez) as part of upstreaming — see
+docs/forum-post-mormot-ai-extension.md.
+
+Copyright (c) 2026 Landrix / Sven Harazim and contributors.
+
+This project is a clean-room implementation. It contains NO source code from
+MakerAI (MIT) — MakerAI was consulted only as a conceptual reference. See NOTICE.

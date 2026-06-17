@@ -1,0 +1,20 @@
+# Upstream reference base
+
+This project is a clean-room, mORMot-native implementation. It is NOT a port of
+MakerAI. MakerAI is consulted only as a *conceptual* reference (which features
+exist, how an MCP tool registry is shaped) — no MakerAI source code is copied.
+
+Conceptual reference snapshot
+  Project:   MakerAI — https://github.com/gustavoeenriquez/MakerAi
+  Fork seen: https://github.com/landrix/MakerAi   (branch: fpc)
+  Commit:    fbf15c0   (fpc HEAD at time of writing, 2026-06)
+
+Authoritative specifications we build against
+  MCP protocol revision: 2025-11-25   — https://modelcontextprotocol.io
+  JSON-RPC 2.0                          — https://www.jsonrpc.org/specification
+
+Runtime foundation
+  mORMot 2 — shared/delphi/libs/_git_Synopse2
+
+The gitignored _upstream/ folder (if present) holds a local read-only clone of
+MakerAI for concept lookup ONLY.

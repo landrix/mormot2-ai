@@ -1,0 +1,23 @@
+LandrixAI — mormot.ai.* extension
+=================================
+
+THIRD-PARTY COMPONENTS AND REFERENCES
+
+mORMot 2  (Synopse Informatique — Arnaud Bouchez)
+  Runtime foundation: JSON, RTTI, variants, HTTP server/client, WebSockets,
+  crypto, threading.
+  License: MPL 1.1 / GPL 2.0 / LGPL 2.1 (three-license).
+  https://github.com/synopse/mORMot2
+
+Model Context Protocol — specification
+  Implemented against revision 2025-11-25. Open specification.
+  https://modelcontextprotocol.io
+
+JSON-RPC 2.0 — specification
+  https://www.jsonrpc.org/specification
+
+MakerAI  (Gustavo Enriquez) — CONCEPTUAL REFERENCE ONLY
+  Consulted to understand MCP feature scope and tool-registry shape.
+  NO MakerAI source code is copied into this project (clean-room).
+  License (MakerAI): MIT.
+  https://github.com/gustavoeenriquez/MakerAi

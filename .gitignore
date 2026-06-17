@@ -1,0 +1,12 @@
+# Lokaler, read-only Klon von MakerAI - NUR als Konzept-Nachschlagequelle
+# (Clean-Room: es wird kein MakerAI-Code uebernommen). Nicht eingecheckt.
+/_upstream/
+
+# FPC/Lazarus-Build-Artefakte
+/tests/lib/
+/tests/*.o
+/tests/*.ppu
+/tests/*.compiled
+/tests/LandrixAiTestRunner
+/tests/LandrixAiTestRunner.exe
+*.bak
