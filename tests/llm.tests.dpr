@@ -18,7 +18,8 @@ uses
   test.llm.agent,
   test.llm.agent.mcp,
   test.llm.structured,
-  test.llm.rag;
+  test.llm.rag,
+  test.llm.rag.tool;
 
 type
   TLlmTests = class(TSynTestsLogged)
@@ -34,7 +35,8 @@ begin
     TTestLlmAgent,
     TTestLlmAgentMcp,
     TTestLlmStructured,
-    TTestLlmRag
+    TTestLlmRag,
+    TTestLlmRagTool
   ]);
 end;
 
