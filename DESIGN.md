@@ -74,8 +74,27 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
 - **Phase C** ✓ — MCP-Spec auf **2025-11-25** mit Versions-Negotiation
   (`initialize` echot unterstützte Client-Versionen, sonst Fallback = neueste);
   der transportabhängige Patch-Hack wurde entfernt (einheitliches Verhalten).
-- **Phase D** — Clean-Room LLM-Client (`mormot.ai.llm`): Provider-Treiber +
-  Agent-/Tool-Calling-Loop gegen die offiziellen Specs.
+- **Phase D** — Clean-Room LLM-Client (`mormot.ai.llm.*`): Provider-Treiber +
+  Agent-/Tool-Calling-Loop gegen die offiziellen Specs. Architektur-Entscheidungen:
+  - **Kanonisches Wire = OpenAI Chat Completions** (Lingua franca): ein
+    OpenAI-Wire-Client + Provider-Config (Base-URL/Auth/Model) deckt OpenAI,
+    LiteLLM und Ollama-Compat ab; native Adapter nur, wo das Wire echt abweicht.
+  - **JSON hybrid**: typisierte Records (`mormot.ai.llm.types`) als API-Fläche,
+    Wire-Mapping/Parsing über `TDocVariantData` (provider-Toleranz).
+  - **Streaming-first**: das einzige echte Risiko zuerst geklärt. Verifiziert per
+    Quelltext: `THttpSocket.GetBody(DestStream)` schreibt **jeden Transfer-Chunk
+    live** in den übergebenen `OutStream` (mormot.net.http.pas) — ein eigener
+    `TStream` (`TLlmSseStream` in `mormot.ai.llm.sse`) parst die `data:`-Events
+    inkrementell. Caveat: für den Stream-Request **kein** Content-Encoding (gzip)
+    anbieten, sonst wirft GetBody.
+  - **Callback = Methoden-Pointer (`of object`)**, NICHT `reference to`/Closures —
+    FPC 3.2.2 kennt die Modeswitches `functionreferences`/`anonymousfunctions`
+    nicht (erst 3.3.1).
+  - **Stand**: `mormot.ai.llm.types` + `mormot.ai.llm.sse` gebaut, Tests grün
+    (`llm.tests`, `scripts/run-fpc-llm-tests.sh`: 18 Assertions — whole/1-byte/
+    tool-call). Offen: HTTP-Client (`mormot.ai.llm`: ILlmClient, ChatComplete +
+    ChatStream) + Provider-Configs (`mormot.ai.llm.openai`: OpenAI/Ollama/LiteLLM)
+    + Agent-/Tool-Calling-Loop (verdrahtet MCP-Tools ↔ Modell).
 
 ## Lizenz / Contribution
 
