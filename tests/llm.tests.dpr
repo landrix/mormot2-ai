@@ -17,6 +17,7 @@ uses
   test.llm.client,
   test.llm.agent,
   test.llm.agent.mcp,
+  test.llm.anthropic,
   test.llm.structured,
   test.llm.rag,
   test.llm.rag.tool;
@@ -34,6 +35,7 @@ begin
     TTestLlmClient,
     TTestLlmAgent,
     TTestLlmAgentMcp,
+    TTestLlmAnthropic,
     TTestLlmStructured,
     TTestLlmRag,
     TTestLlmRagTool

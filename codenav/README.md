@@ -79,7 +79,12 @@ claude mcp add -s local landrix-codenav -- `
 - Das Binary ist ein **aarch64-linux**-Build (WSL); Claude Code läuft auf Windows →
   `wsl`-Wrapper. Vorher bauen (`build-codenav.sh`). Aktiv nach Reload/neuer Session.
 - `CODENAV_ROOT` setzt der Launcher selbst; die durchsuchten Quell-Dirs sind in
-  `codenav.tools.pas` kuratiert (ohne vendored libs / node_modules / generated).
+  `codenav.tools.pas` kuratiert (`CODE_DIRS`): `backend/src`, das gesamte
+  `shared/delphi/landrixai`, `shared/delphi/{client,dto}`, `frontend-react/src`,
+  `frontend-kmp/shared/src` **und** die mORMot2-Lib `shared/delphi/libs/_git_Synopse2`.
+  Schwere Binär-/Build-Unterordner (`bin`, `_eval`, `vendor/{models,sqlite-ext}` mit
+  GGUF-Modellen) sind per `EXCLUDE_DIRS` aus grep **und** ctags ausgeschlossen, sonst
+  liefe der Index über ~1 GB Artefakte. (node_modules / generated bleiben außen vor.)
 
 > **⚠️ Drive-Letter-Casing-Falle (Windows + VS-Code-Extension).** `~/.claude.json`
 > schlüsselt local-scope-Server **case-sensitiv** pro Projektpfad. `claude mcp add` aus

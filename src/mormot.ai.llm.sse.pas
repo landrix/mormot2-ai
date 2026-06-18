@@ -7,11 +7,17 @@ unit mormot.ai.llm.sse;
 {
   *****************************************************************************
 
-    TLlmSseStream is a write-only TStream that an HTTP client fills as the
+    TLlmSseStreamBase is a write-only TStream that an HTTP client fills as the
     response body arrives. mORMot's THttpSocket.GetBody writes each transfer
     chunk straight into the supplied stream, so overriding Write() lets us parse
     the "data:" Server-Sent-Events incrementally and fire a delta callback while
     the model is still generating - no extra socket handling required.
+
+    The base handles the wire-agnostic mechanics (chunk buffering, line framing,
+    raw-body retention). Each provider subclass overrides ProcessData to decode
+    its own event payloads into the neutral TLlmStreamDelta:
+    - TLlmSseStream parses the OpenAI streaming wire (here)
+    - the Anthropic Messages SSE wire lives in mormot.ai.llm.anthropic
 
   *****************************************************************************
 }
@@ -34,12 +40,12 @@ type
   //   Delphi; closures/function-references are deliberately avoided
   TLlmStreamDeltaEvent = procedure(const aDelta: TLlmStreamDelta) of object;
 
-  /// write-only TStream that decodes an OpenAI-style SSE chat stream
+  /// write-only TStream that frames an SSE body and dispatches "data:" payloads
   // - pass an instance as the OutStream of THttpClientSocket.Request: its Write
-  //   is called per transfer chunk, and complete "data:" lines are parsed at
-  //   once, firing OnDelta with the projected TLlmStreamDelta
+  //   is called per transfer chunk, complete lines are framed, and each non-empty
+  //   "data:" payload is handed to the wire-specific ProcessData override
   // - FullText/FinishReason/Done expose the accumulated state for convenience
-  TLlmSseStream = class(TStream)
+  TLlmSseStreamBase = class(TStream)
   protected
     fBuf: RawUtf8;        // accumulates bytes until a full line (#10) is seen
     fText: RawUtf8;       // accumulated assistant content
@@ -50,6 +56,9 @@ type
     fDone: boolean;
     fSawData: boolean;    // stop accumulating fRaw once a real SSE event arrives
     procedure ProcessLine(const aLine: RawUtf8);
+    /// decode one non-empty "data:" payload into a delta and fire OnDelta
+    // - wire-specific; the subclass also accumulates fText/fFinishReason/fDone
+    procedure ProcessData(const aPayload: RawUtf8); virtual; abstract;
     function GetSize: Int64; override;
   public
     /// create the parser with the per-delta callback (may be nil)
@@ -70,14 +79,22 @@ type
     /// the raw body seen before any SSE event - non-empty only for a non-SSE
     // (e.g. JSON error) response, so callers can surface the provider's message
     property RawBody: RawUtf8 read fRaw;
-    /// true once the terminal "[DONE]" sentinel was seen
+    /// true once the terminal sentinel/event was seen
     property Done: boolean read fDone;
+  end;
+
+  /// write-only TStream that decodes an OpenAI-style SSE chat stream
+  // - each "data:" line is a self-contained OpenAI chunk (choices[0].delta);
+  //   the terminal "[DONE]" sentinel ends the stream
+  TLlmSseStream = class(TLlmSseStreamBase)
+  protected
+    procedure ProcessData(const aPayload: RawUtf8); override;
   end;
 
 
 implementation
 
-{ TLlmSseStream }
+{ TLlmSseStreamBase }
 
 // index (1-based) of the first #10 in s, or 0 if none - avoids RawUtf8/Char
 // ambiguities of the RTL Pos() on a single control byte
@@ -94,13 +111,13 @@ begin
   result := 0;
 end;
 
-constructor TLlmSseStream.Create(const aOnDelta: TLlmStreamDeltaEvent);
+constructor TLlmSseStreamBase.Create(const aOnDelta: TLlmStreamDeltaEvent);
 begin
   inherited Create;
   fOnDelta := aOnDelta;
 end;
 
-function TLlmSseStream.Write(const Buffer; Count: Longint): Longint;
+function TLlmSseStreamBase.Write(const Buffer; Count: Longint): Longint;
 var
   chunk, line: RawUtf8;
   nl: PtrInt;
@@ -129,12 +146,9 @@ begin
   until fDone;
 end;
 
-procedure TLlmSseStream.ProcessLine(const aLine: RawUtf8);
+procedure TLlmSseStreamBase.ProcessLine(const aLine: RawUtf8);
 var
   payload: RawUtf8;
-  delta: TLlmStreamDelta;
-  v: variant;
-  d, choice, deltaObj, tcArr, tc, fn, usage: PDocVariantData;
 begin
   if aLine = '' then
     exit;              // event boundary / keep-alive blank line
@@ -148,12 +162,53 @@ begin
   payload := TrimU(copy(aLine, 6, maxInt));
   if payload = '' then
     exit;
+  ProcessData(payload); // wire-specific decode
+end;
 
+function TLlmSseStreamBase.Read(var Buffer; Count: Longint): Longint;
+begin
+  result := 0; // write-only sink
+end;
+
+function TLlmSseStreamBase.Seek(const Offset: Int64; Origin: TSeekOrigin): Int64;
+begin
+  // forward-only stream: report the current byte position so the HTTP client's
+  // position bookkeeping (OutStreamInitialPos) stays consistent
+  result := fPosition;
+end;
+
+function TLlmSseStreamBase.GetSize: Int64;
+begin
+  // a write-only forward sink: the size is whatever has been written so far
+  result := fPosition;
+end;
+
+procedure TLlmSseStreamBase.Flush;
+begin
+  // a well-formed stream ends each event with a newline; this catches a final
+  // event delivered in a last chunk without its closing newline
+  if fBuf = '' then
+    exit;
+  if fBuf[length(fBuf)] = #13 then
+    SetLength(fBuf, length(fBuf) - 1);
+  ProcessLine(fBuf);
+  fBuf := '';
+end;
+
+
+{ TLlmSseStream }
+
+procedure TLlmSseStream.ProcessData(const aPayload: RawUtf8);
+var
+  delta: TLlmStreamDelta;
+  v: variant;
+  d, choice, deltaObj, tcArr, tc, fn, usage: PDocVariantData;
+begin
   // prepare a cleared delta (scalar fields are not auto-initialized in FPC)
   Finalize(delta);
   FillCharFast(delta, SizeOf(delta), 0);
 
-  if payload = '[DONE]' then
+  if aPayload = '[DONE]' then
   begin
     fDone := true;
     delta.Done := true;
@@ -162,7 +217,7 @@ begin
     exit;
   end;
 
-  v := _JsonFast(payload);
+  v := _JsonFast(aPayload);
   d := _Safe(v);
   if d^.Count > 0 then
   begin
@@ -199,36 +254,6 @@ begin
     fFinishReason := delta.FinishReason;
   if Assigned(fOnDelta) then
     fOnDelta(delta);
-end;
-
-function TLlmSseStream.Read(var Buffer; Count: Longint): Longint;
-begin
-  result := 0; // write-only sink
-end;
-
-function TLlmSseStream.Seek(const Offset: Int64; Origin: TSeekOrigin): Int64;
-begin
-  // forward-only stream: report the current byte position so the HTTP client's
-  // position bookkeeping (OutStreamInitialPos) stays consistent
-  result := fPosition;
-end;
-
-function TLlmSseStream.GetSize: Int64;
-begin
-  // a write-only forward sink: the size is whatever has been written so far
-  result := fPosition;
-end;
-
-procedure TLlmSseStream.Flush;
-begin
-  // a well-formed stream ends each event with a newline; this catches a final
-  // event delivered in a last chunk without its closing newline
-  if fBuf = '' then
-    exit;
-  if fBuf[length(fBuf)] = #13 then
-    SetLength(fBuf, length(fBuf) - 1);
-  ProcessLine(fBuf);
-  fBuf := '';
 end;
 
 end.

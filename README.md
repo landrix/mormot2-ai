@@ -47,6 +47,51 @@ die vom Client angefragte Version, wenn unterstützt (2024-11-05 / 2025-03-26 /
 SSE, Streamable HTTP, in-process. Tools: `TMcpServer.RegisterTool(IMcpTool)`,
 Input-Schema automatisch via RTTI aus typisiertem Record (`TMcpToolBase<T: record>`).
 
+## LLM-Client (`mormot.ai.llm`) & Provider-Treiber
+
+Clean-Room-LLM-Client mit provider-neutralen Records (`mormot.ai.llm.types`). Das
+**OpenAI Chat Completions-Wire ist die Lingua franca** (`TLlmClient` deckt OpenAI /
+LiteLLM / Ollama ab); ein Provider mit echt abweichendem Wire bekommt einen
+**nativen Treiber** hinter derselben `ILlmClient`-Naht:
+
+- **Anthropic** (`mormot.ai.llm.anthropic`, `TAnthropicClient`): native Messages-API
+  (`system` top-level, `max_tokens` Pflicht, `input_schema`/`tool_use`/`tool_result`,
+  `x-api-key`+`anthropic-version`, event-getypte SSE). Agent-Loop, RAG und Structured-
+  Output bleiben dadurch provider-agnostisch — nur die `ILlmClient`-Instanz wechselt.
+
+### Tests (LLM-Suite, inkl. Anthropic)
+
+Eigener Runner — baut + fährt `llm.tests.dpr` (alle LLM-Suiten: SSE, Client, Agent,
+Agent-MCP, **Anthropic**, Structured, RAG, RAG-Tool):
+
+```bash
+# in WSL, aus dem Repo-Root:
+bash shared/delphi/landrixai/scripts/run-fpc-llm-tests.sh
+# VERBOSE=1 für vollen Compiler-/Testlog
+```
+
+Der Anthropic-Treiber-Test (`tests/test.llm.anthropic.pas`) ist **hermetisch** —
+keine Netzwerkverbindung, kein API-Key nötig: er prüft Request-Bau (System-Hoisting,
+`input_schema`, Tool-Round-Trip), Response-Parsing (Text/Tool/Usage, stop_reason-
+Mapping) und das SSE-Decoding (Text- + Tool-Stream) gegen canned Payloads. Er läuft
+automatisch als Teil der Suite mit.
+
+### Demos live fahren
+
+Provider-Config kommt aus der Umgebung (`demos/.env`, kopiert aus
+[`demos/.env.sample`](demos/.env.sample)) — **API-Key NUR aus Env**, nie eingecheckt
+oder geloggt:
+
+```bash
+bash shared/delphi/landrixai/scripts/build-demo.sh llm/llm-anthropic.dpr
+set -a; . shared/delphi/landrixai/demos/.env; set +a   # ANTHROPIC_API_KEY[/_MODEL]
+shared/delphi/landrixai/bin/fpc/demos/llm-anthropic
+```
+
+`llm-anthropic` ist der OpenAI-Tool-Loop-Demo (`llm-agent`) 1:1 nachgebaut — gleicher
+`TLlmAgent` + Toolbox, nur `TAnthropicClient` statt `TLlmClient` (beweist die Lingua-
+franca-Naht). OpenAI-/Ollama-Demos nutzen weiter die `LLM_*`-Vars derselben `.env`.
+
 ## Herkunft & Lizenz
 
 MCP-Server-Units adoptiert von flydev-fr/mormot2-extensions (MPL/GPL/LGPL); die

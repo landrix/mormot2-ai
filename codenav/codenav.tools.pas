@@ -34,15 +34,23 @@ uses
   codenav.outline;   // ExtractPascalOutline for the Pascal path
 
 const
-  // kuratierte Quell-Verzeichnisse (relativ zur Root) - ohne vendored libs,
-  // node_modules und generierten Code
-  CODE_DIRS: array[0..5] of string = (
+  // kuratierte Quell-Verzeichnisse (relativ zur Root) - inkl. der mORMot2-Lib
+  // Synopse2; node_modules/generated/Binaer-Artefakte bleiben aussen vor
+  // (siehe EXCLUDE_DIRS fuer schwere Unterordner innerhalb dieser Dirs)
+  CODE_DIRS: array[0..6] of string = (
     'backend/src',
-    'shared/delphi/landrixai/src',
+    'shared/delphi/landrixai',
     'shared/delphi/client',
     'shared/delphi/dto',
     'frontend-react/src',
-    'frontend-kmp/shared/src');
+    'frontend-kmp/shared/src',
+    'shared/delphi/libs/_git_Synopse2');
+  // schwere Binär-/Build-Unterordner, die innerhalb der indizierten Dirs liegen
+  // (landrixai/bin, landrixai/vendor/{models,sqlite-ext}, landrixai/_eval,
+  // backend/bin) - per Verzeichnis-Basename ausgeschlossen, sonst liefe der
+  // Index ueber ~1 GB GGUF-Modelle/Build-Artefakte
+  EXCLUDE_DIRS: array[0..3] of string = (
+    'bin', 'models', 'sqlite-ext', '_eval');
   MAX_SEARCH_LINES = 80;
 
 function CodeNavRoot: TFileName;
@@ -84,6 +92,18 @@ begin
   end;
 end;
 
+// Ausschluss-Flags fuer die externen Tools aus EXCLUDE_DIRS bauen.
+// aFlag ist das toolspezifische Flag inkl. '=' (ctags: '--exclude=',
+// grep: '--exclude-dir='); Basename-Match je Tool.
+function ExcludeArgs(const aFlag: RawUtf8): RawUtf8;
+var
+  i: integer;
+begin
+  result := '';
+  for i := 0 to high(EXCLUDE_DIRS) do
+    result := result + ' ' + aFlag + StringToUtf8(EXCLUDE_DIRS[i]);
+end;
+
 // '/^... $/' -> '...'  (ctags-Pattern in lesbare Signatur)
 function CleanPattern(const p: RawUtf8): RawUtf8;
 begin
@@ -110,8 +130,9 @@ begin
   root := CodeNavRoot;
   cmd := 'ctags -R --output-format=json --fields=+Kn ' +
     '--languages=Pascal,TypeScript,Kotlin ' +
-    '--exclude=node_modules --exclude=.git --exclude=build --exclude=generated ' +
-    '-f -' + DirArgs(root);
+    '--exclude=node_modules --exclude=.git --exclude=build --exclude=generated' +
+    ExcludeArgs('--exclude=') +
+    ' -f -' + DirArgs(root);
   ctagsOut := RunRedirect(cmd, '');  // '' stdinput -> mormot.ext.os fork+pipe overload
   if ctagsOut = '' then
     exit(FormatUtf8('{"error":"ctags returned nothing (is ctags installed? root=%)"}',
@@ -164,7 +185,8 @@ begin
   if aPattern = '' then
     exit('{"error":"missing pattern"}');
   root := CodeNavRoot;
-  cmd := 'grep -rIn --color=never';
+  cmd := 'grep -rIn --color=never --exclude-dir=.git' +
+    ExcludeArgs('--exclude-dir=');
   if aGlob <> '' then
     cmd := cmd + ' --include="' + aGlob + '"';
   // -e schuetzt Pattern, das mit '-' beginnt; Pattern als eigenes argv-Element
