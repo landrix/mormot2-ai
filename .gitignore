@@ -7,6 +7,10 @@
 # Interne Clean-Room-Prozess-/Provenance-Doku - bewusst NICHT eingecheckt.
 /_cleanroom/
 
+# Lokale Secrets/Provider-Konfig fuer die Demos (API-Keys) - NIE einchecken.
+.env
+demos/.env
+
 # FPC/Lazarus-Build-Artefakte (Compiler-Output + Unit-Cache + Demo-/Test-Binaries)
 /bin/
 *.o

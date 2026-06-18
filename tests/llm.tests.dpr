@@ -16,7 +16,8 @@ uses
   test.llm.sse,
   test.llm.client,
   test.llm.agent,
-  test.llm.agent.mcp;
+  test.llm.agent.mcp,
+  test.llm.structured;
 
 type
   TLlmTests = class(TSynTestsLogged)
@@ -30,7 +31,8 @@ begin
     TTestLlmSse,
     TTestLlmClient,
     TTestLlmAgent,
-    TTestLlmAgentMcp
+    TTestLlmAgentMcp,
+    TTestLlmStructured
   ]);
 end;
 

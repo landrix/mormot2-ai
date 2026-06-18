@@ -169,6 +169,8 @@ begin
     end;
     _Safe(body)^.AddValue('tools', tools);
   end;
+  if aRequest.ResponseFormat <> '' then
+    _Safe(body)^.AddValue('response_format', _Json(aRequest.ResponseFormat));
   // merge any provider-specific passthrough fields; AddOrUpdateFrom overwrites
   // rather than blindly appending, so Extra cannot create a duplicate JSON key
   if _Safe(aRequest.Extra)^.Count > 0 then
@@ -244,8 +246,10 @@ begin
     timeout := 30000;
   result := THttpClientSocket.OpenUri(url, aPath, '', timeout, nil);
   try
+    // trim defensively: a stray CR/space in the key (e.g. from a CRLF .env)
+    // would inject a bad byte into the Authorization header
     if (fConfig.AuthScheme = lasBearer) and (fConfig.ApiKey <> '') then
-      result.AuthBearer := fConfig.ApiKey;
+      result.AuthBearer := TrimU(fConfig.ApiKey);
   except
     result.Free; // do not leak the open socket if header setup fails
     raise;

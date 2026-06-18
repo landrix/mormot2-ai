@@ -107,6 +107,13 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
       `TMcpServer` (JSON-RPC `tools/list`/`tools/call` in-process). Damit treibt
       ein Agent direkt die Tools, die ein MCP-Server exponiert — derselbe
       RTTI-Schema-Generator an beiden Enden (der Suite-Schluss).
+    - `mormot.ai.llm.structured` — getypte Ausgabe: `ChatStructured(client, req,
+      TypeInfo(TRec), out rec)` generiert das JSON-Schema aus dem Record
+      (`TMcpSchemaGenerator`, dieselbe Maschine wie MCP-Tool-Input), setzt
+      `response_format: json_schema` und lädt die Antwort via `RecordLoadJson` in
+      den Record. `ResponseFormat`-Feld in `TLlmChatRequest` + Demo
+      `demos/llm/llm-structured.dpr`. **Live**: deutsche Belegextraktion gegen
+      Ollama (`german-text-3.1`) → typisierter Record.
     - **DoS-Cap**: optionales `MaxResponseBytes` in `TLlmProviderConfig` umwickelt
       den Stream-`OutStream` mit `TLimitedStreamWriter` (mORMot-nativ, cappt die
       *kumulative* Antwort — Ergänzung zum per-Chunk-`MaxHttpChunkSize`).
@@ -122,10 +129,11 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
       leak-/double-free-sicheres `ChatStream` (TLimitedStreamWriter kann bei
       Position=Size=0 nicht werfen) + Connect-Guard; MCP `isError`-Durchreichung;
       `IsValidJson`-Guard für Tool-Args; `content` weggelassen statt `""` bei
-      Assistant-Tool-only. **85 Assertions** grün.
+      Assistant-Tool-only. **95 Assertions** grün (inkl. Structured-Output).
   - **Offen**: weitere Provider (Anthropic Messages-API als eigener Treiber, anderes
-    Wire); Embeddings; optional ein Live-Demo `llm-agent-mcp` (Agent über echten
-    MCP-Server).
+    Wire); Embeddings + leichtes RAG; Vision/multimodale Messages (Content-Parts,
+    schaltet die OCR-Modelle frei); optional Live-Demo `llm-agent-mcp` (Agent über
+    echten MCP-Server).
 
 ## Lizenz / Contribution
 

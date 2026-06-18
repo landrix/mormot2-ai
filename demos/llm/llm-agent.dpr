@@ -2,8 +2,8 @@
 // endpoint: the model asks for get_weather, the agent runs it, feeds the result
 // back, and the model produces a final natural-language answer.
 //
-//   llm-agent [baseUrl] [model]
-//   defaults: http://172.16.122.3:11434/v1   Keyvan/german-text-3.1:latest
+//   llm-agent
+//   provider via env: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY (key never logged)
 program llm.agent;
 
 {$I mormot.defines.inc}
@@ -14,6 +14,9 @@ program llm.agent;
 
 uses
   {$I mormot.uses.inc}
+  {$ifdef UNIX}
+  mormot.lib.openssl11, // HTTPS/TLS provider on POSIX (Windows uses SChannel)
+  {$endif}
   sysutils,
   mormot.core.base,
   mormot.core.os,
@@ -58,14 +61,15 @@ var
   resp: TLlmChatResponse;
   server, model: RawUtf8;
 begin
-  server := StringToUtf8(ParamStr(1));
-  if server = '' then
-    server := 'http://172.16.122.3:11434/v1';
-  model := StringToUtf8(ParamStr(2));
-  if model = '' then
-    model := 'Keyvan/german-text-3.1:latest';
+  {$ifdef UNIX}
+  OpenSslInitialize; // enable TLS so HTTPS endpoints (OpenAI/LiteLLM) work
+  {$endif}
+  // provider comes from the environment: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+  cfg := LlmConfigFromEnv;
+  cfg.TimeoutMs := 120000;
+  server := cfg.BaseUrl;
+  model := cfg.DefaultModel;
 
-  cfg := OllamaConfig(server, model);
   client := TLlmClient.Create(cfg);
   tools := TDemoTools.Create;
   toolbox := TLlmCallbackToolbox.Create;

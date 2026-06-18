@@ -1,8 +1,8 @@
 // LandrixAI LLM client demo - streams a chat completion from an OpenAI-compatible
 // endpoint (OpenAI / LiteLLM / Ollama) and prints tokens as they arrive.
 //
-//   llm-chat [baseUrl] [model] [prompt]
-//   defaults: http://172.16.122.3:11434/v1   llama3.2   "Say hello ..."
+//   llm-chat [prompt]
+//   provider via env: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY (key never logged)
 program llm.chat;
 
 {$I mormot.defines.inc}
@@ -13,6 +13,9 @@ program llm.chat;
 
 uses
   {$I mormot.uses.inc}
+  {$ifdef UNIX}
+  mormot.lib.openssl11, // HTTPS/TLS provider on POSIX (Windows uses SChannel)
+  {$endif}
   sysutils,
   mormot.core.base,
   mormot.core.os,
@@ -46,17 +49,18 @@ var
   msgs: TLlmMessageDynArray;
   server, model, prompt: RawUtf8;
 begin
-  server := StringToUtf8(ParamStr(1));
-  if server = '' then
-    server := 'http://172.16.122.3:11434/v1';
-  model := StringToUtf8(ParamStr(2));
-  if model = '' then
-    model := 'llama3.2';
-  prompt := StringToUtf8(ParamStr(3));
+  {$ifdef UNIX}
+  OpenSslInitialize; // enable TLS so HTTPS endpoints (OpenAI/LiteLLM) work
+  {$endif}
+  // provider comes from the environment: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+  cfg := LlmConfigFromEnv;
+  cfg.TimeoutMs := 120000;
+  server := cfg.BaseUrl;
+  model := cfg.DefaultModel;
+  prompt := StringToUtf8(ParamStr(1));
   if prompt = '' then
     prompt := 'Say hello in one short sentence.';
 
-  cfg := OllamaConfig(server, model);
   SetLength(msgs, 1);
   msgs[0] := LlmMessage(lrUser, prompt);
   req := LlmChatRequest(model, msgs);

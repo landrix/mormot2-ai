@@ -107,6 +107,9 @@ type
     MaxTokens: integer;
     /// request a streamed (SSE) response
     Stream: boolean;
+    /// optional response_format value as raw JSON (e.g. '{"type":"json_object"}'
+    // or a json_schema object); '' omits it - see mormot.ai.llm.structured
+    ResponseFormat: RawUtf8;
     /// optional provider-specific fields merged verbatim into the request body
     Extra: variant;
   end;
