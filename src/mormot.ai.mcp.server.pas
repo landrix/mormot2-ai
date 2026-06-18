@@ -188,7 +188,7 @@ type
   end;
 
 
-{ ************ Streamable HTTP Transport (MCP 2025-03-26) }
+{ ************ Streamable HTTP Transport (MCP 2025-11-25) }
 
 type
   /// Session state for the Streamable HTTP transport
@@ -234,7 +234,7 @@ type
   TMcpStreamCall = function(const aRequestJson, aSessionId: RawUtf8;
     const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean of object;
 
-  /// Streamable HTTP transport implementing MCP 2025-03-26
+  /// Streamable HTTP transport implementing MCP 2025-11-25
   // - single endpoint handles POST, GET, DELETE, and OPTIONS
   // - POST responses always use SSE (text/event-stream) for requests
   // - session management via Mcp-Session-Id header
@@ -271,8 +271,6 @@ type
     // CORS + Mcp-Session-Id lines the handler prepared.
     procedure StreamDeferredResponse(const aWrite: TMcpRawWrite;
       const aBody, aOutHeaders: RawUtf8);
-    // -- protocol version patching --
-    function PatchProtocolVersion(const aJson: RawUtf8): RawUtf8;
     // -- explicit route callback for DELETE (TOnHttpServerRequest signature) --
     function OnDelete(Ctxt: THttpServerRequestAbstract): cardinal;
   public
@@ -1483,8 +1481,8 @@ begin
       if not handled then
       begin
         responseJson := fServer.ExecuteRequest(itemJson, sessionId);
-        if method = 'initialize' then
-          responseJson := PatchProtocolVersion(responseJson);
+        // protocolVersion is negotiated centrally in TMcpJsonRpcProcessor.
+        // HandleInitialize, so no transport-level patching is needed.
       end;
       // final SSE event with the JSON-RPC response for this request
       if responseJson <> '' then
@@ -1499,21 +1497,6 @@ begin
 
   // terminating zero-length chunk closes the chunked body
   aWrite('0'#13#10#13#10);
-end;
-
-function TMcpStreamableHttpTransport.PatchProtocolVersion(
-  const aJson: RawUtf8): RawUtf8;
-begin
-  // Post-process the initialize response to replace the protocol version.
-  // This is done at the transport layer to avoid changing TMcpServer or
-  // TMcpJsonRpcProcessor interfaces. The server returns '2024-11-05' by default;
-  // the Streamable HTTP transport patches it to '2025-03-26' because this
-  // transport implements the newer spec version.
-  // We anchor the replacement to the exact JSON key-value pair to avoid
-  // accidentally replacing date strings elsewhere in the response.
-  result := StringReplaceAll(aJson,
-    '"protocolVersion":"' + MCP_PROTOCOL_VERSION + '"',
-    '"protocolVersion":"' + MCP_PROTOCOL_VERSION_20250326 + '"');
 end;
 
 

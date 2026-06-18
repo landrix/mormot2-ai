@@ -54,6 +54,7 @@ type
     procedure ServerNotActive;
     procedure BadRequests;
     procedure NotificationsNoResponse;
+    procedure InitializeVersionNegotiation;
   end;
 
 implementation
@@ -452,6 +453,45 @@ begin
     server.Start;
     response := server.ExecuteRequest('{"jsonrpc":"2.0","method":"ping","params":{}}');
     Check(TrimU(response) = '');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.InitializeVersionNegotiation;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+
+  // sends initialize with the given client protocolVersion and returns the
+  // protocolVersion the server negotiated back
+  function Negotiated(const aClientVersion: RawUtf8): RawUtf8;
+  var
+    rv, resv: variant;
+    rd: PDocVariantData;
+  begin
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
+      '{"protocolVersion":"' + aClientVersion + '","capabilities":{},' +
+      '"clientInfo":{"name":"t","version":"1"}}}');
+    rv := _JsonFast(response);
+    resv := _Safe(rv)^.GetValueOrNull('result');
+    rd := _Safe(resv);
+    Check(rd^.GetAsRawUtf8('protocolVersion', result), 'protocolVersion present');
+  end;
+
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    // a supported version is echoed back to the client
+    CheckEqual(Negotiated('2025-03-26'), MCP_PROTOCOL_VERSION_20250326,
+      'echo supported 2025-03-26');
+    CheckEqual(Negotiated(MCP_PROTOCOL_VERSION_LATEST), MCP_PROTOCOL_VERSION_LATEST,
+      'echo latest');
+    // an unknown version falls back to the server's latest supported version
+    CheckEqual(Negotiated('1999-01-01'), MCP_PROTOCOL_VERSION_LATEST,
+      'fallback to latest');
   finally
     server.Free;
   end;

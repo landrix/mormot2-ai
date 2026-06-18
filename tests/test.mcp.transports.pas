@@ -354,7 +354,8 @@ begin
     resultDoc := _Safe(resultVar);
     Check(resultDoc^.IsObject);
     Check(resultDoc^.GetAsRawUtf8('protocolVersion', tmp));
-    CheckEqual(tmp, MCP_PROTOCOL_VERSION);
+    // negotiated: the server echoes the client's requested version (2025-03-26)
+    CheckEqual(tmp, MCP_PROTOCOL_VERSION_20250326);
     capsDoc := _Safe(resultDoc^.GetValueOrNull('capabilities'));
     Check(capsDoc^.IsObject);
   finally

@@ -5,8 +5,8 @@ Eine **mORMot-native** AI-/LLM-Erweiterung. Erster Use-Case: ein robuster
 [flydev-fr/mormot2-extensions](https://github.com/flydev-fr/mormot2-extensions)
 **adoptiert** (mORMot-lizenziert) und auf den `mormot.ai.*`-Namespace umbenannt.
 
-> Status: **Phase A abgeschlossen** — adoptiert, Build **+ alle Tests grün**
-> (44 Tests / 187 Assertions, aarch64-linux/FPC 3.2.2).
+> Status: **Phase A + Spec-Upgrade** — adoptiert, MCP **2025-11-25** mit Versions-
+> Negotiation, Build **+ alle Tests grün** (193 Assertions, aarch64-linux/FPC 3.2.2).
 
 ## Warum mORMot-nativ
 
@@ -41,10 +41,11 @@ Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
 
 ## MCP-Stand
 
-Adoptierter Server spricht MCP **2025-03-26** (Streamable HTTP). Upgrade auf die
-aktuelle Revision **2025-11-25** ist ein Follow-up. Transporte: stdio, HTTP, SSE,
-Streamable HTTP, in-process. Tools: `TMcpServer.RegisterTool(IMcpTool)`, Input-
-Schema automatisch via RTTI aus typisiertem Record (`TMcpToolBase<T: record>`).
+Server spricht MCP **2025-11-25** mit **Versions-Negotiation**: `initialize` echot
+die vom Client angefragte Version, wenn unterstützt (2024-11-05 / 2025-03-26 /
+2025-06-18 / 2025-11-25), sonst Fallback auf die neueste. Transporte: stdio, HTTP,
+SSE, Streamable HTTP, in-process. Tools: `TMcpServer.RegisterTool(IMcpTool)`,
+Input-Schema automatisch via RTTI aus typisiertem Record (`TMcpToolBase<T: record>`).
 
 ## Herkunft & Lizenz
 
@@ -56,8 +57,7 @@ mit flydev abstimmen (Namespace `mormot.ai.*` vs. flydevs `mormot.ext.mcp`).
 ## Nächste Schritte
 
 1. landrix-spezifische MCP-Tools andocken (über die `TMcpServer`-Registry).
-2. Spec-Upgrade 2025-03-26 → 2025-11-25.
-3. Clean-Room LLM-Client (`mormot.ai.llm`) — gegen die offiziellen Provider-/MCP-
+2. Clean-Room LLM-Client (`mormot.ai.llm`) — gegen die offiziellen Provider-/MCP-
    Specs implementiert (interne Clean-Room-Prozessdoku separat, nicht eingecheckt).
 
 ✓ Demos übernommen (stdio/http/jsonrpc/sse/streamable inkl. Claude) — alle bauen grün.

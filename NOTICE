@@ -18,9 +18,8 @@ flydev-fr/mormot2-extensions — mormot-mcp-server  (ADOPTED & ADAPTED)
   retained. https://github.com/flydev-fr/mormot2-extensions
 
 Model Context Protocol — specification
-  Server implemented against MCP revision 2025-03-26 (Streamable HTTP) as
-  adopted; upgrade to 2025-11-25 is a follow-up step. Open specification.
-  https://modelcontextprotocol.io
+  Server implements MCP revision 2025-11-25 with version negotiation.
+  Open specification. https://modelcontextprotocol.io
 
 JSON-RPC 2.0 — specification
   https://www.jsonrpc.org/specification

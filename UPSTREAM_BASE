@@ -14,7 +14,7 @@ extension and renamed/aligned to the mormot.ai.* namespace.
 
 ## Authoritative specifications we build against
 
-  MCP protocol: adopted server speaks 2025-03-26; target upgrade 2025-11-25
+  MCP protocol: 2025-11-25 with version negotiation (adopted base was 2025-03-26)
                 — https://modelcontextprotocol.io
   JSON-RPC 2.0  — https://www.jsonrpc.org/specification
 

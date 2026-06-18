@@ -40,11 +40,27 @@ uses
 { ************ Core Types and Authentication Context }
 
 const
-  /// MCP Protocol Version
+  /// MCP Protocol Version (legacy baseline)
   MCP_PROTOCOL_VERSION = '2024-11-05';
 
-  /// MCP Protocol Version (2025-03-26 - Streamable HTTP)
+  /// MCP Protocol Version that introduced Streamable HTTP
   MCP_PROTOCOL_VERSION_20250326 = '2025-03-26';
+
+  /// MCP Protocol Version (2025-06-18 revision)
+  MCP_PROTOCOL_VERSION_20250618 = '2025-06-18';
+
+  /// latest MCP Protocol Version implemented by this server
+  // - returned as fallback when the client requests an unsupported version
+  MCP_PROTOCOL_VERSION_LATEST = '2025-11-25';
+
+  /// MCP protocol revisions this server can negotiate
+  // - HandleInitialize echoes the client's requested version if it appears
+  //   here (per MCP version negotiation), otherwise falls back to _LATEST
+  // - assembled from the named version constants so there is a single source
+  //   of truth and the list cannot drift from the constants above
+  MCP_SUPPORTED_PROTOCOL_VERSIONS: array[0..3] of RawUtf8 = (
+    MCP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION_20250326,
+    MCP_PROTOCOL_VERSION_20250618, MCP_PROTOCOL_VERSION_LATEST);
 
   /// JSON-RPC 2.0 Error Codes
   JSONRPC_PARSE_ERROR = -32700;
@@ -376,7 +392,7 @@ begin
   inherited Create;
   fServerName := aServerName;
   fServerVersion := aServerVersion;
-  fProtocolVersion := MCP_PROTOCOL_VERSION;
+  fProtocolVersion := MCP_PROTOCOL_VERSION_LATEST;
 end;
 
 function TMcpJsonRpcProcessor.ExtractRequestId(const aRequest: variant): variant;
@@ -460,8 +476,22 @@ end;
 function TMcpJsonRpcProcessor.HandleInitialize(const aParams: variant): variant;
 var
   result_doc, capabilities, serverInfo: TDocVariantData;
+  clientVersion, negotiated: RawUtf8;
+  i: integer;
 begin
-  result_doc.InitObject(['protocolVersion', fProtocolVersion], JSON_FAST);
+  // MCP version negotiation: echo the client's requested protocolVersion if we
+  // support it; otherwise return our latest supported version and let the
+  // client decide whether to proceed.
+  clientVersion := _Safe(aParams)^.U['protocolVersion'];
+  negotiated := fProtocolVersion; // default = latest supported
+  for i := 0 to high(MCP_SUPPORTED_PROTOCOL_VERSIONS) do
+    if MCP_SUPPORTED_PROTOCOL_VERSIONS[i] = clientVersion then
+    begin
+      negotiated := clientVersion;
+      break;
+    end;
+
+  result_doc.InitObject(['protocolVersion', negotiated], JSON_FAST);
   
   // Add capabilities
   capabilities.InitObject([], JSON_FAST);

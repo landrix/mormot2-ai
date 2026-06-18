@@ -71,7 +71,9 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
 - **Phase A** ✓ — flydev-MCP-Server adoptiert, `mormot.ai.*`, Build/Tests/Demos grün.
 - **Phase B** — landrix-spezifische MCP-Tools über `TMcpServer.RegisterTool`
   andocken; Auth über die vorhandene mORMot-Auth des Backends.
-- **Phase C** — MCP-Spec-Upgrade **2025-03-26 → 2025-11-25**.
+- **Phase C** ✓ — MCP-Spec auf **2025-11-25** mit Versions-Negotiation
+  (`initialize` echot unterstützte Client-Versionen, sonst Fallback = neueste);
+  der transportabhängige Patch-Hack wurde entfernt (einheitliches Verhalten).
 - **Phase D** — Clean-Room LLM-Client (`mormot.ai.llm`): Provider-Treiber +
   Agent-/Tool-Calling-Loop gegen die offiziellen Specs.
 
