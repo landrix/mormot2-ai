@@ -141,6 +141,24 @@ begin
     result := ''; // pause_turn / unknown -> not finished
 end;
 
+// one Anthropic image content block from a neutral image attachment
+function AnthropicImageBlock(const aImage: TLlmImage): variant;
+begin
+  // Anthropic wraps the image in a typed `source` (base64 vs url), unlike
+  // OpenAI's single image_url field
+  if aImage.Source = lisBase64 then
+    result := _ObjFast([
+      'type', 'image',
+      'source', _ObjFast([
+        'type', 'base64',
+        'media_type', LlmImageMediaType(aImage),
+        'data', aImage.Data])])
+  else
+    result := _ObjFast([
+      'type', 'image',
+      'source', _ObjFast(['type', 'url', 'url', aImage.Data])]);
+end;
+
 // translate one neutral message; system text is hoisted into aSystem, every
 // other message is appended to aMessages as an Anthropic message object
 procedure AddAnthropicMessage(const aMessages: variant; var aSystem: RawUtf8;
@@ -157,8 +175,21 @@ begin
       else
         aSystem := aSystem + #10 + aMsg.Content;
     lrUser:
-      _Safe(aMessages)^.AddItem(
-        _ObjFast(['role', 'user', 'content', aMsg.Content]));
+      if length(aMsg.Images) > 0 then
+      begin
+        // multimodal user turn: text part (if any) + one image block per image
+        content := _Arr([]);
+        if aMsg.Content <> '' then
+          _Safe(content)^.AddItem(
+            _ObjFast(['type', 'text', 'text', aMsg.Content]));
+        for i := 0 to high(aMsg.Images) do
+          _Safe(content)^.AddItem(AnthropicImageBlock(aMsg.Images[i]));
+        _Safe(aMessages)^.AddItem(
+          _ObjFast(['role', 'user', 'content', content]));
+      end
+      else
+        _Safe(aMessages)^.AddItem(
+          _ObjFast(['role', 'user', 'content', aMsg.Content]));
     lrAssistant:
       if length(aMsg.ToolCalls) > 0 then
       begin

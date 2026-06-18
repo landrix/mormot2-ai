@@ -29,6 +29,8 @@ type
     procedure RequestHoistsSystem;
     procedure RequestToolsInputSchema;
     procedure RequestToolRoundTrip;
+    procedure RequestVision;
+    procedure RequestVisionDefaultMedia;
     procedure ResponseTextAndUsage;
     procedure ResponseToolUse;
     procedure ResponseToolUseNoInput;
@@ -164,6 +166,68 @@ begin
   CheckEqual(tr^.U['type'], 'tool_result', 'tool_result block');
   CheckEqual(tr^.U['tool_use_id'], 'toolu_1', 'tool_use_id links the call');
   CheckEqual(tr^.U['content'], '{"temp":"22C"}', 'tool result content');
+end;
+
+procedure TTestLlmAnthropic.RequestVision;
+var
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  imgs: TLlmImageDynArray;
+  json: RawUtf8;
+  content, b0, b1, b2, src: PDocVariantData;
+begin
+  // a multimodal user turn: text + a base64 image + a URL image
+  SetLength(imgs, 2);
+  imgs[0] := LlmImageBase64('image/jpeg', 'BBBB');
+  imgs[1] := LlmImageUrl('https://example.com/roof.png');
+  SetLength(msgs, 1);
+  msgs[0] := LlmImageMessage(lrUser, 'Describe these', imgs);
+  req := LlmChatRequest('claude-opus-4-8', msgs);
+
+  json := AnthropicChatRequestJson(req, {stream=}false);
+  content := _Safe(_Json(json))^.A['messages']^._[0]^.A['content'];
+  CheckEqual(content^.Count, 3, 'text block + two image blocks');
+  b0 := content^._[0];
+  CheckEqual(b0^.U['type'], 'text', 'first block is text');
+  // base64 image: typed source with media_type + data (no data: URI prefix)
+  b1 := content^._[1];
+  CheckEqual(b1^.U['type'], 'image', 'second block is image');
+  src := b1^.O['source'];
+  CheckEqual(src^.U['type'], 'base64', 'base64 source');
+  CheckEqual(src^.U['media_type'], 'image/jpeg', 'media type');
+  CheckEqual(src^.U['data'], 'BBBB', 'raw base64 data (no data: prefix)');
+  // URL image: url source
+  b2 := content^._[2];
+  src := b2^.O['source'];
+  CheckEqual(src^.U['type'], 'url', 'url source');
+  CheckEqual(src^.U['url'], 'https://example.com/roof.png', 'image url');
+end;
+
+procedure TTestLlmAnthropic.RequestVisionDefaultMedia;
+var
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  img: TLlmImage;
+  json: RawUtf8;
+  src: PDocVariantData;
+begin
+  // a base64 image without MediaType (manual construction): Anthropic requires
+  // media_type, so the serializer must fall back to the default rather than emit
+  // an empty/absent media_type that the API rejects
+  Finalize(img);
+  FillCharFast(img, SizeOf(img), 0);
+  img.Source := lisBase64;
+  img.Data := 'CCCC';
+  SetLength(msgs, 1);
+  msgs[0] := LlmImageMessage(lrUser, '', nil);
+  SetLength(msgs[0].Images, 1);
+  msgs[0].Images[0] := img;
+  req := LlmChatRequest('claude-opus-4-8', msgs);
+
+  json := AnthropicChatRequestJson(req, {stream=}false);
+  src := _Safe(_Json(json))^.A['messages']^._[0]^.A['content']^._[0]^.O['source'];
+  CheckEqual(src^.U['media_type'], 'image/png', 'empty media_type defaults to png');
+  CheckEqual(src^.U['data'], 'CCCC', 'raw data preserved');
 end;
 
 procedure TTestLlmAnthropic.ResponseTextAndUsage;

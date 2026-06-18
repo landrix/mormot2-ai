@@ -120,13 +120,26 @@ implementation
 // add a single chat message object to the messages array variant
 procedure AddMessage(const aMessages: variant; const aMsg: TLlmMessage);
 var
-  m, calls, call: variant;
+  m, calls, call, parts: variant;
   i: PtrInt;
 begin
+  if length(aMsg.Images) > 0 then
+  begin
+    // multimodal: content becomes an array of typed parts (text + image_url);
+    // a base64 image is inlined as a data: URI, a URL is passed through
+    parts := _Arr([]);
+    if aMsg.Content <> '' then
+      _Safe(parts)^.AddItem(_ObjFast(['type', 'text', 'text', aMsg.Content]));
+    for i := 0 to high(aMsg.Images) do
+      _Safe(parts)^.AddItem(_ObjFast([
+        'type', 'image_url',
+        'image_url', _ObjFast(['url', LlmImageDataUri(aMsg.Images[i])])]));
+    m := _ObjFast(['role', LlmRoleText(aMsg.Role), 'content', parts]);
+  end
   // an assistant turn that only calls tools omits content entirely: per the
   // OpenAI spec content is optional when tool_calls is present, and an empty
   // string "" is rejected by strict validators
-  if (aMsg.Content = '') and (aMsg.Role = lrAssistant) and
+  else if (aMsg.Content = '') and (aMsg.Role = lrAssistant) and
      (length(aMsg.ToolCalls) > 0) then
     m := _ObjFast(['role', LlmRoleText(aMsg.Role)])
   else

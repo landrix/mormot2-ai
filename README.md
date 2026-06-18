@@ -59,6 +59,12 @@ LiteLLM / Ollama ab); ein Provider mit echt abweichendem Wire bekommt einen
   `x-api-key`+`anthropic-version`, event-getypte SSE). Agent-Loop, RAG und Structured-
   Output bleiben dadurch provider-agnostisch — nur die `ILlmClient`-Instanz wechselt.
 
+**Vision/multimodal:** `TLlmMessage.Images` (`LlmImageMessage`/`LlmImageBase64`/
+`LlmImageUrl`) trägt Bild-Anhänge; beide Wires serialisieren sie (OpenAI `image_url`
+inkl. base64-`data:`-URI, Anthropic `image`-Block mit typisiertem `source`). Demo
+`demos/llm/llm-vision.dpr` (env `VISION_IMAGE_B64`/`_MEDIA` oder `VISION_IMAGE_URL`) —
+**live** gegen `gpt-4o-mini` geprüft.
+
 ### Tests (LLM-Suite, inkl. Anthropic)
 
 Eigener Runner — baut + fährt `llm.tests.dpr` (alle LLM-Suiten: SSE, Client, Agent,

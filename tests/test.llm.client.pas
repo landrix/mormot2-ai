@@ -21,6 +21,8 @@ type
   published
     procedure RequestJsonMinimal;
     procedure RequestJsonWithToolsAndParams;
+    procedure RequestJsonVision;
+    procedure VisionDefaultMediaType;
     procedure ResponseParsing;
     procedure ProviderConfigs;
     procedure ExtraOverridesWithoutDuplicateKey;
@@ -110,6 +112,58 @@ begin
   params := fn^.O['parameters'];
   CheckEqual(params^.U['type'], 'object', 'parameters is an object');
   CheckEqual(params^.O['properties']^.O['loc']^.U['type'], 'string', 'nested schema');
+end;
+
+procedure TTestLlmClient.RequestJsonVision;
+var
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  imgs: TLlmImageDynArray;
+  json: RawUtf8;
+  content, p0, p1, p2: PDocVariantData;
+begin
+  // a multimodal user turn: text + a base64 image + a URL image
+  SetLength(imgs, 2);
+  imgs[0] := LlmImageBase64('image/png', 'AAAA');
+  imgs[1] := LlmImageUrl('https://example.com/cat.png');
+  SetLength(msgs, 1);
+  msgs[0] := LlmImageMessage(lrUser, 'What is in these?', imgs);
+  req := LlmChatRequest('gpt-4o-mini', msgs);
+
+  json := OpenAIChatRequestJson(req, {stream=}false);
+  // content is an array of typed parts, not a plain string
+  content := _Safe(_Json(json))^.A['messages']^._[0]^.A['content'];
+  CheckEqual(content^.Count, 3, 'text part + two image parts');
+  p0 := content^._[0];
+  CheckEqual(p0^.U['type'], 'text', 'first part is text');
+  CheckEqual(p0^.U['text'], 'What is in these?', 'text content');
+  p1 := content^._[1];
+  CheckEqual(p1^.U['type'], 'image_url', 'second part is image_url');
+  // base64 is inlined as a data: URI
+  CheckEqual(p1^.O['image_url']^.U['url'], 'data:image/png;base64,AAAA',
+    'base64 image inlined as data URI');
+  p2 := content^._[2];
+  CheckEqual(p2^.O['image_url']^.U['url'], 'https://example.com/cat.png',
+    'URL image passed through');
+end;
+
+procedure TTestLlmClient.VisionDefaultMediaType;
+var
+  img: TLlmImage;
+begin
+  // a base64 image constructed without a MediaType (bypassing LlmImageBase64)
+  // must still serialize to a valid data: URI, not 'data:;base64,...'
+  Finalize(img);
+  FillCharFast(img, SizeOf(img), 0);
+  img.Source := lisBase64;
+  img.Data := 'ZZZZ';
+  CheckEqual(LlmImageMediaType(img), 'image/png', 'empty media defaults to png');
+  CheckEqual(LlmImageDataUri(img), 'data:image/png;base64,ZZZZ',
+    'data URI uses the default media type');
+  // an explicit media type is preserved
+  img.MediaType := 'image/webp';
+  CheckEqual(LlmImageDataUri(img), 'data:image/webp;base64,ZZZZ',
+    'explicit media type wins');
 end;
 
 procedure TTestLlmClient.ResponseParsing;

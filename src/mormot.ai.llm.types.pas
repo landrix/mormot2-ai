@@ -73,6 +73,22 @@ type
   end;
   TLlmToolCallDynArray = array of TLlmToolCall;
 
+  /// how an image attachment is supplied to the model
+  TLlmImageSource = (
+    lisBase64,
+    lisUrl);
+
+  /// one image attachment for a multimodal (vision) message
+  TLlmImage = record
+    /// base64 inline data, or a URL the provider fetches
+    Source: TLlmImageSource;
+    /// MIME type for lisBase64 (e.g. 'image/png'); ignored for lisUrl
+    MediaType: RawUtf8;
+    /// the base64 payload (no 'data:' prefix) for lisBase64, or the URL for lisUrl
+    Data: RawUtf8;
+  end;
+  TLlmImageDynArray = array of TLlmImage;
+
   /// one entry of the chat conversation
   TLlmMessage = record
     Role: TLlmRole;
@@ -84,6 +100,10 @@ type
     ToolCallId: RawUtf8;
     /// for Role=lrAssistant: the tool calls the model requested
     ToolCalls: TLlmToolCallDynArray;
+    /// optional image attachments (vision/multimodal)
+    // - when present the wire serializes Content + these as a content-parts array
+    //   (OpenAI image_url / Anthropic image source); usually on a user message
+    Images: TLlmImageDynArray;
   end;
   TLlmMessageDynArray = array of TLlmMessage;
 
@@ -178,11 +198,32 @@ function LlmChatRequest(const aModel: RawUtf8;
 /// build a single chat message
 function LlmMessage(aRole: TLlmRole; const aContent: RawUtf8): TLlmMessage;
 
+/// build a base64 image attachment (aMediaType e.g. 'image/png')
+function LlmImageBase64(const aMediaType, aBase64: RawUtf8): TLlmImage;
+
+/// build a URL image attachment (the provider fetches it)
+function LlmImageUrl(const aUrl: RawUtf8): TLlmImage;
+
+/// build a multimodal message: text content + image attachments
+function LlmImageMessage(aRole: TLlmRole; const aContent: RawUtf8;
+  const aImages: TLlmImageDynArray): TLlmMessage;
+
+/// the OpenAI image_url value: a 'data:' URI for base64, or the URL as-is
+function LlmImageDataUri(const aImage: TLlmImage): RawUtf8;
+
+/// the effective MIME type of a base64 image: its MediaType, or a sensible
+// default when left empty - so a wire that requires it (Anthropic) stays valid
+function LlmImageMediaType(const aImage: TLlmImage): RawUtf8;
+
 
 implementation
 
 uses
   mormot.core.text;
+
+const
+  /// fallback MIME for a base64 image whose MediaType was left empty
+  LLM_DEFAULT_IMAGE_MEDIA = 'image/png';
 
 function ToLlmRole(const aText: RawUtf8): TLlmRole;
 begin
@@ -241,6 +282,50 @@ begin
   FillCharFast(result, SizeOf(result), 0);
   result.Role := aRole;
   result.Content := aContent;
+end;
+
+function LlmImageBase64(const aMediaType, aBase64: RawUtf8): TLlmImage;
+begin
+  Finalize(result);
+  FillCharFast(result, SizeOf(result), 0);
+  result.Source := lisBase64;
+  result.MediaType := aMediaType;
+  result.Data := aBase64;
+end;
+
+function LlmImageUrl(const aUrl: RawUtf8): TLlmImage;
+begin
+  Finalize(result);
+  FillCharFast(result, SizeOf(result), 0);
+  result.Source := lisUrl;
+  result.Data := aUrl;
+end;
+
+function LlmImageMessage(aRole: TLlmRole; const aContent: RawUtf8;
+  const aImages: TLlmImageDynArray): TLlmMessage;
+begin
+  Finalize(result);
+  FillCharFast(result, SizeOf(result), 0);
+  result.Role := aRole;
+  result.Content := aContent;
+  result.Images := aImages;
+end;
+
+function LlmImageMediaType(const aImage: TLlmImage): RawUtf8;
+begin
+  if aImage.MediaType <> '' then
+    result := aImage.MediaType
+  else
+    result := LLM_DEFAULT_IMAGE_MEDIA;
+end;
+
+function LlmImageDataUri(const aImage: TLlmImage): RawUtf8;
+begin
+  // OpenAI image_url takes either a public URL or an inline data: URI
+  if aImage.Source = lisBase64 then
+    result := FormatUtf8('data:%;base64,%', [LlmImageMediaType(aImage), aImage.Data])
+  else
+    result := aImage.Data;
 end;
 
 end.
