@@ -42,8 +42,8 @@ build_one() {
   set +e
   fpc -MDelphi -Sci -Ci -O2 -g -gl -gw2 \
     -T"$TARGET" -P"$ARCH" \
-    -Fi"$INCLUDES;$DEMO_SRC/_deps" \
-    -Fu"$LIB_SRC;$DEMO_SRC;$DEMO_SRC/_deps;$UNITS" \
+    -Fi"$INCLUDES;$ROOT/shared/delphi/landrixai/vendor" \
+    -Fu"$LIB_SRC;$DEMO_SRC;$ROOT/shared/delphi/landrixai/vendor;$UNITS" \
     -Fl"$STATIC/$ARCH-$TARGET" \
     -FU"$UNIT_OUT" \
     -FE"$DEMO_OUT" \

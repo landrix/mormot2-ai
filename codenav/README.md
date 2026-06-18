@@ -1,0 +1,90 @@
+# code-nav MCP
+
+Ein stdio-MCP-Server (auf `mormot.ai.mcp`), der Coding-Agenten Code-Navigation
+bietet, damit sie das Repo durchsuchen, **ohne große Dateien ganz zu lesen** —
+spart Token. Erster echter Anwendungsfall der `mormot.ai.*`-Extension.
+
+## Tools
+
+| Tool | Zweck | Sprachen | Backend |
+|---|---|---|---|
+| `get_outline(path)` | Code-Outline (Typen/Klassen/Member, kompakt) | **Pascal · TypeScript · Kotlin** | Pascal: eigener Scanner; sonst ctags |
+| `find_definition(name)` | Symbol → `file:line [kind] signature` | **Pascal · TypeScript · Kotlin** | ctags |
+| `search_text(pattern, glob)` | kompakte Volltextsuche (`file:line:text`, gedeckelt) | alle | grep |
+
+`get_outline` dispatcht nach Dateiendung: Pascal (`.pas`/`.pp`/`.inc`/`.lpr`/`.dpr`)
+nutzt einen eigenen Scanner (interface-Teil, dedup) — *weil* ctags' Pascal-Parser nur
+`function`/`procedure` ohne Scope kennt; TS/Kotlin und andere nutzen ctags (Symbole
+line-sortiert, Member via Scope eingerückt).
+
+## Token-Nutzen
+
+`get_outline` einer großen Unit spart **~8–60×** (z. B. `DbFederation.pas`
+178 KB → 17 KB; Handler-Units bis ~59×). `find_definition`/`search_text` ersetzen
+mehrfaches Grep+Read durch eine kompakte, präzise Antwort.
+
+## Grenzen (bekannt)
+
+Die Genauigkeit hängt am jeweiligen Parser — die Tools liefern einen *Outline/Index*,
+keinen vollständigen AST:
+
+- **`get_outline` TS/Kotlin (ctags):** ctags ist kein vollständiger Parser. Bei
+  manchen Konstrukten (z. B. Properties von TS-`interface`s, verschachtelte/anonyme
+  Typen) werden **nicht immer alle Member** gelistet. Für die Outline-Übersicht
+  i. d. R. ausreichend, aber nicht garantiert vollständig.
+- **`get_outline` Pascal (eigener Scanner):** scannt nur den `interface`-Teil;
+  verschachtelte Typen *innerhalb* einer Klasse können das erste `end;` vorzeitig als
+  Body-Ende werten (im interface selten, in der Praxis bislang nicht aufgetreten).
+- **`find_definition` Pascal:** ctags' Pascal-Parser kennt **nur `function`/
+  `procedure`** — Pascal-**Klassen/Records/Interfaces** (`type X = class`) sind **nicht**
+  als Definition auffindbar; nur Methoden/Funktionen. Für solche Typen `get_outline`
+  oder `search_text` nutzen. (TS/Kotlin: vollständig, inkl. class/interface.)
+
+Wenn echte AST-Treue oder cross-unit-Referenzen (`find_references`, geerbte
+Definitionen) nötig werden, wäre **pasls** (CodeTools-LSP) der Weg — aktuell bewusst
+nicht umgesetzt (Build-/Bridge-Overhead, für den Token-Spar-Zweck Overkill).
+
+## Voraussetzung
+
+`universal-ctags` muss installiert sein (`ctags --version` → „Universal Ctags").
+
+## Bauen
+
+```bash
+# in WSL (nativ aarch64), aus dem Repo-Root:
+bash shared/delphi/landrixai/scripts/build-codenav.sh
+```
+Binary: `shared/delphi/landrixai/bin/fpc/codenav.mcp` (gitignored).
+
+## Einbindung (z. B. Claude Code, .mcp.json)
+
+```json
+{ "mcpServers": {
+    "landrix-codenav": {
+      "command": "wsl",
+      "args": ["-e", "/mnt/d/Projekte/landrix-platform/shared/delphi/landrixai/bin/fpc/codenav.mcp"],
+      "env": { "CODENAV_ROOT": "/mnt/d/Projekte/landrix-platform" } } } }
+```
+- Das Binary ist ein **aarch64-linux**-Build (WSL); Claude Code läuft auf Windows →
+  `wsl`-Wrapper. Alternativ ein nativer Windows-Build.
+- `CODENAV_ROOT` = Repo-Wurzel (sonst aktuelles Verzeichnis). Die durchsuchten
+  Quell-Dirs sind in `codenav.tools.pas` kuratiert (ohne vendored libs / node_modules
+  / generated).
+
+## Implementierungs-Hinweis (wichtig)
+
+Die externen Tools (ctags/grep) werden über **`mormot.ext.os`'s `RunRedirect`
+(fork+pipe)** aufgerufen — mORMots eigenes popen-basiertes `RunRedirect`
+(`mormot.core.os`) **hängt in dieser WSL-Umgebung** (auch im Main-Thread, auch bei
+trivialen Befehlen). `mormot.ext.os` liegt unter `landrixai/vendor/` (adoptiert von
+flydev, geteilt mit den Demos).
+
+## Dateien
+
+```
+codenav/
+  codenav.outline.pas   Pascal-interface-Outline (RTL)
+  codenav.tools.pas     find_definition (ctags) + search_text (grep), via mormot.ext.os
+  codenav.mcp.lpr       stdio-MCP-Server, registriert die 3 Tools
+  outline.lpr           eigenständiges Outline-CLI (Prototyp/Debug)
+```
