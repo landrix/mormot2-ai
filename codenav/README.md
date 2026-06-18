@@ -26,7 +26,11 @@ mehrfaches Grep+Read durch eine kompakte, präzise Antwort.
 ## Grenzen (bekannt)
 
 Die Genauigkeit hängt am jeweiligen Parser — die Tools liefern einen *Outline/Index*,
-keinen vollständigen AST:
+keinen vollständigen AST. Wichtig: Ein leeres Ergebnis ist **keine Fehlermeldung**,
+sondern eine normale Antwort — „nichts gefunden" ist also **kein Beweis für
+Abwesenheit**. Damit ein Agent das nicht falsch versteht, hängen `find_definition`
+und `search_text` im Leerfall einen Hinweis an (Blind Spots + indizierte Dirs +
+Fallback auf grep/Read).
 
 - **`get_outline` TS/Kotlin (ctags):** ctags ist kein vollständiger Parser. Bei
   manchen Konstrukten (z. B. Properties von TS-`interface`s, verschachtelte/anonyme
@@ -56,20 +60,26 @@ bash shared/delphi/landrixai/scripts/build-codenav.sh
 ```
 Binary: `shared/delphi/landrixai/bin/fpc/codenav.mcp` (gitignored).
 
-## Einbindung (z. B. Claude Code, .mcp.json)
+## Einbindung (Claude Code)
 
-```json
-{ "mcpServers": {
-    "landrix-codenav": {
-      "command": "wsl",
-      "args": ["-e", "/mnt/d/Projekte/landrix-platform/shared/delphi/landrixai/bin/fpc/codenav.mcp"],
-      "env": { "CODENAV_ROOT": "/mnt/d/Projekte/landrix-platform" } } } }
+Über das portable Launcher-Skript `codenav-mcp.sh` (leitet die Repo-Wurzel aus dem
+eigenen Pfad ab — kein hartkodierter Pfad, keine env-Variable nötig). Registrieren:
+
+```powershell
+# in PowerShell ausführen (NICHT Git-Bash — das mangled /mnt-Pfade)
+claude mcp add -s local landrix-codenav -- `
+  wsl -e bash /mnt/d/Projekte/landrix-platform/shared/delphi/landrixai/codenav/codenav-mcp.sh
 ```
+- Scope `local` = nur du, nur dieses Projekt (landet in `~/.claude.json`, nicht
+  eingecheckt). Prüfen: `claude mcp get landrix-codenav` → `Status: ✓ Connected`.
+- **Pro Maschine einmalig**: Registrierung (`~/.claude.json`) **und** Binary sind nicht
+  in git — auf jedem Rechner separat `build-codenav.sh` (in dessen WSL, baut nativ für
+  dessen Arch: aarch64 bzw. x86_64) **und** den `claude mcp add`-Befehl oben ausführen.
+  Launcher + Befehl sind auf allen Rechnern identisch (laufen über den WSL-Pfad).
 - Das Binary ist ein **aarch64-linux**-Build (WSL); Claude Code läuft auf Windows →
-  `wsl`-Wrapper. Alternativ ein nativer Windows-Build.
-- `CODENAV_ROOT` = Repo-Wurzel (sonst aktuelles Verzeichnis). Die durchsuchten
-  Quell-Dirs sind in `codenav.tools.pas` kuratiert (ohne vendored libs / node_modules
-  / generated).
+  `wsl`-Wrapper. Vorher bauen (`build-codenav.sh`). Aktiv nach Reload/neuer Session.
+- `CODENAV_ROOT` setzt der Launcher selbst; die durchsuchten Quell-Dirs sind in
+  `codenav.tools.pas` kuratiert (ohne vendored libs / node_modules / generated).
 
 ## Implementierungs-Hinweis (wichtig)
 

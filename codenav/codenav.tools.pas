@@ -53,6 +53,22 @@ begin
   result := ExcludeTrailingPathDelimiter(result);
 end;
 
+// kommaseparierte Liste der indizierten Quell-Dirs — für die Hinweis-Texte im
+// Leerfall, damit der Agent die Reichweite kennt (sonst liest „nichts gefunden"
+// wie „existiert nicht", obwohl evtl. nur außerhalb dieser Dirs gesucht wurde)
+function IndexedDirs: RawUtf8;
+var
+  i: integer;
+begin
+  result := '';
+  for i := 0 to high(CODE_DIRS) do
+  begin
+    if i > 0 then
+      result := result + ', ';
+    result := result + StringToUtf8(CODE_DIRS[i]);
+  end;
+end;
+
 // existierende Quell-Dirs als gequotete, leerzeichengetrennte Argumentliste
 function DirArgs(const aRoot: TFileName): RawUtf8;
 var
@@ -126,7 +142,15 @@ begin
     sl.Free;
   end;
   if hits = 0 then
-    result := result + '  (no definition found)'#10;
+    result := result +
+      '  (no definition found -- this does NOT prove the symbol is absent)'#10 +
+      '  - Pascal class/record/interface TYPE names are NOT indexed (ctags'' Pascal'#10 +
+      '    parser knows only function/procedure); for a Pascal type use get_outline'#10 +
+      '    or search_text instead.'#10 +
+      '  - the match is exact + case-sensitive; only these languages are indexed:'#10 +
+      '    Pascal, TypeScript, Kotlin.'#10 +
+      '  - only these dirs are indexed: ' + IndexedDirs + #10 +
+      '    for anything outside them, fall back to grep/Read.'#10;
   result := result + FormatUtf8('# % match(es)'#10, [hits]);
 end;
 
@@ -169,7 +193,12 @@ begin
       inc(shown);
     end;
     if shown = 0 then
-      result := result + '  (no matches)'#10;
+      result := result +
+        '  (no matches -- this does NOT prove absence)'#10 +
+        '  - grep uses basic regex (BRE, no -E); escape/adjust the pattern if it'#10 +
+        '    contains + ? | ( ) { } etc.'#10 +
+        '  - only these dirs are indexed: ' + IndexedDirs + #10 +
+        '    for anything outside them, fall back to grep/Read.'#10;
   finally
     sl.Free;
   end;
