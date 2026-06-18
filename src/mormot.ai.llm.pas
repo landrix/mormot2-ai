@@ -80,7 +80,13 @@ function OpenAIChatRequestJson(const aRequest: TLlmChatRequest;
 /// parse a (non-streamed) OpenAI Chat Completions response into the neutral record
 function ParseOpenAIChatResponse(const aJson: RawUtf8): TLlmChatResponse;
 
+/// build the OpenAI Embeddings request JSON for a model + input texts
+function OpenAIEmbeddingsRequestJson(const aModel: RawUtf8;
+  const aInput: TRawUtf8DynArray): RawUtf8;
+
 /// parse an OpenAI Embeddings response (data[].embedding) into vectors
+// - honours each item's "index" field (the provider may reorder data[]), so a
+//   batch response is mapped back to input order rather than array position
 function ParseOpenAIEmbeddings(const aJson: RawUtf8): TLlmEmbeddingDynArray;
 
 
@@ -224,11 +230,24 @@ begin
   end;
 end;
 
+function OpenAIEmbeddingsRequestJson(const aModel: RawUtf8;
+  const aInput: TRawUtf8DynArray): RawUtf8;
+var
+  body, inputArr: variant;
+  i: PtrInt;
+begin
+  inputArr := _Arr([]);
+  for i := 0 to high(aInput) do
+    _Safe(inputArr)^.AddItem(aInput[i]);
+  body := _ObjFast(['model', aModel, 'input', inputArr]);
+  result := _Safe(body)^.ToJson;
+end;
+
 function ParseOpenAIEmbeddings(const aJson: RawUtf8): TLlmEmbeddingDynArray;
 var
   v: variant;
   d, data, item, emb: PDocVariantData;
-  i, j: PtrInt;
+  i, j, idx: PtrInt;
 begin
   result := nil;
   v := _Json(aJson);
@@ -238,10 +257,16 @@ begin
   for i := 0 to data^.Count - 1 do
   begin
     item := data^._[i];
+    // the provider may return data[] out of order: the "index" field is the
+    // authoritative slot, not the array position (else a batch maps the wrong
+    // vector to an input). Fall back to the position if index is missing/bogus.
+    idx := item^.I['index'];
+    if (idx < 0) or (idx >= data^.Count) then
+      idx := i;
     emb := item^.A['embedding'];
-    SetLength(result[i], emb^.Count);
+    SetLength(result[idx], emb^.Count);
     for j := 0 to emb^.Count - 1 do
-      result[i][j] := emb^.Values[j]; // variant number -> single
+      result[idx][j] := emb^.Values[j]; // variant number -> single
   end;
 end;
 
@@ -311,15 +336,9 @@ function TLlmClient.Embeddings(const aModel: RawUtf8;
 var
   sock: THttpClientSocket;
   path, body: RawUtf8;
-  inputArr, bodyV: variant;
-  i: PtrInt;
   status: integer;
 begin
-  inputArr := _Arr([]);
-  for i := 0 to high(aInput) do
-    _Safe(inputArr)^.AddItem(aInput[i]);
-  bodyV := _ObjFast(['model', aModel, 'input', inputArr]);
-  body := _Safe(bodyV)^.ToJson;
+  body := OpenAIEmbeddingsRequestJson(aModel, aInput);
   sock := Connect('/embeddings', path);
   try
     status := sock.Request(path, 'POST', 0,

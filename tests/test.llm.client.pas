@@ -25,7 +25,9 @@ type
     procedure ProviderConfigs;
     procedure ExtraOverridesWithoutDuplicateKey;
     procedure AssistantToolOnlyOmitsContent;
+    procedure EmbeddingsRequestJson;
     procedure EmbeddingsParsing;
+    procedure EmbeddingsParsingReordered;
   end;
 
 
@@ -198,6 +200,24 @@ begin
   CheckEqual(m0^.A['tool_calls']^.Count, 1, 'tool_calls present');
 end;
 
+procedure TTestLlmClient.EmbeddingsRequestJson;
+var
+  input: TRawUtf8DynArray;
+  json: RawUtf8;
+  d: PDocVariantData;
+begin
+  SetLength(input, 2);
+  input[0] := 'Hund';
+  input[1] := 'Katze';
+  json := OpenAIEmbeddingsRequestJson('text-embedding-3-small', input);
+  d := _Safe(_Json(json));
+  CheckEqual(d^.U['model'], 'text-embedding-3-small', 'model');
+  // input must be a real JSON string array, in order, not a single string
+  CheckEqual(d^.A['input']^.Count, 2, 'two inputs');
+  CheckEqual(VariantToUtf8(d^.A['input']^.Values[0]), 'Hund', 'first input');
+  CheckEqual(VariantToUtf8(d^.A['input']^.Values[1]), 'Katze', 'second input');
+end;
+
 procedure TTestLlmClient.EmbeddingsParsing;
 const
   EMB_RESP =
@@ -214,6 +234,25 @@ begin
   CheckSame(vecs[0][0], 0.1, 1e-4, 'first component');
   CheckSame(vecs[0][2], 0.3, 1e-4, 'third component');
   CheckSame(vecs[1][0], 0.4, 1e-4, 'second vector first component');
+end;
+
+procedure TTestLlmClient.EmbeddingsParsingReordered;
+const
+  // data[] returned out of order: index 1 before index 0 - the parser must map
+  // each vector by its "index", not by array position
+  EMB_RESP =
+    '{"object":"list","data":[' +
+    '{"object":"embedding","index":1,"embedding":[0.4,0.5,0.6]},' +
+    '{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]}],' +
+    '"model":"text-embedding-3-small","usage":{"prompt_tokens":4,"total_tokens":4}}';
+var
+  vecs: TLlmEmbeddingDynArray;
+begin
+  vecs := ParseOpenAIEmbeddings(EMB_RESP);
+  CheckEqual(length(vecs), 2, 'one vector per input');
+  // vec for input 0 must be [0.1..] even though it arrived second
+  CheckSame(vecs[0][0], 0.1, 1e-4, 'index 0 mapped to slot 0');
+  CheckSame(vecs[1][0], 0.4, 1e-4, 'index 1 mapped to slot 1');
 end;
 
 end.
