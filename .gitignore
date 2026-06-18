@@ -1,12 +1,15 @@
-# Lokaler, read-only Klon von MakerAI - NUR als Konzept-Nachschlagequelle
-# (Clean-Room: es wird kein MakerAI-Code uebernommen). Nicht eingecheckt.
+# Externe Konzept-Klone (read-only, nur lokal) - reine Nachschlagequelle.
 /_upstream/
 
-# FPC/Lazarus-Build-Artefakte
-/tests/lib/
-/tests/*.o
-/tests/*.ppu
-/tests/*.compiled
-/tests/LandrixAiTestRunner
-/tests/LandrixAiTestRunner.exe
+# Evaluations-Klone (z.B. flydev mormot-mcp-server) - zum Pruefen, nicht eingecheckt.
+/_eval/
+
+# Interne Clean-Room-Prozess-/Provenance-Doku - bewusst NICHT eingecheckt.
+/_cleanroom/
+
+# FPC/Lazarus-Build-Artefakte (Compiler-Output + Unit-Cache + Demo-/Test-Binaries)
+/bin/
+*.o
+*.ppu
+*.compiled
 *.bak

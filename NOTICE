@@ -9,15 +9,18 @@ mORMot 2  (Synopse Informatique — Arnaud Bouchez)
   License: MPL 1.1 / GPL 2.0 / LGPL 2.1 (three-license).
   https://github.com/synopse/mORMot2
 
+flydev-fr/mormot2-extensions — mormot-mcp-server  (ADOPTED & ADAPTED)
+  The MCP server units (mormot.ai.mcp[.server/.stdio/.tools]), tests and demos
+  are adopted from this project and adapted to the mormot.ai.* namespace.
+  Adopted at commit 8f6202746e14485661a2e82cbad615a090782128 (2026-06-14).
+  License: MPL 1.1 / GPL 2.0 / LGPL 2.1 (three-license, follows mORMot) —
+  the original per-unit "part of the mormot-mcp-server project" headers are
+  retained. https://github.com/flydev-fr/mormot2-extensions
+
 Model Context Protocol — specification
-  Implemented against revision 2025-11-25. Open specification.
+  Server implemented against MCP revision 2025-03-26 (Streamable HTTP) as
+  adopted; upgrade to 2025-11-25 is a follow-up step. Open specification.
   https://modelcontextprotocol.io
 
 JSON-RPC 2.0 — specification
   https://www.jsonrpc.org/specification
-
-MakerAI  (Gustavo Enriquez) — CONCEPTUAL REFERENCE ONLY
-  Consulted to understand MCP feature scope and tool-registry shape.
-  NO MakerAI source code is copied into this project (clean-room).
-  License (MakerAI): MIT.
-  https://github.com/gustavoeenriquez/MakerAi

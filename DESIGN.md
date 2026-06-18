@@ -1,62 +1,82 @@
-# DESIGN — `mormot.ai.*` (MCP-Server)
+# DESIGN — `mormot.ai.*`
 
 ## Ziel
 
 Eine mORMot-native AI-Erweiterung. Erster Use-Case: **landrix als MCP-Server** —
 es stellt Tools/Ressourcen bereit, die ein externer Agent (z. B. Claude Desktop)
-über das Model Context Protocol aufruft.
+über das Model Context Protocol aufruft. Langfristig Synopse-Contribution.
+
+## Aktueller Stand (Phase A abgeschlossen)
+
+Der MCP-Server ist **adoptiert** (mORMot-lizenziert) statt selbst gebaut — Basis:
+flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
+`UPSTREAM_BASE`). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2).
+
+## Architektur (adoptiert)
+
+```
+mormot.ai.mcp         Core: Typen, Auth-Context, IMcpTool/IMcpResource,
+                      RTTI-Schema-Generierung, JSON-RPC-2.0-Prozessor,
+                      TMcpToolBase<T: record>, TMcpServer (Registry + Dispatch:
+                      initialize, tools/list, tools/call, resources/*)
+mormot.ai.mcp.server  Transporte: HTTP (THttpAsyncServer), SSE (Session-Mgmt),
+                      Streamable HTTP
+mormot.ai.mcp.stdio   stdio-Transport (line-based JSON-RPC, Worker-Thread)
+mormot.ai.mcp.tools   Beispiel-Tool-Parameter-Records
+```
+
+Kern-API: `TMcpServer.RegisterTool(IMcpTool)` / `RegisterResource`,
+`Start`/`Stop`/`IsActive`, `ExecuteRequest(json, sessionId)`. Tools implementieren
+`IMcpTool` oder erben `TMcpToolBase<T: record>` — das **Input-Schema wird via RTTI
+aus dem typisierten Record generiert** (kein handgeschriebenes JSON-Schema).
+
+## Transporte
+
+stdio · HTTP · SSE · **Streamable HTTP** · in-process (`ExecuteRequest` direkt).
+SSE ist Spec-`legacy`, bleibt aber als adoptierter Transport vorhanden. Der für
+landrix relevante Produktions-Transport (hinter Caddy) ist **Streamable HTTP**.
 
 ## Clean-Room-Politik (verbindlich)
 
-- MakerAI ist **nur konzeptuelle Vorlage** (welche Features existieren, wie ist
-  eine Tool-Registry geformt). Es wird **kein MakerAI-Code übernommen**.
-- Implementiert wird gegen die **offiziellen Quellen**:
-  - MCP-Spec, Revision **2025-11-25** — https://modelcontextprotocol.io
+Gilt für die **künftigen, selbst gebauten** Teile (v. a. `mormot.ai.llm`) — nicht
+für den adoptierten, mORMot-lizenzierten MCP-Server.
+
+- Selbst gebaute Teile werden **clean-room** gegen die **offiziellen Quellen**
+  implementiert:
+  - MCP-Spec — https://modelcontextprotocol.io
   - JSON-RPC 2.0 — https://www.jsonrpc.org/specification
-- Grund: rechtlich sauber (keine MIT-Bindung an MakerAI) und aufnahmefähig als
-  mORMot-Contribution (Synopse nimmt keine fremd-lizenzierten Schnipsel).
+  - die jeweiligen Provider-API-Dokumentationen
+- Es wird **kein fremder Quellcode übernommen**. Die interne Prozess-/Provenance-
+  Dokumentation (Trennwand) wird separat und **nicht eingecheckt** geführt.
+- Grund: rechtlich sauber und aufnahmefähig als mORMot-Contribution.
 
-## Architektur — transport-neutral
+## Bauen & Testen
 
-Protokoll-Logik strikt vom Transport getrennt (wie `ILandrixContext` im Backend):
-
+```bash
+# in WSL (nativ aarch64), aus dem Repo-Root:
+bash shared/delphi/landrixai/scripts/run-fpc-tests.sh   # Lib + Tests
+bash shared/delphi/landrixai/scripts/build-demo.sh      # alle Demos
 ```
-mormot.ai.mcp.types            JSON-RPC-/MCP-Typen, Envelope-Builder/-Parser
-mormot.ai.mcp.server           Engine: Tool-/Resource-Registry + JSON-RPC-
-                               Dispatch (initialize, tools/list, tools/call).
-                               JSON rein -> JSON raus. KEIN Netz, KEIN stdio.
-mormot.ai.mcp.transport.stdio  stdin/stdout-Loop (Test-Vehikel, lokal)
-mormot.ai.mcp.transport.http   Streamable HTTP auf mormot.net.server (Produktion)
-```
-
-Tool-Vertrag: Interface `IMcpTool` (`GetName`/`GetDescription`/`GetInputSchema`/
-`Execute`).
-
-## Transport-Reihenfolge
-
-1. **stdio** zuerst — einfachstes E2E, perfekt per FPCUnit testbar ohne Netz.
-2. **Streamable HTTP** direkt danach — der echte landrix-Produktions-Transport
-   (hinter Caddy), auf `mormot.net.server` (+ `mormot.net.ws` für Streaming).
-3. SSE-only (alt) wird **nicht** gebaut (Spec-`legacy`).
-
-## Phasen (jede mit grünen FPCUnit-Tests)
-
-- **Phase 0** — Skelett + `mormot.ai.mcp.types` + Tests. *(dieser Stand)*
-- **Phase 1** — Engine (Registry + Dispatch + initialize/tools.list/tools.call)
-  + Demo-Tool + Engine-Tests (JSON rein/raus, Fehlercodes -32601/-32602).
-- **Phase 2** — `transport.stdio` + E2E-Test.
-- **Phase 3** — `transport.http` (Streamable HTTP).
-- **Phase 4** — resources/*, RTTI-Auto-Schema (via `mormot.core.rtti`), Auth über
-  die vorhandene mORMot-Auth des Backends, progress-Notifications.
+Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
+`shared/delphi/libs/_git_Synopse2`; Build-Output unter `bin/` (gitignored).
 
 ## Test-Politik
 
-FPCUnit wie im Backend (`{$mode delphi}`, `RegisterTest`, `consoletestrunner`).
-Da die Engine transport-neutral ist, wird sie direkt getestet — die Tests sind
-die **Spezifikation**, gegen die wir später Spec-Updates abgleichen.
+Die adoptierten Tests nutzen mORMots **`TSynTests`** (nicht FPCUnit) — passend zum
+Contribution-Ziel; Runner `tests/mcp.tests.dpr`. Aktuell **44 Tests / 187
+Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
+
+## Roadmap
+
+- **Phase A** ✓ — flydev-MCP-Server adoptiert, `mormot.ai.*`, Build/Tests/Demos grün.
+- **Phase B** — landrix-spezifische MCP-Tools über `TMcpServer.RegisterTool`
+  andocken; Auth über die vorhandene mORMot-Auth des Backends.
+- **Phase C** — MCP-Spec-Upgrade **2025-03-26 → 2025-11-25**.
+- **Phase D** — Clean-Room LLM-Client (`mormot.ai.llm`): Provider-Treiber +
+  Agent-/Tool-Calling-Loop gegen die offiziellen Specs.
 
 ## Lizenz / Contribution
 
 Ziellizenz: mORMot-Drei-Lizenz (MPL 1.1 / GPL 2.0 / LGPL 2.1). Namespace
-`mormot.ai.*` und CLA/Coding-Style **vorab mit Synopse (Arnaud Bouchez)
-abstimmen** — siehe `docs/forum-post-mormot-ai-extension.md`.
+`mormot.ai.*` und CLA/Coding-Style **vorab mit Synopse (Arnaud Bouchez) sowie mit
+flydev abstimmen** (Namespace `mormot.ai.*` vs. flydevs `mormot.ext.mcp`).

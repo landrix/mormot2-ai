@@ -1,46 +1,63 @@
 # LandrixAI — `mormot.ai.*` Extension (MCP)
 
-Eine **mORMot-native** AI-/LLM-Erweiterung, von Grund auf gebaut — **kein Port**
-von MakerAI. Erstes Ziel: ein robuster **MCP-Server** (Model Context Protocol)
-auf Basis von `mormot.net.server`/`mormot.net.ws` und `mormot.core.json`.
+Eine **mORMot-native** AI-/LLM-Erweiterung. Erster Use-Case: ein robuster
+**MCP-Server** (Model Context Protocol). Die Server-Implementierung wurde aus
+[flydev-fr/mormot2-extensions](https://github.com/flydev-fr/mormot2-extensions)
+**adoptiert** (mORMot-lizenziert) und auf den `mormot.ai.*`-Namespace umbenannt.
 
-> Status: **Phase 0** (Skelett). Lauffähig nach Build-Wireup (siehe unten).
+> Status: **Phase A abgeschlossen** — adoptiert, Build **+ alle Tests grün**
+> (44 Tests / 187 Assertions, aarch64-linux/FPC 3.2.2).
 
-## Warum mORMot-nativ statt Port
+## Warum mORMot-nativ
 
-- **Eine Codebasis für FPC *und* Delphi** — mORMot ist von Haus aus dual und
-  cross-platform (Win/Linux, x64/ARM). Kein `{$IFDEF}`-Wust, keine Indy-Altlast.
-- **Kein Diff-Nachbau-Ballast** — wir folgen den **Specs** (MCP, JSON-RPC),
-  nicht der Entwicklung einer Fremd-Lib.
-- **Bessere Qualität bei MCP** — mORMots Server/WebSocket-Stack ist robuster als
-  MakerAIs experimenteller Indy-SSE-Transport.
-- Langfristig als **Contribution** an Synopse mORMot gedacht (Namespace
-  `mormot.ai.*`).
+- **Eine Codebasis für FPC *und* Delphi** — mORMot ist dual + cross-platform.
+- **Kein Diff-Nachbau-Ballast** — wir folgen den Specs (MCP, JSON-RPC).
+- **Robuster MCP-Stack** — `THttpAsyncServer`, WebSockets, RTTI-Schema-Generierung.
+- Langfristig **Contribution** an Synopse mORMot.
 
 ## Struktur
 
 ```
 landrixai/
-  src/      Lib-Units (mormot.ai.*)
-  tests/    FPCUnit-Suite + Runner (LandrixAiTestRunner.lpr)
-  docs/     Forum-Beitrag, Design-Notizen
-  _upstream/  (gitignored) read-only MakerAI-Klon, nur Konzept-Nachschlag
-  DESIGN.md  Architektur, Clean-Room-Politik, Phasenplan
-  LICENSE  NOTICE  UPSTREAM_BASE
+  src/    mormot.ai.mcp[.server|.stdio|.tools]  — Engine, Transporte, Beispiel-Tools
+  tests/  test.mcp.core / test.mcp.transports + mcp.tests.dpr (mORMot TSynTests)
+  demos/  stdio · http · jsonrpc · sse · streamable (inkl. Claude) + mcp.examples
+          demos/_deps/  adoptierte mormot.ext.os (flydev) — Demo-Dependency
+  scripts/run-fpc-tests.sh   — Build + Test (WSL/FPC)
+  scripts/build-demo.sh      — Demos bauen (alle oder eine)
+  _eval/      (gitignored) flydev-Repo-Klon — Referenz + Demos
+  DESIGN.md  LICENSE  NOTICE  UPSTREAM_BASE
 ```
 
-## Bauen & Testen (Wireup ausstehend)
+## Bauen & Testen
 
-Phase 0 liefert Quellcode + Tests. Der FPC-Build braucht noch die
-mORMot-Include-Pfade (`shared/delphi/libs/_git_Synopse2/src/**`). Geplant analog
-zum Backend (`backend/scripts/run-fpc-tests.*`): ein `.lpi` für
-`tests/LandrixAiTestRunner.lpr` mit den mORMot-Unit-Pfaden, dann
-
+```bash
+# in WSL (nativ aarch64), aus dem Repo-Root:
+bash shared/delphi/landrixai/scripts/run-fpc-tests.sh
+# VERBOSE=1 für vollen Compiler-/Testlog
 ```
-LandrixAiTestRunner -a --format=plain
-```
+Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
+`shared/delphi/libs/_git_Synopse2`. Logs unter `bin/fpc/`.
 
 ## MCP-Stand
 
-Implementiert gegen MCP-Revision **2025-11-25** (JSON-RPC 2.0). Erste Methoden:
-`initialize`, `tools/list`, `tools/call`.
+Adoptierter Server spricht MCP **2025-03-26** (Streamable HTTP). Upgrade auf die
+aktuelle Revision **2025-11-25** ist ein Follow-up. Transporte: stdio, HTTP, SSE,
+Streamable HTTP, in-process. Tools: `TMcpServer.RegisterTool(IMcpTool)`, Input-
+Schema automatisch via RTTI aus typisiertem Record (`TMcpToolBase<T: record>`).
+
+## Herkunft & Lizenz
+
+MCP-Server-Units adoptiert von flydev-fr/mormot2-extensions (MPL/GPL/LGPL); die
+Original-Unit-Header bleiben erhalten. Details: [NOTICE](NOTICE),
+[LICENSE](LICENSE), [DESIGN.md](DESIGN.md). Vor einem Synopse-Contribution-Push
+mit flydev abstimmen (Namespace `mormot.ai.*` vs. flydevs `mormot.ext.mcp`).
+
+## Nächste Schritte
+
+1. landrix-spezifische MCP-Tools andocken (über die `TMcpServer`-Registry).
+2. Spec-Upgrade 2025-03-26 → 2025-11-25.
+3. Clean-Room LLM-Client (`mormot.ai.llm`) — gegen die offiziellen Provider-/MCP-
+   Specs implementiert (interne Clean-Room-Prozessdoku separat, nicht eingecheckt).
+
+✓ Demos übernommen (stdio/http/jsonrpc/sse/streamable inkl. Claude) — alle bauen grün.

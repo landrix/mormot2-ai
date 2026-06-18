@@ -1,0 +1,96 @@
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <ProjectGuid>{C5ADDF3D-8DDB-42AE-866D-4C3C587CBB45}</ProjectGuid>
+    </PropertyGroup>
+    <ItemGroup>
+        <Projects Include="mcp.examples.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="sse\demo.mcp.sse.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="jsonrpc\demo.mcp.jsonrpc.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="http\demo.mcp.http.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="stdio\demo.mcp.stdio.dproj">
+            <Dependencies/>
+        </Projects>
+        <Projects Include="..\test\mcp.tests.dproj">
+            <Dependencies/>
+        </Projects>
+    </ItemGroup>
+    <ProjectExtensions>
+        <Borland.Personality>Default.Personality.12</Borland.Personality>
+        <Borland.ProjectType/>
+        <BorlandProject>
+            <Default.Personality/>
+        </BorlandProject>
+    </ProjectExtensions>
+    <Target Name="mcp_examples">
+        <MSBuild Projects="mcp.examples.dproj"/>
+    </Target>
+    <Target Name="mcp_examples:Clean">
+        <MSBuild Projects="mcp.examples.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="mcp_examples:Make">
+        <MSBuild Projects="mcp.examples.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="demo_mcp_sse">
+        <MSBuild Projects="sse\demo.mcp.sse.dproj"/>
+    </Target>
+    <Target Name="demo_mcp_sse:Clean">
+        <MSBuild Projects="sse\demo.mcp.sse.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="demo_mcp_sse:Make">
+        <MSBuild Projects="sse\demo.mcp.sse.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="demo_mcp_jsonrpc">
+        <MSBuild Projects="jsonrpc\demo.mcp.jsonrpc.dproj"/>
+    </Target>
+    <Target Name="demo_mcp_jsonrpc:Clean">
+        <MSBuild Projects="jsonrpc\demo.mcp.jsonrpc.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="demo_mcp_jsonrpc:Make">
+        <MSBuild Projects="jsonrpc\demo.mcp.jsonrpc.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="demo_mcp_http">
+        <MSBuild Projects="http\demo.mcp.http.dproj"/>
+    </Target>
+    <Target Name="demo_mcp_http:Clean">
+        <MSBuild Projects="http\demo.mcp.http.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="demo_mcp_http:Make">
+        <MSBuild Projects="http\demo.mcp.http.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="demo_mcp_stdio">
+        <MSBuild Projects="stdio\demo.mcp.stdio.dproj"/>
+    </Target>
+    <Target Name="demo_mcp_stdio:Clean">
+        <MSBuild Projects="stdio\demo.mcp.stdio.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="demo_mcp_stdio:Make">
+        <MSBuild Projects="stdio\demo.mcp.stdio.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="mcp_tests">
+        <MSBuild Projects="..\test\mcp.tests.dproj"/>
+    </Target>
+    <Target Name="mcp_tests:Clean">
+        <MSBuild Projects="..\test\mcp.tests.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="mcp_tests:Make">
+        <MSBuild Projects="..\test\mcp.tests.dproj" Targets="Make"/>
+    </Target>
+    <Target Name="Build">
+        <CallTarget Targets="mcp_examples;demo_mcp_sse;demo_mcp_jsonrpc;demo_mcp_http;demo_mcp_stdio;mcp_tests"/>
+    </Target>
+    <Target Name="Clean">
+        <CallTarget Targets="mcp_examples:Clean;demo_mcp_sse:Clean;demo_mcp_jsonrpc:Clean;demo_mcp_http:Clean;demo_mcp_stdio:Clean;mcp_tests:Clean"/>
+    </Target>
+    <Target Name="Make">
+        <CallTarget Targets="mcp_examples:Make;demo_mcp_sse:Make;demo_mcp_jsonrpc:Make;demo_mcp_http:Make;demo_mcp_stdio:Make;mcp_tests:Make"/>
+    </Target>
+    <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
+</Project>

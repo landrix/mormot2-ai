@@ -6,10 +6,10 @@ Intended license: the mORMot three-license
 prerequisite for upstream contribution.
 
 Final licensing and any Contributor terms are to be confirmed with
-Synopse Informatique (Arnaud Bouchez) as part of upstreaming — see
-docs/forum-post-mormot-ai-extension.md.
+Synopse Informatique (Arnaud Bouchez) and flydev as part of upstreaming.
 
 Copyright (c) 2026 Landrix / Sven Harazim and contributors.
 
-This project is a clean-room implementation. It contains NO source code from
-MakerAI (MIT) — MakerAI was consulted only as a conceptual reference. See NOTICE.
+This project adopts mORMot-licensed code from flydev-fr/mormot2-extensions (see
+NOTICE); all other parts are original work. No code from any other third-party
+library is included.

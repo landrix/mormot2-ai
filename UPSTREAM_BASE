@@ -1,20 +1,25 @@
 # Upstream reference base
 
-This project is a clean-room, mORMot-native implementation. It is NOT a port of
-MakerAI. MakerAI is consulted only as a *conceptual* reference (which features
-exist, how an MCP tool registry is shaped) — no MakerAI source code is copied.
+## Adopted code (mORMot-licensed)
 
-Conceptual reference snapshot
-  Project:   MakerAI — https://github.com/gustavoeenriquez/MakerAi
-  Fork seen: https://github.com/landrix/MakerAi   (branch: fpc)
-  Commit:    fbf15c0   (fpc HEAD at time of writing, 2026-06)
+The MCP server (mormot.ai.mcp[.server/.stdio/.tools] + tests + demos, plus the
+mormot.ext.os helper used by the streamable demo) is adopted from flydev's mORMot
+extension and renamed/aligned to the mormot.ai.* namespace.
 
-Authoritative specifications we build against
-  MCP protocol revision: 2025-11-25   — https://modelcontextprotocol.io
-  JSON-RPC 2.0                          — https://www.jsonrpc.org/specification
+  Project: flydev-fr/mormot2-extensions  (subfolder: mormot-mcp-server)
+  URL:     https://github.com/flydev-fr/mormot2-extensions
+  Commit:  8f6202746e14485661a2e82cbad615a090782128
+  Date:    2026-06-14   ("Merge pull request #7 from flydev-fr/feat/mcp-extension")
+  License: MPL 1.1 / GPL 2.0 / LGPL 2.1 (follows mORMot) — headers retained.
 
-Runtime foundation
+## Authoritative specifications we build against
+
+  MCP protocol: adopted server speaks 2025-03-26; target upgrade 2025-11-25
+                — https://modelcontextprotocol.io
+  JSON-RPC 2.0  — https://www.jsonrpc.org/specification
+
+## Runtime foundation
+
   mORMot 2 — shared/delphi/libs/_git_Synopse2
 
-The gitignored _upstream/ folder (if present) holds a local read-only clone of
-MakerAI for concept lookup ONLY.
+The gitignored _eval/ folder holds the flydev clone, pinned at the commit above.
