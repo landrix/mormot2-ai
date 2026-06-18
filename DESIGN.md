@@ -148,7 +148,17 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
     + `load_extension`), GGUF-Modell registriert, deutscher Text lokal geembedded,
     vec0-KNN semantisch korrekt — offline. Binaries/Modelle in `vendor/sqlite-ext/`
     + `vendor/models/` (gitignored; aarch64-linux + win64 + all-MiniLM/bge-m3 da).
-    Offen: saubere Units + x86_64-linux-`.so` für Docker.
+    - **Units gebaut + review-gehärtet**: `mormot.ai.vectorstore` (Loader
+      `Enable/LoadSqliteExtension`, `IVectorStore`/`TVec0Store`, `TLembedEmbedder`
+      als lokaler `IEmbedder`, Blob-Helfer) + `mormot.ai.rag` (`ChunkText`
+      wortausgerichtet/UTF-8-sicher, `TLlmRag` Ingest/Query→Grounding→ChatComplete
+      mit Zitaten). Provider-`Embeddings` im Client (`/embeddings` +
+      `ParseOpenAIEmbeddings`) + `mormot.ai.embeddings.TProviderEmbedder`. Demo
+      `demos/rag/rag-chat.dpr` **live**: lokales lembed-Retrieval + OpenAI-Antwort,
+      geerdet + zitiert. **138 Assertions** grün (Chunking/Blob hermetisch).
+      Review-Fixes: Embedder pinnt Store-Lifetime; dim/topK-Guards; Add
+      transaktional; Embed wirft bei Leerergebnis; Injection-Delimiter; empty-store
+      Early-Return. Offen: x86_64-linux-`.so` für Docker.
   - **Offen**: lokaler lembed/sqlite-vec-Pfad (s. o.); weitere Provider (Anthropic =
     eigenes Wire); Vision/multimodale Messages (Content-Parts → OCR-Modelle).
 
