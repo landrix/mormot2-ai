@@ -124,17 +124,35 @@ end;
 
 function TLlmRag.Ingest(const aText: RawUtf8): integer;
 var
-  chunks: TRawUtf8DynArray;
-  i: PtrInt;
+  chunks, valid: TRawUtf8DynArray;
+  vectors: TLlmEmbeddingDynArray;
+  i, n: PtrInt;
 begin
-  chunks := ChunkText(aText, fChunkChars, fOverlap);
   result := 0;
+  chunks := ChunkText(aText, fChunkChars, fOverlap);
+  // collect the non-empty chunks and embed them in one batch: a provider-backed
+  // embedder turns N Embed() calls into N HTTP round-trips, EmbedBatch into one
+  SetLength(valid, length(chunks));
+  n := 0;
   for i := 0 to high(chunks) do
     if chunks[i] <> '' then
     begin
-      fStore.Add(chunks[i], fEmbedder.Embed(chunks[i]));
-      inc(result);
+      valid[n] := chunks[i];
+      inc(n);
     end;
+  if n = 0 then
+    exit;
+  SetLength(valid, n);
+  vectors := fEmbedder.EmbedBatch(valid);
+  // store only as many as the embedder actually returned (guard a short reply so
+  // a chunk is never paired with a missing/foreign vector)
+  if length(vectors) < n then
+    n := length(vectors);
+  for i := 0 to n - 1 do
+  begin
+    fStore.Add(valid[i], vectors[i]);
+    inc(result);
+  end;
 end;
 
 function TLlmRag.Query(const aQuestion: RawUtf8): TLlmChatResponse;

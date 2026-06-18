@@ -81,6 +81,18 @@ claude mcp add -s local landrix-codenav -- `
 - `CODENAV_ROOT` setzt der Launcher selbst; die durchsuchten Quell-Dirs sind in
   `codenav.tools.pas` kuratiert (ohne vendored libs / node_modules / generated).
 
+> **⚠️ Drive-Letter-Casing-Falle (Windows + VS-Code-Extension).** `~/.claude.json`
+> schlüsselt local-scope-Server **case-sensitiv** pro Projektpfad. `claude mcp add` aus
+> PowerShell registriert unter **groß** geschriebenem Laufwerk (`D:/…`, weil Node
+> `process.cwd()` das Laufwerk großschreibt), die VS-Code-Extension/Agent-Session nutzt
+> aber oft **klein** (`d:/…`). Folge: `claude mcp get` zeigt `✓ Connected` (CLI-cwd =
+> groß), in der Session fehlen die Tools trotzdem (Session-cwd = klein). Nach dem
+> `claude mcp add` prüfen, unter welchem Casing die Session läuft (in Claude Code:
+> „Primary working directory: …") und den `mcpServers`-Eintrag ggf. zusätzlich unter den
+> **kleingeschriebenen** Projekt-Key in `~/.claude.json` kopieren. Diagnose-Beleg: zwei
+> Projekt-Keys, die sich nur im Drive-Letter unterscheiden. Danach VS Code komplett neu
+> starten; eine bereits laufende (resumte) Session lädt den Tool-Index nicht nach.
+
 ## Implementierungs-Hinweis (wichtig)
 
 Die externen Tools (ctags/grep) werden über **`mormot.ext.os`'s `RunRedirect`

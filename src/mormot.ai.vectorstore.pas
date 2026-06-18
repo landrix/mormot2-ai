@@ -237,15 +237,18 @@ begin
   try
     r.BindBlob(1, blob);
     r.Bind(2, aTopK);
+    // vec0 returns at most k rows: preallocate to k and trim to the actual count
+    // afterwards, instead of reallocating on every row
+    SetLength(result, aTopK);
     n := 0;
     while r.Step = SQLITE_ROW do
     begin
-      SetLength(result, n + 1);
       result[n].DocId := r.FieldInt(0);
       r.FieldUtf8(1, result[n].Text);
       result[n].Distance := r.FieldDouble(2);
       inc(n);
     end;
+    SetLength(result, n);
   finally
     r.Close;
   end;
