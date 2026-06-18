@@ -130,10 +130,27 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
       Position=Size=0 nicht werfen) + Connect-Guard; MCP `isError`-Durchreichung;
       `IsValidJson`-Guard für Tool-Args; `content` weggelassen statt `""` bei
       Assistant-Tool-only. **95 Assertions** grün (inkl. Structured-Output).
-  - **Offen**: weitere Provider (Anthropic Messages-API als eigener Treiber, anderes
-    Wire); Embeddings + leichtes RAG; Vision/multimodale Messages (Content-Parts,
-    schaltet die OCR-Modelle frei); optional Live-Demo `llm-agent-mcp` (Agent über
-    echten MCP-Server).
+    - `mormot.ai.embeddings` — `IEmbedder` (backend-neutral) + `TProviderEmbedder`
+      (OpenAI-Wire `/embeddings`). Client um `Embeddings(model, input[])` +
+      `ParseOpenAIEmbeddings` erweitert (Connect endpoint-parametrisiert). Demo
+      `demos/llm/llm-embed.dpr`. **Live**: text-embedding-3-small (1536d),
+      cos(Hund,Katze)=0.59 vs cos(Hund,Auto)=0.25. **104 Assertions** grün.
+  - **RAG (in Arbeit, Backend FPC Linux+Windows)**: Machbarkeit bestätigt — mORMots
+    **static-SQLite exportiert `sqlite3_load_extension`** (mormot.db.raw.sqlite3.static.pas:1047)
+    + `enable_load_extension`, also kann mORMots eigenes SQLite die Extensions
+    `vec0`/`lembed0` laden (FPC, Linux+Windows). Plan: `IEmbedder` (Provider ✓ /
+    lokal `TLembedEmbedder` via `select lembed(...)` offen) + `IVectorStore`
+    (sqlite-vec `vec0` KNN) + Chunking + `TLlmRag` (Ingest/Query→Grounding-Prompt→
+    ChatComplete). Basiert konzeptionell auf [landrix/sqlite-vec-for-Delphi]
+    (sqlite-vec + sqlite-lembed + sqlite-vector, GGUF z. B. BGE-M3).
+    **Fundament bewiesen** (Spike `demos/rag/rag-spike.dpr`, FPC/WSL aarch64 grün):
+    vec0+lembed0 in mORMots SQLite geladen (`db_config(SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION)`
+    + `load_extension`), GGUF-Modell registriert, deutscher Text lokal geembedded,
+    vec0-KNN semantisch korrekt — offline. Binaries/Modelle in `vendor/sqlite-ext/`
+    + `vendor/models/` (gitignored; aarch64-linux + win64 + all-MiniLM/bge-m3 da).
+    Offen: saubere Units + x86_64-linux-`.so` für Docker.
+  - **Offen**: lokaler lembed/sqlite-vec-Pfad (s. o.); weitere Provider (Anthropic =
+    eigenes Wire); Vision/multimodale Messages (Content-Parts → OCR-Modelle).
 
 ## Lizenz / Contribution
 

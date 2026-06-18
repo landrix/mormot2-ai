@@ -80,21 +80,29 @@ function OpenAIChatRequestJson(const aRequest: TLlmChatRequest;
 /// parse a (non-streamed) OpenAI Chat Completions response into the neutral record
 function ParseOpenAIChatResponse(const aJson: RawUtf8): TLlmChatResponse;
 
+/// parse an OpenAI Embeddings response (data[].embedding) into vectors
+function ParseOpenAIEmbeddings(const aJson: RawUtf8): TLlmEmbeddingDynArray;
+
 
 type
   /// OpenAI-wire LLM client driving OpenAI, LiteLLM and Ollama via config
   TLlmClient = class(TInterfacedObject, ILlmClient)
   protected
     fConfig: TLlmProviderConfig;
-    // open a fresh connection to BaseUrl + '/chat/completions'; returns the
-    // request path in aPath; sets the bearer header when configured
-    function Connect(out aPath: RawUtf8): THttpClientSocket;
+    // open a fresh connection to BaseUrl + aEndpoint; returns the request path in
+    // aPath; sets the bearer header when configured
+    function Connect(const aEndpoint: RawUtf8; out aPath: RawUtf8): THttpClientSocket;
   public
     /// create the client for a given provider configuration
     constructor Create(const aConfig: TLlmProviderConfig); reintroduce;
     function ChatComplete(const aRequest: TLlmChatRequest): TLlmChatResponse;
     procedure ChatStream(const aRequest: TLlmChatRequest;
       const aOnDelta: TLlmStreamDeltaEvent);
+    /// embed one or more input texts via the OpenAI-wire /embeddings endpoint
+    // - one vector per input, in order; works against OpenAI/LiteLLM (and Ollama
+    //   which also exposes /v1/embeddings)
+    function Embeddings(const aModel: RawUtf8;
+      const aInput: TRawUtf8DynArray): TLlmEmbeddingDynArray;
     function Config: TLlmProviderConfig;
   end;
 
@@ -216,6 +224,27 @@ begin
   end;
 end;
 
+function ParseOpenAIEmbeddings(const aJson: RawUtf8): TLlmEmbeddingDynArray;
+var
+  v: variant;
+  d, data, item, emb: PDocVariantData;
+  i, j: PtrInt;
+begin
+  result := nil;
+  v := _Json(aJson);
+  d := _Safe(v);
+  data := d^.A['data'];
+  SetLength(result, data^.Count);
+  for i := 0 to data^.Count - 1 do
+  begin
+    item := data^._[i];
+    emb := item^.A['embedding'];
+    SetLength(result[i], emb^.Count);
+    for j := 0 to emb^.Count - 1 do
+      result[i][j] := emb^.Values[j]; // variant number -> single
+  end;
+end;
+
 
 { ************ TLlmClient }
 
@@ -230,7 +259,8 @@ begin
   result := fConfig;
 end;
 
-function TLlmClient.Connect(out aPath: RawUtf8): THttpClientSocket;
+function TLlmClient.Connect(const aEndpoint: RawUtf8;
+  out aPath: RawUtf8): THttpClientSocket;
 var
   url: RawUtf8;
   timeout: cardinal;
@@ -239,7 +269,7 @@ begin
   // tolerate a trailing slash on the configured base URL
   if (url <> '') and (url[length(url)] = '/') then
     SetLength(url, length(url) - 1);
-  url := url + '/chat/completions';
+  url := url + aEndpoint;
   if fConfig.TimeoutMs > 0 then
     timeout := fConfig.TimeoutMs
   else
@@ -263,7 +293,7 @@ var
   status: integer;
 begin
   body := OpenAIChatRequestJson(aRequest, {stream=}false);
-  sock := Connect(path);
+  sock := Connect('/chat/completions', path);
   try
     status := sock.Request(path, 'POST', 0,
       'Accept: application/json'#13#10'Accept-Encoding: identity',
@@ -271,6 +301,33 @@ begin
     if (status < 200) or (status >= 300) then
       ELlmClient.RaiseUtf8('ChatComplete: HTTP % - %', [status, sock.Content]);
     result := ParseOpenAIChatResponse(sock.Content);
+  finally
+    sock.Free;
+  end;
+end;
+
+function TLlmClient.Embeddings(const aModel: RawUtf8;
+  const aInput: TRawUtf8DynArray): TLlmEmbeddingDynArray;
+var
+  sock: THttpClientSocket;
+  path, body: RawUtf8;
+  inputArr, bodyV: variant;
+  i: PtrInt;
+  status: integer;
+begin
+  inputArr := _Arr([]);
+  for i := 0 to high(aInput) do
+    _Safe(inputArr)^.AddItem(aInput[i]);
+  bodyV := _ObjFast(['model', aModel, 'input', inputArr]);
+  body := _Safe(bodyV)^.ToJson;
+  sock := Connect('/embeddings', path);
+  try
+    status := sock.Request(path, 'POST', 0,
+      'Accept: application/json'#13#10'Accept-Encoding: identity',
+      body, 'application/json', false, nil, nil);
+    if (status < 200) or (status >= 300) then
+      ELlmClient.RaiseUtf8('Embeddings: HTTP % - %', [status, sock.Content]);
+    result := ParseOpenAIEmbeddings(sock.Content);
   finally
     sock.Free;
   end;
@@ -286,7 +343,7 @@ var
   status: integer;
 begin
   body := OpenAIChatRequestJson(aRequest, {stream=}true);
-  sock := Connect(path);
+  sock := Connect('/chat/completions', path);
   try
     sse := TLlmSseStream.Create(aOnDelta);
     outStream := sse; // until/unless wrapped, freeing outStream frees sse

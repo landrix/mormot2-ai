@@ -11,6 +11,13 @@
 .env
 demos/.env
 
+# GGUF-Embedding-Modelle (gross, maschinenlokal) - nie einchecken, per Pfad referenzieren.
+/vendor/models/
+*.gguf
+
+# SQLite-Extension-Binaries (vec0/lembed0, .so/.dll je Arch) - lokal beschaffen.
+/vendor/sqlite-ext/
+
 # FPC/Lazarus-Build-Artefakte (Compiler-Output + Unit-Cache + Demo-/Test-Binaries)
 /bin/
 *.o

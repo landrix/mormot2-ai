@@ -25,6 +25,7 @@ type
     procedure ProviderConfigs;
     procedure ExtraOverridesWithoutDuplicateKey;
     procedure AssistantToolOnlyOmitsContent;
+    procedure EmbeddingsParsing;
   end;
 
 
@@ -195,6 +196,24 @@ begin
   m0 := _Safe(_Json(json))^.A['messages']^._[0];
   Check(m0^.GetValueIndex('content') < 0, 'content omitted for tool-only assistant');
   CheckEqual(m0^.A['tool_calls']^.Count, 1, 'tool_calls present');
+end;
+
+procedure TTestLlmClient.EmbeddingsParsing;
+const
+  EMB_RESP =
+    '{"object":"list","data":[' +
+    '{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]},' +
+    '{"object":"embedding","index":1,"embedding":[0.4,0.5,0.6]}],' +
+    '"model":"text-embedding-3-small","usage":{"prompt_tokens":4,"total_tokens":4}}';
+var
+  vecs: TLlmEmbeddingDynArray;
+begin
+  vecs := ParseOpenAIEmbeddings(EMB_RESP);
+  CheckEqual(length(vecs), 2, 'one vector per input');
+  CheckEqual(length(vecs[0]), 3, 'vector dimension');
+  CheckSame(vecs[0][0], 0.1, 1e-4, 'first component');
+  CheckSame(vecs[0][2], 0.3, 1e-4, 'third component');
+  CheckSame(vecs[1][0], 0.4, 1e-4, 'second vector first component');
 end;
 
 end.

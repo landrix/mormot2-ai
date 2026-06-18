@@ -54,6 +54,11 @@ type
     TotalTokens: integer;
   end;
 
+  /// a single embedding vector (float32, as returned by the provider/model)
+  TLlmEmbedding = TSingleDynArray;
+  /// one embedding vector per input text
+  TLlmEmbeddingDynArray = array of TLlmEmbedding;
+
 
 { ************ Tools and Messages }
 
