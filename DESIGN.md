@@ -90,11 +90,42 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
   - **Callback = Methoden-Pointer (`of object`)**, NICHT `reference to`/Closures —
     FPC 3.2.2 kennt die Modeswitches `functionreferences`/`anonymousfunctions`
     nicht (erst 3.3.1).
-  - **Stand**: `mormot.ai.llm.types` + `mormot.ai.llm.sse` gebaut, Tests grün
-    (`llm.tests`, `scripts/run-fpc-llm-tests.sh`: 18 Assertions — whole/1-byte/
-    tool-call). Offen: HTTP-Client (`mormot.ai.llm`: ILlmClient, ChatComplete +
-    ChatStream) + Provider-Configs (`mormot.ai.llm.openai`: OpenAI/Ollama/LiteLLM)
-    + Agent-/Tool-Calling-Loop (verdrahtet MCP-Tools ↔ Modell).
+  - **Stand**: gebaut + Tests grün (`llm.tests`, `scripts/run-fpc-llm-tests.sh`:
+    **51 Assertions**):
+    - `mormot.ai.llm.types` — provider-neutrale Records.
+    - `mormot.ai.llm.sse` — `TLlmSseStream` (Streaming-Parser; whole/1-byte/tool-call).
+    - `mormot.ai.llm` — `ILlmClient`/`TLlmClient` (`ChatComplete` + `ChatStream`)
+      über `THttpClientSocket`; freie Funktionen `OpenAIChatRequestJson` /
+      `ParseOpenAIChatResponse` (hermetisch getestet).
+    - `mormot.ai.llm.openai` — Provider-Configs `OpenAIConfig`/`OllamaConfig`/
+      `LiteLLMConfig`.
+    - `mormot.ai.agent` — `ILlmToolbox` (toolquellen-agnostische Naht) +
+      `TLlmCallbackToolbox` + `TLlmAgent` (Tool-Calling-Loop: Tools anbieten →
+      `tool_calls` ausführen → `role:tool` zurückspeisen → bis Antwort, mit
+      `MaxIterations`-Guard).
+    - `mormot.ai.agent.mcp` — `TLlmMcpToolbox`: `ILlmToolbox` über einen
+      `TMcpServer` (JSON-RPC `tools/list`/`tools/call` in-process). Damit treibt
+      ein Agent direkt die Tools, die ein MCP-Server exponiert — derselbe
+      RTTI-Schema-Generator an beiden Enden (der Suite-Schluss).
+    - **DoS-Cap**: optionales `MaxResponseBytes` in `TLlmProviderConfig` umwickelt
+      den Stream-`OutStream` mit `TLimitedStreamWriter` (mORMot-nativ, cappt die
+      *kumulative* Antwort — Ergänzung zum per-Chunk-`MaxHttpChunkSize`).
+    - Demos `demos/llm/llm-chat.dpr` (Streaming) + `llm-agent.dpr` (Tool-Loop).
+    - **Live verifiziert gegen Ollama (172.16.122.3)**: (a) Token-Streaming
+      end-to-end (`gemma3:12b`): `TLlmClient → THttpClientSocket → GetBody (live
+      chunks) → TLlmSseStream → OnDelta`; (b) Tool-Calling-Loop
+      (`german-text-3.1`): Modell ruft `get_weather`, Agent führt aus, Modell
+      antwortet aus dem Tool-Ergebnis.
+    - **Review-gehärtet** (landrix-code-review, 8 Findings behoben + Tests):
+      `AddOrUpdateFrom` statt duplizierendem `AddFrom`; SSE-`Flush` für ein letztes
+      Event ohne Trailing-`\n`; `RawBody` für lesbare Nicht-SSE-Fehlerbodies;
+      leak-/double-free-sicheres `ChatStream` (TLimitedStreamWriter kann bei
+      Position=Size=0 nicht werfen) + Connect-Guard; MCP `isError`-Durchreichung;
+      `IsValidJson`-Guard für Tool-Args; `content` weggelassen statt `""` bei
+      Assistant-Tool-only. **85 Assertions** grün.
+  - **Offen**: weitere Provider (Anthropic Messages-API als eigener Treiber, anderes
+    Wire); Embeddings; optional ein Live-Demo `llm-agent-mcp` (Agent über echten
+    MCP-Server).
 
 ## Lizenz / Contribution
 

@@ -38,6 +38,8 @@ type
     procedure StreamWholePayload;
     procedure StreamSingleByteChunks;
     procedure StreamToolCalls;
+    procedure FlushTrailingEvent;
+    procedure RawBodyOnNonSse;
   end;
 
 
@@ -177,6 +179,57 @@ begin
     CheckEqual(coll.ToolArgs, '{"location":"NYC"}', 'assembled tool arguments');
     CheckEqual(coll.FinishReason, 'tool_calls', 'tool-call finish reason');
     Check(s.Done, 'tool-call stream done');
+  finally
+    s.Free;
+    coll.Free;
+  end;
+end;
+
+procedure TTestLlmSse.FlushTrailingEvent;
+const
+  // the final event arrives without a closing newline (truncated last chunk)
+  SSE_NOTRAIL =
+    'data: {"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}'#10 +
+    #10 +
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}';
+var
+  s: TLlmSseStream;
+  coll: TSseCollector;
+  data: RawUtf8;
+begin
+  data := SSE_NOTRAIL; // a local var: FPC forbids pointer() on a const string
+  coll := TSseCollector.Create;
+  s := TLlmSseStream.Create(coll.Handle);
+  try
+    s.WriteBuffer(pointer(data)^, length(data));
+    // without a trailing newline the last event stays buffered until Flush
+    CheckEqual(s.FinishReason, '', 'final event buffered before flush');
+    s.Flush;
+    CheckEqual(coll.Text, 'Hi', 'content seen');
+    CheckEqual(s.FinishReason, 'stop', 'final event recovered by flush');
+  finally
+    s.Free;
+    coll.Free;
+  end;
+end;
+
+procedure TTestLlmSse.RawBodyOnNonSse;
+const
+  // a non-SSE JSON error body (e.g. HTTP 401) - no "data:" lines at all
+  ERR_BODY = '{"error":{"message":"invalid api key"}}';
+var
+  s: TLlmSseStream;
+  coll: TSseCollector;
+  data: RawUtf8;
+begin
+  data := ERR_BODY; // a local var: FPC forbids pointer() on a const string
+  coll := TSseCollector.Create;
+  s := TLlmSseStream.Create(coll.Handle);
+  try
+    s.WriteBuffer(pointer(data)^, length(data));
+    CheckEqual(s.FullText, '', 'no SSE content parsed');
+    // the raw body is retained so the client can surface the provider's message
+    Check(Pos(RawUtf8('invalid api key'), s.RawBody) > 0, 'raw error body retained');
   finally
     s.Free;
     coll.Free;

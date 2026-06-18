@@ -44,10 +44,13 @@ type
     fBuf: RawUtf8;        // accumulates bytes until a full line (#10) is seen
     fText: RawUtf8;       // accumulated assistant content
     fFinishReason: RawUtf8;
+    fRaw: RawUtf8;        // raw bytes seen before the first "data:" line
     fOnDelta: TLlmStreamDeltaEvent;
     fPosition: Int64;
     fDone: boolean;
+    fSawData: boolean;    // stop accumulating fRaw once a real SSE event arrives
     procedure ProcessLine(const aLine: RawUtf8);
+    function GetSize: Int64; override;
   public
     /// create the parser with the per-delta callback (may be nil)
     constructor Create(const aOnDelta: TLlmStreamDeltaEvent);
@@ -57,10 +60,16 @@ type
     function Read(var Buffer; Count: Longint): Longint; override;
     /// TStream contract: forward-only, just reports the byte position
     function Seek(const Offset: Int64; Origin: TSeekOrigin): Int64; override;
+    /// process any buffered trailing line - call once the body is fully received
+    // - guards against a final event delivered without a closing newline
+    procedure Flush;
     /// the full assistant text accumulated so far
     property FullText: RawUtf8 read fText;
     /// the finish reason once the stream reported one
     property FinishReason: RawUtf8 read fFinishReason;
+    /// the raw body seen before any SSE event - non-empty only for a non-SSE
+    // (e.g. JSON error) response, so callers can surface the provider's message
+    property RawBody: RawUtf8 read fRaw;
     /// true once the terminal "[DONE]" sentinel was seen
     property Done: boolean read fDone;
   end;
@@ -102,6 +111,10 @@ begin
   FastSetString(chunk, @Buffer, Count);
   fBuf := fBuf + chunk;
   inc(fPosition, Count);
+  // keep the leading raw body until the first real SSE event, so a non-SSE
+  // (e.g. JSON error) response stays available for diagnostics, bounded in size
+  if not fSawData then
+    fRaw := fRaw + chunk;
   // process every complete line currently buffered
   repeat
     nl := IndexOfLF(fBuf);
@@ -131,6 +144,7 @@ begin
   // SSE field names are case-sensitive and lower-case per the spec
   if copy(aLine, 1, 5) <> 'data:' then
     exit;
+  fSawData := true; // a real SSE event: stop retaining the raw body
   payload := TrimU(copy(aLine, 6, maxInt));
   if payload = '' then
     exit;
@@ -197,6 +211,24 @@ begin
   // forward-only stream: report the current byte position so the HTTP client's
   // position bookkeeping (OutStreamInitialPos) stays consistent
   result := fPosition;
+end;
+
+function TLlmSseStream.GetSize: Int64;
+begin
+  // a write-only forward sink: the size is whatever has been written so far
+  result := fPosition;
+end;
+
+procedure TLlmSseStream.Flush;
+begin
+  // a well-formed stream ends each event with a newline; this catches a final
+  // event delivered in a last chunk without its closing newline
+  if fBuf = '' then
+    exit;
+  if fBuf[length(fBuf)] = #13 then
+    SetLength(fBuf, length(fBuf) - 1);
+  ProcessLine(fBuf);
+  fBuf := '';
 end;
 
 end.

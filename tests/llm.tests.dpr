@@ -13,7 +13,10 @@ uses
   mormot.core.os,
   mormot.core.log,
   mormot.core.test,
-  test.llm.sse;
+  test.llm.sse,
+  test.llm.client,
+  test.llm.agent,
+  test.llm.agent.mcp;
 
 type
   TLlmTests = class(TSynTestsLogged)
@@ -24,7 +27,10 @@ type
 procedure TLlmTests.LLM;
 begin
   AddCase([
-    TTestLlmSse
+    TTestLlmSse,
+    TTestLlmClient,
+    TTestLlmAgent,
+    TTestLlmAgentMcp
   ]);
 end;
 
