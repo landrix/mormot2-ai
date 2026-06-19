@@ -4,8 +4,10 @@
 // (OpenAI image_url here). Switch the provider via the LLM_* env vars.
 //
 //   llm-vision
-//   env: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY  (a vision-capable model, e.g.
-//        gpt-4o / gpt-4o-mini); VISION_IMAGE_URL (optional, default below)
+//   env: VISION_PROVIDER (openai [default] | anthropic) selects the client.
+//        openai    -> LLM_BASE_URL / LLM_MODEL / LLM_API_KEY (e.g. gpt-4o-mini)
+//        anthropic -> ANTHROPIC_API_KEY / ANTHROPIC_MODEL (default claude-opus-4-8)
+//        image: VISION_IMAGE_B64 (+VISION_IMAGE_MEDIA) or VISION_IMAGE_URL
 //   the key is read from the environment ONLY - never hard-code or log it
 program llm.vision;
 
@@ -27,7 +29,8 @@ uses
   mormot.core.text,
   mormot.ai.llm.types,
   mormot.ai.llm,
-  mormot.ai.llm.openai;
+  mormot.ai.llm.openai,
+  mormot.ai.llm.anthropic;
 
 var
   cfg: TLlmProviderConfig;
@@ -36,13 +39,34 @@ var
   imgs: TLlmImageDynArray;
   req: TLlmChatRequest;
   resp: TLlmChatResponse;
-  imageUrl, imageB64, media, srcLabel: RawUtf8;
+  imageUrl, imageB64, media, srcLabel, provider, akey: RawUtf8;
 begin
   {$ifdef UNIX}
   OpenSslInitialize;
   {$endif}
-  cfg := LlmConfigFromEnv;
-  cfg.TimeoutMs := 120000;
+  // same neutral request; only the ILlmClient differs per provider
+  provider := LowerCaseU(TrimU(StringToUtf8(GetEnvironmentVariable('VISION_PROVIDER'))));
+  if provider = 'anthropic' then
+  begin
+    akey := TrimU(StringToUtf8(GetEnvironmentVariable('ANTHROPIC_API_KEY')));
+    if akey = '' then
+    begin
+      ConsoleWrite('set ANTHROPIC_API_KEY for VISION_PROVIDER=anthropic', ccLightRed);
+      exit;
+    end;
+    cfg := AnthropicConfig(akey,
+      TrimU(StringToUtf8(GetEnvironmentVariable('ANTHROPIC_MODEL'))));
+    if cfg.DefaultModel = '' then
+      cfg.DefaultModel := 'claude-opus-4-8';
+    cfg.TimeoutMs := 120000;
+    client := TAnthropicClient.Create(cfg);
+  end
+  else
+  begin
+    cfg := LlmConfigFromEnv;
+    cfg.TimeoutMs := 120000;
+    client := TLlmClient.Create(cfg);
+  end;
   // VISION_IMAGE_B64 (+ optional VISION_IMAGE_MEDIA) inlines a base64 image, fully
   // self-contained; otherwise VISION_IMAGE_URL lets the provider fetch a URL
   imageB64 := TrimU(StringToUtf8(GetEnvironmentVariable('VISION_IMAGE_B64')));
@@ -51,8 +75,6 @@ begin
     // a stable public test image (a gull portrait); override via the env vars
     imageUrl := 'https://upload.wikimedia.org/wikipedia/commons/thumb/' +
       'd/dd/Gull_portrait_ca_usa.jpg/320px-Gull_portrait_ca_usa.jpg';
-
-  client := TLlmClient.Create(cfg);
 
   SetLength(imgs, 1);
   if imageB64 <> '' then

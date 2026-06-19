@@ -61,9 +61,11 @@ LiteLLM / Ollama ab); ein Provider mit echt abweichendem Wire bekommt einen
 
 **Vision/multimodal:** `TLlmMessage.Images` (`LlmImageMessage`/`LlmImageBase64`/
 `LlmImageUrl`) trägt Bild-Anhänge; beide Wires serialisieren sie (OpenAI `image_url`
-inkl. base64-`data:`-URI, Anthropic `image`-Block mit typisiertem `source`). Demo
-`demos/llm/llm-vision.dpr` (env `VISION_IMAGE_B64`/`_MEDIA` oder `VISION_IMAGE_URL`) —
-**live** gegen `gpt-4o-mini` geprüft.
+inkl. base64-`data:`-URI, Anthropic `image`-Block mit typisiertem `source`; leerer
+`MediaType` fällt auf `image/png` zurück). Demo `demos/llm/llm-vision.dpr` ist
+provider-agnostisch (`VISION_PROVIDER=openai|anthropic`, Bild via `VISION_IMAGE_B64`/
+`_MEDIA` oder `VISION_IMAGE_URL`) — **live** gegen `gpt-4o-mini` **und** `claude-opus-4-8`
+geprüft (beide erkennen denselben inline-base64-Kreis).
 
 ### Tests (LLM-Suite, inkl. Anthropic)
 
