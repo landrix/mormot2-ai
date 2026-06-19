@@ -23,6 +23,7 @@ interface
 {$I mormot.defines.inc}
 
 uses
+  sysutils, // RTL Exception base type (broad catch in ExecuteRequest)
   mormot.core.base,
   mormot.core.os,
   mormot.core.unicode,
@@ -73,9 +74,15 @@ type
   /// Authentication context passed to tool/resource execution
   // - provides user identity and authorization information
   TMcpAuthContext = packed record
-    /// whether the request has been authenticated
+    /// whether the request carries a verified identity
+    // - stays FALSE until a real auth resolver sets it; the core transport never
+    //   sets it true merely because a session id is present (a session id is an
+    //   opaque correlation handle, not proof of identity). A tool that gates on
+    //   identity MUST treat false as "unauthenticated" and fail closed.
     IsAuthenticated: boolean;
     /// unique user identifier
+    // - until a real auth resolver runs this carries only the transport session
+    //   id for correlation — do NOT treat it as an authenticated principal
     UserID: RawUtf8;
     /// user display name
     UserName: RawUtf8;
@@ -95,6 +102,9 @@ type
 
   /// MCP-specific exception class
   EMcpException = class(ESynException);
+
+  /// raised when a JSON-RPC method is not implemented (mapped to -32601)
+  EMcpMethodNotFound = class(EMcpException);
 
 
 { ************ IInvokable Interfaces for Tools and Resources }
@@ -429,28 +439,44 @@ function TMcpJsonRpcProcessor.ParseRequest(const aJson: RawUtf8;
 var
   doc: PDocVariantData;
   request: variant;
+  jsonrpc: RawUtf8;
+  paramsIdx: PtrInt;
 begin
   result := false;
   aMethod := '';
   aParams := Null;
   aRequestId := Null;
 
-  // Parse JSON
+  // Parse JSON (invalid JSON yields a non-object -> rejected below)
   request := _JsonFast(aJson);
   doc := _Safe(request);
   if not doc.IsObject then
     exit;
 
-  // Extract method
+  // JSON-RPC 2.0 envelope: the spec REQUIRES "jsonrpc":"2.0". Reject anything else
+  // (missing / wrong version) so a malformed/foreign payload cannot be dispatched.
+  if not doc.GetAsRawUtf8('jsonrpc', jsonrpc) or (jsonrpc <> '2.0') then
+    exit;
+
+  // Extract method (required, must be a string)
   if not doc.GetAsRawUtf8('method', aMethod) then
     exit;
 
-  // Extract params (optional)
-  aParams := doc.GetValueOrNull('params');
+  // Extract params (optional): if present it MUST be a structured value
+  // (object or array) per the spec — a scalar params is a malformed request.
+  paramsIdx := doc.GetValueIndex('params');
+  if paramsIdx >= 0 then
+  begin
+    aParams := doc.Values[paramsIdx];
+    if not (_Safe(aParams)^.IsObject or _Safe(aParams)^.IsArray) then
+      exit;
+  end
+  else
+    aParams := Null;
 
-  // Extract id (optional for notifications)
+  // Extract id (absent => notification; when present must be string/number/null)
   aRequestId := ExtractRequestId(request);
-  
+
   result := true;
 end;
 
@@ -826,19 +852,30 @@ begin
     exit;
   end;
 
+  // Parse request: a malformed envelope (bad JSON / missing or wrong jsonrpc /
+  // scalar params) is an Invalid Request — answer with -32600 and no id (we
+  // could not reliably extract one), never dispatch it.
+  if not fProcessor.ParseRequest(aRequestJson, method, params, requestId) then
+  begin
+    result := fProcessor.CreateError(Null, JSONRPC_INVALID_REQUEST,
+      'Invalid JSON-RPC request');
+    exit;
+  end;
+
+  isNotification := VarIsVoid(requestId);
+
+  // Auth context. NOTE: a session id is NOT authentication — it is an opaque
+  // transport correlation handle. We therefore leave IsAuthenticated = false
+  // (fail-closed) and only carry the session id for correlation. Real identity
+  // must be injected by a backend auth resolver (Phase B) before any tool may
+  // trust IsAuthenticated/Roles. See DESIGN.md / CONCEPT.md roadmap.
+  FillCharFast(authCtx, SizeOf(authCtx), 0);
+  authCtx.IsAuthenticated := false;
+  authCtx.UserID := aSessionId; // correlation only, not an authenticated identity
+
   try
-    // Parse request
-    if not fProcessor.ParseRequest(aRequestJson, method, params, requestId) then
-      raise EMcpException.Create('Invalid JSON-RPC request');
-
-    isNotification := VarIsVoid(requestId);
-
-    // Setup auth context (stub for now)
-    FillCharFast(authCtx, SizeOf(authCtx), 0);
-    authCtx.IsAuthenticated := (aSessionId <> '');
-    authCtx.UserID := aSessionId;
-
-    // Dispatch to handler
+    // Dispatch to handler — any handler/tool exception is mapped to a JSON-RPC
+    // error below, so it never escapes into the HTTP worker.
     if method = 'initialize' then
       resultData := fProcessor.HandleInitialize(params)
     else if method = 'ping' then
@@ -856,7 +893,7 @@ begin
     else if isNotification then
       resultData := Null
     else
-      raise EMcpException.CreateUtf8('Method not found: %', [method]);
+      raise EMcpMethodNotFound.CreateUtf8('Method not found: %', [method]);
 
     // Create success response (unless notification)
     if isNotification then
@@ -865,7 +902,16 @@ begin
       result := fProcessor.CreateSuccessResponse(requestId, resultData);
 
   except
-    on E: ESynException do
+    // Catch EVERY exception (not just ESynException): tools may raise plain
+    // Exception, EConvertError, DB/OS errors. Translate to a JSON-RPC error so
+    // the transport stays alive and the client gets a well-formed response.
+    on E: EMcpMethodNotFound do
+      if isNotification then
+        result := ''
+      else
+        result := fProcessor.CreateError(requestId, JSONRPC_METHOD_NOT_FOUND,
+          StringToUtf8(E.Message));
+    on E: Exception do
       if isNotification then
         result := ''
       else

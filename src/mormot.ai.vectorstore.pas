@@ -36,6 +36,13 @@ type
     ['{8C1A4F92-5D63-4E7B-9A20-3F4C5D6E7A8B}']
     /// store a text and its embedding; returns the assigned document id
     function Add(const aText: RawUtf8; const aVector: TLlmEmbedding): Int64;
+    /// store many text+vector pairs ATOMICALLY (single transaction)
+    // - aTexts and aVectors must have the same length (else raises)
+    // - either all pairs are committed or none (a failure rolls the batch back),
+    //   so a document is never left partially indexed
+    // - returns the number of pairs stored (= length(aTexts))
+    function AddBatch(const aTexts: TRawUtf8DynArray;
+      const aVectors: TLlmEmbeddingDynArray): integer;
     /// the aTopK documents nearest to a query vector, closest first
     function Search(const aQuery: TLlmEmbedding; aTopK: integer): TRagHitDynArray;
     /// number of stored documents
@@ -77,6 +84,8 @@ type
     constructor Create(const aDbPath, aExtDir: RawUtf8; aDim: integer); reintroduce;
     destructor Destroy; override;
     function Add(const aText: RawUtf8; const aVector: TLlmEmbedding): Int64;
+    function AddBatch(const aTexts: TRawUtf8DynArray;
+      const aVectors: TLlmEmbeddingDynArray): integer;
     function Search(const aQuery: TLlmEmbedding; aTopK: integer): TRagHitDynArray;
     function Count: Int64;
     /// the underlying connection, shared e.g. with a TLembedEmbedder
@@ -211,6 +220,56 @@ begin
       r.Close;
     end;
     fDB.Commit;
+  except
+    fDB.RollBack;
+    raise;
+  end;
+end;
+
+function TVec0Store.AddBatch(const aTexts: TRawUtf8DynArray;
+  const aVectors: TLlmEmbeddingDynArray): integer;
+var
+  i: PtrInt;
+  r: TSqlRequest;
+  rowid: Int64;
+  blob: RawByteString;
+begin
+  result := 0;
+  if length(aTexts) <> length(aVectors) then
+    ESynException.RaiseUtf8('%.AddBatch: % texts but % vectors',
+      [self, length(aTexts), length(aVectors)]);
+  if aTexts = nil then
+    exit;
+  // validate every vector BEFORE opening the transaction: a wrong-length vector
+  // must fail the whole batch without writing anything
+  for i := 0 to high(aVectors) do
+    CheckDim(aVectors[i]);
+  // one transaction for the whole document: either all chunks land or none —
+  // a mid-batch failure rolls back so the document is never partially indexed
+  fDB.TransactionBegin;
+  try
+    for i := 0 to high(aTexts) do
+    begin
+      blob := VectorToBlob(aVectors[i]);
+      r.Prepare(fDB.DB, 'INSERT INTO documents(content) VALUES (?);');
+      try
+        r.Bind(1, aTexts[i]);
+        r.Step;
+      finally
+        r.Close;
+      end;
+      rowid := fDB.LastInsertRowID;
+      r.Prepare(fDB.DB, 'INSERT INTO vec_documents(rowid, embedding) VALUES (?, ?);');
+      try
+        r.Bind(1, rowid);
+        r.BindBlob(2, blob);
+        r.Step;
+      finally
+        r.Close;
+      end;
+    end;
+    fDB.Commit;
+    result := length(aTexts);
   except
     fDB.RollBack;
     raise;

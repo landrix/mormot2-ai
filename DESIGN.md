@@ -13,7 +13,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 `UPSTREAM_BASE`). Darauf aufgesetzt: Spec-Upgrade (Phase C, MCP 2025-11-25) und der
 clean-room LLM-Client (Phase D: OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop,
 Embeddings/RAG, agentic RAG, Vision). Build **+ alle Tests + alle Demos grün**
-(aarch64-linux/FPC 3.2.2): **193 Assertions** MCP-Suite + **254 Assertions** LLM-Suite.
+(aarch64-linux/FPC 3.2.2): **202 Assertions** MCP-Suite + **256 Assertions** LLM-Suite.
 Offen ist die Schichtung/der Merge/die Backend-Bindung (Phase E, siehe
 [CONCEPT.md](CONCEPT.md)).
 
@@ -70,9 +70,9 @@ Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
 Die Tests nutzen mORMots **`TSynTests`** (nicht FPCUnit) — passend zum
 Contribution-Ziel. Zwei Runner:
 - `tests/mcp.tests.dpr` — MCP-Suite (Core + Transporte + Streamable),
-  **193 Assertions** grün; `scripts/run-fpc-tests.sh`.
+  **202 Assertions** grün; `scripts/run-fpc-tests.sh`.
 - `tests/llm.tests.dpr` — LLM-Suite (SSE, Client, Agent, Agent-MCP, **Anthropic**,
-  Structured, RAG, RAG-Tool, Vision), **254 Assertions** grün;
+  Structured, RAG, RAG-Tool, Vision), **256 Assertions** grün;
   `scripts/run-fpc-llm-tests.sh`.
 
 Neue Tests im passenden Runner ergänzen.
@@ -87,7 +87,7 @@ Neue Tests im passenden Runner ergänzen.
   der transportabhängige Patch-Hack wurde entfernt (einheitliches Verhalten).
 - **Phase D** ✓ — Clean-Room LLM-Client (`mormot.ai.llm.*`): Provider-Treiber +
   Agent-/Tool-Calling-Loop + Embeddings/RAG + zweiter Provider (Anthropic) +
-  Vision. Komplett gebaut, review-gehärtet, **254 Assertions** grün
+  Vision. Komplett gebaut, review-gehärtet, **256 Assertions** grün
   (`llm.tests.dpr`); Streaming/Tool-Loop/RAG/Vision live verifiziert. Details unten.
 - **Phase E** (offen) — Schichtung/Merge/Backend-Bindung, siehe
   **[CONCEPT.md](CONCEPT.md)** (Single Source of Truth für die offenen Punkte) und
@@ -108,7 +108,7 @@ Neue Tests im passenden Runner ergänzen.
   - **Callback = Methoden-Pointer (`of object`)**, NICHT `reference to`/Closures —
     FPC 3.2.2 kennt die Modeswitches `functionreferences`/`anonymousfunctions`
     nicht (erst 3.3.1).
-  - **Stand**: vollständig gebaut + review-gehärtet, **254 Assertions** grün
+  - **Stand**: vollständig gebaut + review-gehärtet, **256 Assertions** grün
     (`llm.tests`, `scripts/run-fpc-llm-tests.sh`). Bausteine:
     - `mormot.ai.llm.types` — provider-neutrale Records.
     - `mormot.ai.llm.sse` — `TLlmSseStream` (Streaming-Parser; whole/1-byte/tool-call).
@@ -213,6 +213,32 @@ Neue Tests im passenden Runner ergänzen.
     5. **Anthropic-Restfläche**: Structured Output (`output_config.format`, abweichend
        vom OpenAI `response_format`) und Live-Verifikation des Anthropic-Streamings
        (SSE-Parser inkl. error-Event bisher nur hermetisch getestet).
+    6. **MCP-Transport-Produktionsreife** (kritischer Review, CONCEPT §6): echter
+       Auth-Resolver (Phase B; Core ist jetzt fail-closed), Parallel-Stresstest
+       POST↔DELETE/Session-Ablauf für die Streamable-Sessions (UAF per FSafe-Re-Resolve
+       geschlossen, aber nur review-belegt), Legacy-SSE-Transport härten oder entfernen,
+       TVec0Store/lembed-Realtests + RAG-Atomar-Rollback (brauchen die sqlite-vec-Runtime).
+
+### Review-Härtung (kritischer Review, behoben — Build + Tests grün)
+
+Befunde aus einem kritischen Review abgearbeitet (verifiziert: MCP **202** + LLM **256**
+Assertions, alle 15 Demos bauen):
+- **JSON-RPC robust**: `ParseRequest` validiert `jsonrpc:"2.0"` + Params-Typ;
+  `ExecuteRequest` fängt **jede** Exception (nicht nur `ESynException`) und mappt auf
+  korrekte Codes (−32600 Invalid Request / −32601 Method Not Found / −32603 Internal) —
+  eine Tool-Exception kann den HTTP-Worker nicht mehr abreißen.
+- **Auth ehrlich**: `IsAuthenticated` ist **fail-closed** (Session-ID ≠ Identität).
+- **Streamable-UAF geschlossen**: kein Session-**Objekt**-Pointer mehr über Lock-Grenzen;
+  DELETE/POST/Stream serialisieren über `FSafe`, Event-IDs via `NextSessionEventId`
+  (Re-Resolve unter Lock).
+- **Legacy-SSE**: Session-Map thread-safe + Leak in `ClearSessions` behoben; Transport
+  klar als nicht produktionsreif markiert.
+- **RAG-Ingestion strikt + atomar**: exakte Vektoranzahl erzwungen (sonst Fehler);
+  `IVectorStore.AddBatch` committet ein Dokument in **einer** Transaktion (kein
+  Teil-Index).
+- **build-demo.sh** baut wieder **alle** Demos (vorher nur 5 MCP-Demos trotz „ALL DEMOS
+  OK"); **Demo-Härtung**: Streamable-Demo bindet Loopback, `ask_claude` nur per
+  `MCP_ENABLE_ASK_CLAUDE=1` (neue `BindAddress`-Property am Transport).
 
 ## Lizenz / Contribution
 

@@ -38,6 +38,14 @@ type
     function GetContent: RawUtf8; override;
   end;
 
+  /// a tool that raises a PLAIN Exception (not ESynException) — used to prove a
+  /// tool error is translated into a JSON-RPC error, never escapes the handler
+  TThrowingTool = class(TMcpToolBase<TCalcParams>)
+  protected
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  end;
+
   TTestMcpCore = class(TSynTestCase)
   protected
     procedure EnsureCalcParamsRtti;
@@ -53,6 +61,8 @@ type
     procedure ResponseBuilderTextAndFile;
     procedure ServerNotActive;
     procedure BadRequests;
+    procedure ToolExceptionBecomesError;
+    procedure InvalidJsonRpcEnvelope;
     procedure NotificationsNoResponse;
     procedure InitializeVersionNegotiation;
   end;
@@ -80,6 +90,15 @@ end;
 function TVersionResource.GetContent: RawUtf8;
 begin
   result := '{"version":"1.0.0","protocol":"MCP"}';
+end;
+
+{ TThrowingTool }
+
+function TThrowingTool.ExecuteTyped(const aParams: TCalcParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  // a plain RTL Exception (NOT ESynException): the dispatcher must still catch it
+  raise Exception.Create('tool blew up');
 end;
 
 { TTestMcpCore }
@@ -414,14 +433,16 @@ begin
     server.RegisterResource(res);
     server.Start;
 
+    // invalid JSON / malformed envelope -> Invalid Request (-32600)
     response := server.ExecuteRequest('{');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, '');
+    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
 
     response := server.ExecuteRequest('{"jsonrpc":"2.0","id":1}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, '');
+    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
 
+    // unknown method -> Method not found (-32601)
     response := server.ExecuteRequest('{"jsonrpc":"2.0","id":2,"method":"nope"}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Method not found');
+    CheckErrorResponse(response, JSONRPC_METHOD_NOT_FOUND, 'Method not found');
 
     response := server.ExecuteRequest(
       '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}');
@@ -438,6 +459,51 @@ begin
     response := server.ExecuteRequest(
       '{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"missing://info"}}');
     CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Resource not found');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.ToolExceptionBecomesError;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TThrowingTool.Create('boom', 'Always throws'));
+    server.Start;
+    // a plain Exception from the tool must be turned into a JSON-RPC internal
+    // error (not crash the worker, not escape ExecuteRequest)
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"boom",' +
+      '"arguments":{"a":1,"b":2,"enabled":true,"name":"x"}}}');
+    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'tool blew up');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.InvalidJsonRpcEnvelope;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    // wrong jsonrpc version -> Invalid Request
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"1.0","id":1,"method":"ping","params":{}}');
+    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
+    // missing jsonrpc field -> Invalid Request
+    response := server.ExecuteRequest('{"id":2,"method":"ping"}');
+    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
+    // scalar params (must be object or array) -> Invalid Request
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":3,"method":"ping","params":5}');
+    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
   finally
     server.Free;
   end;

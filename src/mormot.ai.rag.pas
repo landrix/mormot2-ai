@@ -150,15 +150,16 @@ begin
     exit;
   SetLength(valid, n);
   vectors := fEmbedder.EmbedBatch(valid);
-  // store only as many as the embedder actually returned (guard a short reply so
-  // a chunk is never paired with a missing/foreign vector)
-  if length(vectors) < n then
-    n := length(vectors);
-  for i := 0 to n - 1 do
-  begin
-    fStore.Add(valid[i], vectors[i]);
-    inc(result);
-  end;
+  // STRICT: the embedder must return exactly one vector per chunk. A short (or
+  // long) reply means the document cannot be indexed correctly — fail loudly
+  // rather than silently storing a partial document with mis-paired vectors.
+  if length(vectors) <> n then
+    ESynException.RaiseUtf8(
+      '%.Ingest: embedder returned % vectors for % chunks (model %)',
+      [self, length(vectors), n, fEmbedder.Model]);
+  // atomic store: AddBatch commits all chunks in one transaction or none, so a
+  // failure mid-way never leaves the document half-indexed
+  result := fStore.AddBatch(valid, vectors);
 end;
 
 function TLlmRag.Query(const aQuestion: RawUtf8): TLlmChatResponse;

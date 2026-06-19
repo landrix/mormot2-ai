@@ -21,6 +21,7 @@ uses
   mormot.ai.mcp,
   mormot.ai.agent,
   mormot.ai.agent.mcp,
+  mormot.ai.rag,      // TLlmRag.Ingest (strict-count regression)
   mormot.ai.rag.tool,
   test.llm.agent; // reuse the scripted TStubLlmClient
 
@@ -41,9 +42,20 @@ type
   public
     procedure SetHits(const aTexts: array of RawUtf8);
     function Add(const aText: RawUtf8; const aVector: TLlmEmbedding): Int64;
+    function AddBatch(const aTexts: TRawUtf8DynArray;
+      const aVectors: TLlmEmbeddingDynArray): integer;
     function Search(const aQuery: TLlmEmbedding; aTopK: integer): TRagHitDynArray;
     function Count: Int64;
     property LastTopK: integer read fLastTopK;
+  end;
+
+  /// an embedder that returns FEWER vectors than requested, to drive the
+  /// strict-count guard in TLlmRag.Ingest
+  TShortEmbedder = class(TInterfacedObject, IEmbedder)
+  public
+    function Embed(const aText: RawUtf8): TLlmEmbedding;
+    function EmbedBatch(const aTexts: TRawUtf8DynArray): TLlmEmbeddingDynArray;
+    function Model: RawUtf8;
   end;
 
   TTestLlmRagTool = class(TSynTestCase)
@@ -54,6 +66,8 @@ type
     procedure EmptyQueryIsError;
     procedure NoHits;
     procedure AgentRetrievesOnDemand;
+    procedure IngestRejectsShortEmbedding;
+    procedure IngestStoresAllChunks;
   end;
 
 
@@ -101,6 +115,12 @@ end;
 function TFakeStore.Add(const aText: RawUtf8; const aVector: TLlmEmbedding): Int64;
 begin
   result := 0; // not exercised
+end;
+
+function TFakeStore.AddBatch(const aTexts: TRawUtf8DynArray;
+  const aVectors: TLlmEmbeddingDynArray): integer;
+begin
+  result := length(aTexts); // not exercised by these tests
 end;
 
 function TFakeStore.Search(const aQuery: TLlmEmbedding;
@@ -267,6 +287,79 @@ begin
     end;
   finally
     server.Free;
+  end;
+end;
+
+{ TShortEmbedder }
+
+function TShortEmbedder.Embed(const aText: RawUtf8): TLlmEmbedding;
+begin
+  SetLength(result, 1);
+  result[0] := 1;
+end;
+
+function TShortEmbedder.EmbedBatch(
+  const aTexts: TRawUtf8DynArray): TLlmEmbeddingDynArray;
+var
+  i: PtrInt;
+begin
+  // deliberately return one FEWER vector than requested (or none for a single
+  // chunk) to trip the strict-count guard — never returns a full set
+  SetLength(result, length(aTexts) - 1); // 0 for a single chunk
+  for i := 0 to high(result) do
+    result[i] := Embed(aTexts[i]);
+end;
+
+function TShortEmbedder.Model: RawUtf8;
+begin
+  result := 'short-embed';
+end;
+
+procedure TTestLlmRagTool.IngestRejectsShortEmbedding;
+var
+  store: IVectorStore;
+  emb: IEmbedder;
+  rag: TLlmRag;
+  raised: boolean;
+begin
+  store := TFakeStore.Create;
+  emb := TShortEmbedder.Create;
+  // one chunk requested, zero vectors returned -> count mismatch must raise
+  // (no silent partial index)
+  rag := TLlmRag.Create(nil, emb, store, 'test-model');
+  try
+    rag.ChunkChars := 1000; // 'kurzer text' stays a single chunk
+    rag.Overlap := 0;
+    raised := false;
+    try
+      rag.Ingest('kurzer text');
+    except
+      on E: Exception do
+        raised := true;
+    end;
+    Check(raised, 'a short embedding reply must fail the ingestion loudly');
+  finally
+    rag.Free;
+  end;
+end;
+
+procedure TTestLlmRagTool.IngestStoresAllChunks;
+var
+  store: IVectorStore;
+  emb: IEmbedder;
+  rag: TLlmRag;
+  n: integer;
+begin
+  store := TFakeStore.Create;
+  emb := TFakeEmbedder.Create; // returns exactly one vector per chunk
+  rag := TLlmRag.Create(nil, emb, store, 'test-model');
+  try
+    rag.ChunkChars := 1000;
+    rag.Overlap := 0;
+    n := rag.Ingest('ein dokument'); // single chunk, matching vector count
+    CheckEqual(n, 1, 'all chunks stored when the embedder count matches');
+  finally
+    rag.Free;
   end;
 end;
 

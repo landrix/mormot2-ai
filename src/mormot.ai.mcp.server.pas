@@ -136,6 +136,12 @@ type
   /// SSE transport with session management
   // - uses Server-Sent Events for streaming responses
   // - maintains sessions for async communication
+  // - LEGACY / NOT production-hardened: this is the MCP-spec "legacy" HTTP+SSE
+  //   transport. The session map is now thread-safe and no longer leaks, but a
+  //   session OBJECT is still dereferenced across GET/POST handlers without a
+  //   transport-wide lock (unlike the Streamable transport, which re-resolves
+  //   under FSafe). Prefer TMcpStreamableHttpTransport for production; harden or
+  //   retire this one before exposing it (see DESIGN.md roadmap).
   TMcpSseTransport = class(TMcpTransportBase)
   private
     fHttpServer: THttpAsyncServer;
@@ -247,6 +253,7 @@ type
     fSessions: IKeyValue<RawUtf8, TMcpStreamableSession>;
     FSafe: IAutoLocker;
     fEndpoint: RawUtf8;
+    fBindAddress: RawUtf8;
     fCorsEnabled: boolean;
     fCorsOrigins: RawUtf8;
     fOnStreamCall: TMcpStreamCall;
@@ -257,6 +264,10 @@ type
     function GetOrCreateSession(const aSessionId: RawUtf8): TMcpStreamableSession;
     procedure RemoveSession(const aSessionId: RawUtf8);
     procedure ClearSessions;
+    // resolve a session by id and return its next SSE event id, all under FSafe
+    // - never hands out the session OBJECT, so a concurrent DELETE cannot cause a
+    //   use-after-free; returns 0 if the session no longer exists
+    function NextSessionEventId(const aSessionId: RawUtf8): Int64;
     // -- SSE formatting --
     function FormatSseEvent(const aEvent, aData: RawUtf8; aId: Int64): RawUtf8;
     // wrap a payload as one HTTP/1.1 chunked-transfer frame (hex-len CRLF .. CRLF)
@@ -284,6 +295,13 @@ type
     procedure Stop; override;
     /// the endpoint path (default: '/mcp')
     property Endpoint: RawUtf8 read fEndpoint write fEndpoint;
+    /// optional bind address to restrict the listening socket
+    // - empty (default) binds all interfaces (e.g. '0.0.0.0'), preserving the
+    //   original behavior
+    // - set to '127.0.0.1' to expose the server on loopback only — strongly
+    //   recommended for demos/tools that wrap local resources, since this
+    //   transport ships with CORS '*' and no authentication
+    property BindAddress: RawUtf8 read fBindAddress write fBindAddress;
     /// enable/disable CORS support (default: true)
     property CorsEnabled: boolean read fCorsEnabled write fCorsEnabled;
     /// allowed CORS origins (default: '*')
@@ -607,8 +625,11 @@ begin
   fMessagesEndpoint := '/messages';
   fCorsEnabled := true;
   fCorsOrigins := '*';
-  fSessions := Collections.NewPlainKeyValue<RawUtf8, TMcpSseSession>;{(
-    [kvoThreadSafe], 60);}
+  // thread-safe map: the session table is read/written from multiple HTTP worker
+  // threads (SSE GET, POST /messages, cleanup) — a plain map would corrupt under
+  // concurrency. Same options as the Streamable transport.
+  fSessions := Collections.NewPlainKeyValue<RawUtf8, TMcpSseSession>(
+    [kvoThreadCriticalSection, kvoThreadSafe], 60);
 end;
 
 destructor TMcpSseTransport.Destroy;
@@ -804,11 +825,11 @@ procedure TMcpSseTransport.ClearSessions;
 begin
   if fSessions = nil then
     exit;
-  // Note: TMcpSseSession objects are not freed here (pre-existing behavior).
-  // IKeyValue.Clear zeroes the references but does not call .Free on TObject values.
-  // A proper fix would require tracking and freeing sessions, but the async
-  // connection lifecycle makes this non-trivial — sessions may still be
-  // referenced by active connections during shutdown.
+  // The IKeyValue owns its object values (no kvoValueNoFinalize), so Clear frees
+  // every remaining TMcpSseSession — no leak. Safe at shutdown because Destroy
+  // calls Stop first, so no worker thread is still touching a session.
+  // (RemoveSession uses Extract+Free, which transfers ownership out before the
+  // manual Free — no double-free.)
   fSessions.Clear;
 end;
 
@@ -1067,11 +1088,19 @@ begin
 end;
 
 procedure TMcpStreamableHttpTransport.Start;
+var
+  bind: RawUtf8;
 begin
   if fActive then
     exit;
+  // bind spec: 'host:port' when BindAddress is set (e.g. '127.0.0.1' for
+  // loopback-only), else just the port (all interfaces) as before
+  if fBindAddress <> '' then
+    bind := fBindAddress + ':' + ToUtf8(fPort)
+  else
+    bind := ToUtf8(fPort);
   fHttpServer := TMcpStreamableAsyncServer.Create(
-    ToUtf8(fPort), nil, nil, 'mcp-streamable', 32,
+    bind, nil, nil, 'mcp-streamable', 32,
     5 * 60 * 1000,
     [hsoNoXPoweredHeader,
      hsoNoStats,
@@ -1142,9 +1171,17 @@ begin
     sessionId := ExtractSessionId(Ctxt);
     if sessionId = '' then
       exit(HTTP_BADREQUEST);
-    if not fSessions.ContainsKey(sessionId) then
-      exit(HTTP_NOTFOUND);
-    RemoveSession(sessionId);
+    // FSafe serializes the free against any concurrent POST/stream that may be
+    // dereferencing the same session object — without it a DELETE could free a
+    // session while a parallel POST still calls Touch/NextEventId (use-after-free)
+    FSafe.Enter;
+    try
+      if not fSessions.ContainsKey(sessionId) then
+        exit(HTTP_NOTFOUND);
+      RemoveSession(sessionId);
+    finally
+      FSafe.Leave;
+    end;
     exit(HTTP_SUCCESS);
   end;
 
@@ -1216,9 +1253,18 @@ begin
   begin
     if sessionId = '' then
       exit(HTTP_BADREQUEST);
-    if not fSessions.TryGetValue(sessionId, session) then
-      exit(HTTP_NOTFOUND);
-    session.Touch;
+    // resolve + Touch under FSafe so a concurrent DELETE cannot free the session
+    // between lookup and use. The deferred stream re-resolves the session by id,
+    // so we deliberately do NOT keep the object pointer past this lock.
+    FSafe.Enter;
+    try
+      if not fSessions.TryGetValue(sessionId, session) then
+        exit(HTTP_NOTFOUND);
+      session.Touch;
+      session := nil; // never dereference the pointer outside the lock
+    finally
+      FSafe.Leave;
+    end;
   end;
 
   // --- Notifications/responses only: process and return 202 ---
@@ -1249,8 +1295,15 @@ begin
        (sessionId[1] = '{') and
        (sessionId[length(sessionId)] = '}') then
       sessionId := copy(sessionId, 2, length(sessionId) - 2);
-    session := GetOrCreateSession(sessionId);
-    session.Initialized := true;
+    // create + mark initialized under FSafe (consistent with DELETE/POST)
+    FSafe.Enter;
+    try
+      session := GetOrCreateSession(sessionId);
+      session.Initialized := true;
+      session := nil; // never dereference outside the lock
+    finally
+      FSafe.Leave;
+    end;
   end;
   // Stash the resolved session id in the response headers: it is echoed to the
   // client (required for initialize) AND re-read by BuildDeferredResponse to
@@ -1335,7 +1388,29 @@ begin
   // No leak here despite the previous TODO: the IKeyValue OWNS its object values
   // (created without kvoValueNoFinalize), so Remove() frees the
   // TMcpStreamableSession instance. Freeing it again here would double-free.
+  // Callers serialize this with FSafe so no parallel POST/stream still holds the
+  // object being freed.
   fSessions.Remove(aSessionId);
+end;
+
+function TMcpStreamableHttpTransport.NextSessionEventId(
+  const aSessionId: RawUtf8): Int64;
+var
+  session: TMcpStreamableSession;
+begin
+  result := 0;
+  if aSessionId = '' then
+    exit;
+  // re-resolve + increment under FSafe: the object is only ever touched while the
+  // lock is held, so a concurrent DELETE (which also takes FSafe before freeing)
+  // can never free it mid-use
+  FSafe.Enter;
+  try
+    if fSessions.TryGetValue(aSessionId, session) then
+      result := session.NextEventId;
+  finally
+    FSafe.Leave;
+  end;
 end;
 
 function TMcpStreamableHttpTransport.FormatSseEvent(
@@ -1380,30 +1455,29 @@ type
   protected
     fTransport: TMcpStreamableHttpTransport;
     fWrite: TMcpRawWrite;
-    fSession: TMcpStreamableSession;
+    // hold the session ID (not the object): the event id is re-resolved under
+    // FSafe per emit, so a concurrent DELETE during a long stream is safe
+    fSessionId: RawUtf8;
   public
     constructor Create(aTransport: TMcpStreamableHttpTransport;
-      const aWrite: TMcpRawWrite; aSession: TMcpStreamableSession);
+      const aWrite: TMcpRawWrite; const aSessionId: RawUtf8);
     procedure Emit(const aJsonMessage: RawUtf8);
   end;
 
 constructor TMcpStreamEmitter.Create(aTransport: TMcpStreamableHttpTransport;
-  const aWrite: TMcpRawWrite; aSession: TMcpStreamableSession);
+  const aWrite: TMcpRawWrite; const aSessionId: RawUtf8);
 begin
   inherited Create;
   fTransport := aTransport;
   fWrite := aWrite;
-  fSession := aSession;
+  fSessionId := aSessionId;
 end;
 
 procedure TMcpStreamEmitter.Emit(const aJsonMessage: RawUtf8);
 var
   eventId: Int64;
 begin
-  if fSession <> nil then
-    eventId := fSession.NextEventId
-  else
-    eventId := 0;
+  eventId := fTransport.NextSessionEventId(fSessionId);
   fWrite(fTransport.SseChunk(
     fTransport.FormatSseEvent('message', aJsonMessage, eventId)));
 end;
@@ -1415,7 +1489,6 @@ var
   doc: TDocVariantData;
   singleItem: variant;
   item: PDocVariantData;
-  session: TMcpStreamableSession;
   emitter: IMcpStreamEmitter;
   handled: boolean;
   i: PtrInt;
@@ -1423,16 +1496,15 @@ var
   p: PUtf8Char;
   len: PtrInt;
 begin
-  // Resolve the session id the handler stashed in the response headers.
+  // Resolve the session id the handler stashed in the response headers. We carry
+  // only the id through the (possibly long) stream — every event id is resolved
+  // via NextSessionEventId under FSafe, so a concurrent DELETE is safe.
   sessionId := '';
   p := FindNameValuePointer(pointer(aOutHeaders), 'MCP-SESSION-ID: ', len);
   if p = nil then
     p := FindNameValuePointer(pointer(aOutHeaders), 'MCP-SESSION-ID:', len);
   if p <> nil then
     FastSetString(sessionId, p, len);
-  session := nil;
-  if sessionId <> '' then
-    fSessions.TryGetValue(sessionId, session);
 
   // Re-parse the request body (same normalization as mcp()).
   doc.InitJson(aBody, JSON_FAST);
@@ -1455,7 +1527,7 @@ begin
     #13#10);
 
   // shared emitter so a streaming tool can push intermediate token events
-  emitter := TMcpStreamEmitter.Create(self, aWrite, session);
+  emitter := TMcpStreamEmitter.Create(self, aWrite, sessionId);
 
   // One SSE event (one chunk) per JSON-RPC response; each request is executed
   // at the point its event is emitted.
@@ -1487,10 +1559,7 @@ begin
       // final SSE event with the JSON-RPC response for this request
       if responseJson <> '' then
       begin
-        if session <> nil then
-          eventId := session.NextEventId
-        else
-          eventId := 0;
+        eventId := NextSessionEventId(sessionId);
         aWrite(SseChunk(FormatSseEvent('message', responseJson, eventId)));
       end;
     end;

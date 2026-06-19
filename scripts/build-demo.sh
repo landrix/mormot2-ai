@@ -5,7 +5,7 @@ set -euo pipefail
 # Teilt den mORMot-Unit-Cache (bin/fpc/lib) mit run-fpc-tests.sh -> Folgebuilds
 # sind schnell.
 #
-#   build-demo.sh                         # alle Demos (examples + 4 Transporte)
+#   build-demo.sh                         # ALLE Demos (MCP-Transporte + LLM + RAG)
 #   build-demo.sh mcp.examples.dpr        # eine Demo (Pfad relativ zu demos/)
 #   build-demo.sh stdio/demo.mcp.stdio.dpr
 #   VERBOSE=1 build-demo.sh ...           # vollen Compilerlog zeigen
@@ -30,8 +30,13 @@ mkdir -p "$UNIT_OUT" "$DEMO_OUT"
 if [ "$#" -ge 1 ] && [ "$1" != "all" ]; then
   DEMOS=("$1")
 else
+  # WICHTIG: hier ALLE Demos auflisten, sonst meldet der "all"-Build faelschlich
+  # "ALL DEMOS OK", obwohl LLM-/RAG-Demos nie gebaut (und evtl. kaputt) sind.
   DEMOS=(mcp.examples.dpr stdio/demo.mcp.stdio.dpr http/demo.mcp.http.dpr \
-         sse/demo.mcp.sse.dpr streamable/demo.mcp.streamable.dpr)
+         sse/demo.mcp.sse.dpr streamable/demo.mcp.streamable.dpr \
+         llm/llm-chat.dpr llm/llm-agent.dpr llm/llm-structured.dpr \
+         llm/llm-embed.dpr llm/llm-vision.dpr llm/llm-anthropic.dpr \
+         rag/rag-spike.dpr rag/rag-chat.dpr rag/rag-agent.dpr)
 fi
 
 build_one() {

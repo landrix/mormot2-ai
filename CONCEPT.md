@@ -122,8 +122,8 @@ Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP
 ## 6. Offene Punkte / Roadmap
 
 Die Engine-Funktionsfläche (Phase D) steht; offen ist die **Schichtung/der Merge/die
-Backend-Bindung** (Phase E). Diese Liste ist die konsolidierte Roadmap — DESIGN.md
-verweist hierher.
+Backend-Bindung** (Phase E) **und die Produktionsreife des MCP-Transports**. Diese
+Liste ist die konsolidierte Roadmap — DESIGN.md verweist hierher.
 
 1. **Refactor §3** (Interface/Impl-Units trennen) — Voraussetzung für pgvector +
    Upstream.
@@ -138,3 +138,31 @@ verweist hierher.
 5. **Anthropic-Restfläche**: Structured Output (`output_config.format`, abweichend vom
    OpenAI `response_format`) + Live-Verifikation des Anthropic-Streamings (SSE-Parser
    inkl. error-Event bisher nur hermetisch getestet).
+6. **MCP-Transport-Produktionsreife** (Befunde aus dem kritischen Review, teils
+   behoben, teils offen):
+   - **Echte Auth** (Phase B): Der Core setzt `IsAuthenticated` jetzt **fail-closed**
+     (eine Session-ID ist keine Identität, [mormot.ai.mcp.pas](src/mormot.ai.mcp.pas)).
+     Offen: ein verpflichtender Auth-Resolver, der Identität/Rollen aus der
+     Backend-Auth befüllt, bevor ein Tool Identität gewährt.
+   - **Streamable-Sessions**: Use-after-free (POST/Stream gg. paralleles DELETE) ist
+     durch FSafe-serialisiertes **Re-Resolve** geschlossen (kein Objekt-Pointer mehr
+     über Lock-Grenzen, `NextSessionEventId`). Offen: ein echter **Parallel-Stresstest**
+     (POST↔DELETE, Session-Ablauf während eines laufenden Streams) — die Härtung ist
+     bisher nur durch Code-Review, nicht durch einen Concurrency-Test belegt.
+   - **Legacy-SSE-Transport** (`TMcpSseTransport`): Map jetzt thread-safe + kein
+     Session-Leak mehr, aber Objekt-Lebensdauer über GET/POST-Handler noch ungelockt.
+     **Nicht produktionsreif** — vor Exposition härten oder zugunsten von
+     **Streamable HTTP** entfernen.
+   - **Demo-Härtung** ✓: Die Streamable-Demo bindet jetzt **Loopback** und das
+     `ask_claude`-Tool (lokale Claude-CLI) ist standardmäßig **deaktiviert**
+     (`MCP_ENABLE_ASK_CLAUDE=1` als Opt-in). Neue `BindAddress`-Property am Transport.
+   - **Tests offen**: TVec0Store/TLembedEmbedder-Realtests + RAG-Atomar-Rollback
+     (brauchen die sqlite-vec/lembed-Runtime, s. Punkt 4) sowie der o. g. Parallel-Test.
+
+**In diesem Review-Pass bereits behoben** (Build + Tests grün: MCP 202, LLM 256
+Assertions): JSON-RPC-Envelope-Validierung (`jsonrpc:"2.0"`, Params-Typ) + breiter
+Exception→JSON-RPC-Error-Fang mit korrekten Codes (−32600/−32601/−32603);
+fail-closed-Auth; Streamable-UAF via FSafe; SSE-Map thread-safe + Leak-Fix;
+RAG-Ingestion **strikt** (exakte Vektoranzahl) **+ atomar** (`IVectorStore.AddBatch`,
+eine Transaktion); `build-demo.sh` baut wieder **alle** Demos (vorher nur 5 MCP-Demos
+trotz „ALL DEMOS OK"); Demo-Loopback + `ask_claude`-Gate.
