@@ -202,8 +202,9 @@ Neue Tests im passenden Runner ergänzen.
   - **Offene Punkte** (Roadmap → siehe [CONCEPT.md §6](CONCEPT.md), dort konsolidiert):
     1. **x86_64-linux-`.so`** von `vec0`/`lembed0` fürs Docker-Image (aarch64-linux +
        win64 vorhanden; Upstream-Pull offen).
-    2. **Interface/Impl-Split** der VectorStore-/Embedder-Units (CONCEPT §3) —
-       Voraussetzung für pgvector + sauberes Upstreamen.
+    2. **Interface/Impl-Split** der VectorStore-/Embedder-Units (CONCEPT §3) ✓
+       **umgesetzt** — `vectorstore`(+`.sqlitevec`) / `embeddings`(+`embed.provider`/
+       `embed.lembed`); Engine ist SQLite-frei, Demos grün. Rest = pgvector (Punkt 3).
     3. **Merge** mit dem parallelen `mormot.ai.*`-Repo (CONCEPT §4): Namespaces
        angleichen (SSE → `mormot.ai.http.sse`, Chunking → `mormot.ai.chunk`), RAG
        zerlegen, pgvector als zweites `IVectorStore`-Backend.

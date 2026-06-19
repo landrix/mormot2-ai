@@ -34,7 +34,9 @@ uses
   mormot.ai.llm,
   mormot.ai.llm.openai,
   mormot.ai.embeddings,
+  mormot.ai.embed.lembed,          // TLembedEmbedder (local GGUF in SQLite)
   mormot.ai.vectorstore,
+  mormot.ai.vectorstore.sqlitevec, // TVec0Store (sqlite-vec)
   mormot.ai.rag,       // TLlmRag - reused only to ingest the document
   mormot.ai.mcp,       // TMcpServer, TMcpAuthContext
   mormot.ai.agent,     // TLlmAgent, ILlmToolbox

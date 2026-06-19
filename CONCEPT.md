@@ -46,34 +46,33 @@ einzigen Frage:
 
 ## 3. Persistenz- & Vektor-Abstraktion (sqlite-vec ↔ pgvector)
 
-**Status heute:** Die Abstraktion existiert bereits — `IVectorStore` (Add/Search/
-Count) und `IEmbedder` (Embed/EmbedBatch/Model) sind Interfaces, und `TLlmRag`
-hängt **nur** an ihnen ([mormot.ai.rag.pas](src/mormot.ai.rag.pas),
-[mormot.ai.vectorstore.pas](src/mormot.ai.vectorstore.pas)). Ein zweites Backend
-(pgvector) ist damit eine **neue Implementierung**, kein Umbau der RAG-Engine.
+**Status heute ✓ (Interface/Impl-Split umgesetzt):** Die Abstraktion existiert nicht
+nur, sie ist jetzt auch **sauber getrennt**. `IVectorStore` und `IEmbedder` liegen in
+reinen Interface-Units ohne Backend-Abhängigkeiten; die Engine (`TLlmRag`,
+`TRagSearchTool`) hängt **nur** an ihnen und zieht damit **keine** statische SQLite
+mehr. Ein zweites Backend (pgvector) ist eine **neue Implementierung**, kein Umbau.
 
-**Problem:** Interface *und* sqlite-vec-Implementierung stecken in **einer** Unit,
-die `mormot.db.raw.sqlite3.static` zieht
-([mormot.ai.vectorstore.pas:21](src/mormot.ai.vectorstore.pas#L21)). Wer pgvector
-(oder gar kein SQLite) will, schleppt trotzdem die statische SQLite-Abhängigkeit
-mit. Das verhindert sauberes Upstreamen *und* den Merge.
+**Vorher das Problem (behoben):** Interface *und* sqlite-vec-Implementierung steckten
+in **einer** Unit, die `mormot.db.raw.sqlite3.static` zog — wer pgvector (oder gar
+kein SQLite) wollte, schleppte die statische SQLite-Abhängigkeit mit.
 
-**Soll-Struktur (Refactor):**
+**Ist-Struktur (umgesetzt):**
 
 ```
-mormot.ai.vectorstore           # NUR Interface IVectorStore + TRagHit + Vektor-Helfer
-mormot.ai.vectorstore.sqlitevec # TVec0Store (sqlite-vec) + sqlite-vec/lembed-Loader
-mormot.ai.vectorstore.pgvector  # TPgVectorStore (IVectorStore) auf mormot.db.pgvector.*
-mormot.ai.embeddings            # NUR Interface IEmbedder
-mormot.ai.embed.provider        # TProviderEmbedder (OpenAI-Wire)
-mormot.ai.embed.ollama          # TOllamaEmbedder (aus Merge)
-mormot.ai.embed.lembed          # TLembedEmbedder (sqlite-lembed, lokal)
+mormot.ai.vectorstore           ✓ NUR IVectorStore + TRagHit + Vektor-Helfer (SQLite-frei)
+mormot.ai.vectorstore.sqlitevec ✓ TVec0Store (sqlite-vec) + Extension-Loader [static SQLite hier isoliert]
+mormot.ai.vectorstore.pgvector  ○ TPgVectorStore (IVectorStore) auf mormot.db.pgvector.* (Merge §4)
+mormot.ai.embeddings            ✓ NUR IEmbedder (zieht nicht mehr den LLM-Client)
+mormot.ai.embed.provider        ✓ TProviderEmbedder (OpenAI-Wire)
+mormot.ai.embed.ollama          ○ TOllamaEmbedder (aus Merge §4)
+mormot.ai.embed.lembed          ✓ TLembedEmbedder (sqlite-lembed, lokal; lädt lembed0 via sqlitevec-Loader)
 ```
+(✓ = gebaut, Demos grün · ○ = offen, kommt mit dem Merge §4)
 
-Regel: **Die RAG-/Agent-Engine kennt nur die Interfaces.** Welches Backend
-(sqlite-vec im Single-Binary-Edge-Fall, pgvector im Server-/Multi-Tenant-Fall)
-zum Einsatz kommt, entscheidet die Komposition in Schicht A/B per DI — nie ein
-`{$ifdef}` in der Engine.
+Regel (gilt jetzt durchgängig): **Die RAG-/Agent-Engine kennt nur die Interfaces.**
+Welches Backend (sqlite-vec im Single-Binary-Edge-Fall, pgvector im
+Server-/Multi-Tenant-Fall) zum Einsatz kommt, entscheidet die Komposition in
+Schicht A/B per DI — nie ein `{$ifdef}` in der Engine.
 
 `mormot.db.pgvector.*` (Binding/ORM/Core) ist der **stärkste reine Upstream-
 Kandidat**: pure DB-Schicht, passt in mORMots `mormot.db.*`-Familie, kein
@@ -102,7 +101,7 @@ flydev) — siehe [NOTICE](NOTICE)/[LICENSE](LICENSE).
 ## 5. Ist-Stand-Inventar (Schicht M/A, gebaut)
 
 Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP-Suite
-**193 Assertions**, LLM-Suite **254 Assertions**; Streaming/Tool-Loop/RAG/Vision auch
+**202 Assertions**, LLM-Suite **256 Assertions**; Streaming/Tool-Loop/RAG/Vision auch
 **live** verifiziert (OpenAI/Ollama/Anthropic). Aufbau-Historie: [DESIGN.md](DESIGN.md).
 
 - **LLM-Client**: `mormot.ai.llm` (OpenAI-Wire = Lingua franca, deckt OpenAI/LiteLLM/
@@ -114,8 +113,11 @@ Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP
 - **MCP**: Server+Client, stdio/HTTP/SSE/Streamable, RTTI-Tool-Schema
   (`mormot.ai.mcp.*`), MCP-Bridge in den Agenten (`mormot.ai.agent.mcp`).
 - **Structured Output**: `mormot.ai.llm.structured` (OpenAI `response_format`).
-- **Embeddings/RAG**: `IEmbedder` (Provider + lokal lembed), `IVectorStore`
-  (sqlite-vec), `TLlmRag`, **agentic RAG** als `search_docs`-MCP-Tool
+- **Embeddings/RAG** (Interface/Impl getrennt, §3): Interfaces `IEmbedder`
+  (`mormot.ai.embeddings`) + `IVectorStore` (`mormot.ai.vectorstore`, SQLite-frei);
+  Impls `TProviderEmbedder` (`mormot.ai.embed.provider`), `TLembedEmbedder`
+  (`mormot.ai.embed.lembed`), `TVec0Store` (`mormot.ai.vectorstore.sqlitevec`);
+  Engine `TLlmRag` (`mormot.ai.rag`) + **agentic RAG** als `search_docs`-MCP-Tool
   (`mormot.ai.rag.tool`, dasselbe Tool extern wie in-process).
 - **codenav**: MCP-Tools für Code-Navigation (`codenav/`).
 
@@ -125,11 +127,13 @@ Die Engine-Funktionsfläche (Phase D) steht; offen ist die **Schichtung/der Merg
 Backend-Bindung** (Phase E) **und die Produktionsreife des MCP-Transports**. Diese
 Liste ist die konsolidierte Roadmap — DESIGN.md verweist hierher.
 
-1. **Refactor §3** (Interface/Impl-Units trennen) — Voraussetzung für pgvector +
-   Upstream.
+1. **Refactor §3** ✓ **umgesetzt** (Interface/Impl-Units getrennt: `vectorstore` +
+   `vectorstore.sqlitevec`, `embeddings` + `embed.provider` + `embed.lembed`; Engine
+   SQLite-frei, Demos grün). Offen bleibt nur das **neue** pgvector-Backend (Punkt 2).
 2. **Merge §4** durchziehen (Namespaces angleichen: SSE → `mormot.ai.http.sse`,
    Chunking → `mormot.ai.chunk`; RAG zerlegen; pgvector als zweites
-   `IVectorStore`-Backend rein).
+   `IVectorStore`-Backend `mormot.ai.vectorstore.pgvector` rein — die Naht steht
+   jetzt; Ollama-Embedder als `mormot.ai.embed.ollama`).
 3. **Memory-/Session-Interfaces** (Schicht A) definieren — Implementierung im
    Backend (Schicht B), Details in
    [docs/Feature-LandrixAI-Agent.md](../../../docs/Feature-LandrixAI-Agent.md).

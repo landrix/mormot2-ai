@@ -29,7 +29,9 @@ uses
   mormot.ai.llm,
   mormot.ai.llm.openai,
   mormot.ai.embeddings,
+  mormot.ai.embed.lembed,          // TLembedEmbedder (local GGUF in SQLite)
   mormot.ai.vectorstore,
+  mormot.ai.vectorstore.sqlitevec, // TVec0Store (sqlite-vec)
   mormot.ai.rag;
 
 const

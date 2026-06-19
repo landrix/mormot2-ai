@@ -25,7 +25,8 @@ uses
   mormot.ai.llm.types,
   mormot.ai.llm,
   mormot.ai.llm.openai,
-  mormot.ai.embeddings;
+  mormot.ai.embeddings,
+  mormot.ai.embed.provider; // TProviderEmbedder (OpenAI-wire /embeddings)
 
 function Cosine(const a, b: TLlmEmbedding): double;
 var

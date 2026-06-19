@@ -1,7 +1,11 @@
-/// LandrixAI LLM Client - embeddings abstraction
+/// LandrixAI LLM Client - embeddings abstraction (backend-neutral)
 // - part of the mormot.ai.* extension (LandrixAI)
-// - IEmbedder is backend-agnostic: a provider endpoint (this unit) or, later, a
-//   local model in SQLite via sqlite-lembed - so RAG can switch source freely
+// - defines ONLY the IEmbedder interface, so the RAG engine depends on this unit
+//   without pulling any concrete embedder (and its deps). Implementations live in
+//   sibling units:
+//     mormot.ai.embed.provider  - TProviderEmbedder (OpenAI-wire /embeddings)
+//     mormot.ai.embed.lembed    - TLembedEmbedder (local GGUF model in SQLite)
+//     mormot.ai.embed.ollama    - TOllamaEmbedder (future, from the merge)
 // - clean-room from the OpenAI Embeddings spec; target license MPL/GPL/LGPL
 unit mormot.ai.embeddings;
 
@@ -11,8 +15,7 @@ interface
 
 uses
   mormot.core.base,
-  mormot.ai.llm.types,
-  mormot.ai.llm;
+  mormot.ai.llm.types;
 
 type
   /// turns text into an embedding vector - provider-backed or local
@@ -26,62 +29,6 @@ type
     function Model: RawUtf8;
   end;
 
-  /// an IEmbedder backed by a provider's OpenAI-wire /embeddings endpoint
-  // - owns its TLlmClient, built from the given provider config
-  TProviderEmbedder = class(TInterfacedObject, IEmbedder)
-  protected
-    fClient: TLlmClient;
-    fModel: RawUtf8;
-  public
-    /// create from a provider config and an embedding model name
-    // - e.g. OpenAIConfig(key) + 'text-embedding-3-small'
-    constructor Create(const aConfig: TLlmProviderConfig; const aModel: RawUtf8);
-    destructor Destroy; override;
-    function Embed(const aText: RawUtf8): TLlmEmbedding;
-    function EmbedBatch(const aTexts: TRawUtf8DynArray): TLlmEmbeddingDynArray;
-    function Model: RawUtf8;
-  end;
-
-
 implementation
-
-constructor TProviderEmbedder.Create(const aConfig: TLlmProviderConfig;
-  const aModel: RawUtf8);
-begin
-  inherited Create;
-  fClient := TLlmClient.Create(aConfig);
-  fModel := aModel;
-end;
-
-destructor TProviderEmbedder.Destroy;
-begin
-  fClient.Free;
-  inherited Destroy;
-end;
-
-function TProviderEmbedder.Embed(const aText: RawUtf8): TLlmEmbedding;
-var
-  input: TRawUtf8DynArray;
-  batch: TLlmEmbeddingDynArray;
-begin
-  SetLength(input, 1);
-  input[0] := aText;
-  batch := fClient.Embeddings(fModel, input);
-  if length(batch) > 0 then
-    result := batch[0]
-  else
-    result := nil;
-end;
-
-function TProviderEmbedder.EmbedBatch(
-  const aTexts: TRawUtf8DynArray): TLlmEmbeddingDynArray;
-begin
-  result := fClient.Embeddings(fModel, aTexts);
-end;
-
-function TProviderEmbedder.Model: RawUtf8;
-begin
-  result := fModel;
-end;
 
 end.

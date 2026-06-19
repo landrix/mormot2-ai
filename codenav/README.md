@@ -10,7 +10,7 @@ spart Token. Erster echter Anwendungsfall der `mormot.ai.*`-Extension.
 |---|---|---|---|
 | `get_outline(path)` | Code-Outline (Typen/Klassen/Member, kompakt) | **Pascal · TypeScript · Kotlin** | Pascal: eigener Scanner; sonst ctags |
 | `find_definition(name)` | Symbol → `file:line [kind] signature` | **Pascal · TypeScript · Kotlin** | ctags |
-| `search_text(pattern, glob)` | kompakte Volltextsuche (`file:line:text`, gedeckelt) | alle | grep |
+| `search_text(pattern, glob)` | kompakte Volltextsuche (`file:line:text`, gedeckelt) | alle | grep (ERE: `\|` `+` `?` `()` ohne Escape) |
 
 `get_outline` dispatcht nach Dateiendung: Pascal (`.pas`/`.pp`/`.inc`/`.lpr`/`.dpr`)
 nutzt einen eigenen Scanner (interface-Teil, dedup) — *weil* ctags' Pascal-Parser nur
@@ -40,9 +40,11 @@ Fallback auf grep/Read).
   verschachtelte Typen *innerhalb* einer Klasse können das erste `end;` vorzeitig als
   Body-Ende werten (im interface selten, in der Praxis bislang nicht aufgetreten).
 - **`find_definition` Pascal:** ctags' Pascal-Parser kennt **nur `function`/
-  `procedure`** — Pascal-**Klassen/Records/Interfaces** (`type X = class`) sind **nicht**
-  als Definition auffindbar; nur Methoden/Funktionen. Für solche Typen `get_outline`
-  oder `search_text` nutzen. (TS/Kotlin: vollständig, inkl. class/interface.)
+  `procedure`**; Pascal-**Typen** werden deshalb per gezieltem grep nachgezogen.
+  Gefunden werden `class`/`record`/`object`/`interface` (`type X = class …`).
+  **Nicht** abgedeckt: Enums (`= (a,b)`), Sets (`= set of …`) und Typ-Aliase
+  (`X = type Integer`) — dafür `get_outline`/`search_text`. (TS/Kotlin: vollständig
+  über ctags, inkl. class/interface.)
 
 Wenn echte AST-Treue oder cross-unit-Referenzen (`find_references`, geerbte
 Definitionen) nötig werden, wäre **pasls** (CodeTools-LSP) der Weg — aktuell bewusst

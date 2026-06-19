@@ -1,7 +1,8 @@
 unit codenav.tools;
 
-// code-nav backend tools that shell out to ctags/grep (no shell: RunRedirect
-// parses argv directly, so tool arguments cannot inject shell commands).
+// code-nav backend tools that shell out to ctags/grep. The RunRedirect overload
+// used here (mormot.ext.os) launches via /bin/sh -c, so every interpolated
+// argument is single-quoted (ShellQuote) to stay literal and injection-safe.
 //   FindDefinition(name)         -> symbol -> file:line [kind] signature (multi-language)
 //   SearchText(pattern, glob)    -> compact grep over the curated source dirs
 // Repo root from env CODENAV_ROOT, else the current directory.
@@ -39,7 +40,7 @@ const
   // (siehe EXCLUDE_DIRS fuer schwere Unterordner innerhalb dieser Dirs)
   CODE_DIRS: array[0..6] of string = (
     'backend/src',
-    'shared/delphi/landrixai/src',
+    'shared/delphi/landrixai',
     'shared/delphi/client',
     'shared/delphi/dto',
     'frontend-react/src',
@@ -59,6 +60,17 @@ begin
   if result = '' then
     result := GetCurrentDir;
   result := ExcludeTrailingPathDelimiter(result);
+end;
+
+// POSIX-Shell-sicheres Single-Quoting eines Kommando-Arguments: der genutzte
+// RunRedirect-Overload (mormot.ext.os) startet ueber /bin/sh -c, daher wuerde
+// ein Pattern/Pfad mit $ ` " oder \ vom Shell interpretiert (ein '$'-Regex-Anker
+// oder ein $(...)/Backtick zerlegte bzw. missbrauchte das Kommando). In einfachen
+// Quotes interpretiert die Shell NICHTS ausser dem ' selbst -> dieses als '\''
+// einbetten (Quote schliessen, literales ' per \', Quote wieder oeffnen).
+function ShellQuote(const s: RawUtf8): RawUtf8;
+begin
+  result := #39 + StringReplaceAll(s, #39, #39 + '\' + #39 + #39) + #39;
 end;
 
 // kommaseparierte Liste der indizierten Quell-Dirs — für die Hinweis-Texte im
@@ -88,7 +100,7 @@ begin
   begin
     d := aRoot + PathDelim + StringReplace(CODE_DIRS[i], '/', PathDelim, [rfReplaceAll]);
     if DirectoryExists(d) then
-      result := result + ' "' + StringToUtf8(d) + '"';
+      result := result + ' ' + ShellQuote(StringToUtf8(d));
   end;
 end;
 
@@ -114,6 +126,73 @@ begin
      (result[length(result) - 1] = '$') then
     SetLength(result, length(result) - 2);
   result := TrimU(result);
+end;
+
+// Pascal-Typdefinitionen (class/record/object/interface) per grep nachziehen —
+// ctags' Pascal-Parser kennt nur function/procedure, daher fehlen Typ-NAMEN in
+// find_definition. Liefert formatierte Zeilen "  path:line  [kind]  text" und
+// zaehlt jeden Treffer in aHits. Keyword wird ERE-case-sensitiv (lowercase)
+// gematcht — Konvention im Repo; sonst muesste -i auch den Namen aufweichen.
+function FindPascalTypes(const aRoot: TFileName; const aName: RawUtf8;
+  var aHits: integer): RawUtf8;
+var
+  cmd, grepOut, pat, raw, fileLine, txt, rhs, kind: RawUtf8;
+  sl: TStringList;
+  i, p1, p2, eq, sp: integer;
+begin
+  result := '';
+  // Name [<generic>] = [packed] class|record|object|interface
+  pat := '^[[:space:]]*' + aName +
+    '[[:space:]]*(<[^=]*>)?[[:space:]]*=[[:space:]]*(packed[[:space:]]+)?' +
+    '(class|record|object|interface)';
+  cmd := 'grep -rInE --color=never --exclude-dir=.git' +
+    ExcludeArgs('--exclude-dir=') +
+    ' --include="*.pas" --include="*.pp" --include="*.inc"' +
+    ' --include="*.lpr" --include="*.dpr"' +
+    ' -e "' + pat + '"' + DirArgs(aRoot);
+  grepOut := RunRedirect(cmd, '');  // '' stdinput -> mormot.ext.os fork+pipe overload
+  if grepOut = '' then
+    exit;
+  sl := TStringList.Create;
+  try
+    sl.Text := Utf8ToString(grepOut);
+    for i := 0 to sl.Count - 1 do
+    begin
+      raw := StringToUtf8(sl[i]);
+      if raw = '' then
+        continue;
+      // grep-Format "path:line:text" — Root ist ein /mnt-Pfad (WSL), also kein
+      // Laufwerks-':' im Pfad; die ersten zwei ':' trennen path / line / text
+      p1 := PosEx(':', raw);
+      if p1 = 0 then
+        continue;
+      p2 := PosEx(':', raw, p1 + 1);
+      if p2 = 0 then
+        continue;
+      fileLine := copy(raw, 1, p2 - 1);          // path:line
+      txt := TrimU(copy(raw, p2 + 1, maxInt));    // Quelltext der Zeile
+      // RHS hinter '=' bestimmen (fuer kind + 'class of'-/Forward-Ausschluss)
+      eq := PosEx('=', txt);
+      rhs := TrimU(copy(txt, eq + 1, maxInt));
+      if IdemPChar(pointer(rhs), 'PACKED ') then
+        rhs := TrimU(copy(rhs, 8, maxInt));
+      // Class-Referenz "class of X" ist keine Typ-Definition -> ueberspringen
+      if IdemPChar(pointer(rhs), 'CLASS OF ') then
+        continue;
+      // erstes Wort = kind (class/record/object/interface); matchbedingt lowercase
+      sp := 1;
+      while (sp <= length(rhs)) and (rhs[sp] in ['a'..'z']) do
+        inc(sp);
+      kind := copy(rhs, 1, sp - 1);
+      // Forward-Deklaration "TFoo = class;" ueberspringen (echte Def. matcht separat)
+      if (sp <= length(rhs)) and (rhs[sp] = ';') then
+        continue;
+      result := result + '  ' + fileLine + '  [' + kind + ']  ' + txt + #10;
+      inc(aHits);
+    end;
+  finally
+    sl.Free;
+  end;
 end;
 
 function FindDefinition(const aName: RawUtf8): RawUtf8;
@@ -162,12 +241,14 @@ begin
   finally
     sl.Free;
   end;
+  // Pascal-Typen (class/record/object/interface) ergaenzen — ctags findet sie nicht
+  result := result + FindPascalTypes(root, aName, hits);
   if hits = 0 then
     result := result +
       '  (no definition found -- this does NOT prove the symbol is absent)'#10 +
-      '  - Pascal class/record/interface TYPE names are NOT indexed (ctags'' Pascal'#10 +
-      '    parser knows only function/procedure); for a Pascal type use get_outline'#10 +
-      '    or search_text instead.'#10 +
+      '  - Pascal class/record/object/interface types ARE found; but enums, sets'#10 +
+      '    and type aliases (T = type X) are NOT -- for those use get_outline or'#10 +
+      '    search_text.'#10 +
       '  - the match is exact + case-sensitive; only these languages are indexed:'#10 +
       '    Pascal, TypeScript, Kotlin.'#10 +
       '  - only these dirs are indexed: ' + IndexedDirs + #10 +
@@ -185,12 +266,15 @@ begin
   if aPattern = '' then
     exit('{"error":"missing pattern"}');
   root := CodeNavRoot;
-  cmd := 'grep -rIn --color=never --exclude-dir=.git' +
+  // -E = extended regex (ERE): erlaubt | + ? ( ) ohne Escape — entspricht dem,
+  // was Agents vom eingebauten Grep/ripgrep gewohnt sind
+  cmd := 'grep -rInE --color=never --exclude-dir=.git' +
     ExcludeArgs('--exclude-dir=');
   if aGlob <> '' then
-    cmd := cmd + ' --include="' + aGlob + '"';
-  // -e schuetzt Pattern, das mit '-' beginnt; Pattern als eigenes argv-Element
-  cmd := cmd + ' -e "' + aPattern + '"' + DirArgs(root);
+    cmd := cmd + ' --include=' + ShellQuote(aGlob);
+  // -e schuetzt ein Pattern, das mit '-' beginnt; ShellQuote haelt $ ` " \ im
+  // Pattern fuer /bin/sh literal (RunRedirect startet ueber sh -c)
+  cmd := cmd + ' -e ' + ShellQuote(aPattern) + DirArgs(root);
   grepOut := RunRedirect(cmd, '');  // '' stdinput -> mormot.ext.os fork+pipe overload
 
   if aGlob <> '' then
@@ -217,8 +301,8 @@ begin
     if shown = 0 then
       result := result +
         '  (no matches -- this does NOT prove absence)'#10 +
-        '  - grep uses basic regex (BRE, no -E); escape/adjust the pattern if it'#10 +
-        '    contains + ? | ( ) { } etc.'#10 +
+        '  - grep uses extended regex (ERE): | + ? ( ) work unescaped; escape a'#10 +
+        '    LITERAL + ? ( ) { } | with a backslash.'#10 +
         '  - only these dirs are indexed: ' + IndexedDirs + #10 +
         '    for anything outside them, fall back to grep/Read.'#10;
   finally
