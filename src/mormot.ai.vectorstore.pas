@@ -230,7 +230,7 @@ function TVec0Store.AddBatch(const aTexts: TRawUtf8DynArray;
   const aVectors: TLlmEmbeddingDynArray): integer;
 var
   i: PtrInt;
-  r: TSqlRequest;
+  rDoc, rVec: TSqlRequest;
   rowid: Int64;
   blob: RawByteString;
 begin
@@ -245,28 +245,33 @@ begin
   for i := 0 to high(aVectors) do
     CheckDim(aVectors[i]);
   // one transaction for the whole document: either all chunks land or none —
-  // a mid-batch failure rolls back so the document is never partially indexed
+  // a mid-batch failure rolls back so the document is never partially indexed.
+  // Both INSERTs are prepared ONCE and reused per row via Reset() — preparing
+  // inside the loop would re-compile the statements on every chunk.
   fDB.TransactionBegin;
   try
-    for i := 0 to high(aTexts) do
-    begin
-      blob := VectorToBlob(aVectors[i]);
-      r.Prepare(fDB.DB, 'INSERT INTO documents(content) VALUES (?);');
+    rDoc.Prepare(fDB.DB, 'INSERT INTO documents(content) VALUES (?);');
+    try
+      rVec.Prepare(fDB.DB,
+        'INSERT INTO vec_documents(rowid, embedding) VALUES (?, ?);');
       try
-        r.Bind(1, aTexts[i]);
-        r.Step;
+        for i := 0 to high(aTexts) do
+        begin
+          blob := VectorToBlob(aVectors[i]);
+          rDoc.Bind(1, aTexts[i]);
+          rDoc.Step;
+          rowid := fDB.LastInsertRowID;
+          rDoc.Reset;
+          rVec.Bind(1, rowid);
+          rVec.BindBlob(2, blob);
+          rVec.Step;
+          rVec.Reset;
+        end;
       finally
-        r.Close;
+        rVec.Close;
       end;
-      rowid := fDB.LastInsertRowID;
-      r.Prepare(fDB.DB, 'INSERT INTO vec_documents(rowid, embedding) VALUES (?, ?);');
-      try
-        r.Bind(1, rowid);
-        r.BindBlob(2, blob);
-        r.Step;
-      finally
-        r.Close;
-      end;
+    finally
+      rDoc.Close;
     end;
     fDB.Commit;
     result := length(aTexts);
@@ -383,10 +388,33 @@ function TLembedEmbedder.EmbedBatch(
   const aTexts: TRawUtf8DynArray): TLlmEmbeddingDynArray;
 var
   i: PtrInt;
+  r: TSqlRequest;
+  blob: RawByteString;
 begin
   SetLength(result, length(aTexts));
-  for i := 0 to high(aTexts) do
-    result[i] := Embed(aTexts[i]);
+  if aTexts = nil then
+    exit;
+  // prepare the lembed statement ONCE and reuse it per text via Reset(); calling
+  // Embed() per item re-prepares 'SELECT lembed(?,?)' on every chunk
+  r.Prepare(fDB.DB, 'SELECT lembed(?, ?);');
+  try
+    for i := 0 to high(aTexts) do
+    begin
+      r.Bind(1, fModel);
+      r.Bind(2, aTexts[i]);
+      blob := '';
+      if r.Step = SQLITE_ROW then
+        blob := r.FieldBlob(0);
+      r.Reset;
+      // same loud-fail contract as Embed(): never return a zero-length vector
+      if blob = '' then
+        ESynException.RaiseUtf8('%.EmbedBatch: lembed returned no vector (model %)',
+          [self, fModel]);
+      result[i] := BlobToVector(blob);
+    end;
+  finally
+    r.Close;
+  end;
 end;
 
 function TLembedEmbedder.Model: RawUtf8;
