@@ -149,7 +149,9 @@ begin
     ExcludeArgs('--exclude-dir=') +
     ' --include="*.pas" --include="*.pp" --include="*.inc"' +
     ' --include="*.lpr" --include="*.dpr"' +
-    ' -e "' + pat + '"' + DirArgs(aRoot);
+    // ShellQuote haelt $ ` " \ im Pattern fuer /bin/sh literal (RunRedirect
+    // startet ueber sh -c) — gegen Command-Injection ueber den Symbolnamen
+    ' -e ' + ShellQuote(pat) + DirArgs(aRoot);
   grepOut := RunRedirect(cmd, '');  // '' stdinput -> mormot.ext.os fork+pipe overload
   if grepOut = '' then
     exit;

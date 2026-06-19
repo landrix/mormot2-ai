@@ -35,6 +35,7 @@ type
     procedure RequestVisionDefaultMedia;
     procedure RequestStructuredOutput;
     procedure RequestStructuredOutputNestedClosed;
+    procedure RequestStructuredOutputNormalizesOpenSchema;
     procedure RequestStructuredOutputJsonObjectDropped;
     procedure ResponseTextAndUsage;
     procedure ResponseToolUse;
@@ -323,6 +324,31 @@ begin
     'nested object closed too');
   Check(not schema^.O['properties']^.O['address']^.B['additionalProperties'],
     'nested additionalProperties false');
+end;
+
+procedure TTestLlmAnthropic.RequestStructuredOutputNormalizesOpenSchema;
+var
+  req: TLlmChatRequest;
+  json: RawUtf8;
+  schema: PDocVariantData;
+begin
+  // robustness against caller-supplied schemas: an explicit additionalProperties:true
+  // must be FORCED to false (else Anthropic 400s), and a nested object that omits
+  // "type":"object" (implied by "properties") must still be detected and closed
+  req := SystemUserRequest;
+  req.ResponseFormat := OpenAIJsonSchemaFormat('order',
+    '{"type":"object","additionalProperties":true,"properties":{' +
+    '"id":{"type":"string"},' +
+    '"meta":{"properties":{"note":{"type":"string"}}}}}');
+  json := AnthropicChatRequestJson(req, false);
+  schema := _Safe(_Json(json))^.O['output_config']^.O['format']^.O['schema'];
+  // the caller's additionalProperties:true is overwritten, not left intact
+  Check(not schema^.B['additionalProperties'], 'root additionalProperties forced false');
+  // the type-less nested object (only "properties") is recognized and closed
+  Check(schema^.O['properties']^.O['meta']^.Exists('additionalProperties'),
+    'type-less nested object detected via properties');
+  Check(not schema^.O['properties']^.O['meta']^.B['additionalProperties'],
+    'type-less nested additionalProperties false');
 end;
 
 procedure TTestLlmAnthropic.RequestStructuredOutputJsonObjectDropped;

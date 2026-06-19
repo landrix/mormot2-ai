@@ -101,7 +101,7 @@ flydev) — siehe [NOTICE](NOTICE)/[LICENSE](LICENSE).
 ## 5. Ist-Stand-Inventar (Schicht M/A, gebaut)
 
 Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP-Suite
-**202 Assertions**, LLM-Suite **269 Assertions**; Streaming/Tool-Loop/RAG/Vision auch
+**202 Assertions**, LLM-Suite **272 Assertions**; Streaming/Tool-Loop/RAG/Vision auch
 **live** verifiziert (OpenAI/Ollama/Anthropic). Aufbau-Historie: [DESIGN.md](DESIGN.md).
 
 - **LLM-Client**: `mormot.ai.llm` (OpenAI-Wire = Lingua franca, deckt OpenAI/LiteLLM/

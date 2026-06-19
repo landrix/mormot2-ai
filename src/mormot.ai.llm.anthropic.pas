@@ -244,16 +244,21 @@ var
 begin
   if aSchema = nil then
     exit;
-  if aSchema^.U['type'] = 'object' then
+  // detect an object node even when "type" is omitted: a JSON-Schema object may
+  // be implied by "properties" alone, so fall back to that marker
+  if (aSchema^.U['type'] = 'object') or (aSchema^.GetValueIndex('properties') >= 0) then
   begin
-    if aSchema^.GetValueIndex('additionalProperties') < 0 then
-      aSchema^.AddValue('additionalProperties', false);
+    // FORCE (not just default) additionalProperties:false - a caller-supplied
+    // schema with additionalProperties:true would otherwise stay open and be
+    // rejected by Anthropic; normalize it instead of failing the request
+    aSchema^.AddOrUpdateValue('additionalProperties', false);
     props := aSchema^.O['properties'];
     if props^.IsObject then
       for i := 0 to props^.Count - 1 do
         AnthropicForceClosedObjects(_Safe(props^.Values[i]));
   end
-  else if aSchema^.U['type'] = 'array' then
+  // likewise treat a node with "items" as an array even without "type":"array"
+  else if (aSchema^.U['type'] = 'array') or (aSchema^.GetValueIndex('items') >= 0) then
     // a missing items yields mORMot's fake-void doc (type=''), so this no-ops
     AnthropicForceClosedObjects(aSchema^.O['items']);
 end;
