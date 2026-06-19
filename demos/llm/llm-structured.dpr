@@ -3,7 +3,11 @@
 // the model's JSON answer is loaded straight back into the record.
 //
 //   llm-structured
-//   provider via env: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY (key never logged)
+//   provider via env: LLM_PROVIDER=openai|anthropic (default openai)
+//     openai:    LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+//     anthropic: ANTHROPIC_API_KEY (required), ANTHROPIC_MODEL (default claude-opus-4-8)
+//   on Anthropic the json_schema is sent as output_config.format (not response_format);
+//   the key is read from the environment ONLY - never hard-code or log it
 program llm.structured;
 
 {$I mormot.defines.inc}
@@ -26,6 +30,7 @@ uses
   mormot.ai.llm.types,
   mormot.ai.llm,
   mormot.ai.llm.openai,
+  mormot.ai.llm.anthropic, // native Anthropic wire (LLM_PROVIDER=anthropic)
   mormot.ai.llm.structured;
 
 type
@@ -41,21 +46,42 @@ var
   req: TLlmChatRequest;
   msgs: TLlmMessageDynArray;
   inv: TInvoice;
-  server, model: RawUtf8;
+  server, model, provider, key: RawUtf8;
 begin
   {$ifdef UNIX}
-  OpenSslInitialize; // enable TLS so HTTPS endpoints (OpenAI/LiteLLM) work
+  OpenSslInitialize; // enable TLS so HTTPS endpoints work
   {$endif}
   // the same RTTI that an MCP tool would use to describe its input
   Rtti.RegisterFromText(TypeInfo(TInvoice),
     'vendor,contact:RawUtf8 amount_eur:integer');
 
-  // provider comes from the environment: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
-  cfg := LlmConfigFromEnv;
-  cfg.TimeoutMs := 120000;
-  server := cfg.BaseUrl;
-  model := cfg.DefaultModel;
-  client := TLlmClient.Create(cfg);
+  // provider selected by LLM_PROVIDER; ChatStructured + the schema are identical,
+  // only the wire that carries the schema differs (response_format vs output_config)
+  provider := LowerCaseU(TrimU(StringToUtf8(GetEnvironmentVariable('LLM_PROVIDER'))));
+  if provider = 'anthropic' then
+  begin
+    key := TrimU(StringToUtf8(GetEnvironmentVariable('ANTHROPIC_API_KEY')));
+    if key = '' then
+    begin
+      ConsoleWrite('set ANTHROPIC_API_KEY', ccLightRed);
+      exit;
+    end;
+    model := TrimU(StringToUtf8(GetEnvironmentVariable('ANTHROPIC_MODEL')));
+    if model = '' then
+      model := 'claude-opus-4-8';
+    cfg := AnthropicConfig(key, model);
+    cfg.TimeoutMs := 120000;
+    server := 'Anthropic Messages API';
+    client := TAnthropicClient.Create(cfg);
+  end
+  else
+  begin
+    cfg := LlmConfigFromEnv; // LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+    cfg.TimeoutMs := 120000;
+    server := cfg.BaseUrl;
+    model := cfg.DefaultModel;
+    client := TLlmClient.Create(cfg);
+  end;
   SetLength(msgs, 2);
   msgs[0] := LlmMessage(lrSystem,
     'Extract the invoice fields from the user text. Reply with JSON only.');

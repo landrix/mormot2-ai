@@ -2,7 +2,10 @@
 // endpoint (OpenAI / LiteLLM / Ollama) and prints tokens as they arrive.
 //
 //   llm-chat [prompt]
-//   provider via env: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY (key never logged)
+//   provider via env: LLM_PROVIDER=openai|anthropic (default openai)
+//     openai:    LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+//     anthropic: ANTHROPIC_API_KEY (required), ANTHROPIC_MODEL (default claude-opus-4-8)
+//   the key is read from the environment ONLY - never hard-code or log it
 program llm.chat;
 
 {$I mormot.defines.inc}
@@ -23,7 +26,8 @@ uses
   mormot.core.text,
   mormot.ai.llm.types,
   mormot.ai.llm,
-  mormot.ai.llm.openai;
+  mormot.ai.llm.openai,
+  mormot.ai.llm.anthropic; // native Anthropic wire (LLM_PROVIDER=anthropic)
 
 type
   // the streaming callback must be a method (of object) - see mormot.ai.llm.sse
@@ -43,20 +47,41 @@ end;
 
 var
   cfg: TLlmProviderConfig;
-  client: TLlmClient;
+  client: ILlmClient; // interface-managed; works for OpenAI-wire or Anthropic
   printer: TPrinter;
   req: TLlmChatRequest;
   msgs: TLlmMessageDynArray;
-  server, model, prompt: RawUtf8;
+  server, model, prompt, provider, key: RawUtf8;
 begin
   {$ifdef UNIX}
-  OpenSslInitialize; // enable TLS so HTTPS endpoints (OpenAI/LiteLLM) work
+  OpenSslInitialize; // enable TLS so HTTPS endpoints work
   {$endif}
-  // provider comes from the environment: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
-  cfg := LlmConfigFromEnv;
-  cfg.TimeoutMs := 120000;
-  server := cfg.BaseUrl;
-  model := cfg.DefaultModel;
+  // provider selected by LLM_PROVIDER; the same streaming path drives either wire
+  provider := LowerCaseU(TrimU(StringToUtf8(GetEnvironmentVariable('LLM_PROVIDER'))));
+  if provider = 'anthropic' then
+  begin
+    key := TrimU(StringToUtf8(GetEnvironmentVariable('ANTHROPIC_API_KEY')));
+    if key = '' then
+    begin
+      ConsoleWrite('set ANTHROPIC_API_KEY', ccLightRed);
+      exit;
+    end;
+    model := TrimU(StringToUtf8(GetEnvironmentVariable('ANTHROPIC_MODEL')));
+    if model = '' then
+      model := 'claude-opus-4-8';
+    cfg := AnthropicConfig(key, model);
+    cfg.TimeoutMs := 120000;
+    server := 'Anthropic Messages API';
+    client := TAnthropicClient.Create(cfg);
+  end
+  else
+  begin
+    cfg := LlmConfigFromEnv; // LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+    cfg.TimeoutMs := 120000;
+    server := cfg.BaseUrl;
+    model := cfg.DefaultModel;
+    client := TLlmClient.Create(cfg);
+  end;
   prompt := StringToUtf8(ParamStr(1));
   if prompt = '' then
     prompt := 'Say hello in one short sentence.';
@@ -66,7 +91,6 @@ begin
   req := LlmChatRequest(model, msgs);
 
   printer := TPrinter.Create;
-  client := TLlmClient.Create(cfg);
   try
     ConsoleWrite(FormatUtf8('>>> %  model=%', [server, model]), ccLightBlue);
     ConsoleWrite(FormatUtf8('>>> prompt: %'#10'--- streaming ---', [prompt]), ccLightBlue);
@@ -78,7 +102,6 @@ begin
         ConsoleWrite(FormatUtf8(#10'ERROR %: %', [E.ClassName, E.Message]), ccLightRed);
     end;
   finally
-    client.Free;
-    printer.Free;
+    printer.Free; // client is interface-managed - no manual Free
   end;
 end.

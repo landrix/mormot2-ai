@@ -233,10 +233,73 @@ begin
   end;
 end;
 
+// recursively set additionalProperties:false on every object node of a JSON
+// schema (in place). Anthropic requires it on ALL objects - not just the root -
+// or it rejects the request with a 400 (stricter than OpenAI, where it is only a
+// strict-mode requirement). Walks into each property's schema and into array items.
+procedure AnthropicForceClosedObjects(aSchema: PDocVariantData);
+var
+  i: PtrInt;
+  props: PDocVariantData;
+begin
+  if aSchema = nil then
+    exit;
+  if aSchema^.U['type'] = 'object' then
+  begin
+    if aSchema^.GetValueIndex('additionalProperties') < 0 then
+      aSchema^.AddValue('additionalProperties', false);
+    props := aSchema^.O['properties'];
+    if props^.IsObject then
+      for i := 0 to props^.Count - 1 do
+        AnthropicForceClosedObjects(_Safe(props^.Values[i]));
+  end
+  else if aSchema^.U['type'] = 'array' then
+    // a missing items yields mORMot's fake-void doc (type=''), so this no-ops
+    AnthropicForceClosedObjects(aSchema^.O['items']);
+end;
+
+// translate the OpenAI-shaped neutral ResponseFormat into Anthropic's
+// output_config.format (structured outputs). Anthropic differs from OpenAI here:
+// the schema sits DIRECTLY under output_config.format (no name/strict wrapper),
+// and there is no json_object mode - so an OpenAI json_schema response_format maps
+// to {format:{type:'json_schema',schema:<schema>}}, while a json_object one has no
+// wire equivalent and is dropped (the prompt still guides the model). Returns
+// false when there is nothing to emit.
+// NOTE: a nested-record schema must already be fully expanded by the caller - the
+// RTTI generator (mormot.ai.llm.structured) currently emits only flat schemas, the
+// same limitation OpenAI strict mode has; this function closes whatever objects it
+// is given but does not synthesize missing nested schemas.
+function AnthropicOutputConfig(const aResponseFormat: RawUtf8;
+  out aOutputConfig: variant): boolean;
+var
+  rfv, schema: variant; // named locals keep the parsed temporaries alive: rf/js
+  rf, js: PDocVariantData; // point INTO rfv, so rfv must outlive their use
+begin
+  result := false;
+  if aResponseFormat = '' then
+    exit;
+  rfv := _Json(aResponseFormat);
+  rf := _Safe(rfv);
+  // only the OpenAI json_schema shape carries a schema Anthropic can enforce
+  if rf^.U['type'] <> 'json_schema' then
+    exit;
+  js := rf^.O['json_schema'];
+  if js^.GetValueIndex('schema') < 0 then
+    exit;
+  // GetValueOrNull copies an independent variant out, so it survives rfv's scope
+  schema := js^.GetValueOrNull('schema');
+  // Anthropic requires additionalProperties:false on every object of the schema
+  AnthropicForceClosedObjects(_Safe(schema));
+  aOutputConfig := _ObjFast(['format', _ObjFast([
+    'type', 'json_schema',
+    'schema', schema])]);
+  result := true;
+end;
+
 function AnthropicChatRequestJson(const aRequest: TLlmChatRequest;
   aStream: boolean): RawUtf8;
 var
-  body, messages, tools, tool, content: variant;
+  body, messages, tools, tool, content, outputCfg: variant;
   system: RawUtf8;
   maxTokens, i: integer;
 begin
@@ -294,6 +357,10 @@ begin
     end;
     _Safe(body)^.AddValue('tools', tools);
   end;
+  // structured outputs: a json_schema ResponseFormat becomes output_config.format
+  // (Extra may still override the whole output_config below, e.g. to add effort)
+  if AnthropicOutputConfig(aRequest.ResponseFormat, outputCfg) then
+    _Safe(body)^.AddValue('output_config', outputCfg);
   // merge any provider-specific passthrough (e.g. thinking, tool_choice);
   // AddOrUpdateFrom overwrites rather than duplicating a key
   if _Safe(aRequest.Extra)^.Count > 0 then

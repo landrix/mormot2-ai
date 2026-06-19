@@ -101,7 +101,7 @@ flydev) — siehe [NOTICE](NOTICE)/[LICENSE](LICENSE).
 ## 5. Ist-Stand-Inventar (Schicht M/A, gebaut)
 
 Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP-Suite
-**202 Assertions**, LLM-Suite **256 Assertions**; Streaming/Tool-Loop/RAG/Vision auch
+**202 Assertions**, LLM-Suite **269 Assertions**; Streaming/Tool-Loop/RAG/Vision auch
 **live** verifiziert (OpenAI/Ollama/Anthropic). Aufbau-Historie: [DESIGN.md](DESIGN.md).
 
 - **LLM-Client**: `mormot.ai.llm` (OpenAI-Wire = Lingua franca, deckt OpenAI/LiteLLM/
@@ -112,7 +112,9 @@ Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP
 - **Agent-Loop**: `TLlmAgent` + `ILlmToolbox` ([mormot.ai.agent.pas](src/mormot.ai.agent.pas)).
 - **MCP**: Server+Client, stdio/HTTP/SSE/Streamable, RTTI-Tool-Schema
   (`mormot.ai.mcp.*`), MCP-Bridge in den Agenten (`mormot.ai.agent.mcp`).
-- **Structured Output**: `mormot.ai.llm.structured` (OpenAI `response_format`).
+- **Structured Output**: `mormot.ai.llm.structured` (`ChatStructured` provider-agnostisch);
+  OpenAI `response_format` ↔ Anthropic `output_config.format` (Adapter übersetzt + injiziert
+  `additionalProperties:false`), beide live verifiziert.
 - **Embeddings/RAG** (Interface/Impl getrennt, §3): Interfaces `IEmbedder`
   (`mormot.ai.embeddings`) + `IVectorStore` (`mormot.ai.vectorstore`, SQLite-frei);
   Impls `TProviderEmbedder` (`mormot.ai.embed.provider`), `TLembedEmbedder`
@@ -142,9 +144,12 @@ Liste ist die konsolidierte Roadmap — DESIGN.md verweist hierher.
    lembed0 laufzeit-geprüft auf **beiden** Deploy-Arches: aarch64 nativ (rag-spike/
    chat/agent) und x86_64 gegen mORMots **statisches** SQLite im amd64-Container
    (`scripts/x64-ext-verify.sh`). Offen bleibt nur die Verdrahtung ins Docker-Image.
-5. **Anthropic-Restfläche**: Structured Output (`output_config.format`, abweichend vom
-   OpenAI `response_format`) + Live-Verifikation des Anthropic-Streamings (SSE-Parser
-   inkl. error-Event bisher nur hermetisch getestet).
+5. **Anthropic-Restfläche** ✓ **erledigt**: Structured Output über `output_config.format`
+   (Adapter übersetzt das neutrale `ResponseFormat` und injiziert das von Anthropic
+   geforderte `additionalProperties:false`) — live gegen `claude-opus-4-8` (typisierter
+   Record extrahiert). Anthropic-**Streaming** live verifiziert (SSE-Parser inkl.
+   message_start/delta-usage end-to-end). Beide Demos (`llm-structured`, `llm-chat`) jetzt
+   provider-agnostisch via `LLM_PROVIDER`.
 6. **MCP-Transport-Produktionsreife** (Befunde aus dem kritischen Review, teils
    behoben, teils offen):
    - **Echte Auth** (Phase B): Der Core setzt `IsAuthenticated` jetzt **fail-closed**

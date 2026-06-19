@@ -13,7 +13,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 `UPSTREAM_BASE`). Darauf aufgesetzt: Spec-Upgrade (Phase C, MCP 2025-11-25) und der
 clean-room LLM-Client (Phase D: OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop,
 Embeddings/RAG, agentic RAG, Vision). Build **+ alle Tests + alle Demos grün**
-(aarch64-linux/FPC 3.2.2): **202 Assertions** MCP-Suite + **256 Assertions** LLM-Suite.
+(aarch64-linux/FPC 3.2.2): **202 Assertions** MCP-Suite + **269 Assertions** LLM-Suite.
 Offen ist die Schichtung/der Merge/die Backend-Bindung (Phase E, siehe
 [CONCEPT.md](CONCEPT.md)).
 
@@ -72,7 +72,7 @@ Contribution-Ziel. Zwei Runner:
 - `tests/mcp.tests.dpr` — MCP-Suite (Core + Transporte + Streamable),
   **202 Assertions** grün; `scripts/run-fpc-tests.sh`.
 - `tests/llm.tests.dpr` — LLM-Suite (SSE, Client, Agent, Agent-MCP, **Anthropic**,
-  Structured, RAG, RAG-Tool, Vision), **256 Assertions** grün;
+  Structured, RAG, RAG-Tool, Vision), **269 Assertions** grün;
   `scripts/run-fpc-llm-tests.sh`.
 
 Neue Tests im passenden Runner ergänzen.
@@ -87,7 +87,7 @@ Neue Tests im passenden Runner ergänzen.
   der transportabhängige Patch-Hack wurde entfernt (einheitliches Verhalten).
 - **Phase D** ✓ — Clean-Room LLM-Client (`mormot.ai.llm.*`): Provider-Treiber +
   Agent-/Tool-Calling-Loop + Embeddings/RAG + zweiter Provider (Anthropic) +
-  Vision. Komplett gebaut, review-gehärtet, **256 Assertions** grün
+  Vision. Komplett gebaut, review-gehärtet, **269 Assertions** grün
   (`llm.tests.dpr`); Streaming/Tool-Loop/RAG/Vision live verifiziert. Details unten.
 - **Phase E** (offen) — Schichtung/Merge/Backend-Bindung, siehe
   **[CONCEPT.md](CONCEPT.md)** (Single Source of Truth für die offenen Punkte) und
@@ -108,7 +108,7 @@ Neue Tests im passenden Runner ergänzen.
   - **Callback = Methoden-Pointer (`of object`)**, NICHT `reference to`/Closures —
     FPC 3.2.2 kennt die Modeswitches `functionreferences`/`anonymousfunctions`
     nicht (erst 3.3.1).
-  - **Stand**: vollständig gebaut + review-gehärtet, **256 Assertions** grün
+  - **Stand**: vollständig gebaut + review-gehärtet, **269 Assertions** grün
     (`llm.tests`, `scripts/run-fpc-llm-tests.sh`). Bausteine:
     - `mormot.ai.llm.types` — provider-neutrale Records.
     - `mormot.ai.llm.sse` — `TLlmSseStream` (Streaming-Parser; whole/1-byte/tool-call).
@@ -213,9 +213,11 @@ Neue Tests im passenden Runner ergänzen.
     4. **Memory-/Session-Interfaces** (Schicht A) definieren, Backend-Bindung
        (Schicht B) implementieren — siehe
        [docs/Feature-LandrixAI-Agent.md](../../../docs/Feature-LandrixAI-Agent.md).
-    5. **Anthropic-Restfläche**: Structured Output (`output_config.format`, abweichend
-       vom OpenAI `response_format`) und Live-Verifikation des Anthropic-Streamings
-       (SSE-Parser inkl. error-Event bisher nur hermetisch getestet).
+    5. **Anthropic-Restfläche** ✓ **erledigt**: Structured Output via
+       `output_config.format` (Adapter übersetzt das neutrale `ResponseFormat` +
+       injiziert `additionalProperties:false`) und Anthropic-**Streaming** — beide
+       **live** gegen `claude-opus-4-8` verifiziert; `llm-structured`/`llm-chat` jetzt
+       provider-agnostisch (`LLM_PROVIDER`).
     6. **MCP-Transport-Produktionsreife** (kritischer Review, CONCEPT §6): echter
        Auth-Resolver (Phase B; Core ist jetzt fail-closed), Parallel-Stresstest
        POST↔DELETE/Session-Ablauf für die Streamable-Sessions (UAF per FSafe-Re-Resolve

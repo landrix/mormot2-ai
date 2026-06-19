@@ -18,6 +18,7 @@ uses
   mormot.ai.llm,
   mormot.ai.llm.sse,
   mormot.ai.llm.anthropic,
+  mormot.ai.llm.structured, // OpenAIJsonSchemaFormat / LLM_JSON_OBJECT_FORMAT
   test.llm.sse; // reuse TSseCollector
 
 type
@@ -32,6 +33,9 @@ type
     procedure RequestParallelToolResults;
     procedure RequestVision;
     procedure RequestVisionDefaultMedia;
+    procedure RequestStructuredOutput;
+    procedure RequestStructuredOutputNestedClosed;
+    procedure RequestStructuredOutputJsonObjectDropped;
     procedure ResponseTextAndUsage;
     procedure ResponseToolUse;
     procedure ResponseToolUseNoInput;
@@ -266,6 +270,74 @@ begin
   src := _Safe(_Json(json))^.A['messages']^._[0]^.A['content']^._[0]^.O['source'];
   CheckEqual(src^.U['media_type'], 'image/png', 'empty media_type defaults to png');
   CheckEqual(src^.U['data'], 'CCCC', 'raw data preserved');
+end;
+
+procedure TTestLlmAnthropic.RequestStructuredOutput;
+var
+  req: TLlmChatRequest;
+  json: RawUtf8;
+  d, fmt: PDocVariantData;
+begin
+  // ChatStructured sets the OpenAI-shaped json_schema ResponseFormat; the Anthropic
+  // adapter must translate it to output_config.format with the schema DIRECTLY under
+  // it (no name/strict wrapper) and emit no OpenAI response_format key
+  req := SystemUserRequest;
+  req.ResponseFormat := OpenAIJsonSchemaFormat('invoice',
+    '{"type":"object","properties":{"vendor":{"type":"string"},' +
+    '"amount":{"type":"number"}},"required":["vendor","amount"]}');
+  json := AnthropicChatRequestJson(req, false);
+  d := _Safe(_Json(json));
+  Check(d^.Exists('output_config'), 'output_config emitted');
+  Check(not d^.Exists('response_format'), 'no OpenAI response_format key');
+  fmt := d^.O['output_config']^.O['format'];
+  CheckEqual(fmt^.U['type'], 'json_schema', 'format type');
+  // the schema sits directly under format (Anthropic shape), not wrapped in a name
+  Check(not fmt^.Exists('name'), 'no name wrapper (unlike OpenAI)');
+  CheckEqual(fmt^.O['schema']^.U['type'], 'object', 'schema passed through');
+  Check(fmt^.O['schema']^.O['properties']^.Exists('vendor'), 'schema property kept');
+  // Anthropic requires additionalProperties:false explicitly - the adapter injects it
+  Check(fmt^.O['schema']^.Exists('additionalProperties'),
+    'additionalProperties injected for Anthropic');
+  Check(not fmt^.O['schema']^.B['additionalProperties'],
+    'additionalProperties is false');
+end;
+
+procedure TTestLlmAnthropic.RequestStructuredOutputNestedClosed;
+var
+  req: TLlmChatRequest;
+  json: RawUtf8;
+  schema: PDocVariantData;
+begin
+  // a nested object property: Anthropic requires additionalProperties:false on
+  // EVERY object, so the adapter must close the nested object too, not only the root
+  req := SystemUserRequest;
+  req.ResponseFormat := OpenAIJsonSchemaFormat('order',
+    '{"type":"object","properties":{"id":{"type":"string"},' +
+    '"address":{"type":"object","properties":{"city":{"type":"string"}}}}}');
+  json := AnthropicChatRequestJson(req, false);
+  schema := _Safe(_Json(json))^.O['output_config']^.O['format']^.O['schema'];
+  Check(schema^.Exists('additionalProperties'), 'root object closed');
+  Check(not schema^.B['additionalProperties'], 'root additionalProperties false');
+  // the nested object under properties.address must also be closed
+  Check(schema^.O['properties']^.O['address']^.Exists('additionalProperties'),
+    'nested object closed too');
+  Check(not schema^.O['properties']^.O['address']^.B['additionalProperties'],
+    'nested additionalProperties false');
+end;
+
+procedure TTestLlmAnthropic.RequestStructuredOutputJsonObjectDropped;
+var
+  req: TLlmChatRequest;
+  json: RawUtf8;
+  d: PDocVariantData;
+begin
+  // json_object mode has no Anthropic wire equivalent: it must be dropped (the
+  // prompt still guides the model), not emitted as a malformed output_config
+  req := SystemUserRequest;
+  req.ResponseFormat := LLM_JSON_OBJECT_FORMAT;
+  json := AnthropicChatRequestJson(req, false);
+  d := _Safe(_Json(json));
+  Check(not d^.Exists('output_config'), 'json_object yields no output_config');
 end;
 
 procedure TTestLlmAnthropic.ResponseTextAndUsage;
