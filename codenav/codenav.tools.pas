@@ -39,12 +39,12 @@ const
   // (siehe EXCLUDE_DIRS fuer schwere Unterordner innerhalb dieser Dirs)
   CODE_DIRS: array[0..6] of string = (
     'backend/src',
-    'shared/delphi/landrixai',
+    'shared/delphi/landrixai/src',
     'shared/delphi/client',
     'shared/delphi/dto',
     'frontend-react/src',
     'frontend-kmp/shared/src',
-    'shared/delphi/libs/_git_Synopse2');
+    'shared/delphi/libs/_git_Synopse2/src');
   // schwere Binär-/Build-Unterordner, die innerhalb der indizierten Dirs liegen
   // (landrixai/bin, landrixai/vendor/{models,sqlite-ext}, landrixai/_eval,
   // backend/bin) - per Verzeichnis-Basename ausgeschlossen, sonst liefe der
