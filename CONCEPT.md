@@ -137,8 +137,11 @@ Liste ist die konsolidierte Roadmap — DESIGN.md verweist hierher.
 3. **Memory-/Session-Interfaces** (Schicht A) definieren — Implementierung im
    Backend (Schicht B), Details in
    [docs/Feature-LandrixAI-Agent.md](../../../docs/Feature-LandrixAI-Agent.md).
-4. **x64-linux-`.so`** für sqlite-vec/lembed im Docker-Image (aarch64-linux + win64
-   vorhanden; Upstream-Pull offen).
+4. **x64-linux-`.so`** für sqlite-vec/lembed ✓ **vorhanden + verifiziert** — alle vier
+   Arch-Builds da (aarch64/x86_64 × linux/win64); neues vec0 `v0.1.10-alpha.4` +
+   lembed0 laufzeit-geprüft auf **beiden** Deploy-Arches: aarch64 nativ (rag-spike/
+   chat/agent) und x86_64 gegen mORMots **statisches** SQLite im amd64-Container
+   (`scripts/x64-ext-verify.sh`). Offen bleibt nur die Verdrahtung ins Docker-Image.
 5. **Anthropic-Restfläche**: Structured Output (`output_config.format`, abweichend vom
    OpenAI `response_format`) + Live-Verifikation des Anthropic-Streamings (SSE-Parser
    inkl. error-Event bisher nur hermetisch getestet).

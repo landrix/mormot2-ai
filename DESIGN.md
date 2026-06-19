@@ -200,8 +200,10 @@ Neue Tests im passenden Runner ergänzen.
     **Live** gegen `gpt-4o-mini` **und** `claude-opus-4-8` (beide erkennen denselben
     inline-base64-Kreis).
   - **Offene Punkte** (Roadmap → siehe [CONCEPT.md §6](CONCEPT.md), dort konsolidiert):
-    1. **x86_64-linux-`.so`** von `vec0`/`lembed0` fürs Docker-Image (aarch64-linux +
-       win64 vorhanden; Upstream-Pull offen).
+    1. **x86_64-linux-`.so`** von `vec0`/`lembed0` ✓ **vorhanden + laufzeit-verifiziert**
+       (alle 4 Arch-Builds da; vec0 `v0.1.10-alpha.4` + lembed0 gegen mORMots statisches
+       SQLite geprüft — aarch64 nativ + x86_64 im amd64-Container via
+       `scripts/x64-ext-verify.sh`). Rest: Verdrahtung ins Docker-Image.
     2. **Interface/Impl-Split** der VectorStore-/Embedder-Units (CONCEPT §3) ✓
        **umgesetzt** — `vectorstore`(+`.sqlitevec`) / `embeddings`(+`embed.provider`/
        `embed.lembed`); Engine ist SQLite-frei, Demos grün. Rest = pgvector (Punkt 3).
