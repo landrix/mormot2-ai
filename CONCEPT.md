@@ -101,23 +101,40 @@ flydev) — siehe [NOTICE](NOTICE)/[LICENSE](LICENSE).
 
 ## 5. Ist-Stand-Inventar (Schicht M/A, gebaut)
 
-- **LLM-Client**: `mormot.ai.llm` (OpenAI-Wire = Lingua franca) + nativer
-  `mormot.ai.llm.anthropic`; Typen `mormot.ai.llm.types`; SSE-Streaming;
-  Vision/Multimodal (`TLlmMessage.Images`).
+Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP-Suite
+**193 Assertions**, LLM-Suite **254 Assertions**; Streaming/Tool-Loop/RAG/Vision auch
+**live** verifiziert (OpenAI/Ollama/Anthropic). Aufbau-Historie: [DESIGN.md](DESIGN.md).
+
+- **LLM-Client**: `mormot.ai.llm` (OpenAI-Wire = Lingua franca, deckt OpenAI/LiteLLM/
+  Ollama) + nativer `mormot.ai.llm.anthropic` (Messages-API hinter derselben
+  `ILlmClient`-Naht); Typen `mormot.ai.llm.types`; SSE-Streaming
+  (`mormot.ai.llm.sse`, Basis + OpenAI-/Anthropic-Subklassen); Vision/Multimodal
+  (`TLlmMessage.Images`, beide Wires).
 - **Agent-Loop**: `TLlmAgent` + `ILlmToolbox` ([mormot.ai.agent.pas](src/mormot.ai.agent.pas)).
 - **MCP**: Server+Client, stdio/HTTP/SSE/Streamable, RTTI-Tool-Schema
   (`mormot.ai.mcp.*`), MCP-Bridge in den Agenten (`mormot.ai.agent.mcp`).
-- **Structured Output**: `mormot.ai.llm.structured`.
+- **Structured Output**: `mormot.ai.llm.structured` (OpenAI `response_format`).
 - **Embeddings/RAG**: `IEmbedder` (Provider + lokal lembed), `IVectorStore`
-  (sqlite-vec), `TLlmRag`, RAG-as-Tool (`mormot.ai.rag.tool`).
+  (sqlite-vec), `TLlmRag`, **agentic RAG** als `search_docs`-MCP-Tool
+  (`mormot.ai.rag.tool`, dasselbe Tool extern wie in-process).
 - **codenav**: MCP-Tools für Code-Navigation (`codenav/`).
 
-## 6. Offene Punkte
+## 6. Offene Punkte / Roadmap
+
+Die Engine-Funktionsfläche (Phase D) steht; offen ist die **Schichtung/der Merge/die
+Backend-Bindung** (Phase E). Diese Liste ist die konsolidierte Roadmap — DESIGN.md
+verweist hierher.
 
 1. **Refactor §3** (Interface/Impl-Units trennen) — Voraussetzung für pgvector +
    Upstream.
-2. **Merge §4** durchziehen (Namespaces angleichen, RAG zerlegen, pgvector rein).
+2. **Merge §4** durchziehen (Namespaces angleichen: SSE → `mormot.ai.http.sse`,
+   Chunking → `mormot.ai.chunk`; RAG zerlegen; pgvector als zweites
+   `IVectorStore`-Backend rein).
 3. **Memory-/Session-Interfaces** (Schicht A) definieren — Implementierung im
    Backend (Schicht B), Details in
    [docs/Feature-LandrixAI-Agent.md](../../../docs/Feature-LandrixAI-Agent.md).
-4. **x64-linux-`.so`** für sqlite-vec/lembed im Docker-Image (bekannt offen).
+4. **x64-linux-`.so`** für sqlite-vec/lembed im Docker-Image (aarch64-linux + win64
+   vorhanden; Upstream-Pull offen).
+5. **Anthropic-Restfläche**: Structured Output (`output_config.format`, abweichend vom
+   OpenAI `response_format`) + Live-Verifikation des Anthropic-Streamings (SSE-Parser
+   inkl. error-Event bisher nur hermetisch getestet).

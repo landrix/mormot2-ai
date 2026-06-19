@@ -6,11 +6,16 @@ Eine mORMot-native AI-Erweiterung. Erster Use-Case: **landrix als MCP-Server** �
 es stellt Tools/Ressourcen bereit, die ein externer Agent (z. B. Claude Desktop)
 über das Model Context Protocol aufruft. Langfristig Synopse-Contribution.
 
-## Aktueller Stand (Phase A abgeschlossen)
+## Aktueller Stand (Phasen A·C·D abgeschlossen)
 
 Der MCP-Server ist **adoptiert** (mORMot-lizenziert) statt selbst gebaut — Basis:
 flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
-`UPSTREAM_BASE`). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2).
+`UPSTREAM_BASE`). Darauf aufgesetzt: Spec-Upgrade (Phase C, MCP 2025-11-25) und der
+clean-room LLM-Client (Phase D: OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop,
+Embeddings/RAG, agentic RAG, Vision). Build **+ alle Tests + alle Demos grün**
+(aarch64-linux/FPC 3.2.2): **193 Assertions** MCP-Suite + **254 Assertions** LLM-Suite.
+Offen ist die Schichtung/der Merge/die Backend-Bindung (Phase E, siehe
+[CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
 
@@ -62,9 +67,15 @@ Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
 
 ## Test-Politik
 
-Die adoptierten Tests nutzen mORMots **`TSynTests`** (nicht FPCUnit) — passend zum
-Contribution-Ziel; Runner `tests/mcp.tests.dpr`. Aktuell **44 Tests / 187
-Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
+Die Tests nutzen mORMots **`TSynTests`** (nicht FPCUnit) — passend zum
+Contribution-Ziel. Zwei Runner:
+- `tests/mcp.tests.dpr` — MCP-Suite (Core + Transporte + Streamable),
+  **193 Assertions** grün; `scripts/run-fpc-tests.sh`.
+- `tests/llm.tests.dpr` — LLM-Suite (SSE, Client, Agent, Agent-MCP, **Anthropic**,
+  Structured, RAG, RAG-Tool, Vision), **254 Assertions** grün;
+  `scripts/run-fpc-llm-tests.sh`.
+
+Neue Tests im passenden Runner ergänzen.
 
 ## Roadmap
 
@@ -74,8 +85,15 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
 - **Phase C** ✓ — MCP-Spec auf **2025-11-25** mit Versions-Negotiation
   (`initialize` echot unterstützte Client-Versionen, sonst Fallback = neueste);
   der transportabhängige Patch-Hack wurde entfernt (einheitliches Verhalten).
-- **Phase D** — Clean-Room LLM-Client (`mormot.ai.llm.*`): Provider-Treiber +
-  Agent-/Tool-Calling-Loop gegen die offiziellen Specs. Architektur-Entscheidungen:
+- **Phase D** ✓ — Clean-Room LLM-Client (`mormot.ai.llm.*`): Provider-Treiber +
+  Agent-/Tool-Calling-Loop + Embeddings/RAG + zweiter Provider (Anthropic) +
+  Vision. Komplett gebaut, review-gehärtet, **254 Assertions** grün
+  (`llm.tests.dpr`); Streaming/Tool-Loop/RAG/Vision live verifiziert. Details unten.
+- **Phase E** (offen) — Schichtung/Merge/Backend-Bindung, siehe
+  **[CONCEPT.md](CONCEPT.md)** (Single Source of Truth für die offenen Punkte) und
+  „Offene Punkte" weiter unten.
+
+### Phase D im Detail — Architektur-Entscheidungen:
   - **Kanonisches Wire = OpenAI Chat Completions** (Lingua franca): ein
     OpenAI-Wire-Client + Provider-Config (Base-URL/Auth/Model) deckt OpenAI,
     LiteLLM und Ollama-Compat ab; native Adapter nur, wo das Wire echt abweicht.
@@ -90,8 +108,8 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
   - **Callback = Methoden-Pointer (`of object`)**, NICHT `reference to`/Closures —
     FPC 3.2.2 kennt die Modeswitches `functionreferences`/`anonymousfunctions`
     nicht (erst 3.3.1).
-  - **Stand**: gebaut + Tests grün (`llm.tests`, `scripts/run-fpc-llm-tests.sh`:
-    **51 Assertions**):
+  - **Stand**: vollständig gebaut + review-gehärtet, **254 Assertions** grün
+    (`llm.tests`, `scripts/run-fpc-llm-tests.sh`). Bausteine:
     - `mormot.ai.llm.types` — provider-neutrale Records.
     - `mormot.ai.llm.sse` — `TLlmSseStream` (Streaming-Parser; whole/1-byte/tool-call).
     - `mormot.ai.llm` — `ILlmClient`/`TLlmClient` (`ChatComplete` + `ChatStream`)
@@ -155,12 +173,46 @@ Assertions** grün (Core + Transporte + Streamable). Neue Tests dort ergänzen.
       mit Zitaten). Provider-`Embeddings` im Client (`/embeddings` +
       `ParseOpenAIEmbeddings`) + `mormot.ai.embeddings.TProviderEmbedder`. Demo
       `demos/rag/rag-chat.dpr` **live**: lokales lembed-Retrieval + OpenAI-Antwort,
-      geerdet + zitiert. **138 Assertions** grün (Chunking/Blob hermetisch).
+      geerdet + zitiert. Chunking/Blob hermetisch.
       Review-Fixes: Embedder pinnt Store-Lifetime; dim/topK-Guards; Add
       transaktional; Embed wirft bei Leerergebnis; Injection-Delimiter; empty-store
-      Early-Return. Offen: x86_64-linux-`.so` für Docker.
-  - **Offen**: lokaler lembed/sqlite-vec-Pfad (s. o.); weitere Provider (Anthropic =
-    eigenes Wire); Vision/multimodale Messages (Content-Parts → OCR-Modelle).
+      Early-Return.
+  - **Agentic RAG** ✓ (`mormot.ai.rag.tool`): `TRagSearchTool` =
+    `TMcpToolBase<TRagSearchParams>` exponiert Retrieval als **`search_docs`**-MCP-Tool
+    — dasselbe Tool für externe MCP-Clients **und** für den In-Process-Agenten (über
+    den vorhandenen `TLlmMcpToolbox`-Bridge, keine neue Toolbox-Verdrahtung). Der Agent
+    entscheidet selbst, **wann** er retrievt, und antwortet zitiert nur aus den
+    Treffern. Demo `demos/rag/rag-agent.dpr` **live** (verfeinerte Query → Retrieval).
+  - **Anthropic-Treiber** ✓ (`mormot.ai.llm.anthropic`, `TAnthropicClient`): nativer
+    Messages-API-Adapter hinter derselben `ILlmClient`-Naht — `system` top-level,
+    `max_tokens` Pflicht, Tools via `input_schema`/`tool_use`/`tool_result`,
+    `x-api-key`+`anthropic-version`, event-getypte SSE (`TAnthropicSseStream`:
+    message_start/content_block_delta/message_delta/message_stop/**error**). Parallele
+    Tool-Resultate werden zu **einer** User-Message mit mehreren `tool_result`-Blöcken
+    gebündelt; `input_tokens` aus `message_start` füllt `TotalTokens`. Test hermetisch
+    (kein Key/Netz). **Live** (`claude-opus-4-8`): Tool-Loop `get_weather` → geerdete
+    Antwort.
+  - **Vision/multimodal** ✓: `TLlmMessage.Images` (`TLlmImage` Source/MediaType/Data;
+    `LlmImageBase64`/`LlmImageUrl`/`LlmImageMessage`) — beide Wires serialisieren
+    (OpenAI `image_url` inkl. base64-`data:`-URI, Anthropic `image`-Block mit
+    typisiertem `source`); leerer `MediaType` → Default `image/png`. Demo
+    `demos/llm/llm-vision.dpr` provider-agnostisch (`VISION_PROVIDER=openai|anthropic`).
+    **Live** gegen `gpt-4o-mini` **und** `claude-opus-4-8` (beide erkennen denselben
+    inline-base64-Kreis).
+  - **Offene Punkte** (Roadmap → siehe [CONCEPT.md §6](CONCEPT.md), dort konsolidiert):
+    1. **x86_64-linux-`.so`** von `vec0`/`lembed0` fürs Docker-Image (aarch64-linux +
+       win64 vorhanden; Upstream-Pull offen).
+    2. **Interface/Impl-Split** der VectorStore-/Embedder-Units (CONCEPT §3) —
+       Voraussetzung für pgvector + sauberes Upstreamen.
+    3. **Merge** mit dem parallelen `mormot.ai.*`-Repo (CONCEPT §4): Namespaces
+       angleichen (SSE → `mormot.ai.http.sse`, Chunking → `mormot.ai.chunk`), RAG
+       zerlegen, pgvector als zweites `IVectorStore`-Backend.
+    4. **Memory-/Session-Interfaces** (Schicht A) definieren, Backend-Bindung
+       (Schicht B) implementieren — siehe
+       [docs/Feature-LandrixAI-Agent.md](../../../docs/Feature-LandrixAI-Agent.md).
+    5. **Anthropic-Restfläche**: Structured Output (`output_config.format`, abweichend
+       vom OpenAI `response_format`) und Live-Verifikation des Anthropic-Streamings
+       (SSE-Parser inkl. error-Event bisher nur hermetisch getestet).
 
 ## Lizenz / Contribution
 
