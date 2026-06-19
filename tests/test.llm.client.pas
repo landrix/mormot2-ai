@@ -30,6 +30,7 @@ type
     procedure EmbeddingsRequestJson;
     procedure EmbeddingsParsing;
     procedure EmbeddingsParsingReordered;
+    procedure EmbeddingsParsingNoIndex;
   end;
 
 
@@ -307,6 +308,24 @@ begin
   // vec for input 0 must be [0.1..] even though it arrived second
   CheckSame(vecs[0][0], 0.1, 1e-4, 'index 0 mapped to slot 0');
   CheckSame(vecs[1][0], 0.4, 1e-4, 'index 1 mapped to slot 1');
+end;
+
+procedure TTestLlmClient.EmbeddingsParsingNoIndex;
+const
+  // a provider that omits the "index" field: each vector must map to its array
+  // position, NOT collapse onto slot 0 (a missing index reads as 0)
+  EMB_RESP =
+    '{"object":"list","data":[' +
+    '{"object":"embedding","embedding":[0.1,0.2,0.3]},' +
+    '{"object":"embedding","embedding":[0.4,0.5,0.6]}],' +
+    '"model":"text-embedding-3-small"}';
+var
+  vecs: TLlmEmbeddingDynArray;
+begin
+  vecs := ParseOpenAIEmbeddings(EMB_RESP);
+  CheckEqual(length(vecs), 2, 'one vector per input');
+  CheckSame(vecs[0][0], 0.1, 1e-4, 'first item -> slot 0 (not collapsed)');
+  CheckSame(vecs[1][0], 0.4, 1e-4, 'second item -> slot 1 by position');
 end;
 
 end.

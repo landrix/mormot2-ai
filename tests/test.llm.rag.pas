@@ -22,6 +22,7 @@ type
     procedure ChunkingSingle;
     procedure ChunkingMultipleWithOverlap;
     procedure ChunkingUtf8Safe;
+    procedure ChunkingUtf8LongToken;
     procedure VectorBlobRoundTrip;
   end;
 
@@ -81,6 +82,28 @@ begin
   Check(length(chunks) > 3, 'small window yields many chunks');
   for i := 0 to high(chunks) do
     Check(IsValidUtf8(chunks[i]), 'every chunk is valid UTF-8');
+end;
+
+procedure TTestLlmRag.ChunkingUtf8LongToken;
+var
+  text: RawUtf8;
+  chunks: TRawUtf8DynArray;
+  i: PtrInt;
+begin
+  // a single long token with NO whitespace, all multi-byte: build the UTF-8 for
+  // 'ü' (C3 BC) from explicit bytes so the input is byte-exact regardless of the
+  // source-file codepage. The whitespace backup cannot help here, so the window
+  // cut must still land on a UTF-8 boundary rather than splitting a codepoint.
+  text := '';
+  for i := 1 to 40 do
+    text := text + #$C3 + #$BC;
+  chunks := ChunkText(text, 15, 4);
+  Check(length(chunks) > 1, 'long no-whitespace token still splits');
+  for i := 0 to high(chunks) do
+  begin
+    Check(chunks[i] <> '', 'no empty chunk');
+    Check(IsValidUtf8(chunks[i]), 'every chunk is valid UTF-8 (no split codepoint)');
+  end;
 end;
 
 procedure TTestLlmRag.VectorBlobRoundTrip;

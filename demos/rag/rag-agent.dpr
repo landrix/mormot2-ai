@@ -116,27 +116,30 @@ begin
   // expose retrieval as the search_docs MCP tool and let the agent drive it
   RegisterRagSearchRtti;
   server := TMcpServer.Create('rag-agent', '1.0.0');
-  server.RegisterTool(TLoggingRagTool.Create(
-    emb, store, 3, RAG_SEARCH_TOOL_NAME, RAG_SEARCH_TOOL_DESCRIPTION));
-  server.Start;
-  box := TLlmMcpToolbox.Create(server);
-  agent := TLlmAgent.Create(client, box, chatModel);
   try
-    SetLength(msgs, 2);
-    msgs[0] := LlmMessage(lrSystem, RAG_AGENT_SYSTEM_PROMPT);
-    msgs[1] := LlmMessage(lrUser,
-      'Was kostet eine Dachsanierung und wie lange dauert sie? Antworte kurz.');
-    ConsoleWrite('--- agent run (retrieve-on-demand) ---', ccLightBlue);
+    server.RegisterTool(TLoggingRagTool.Create(
+      emb, store, 3, RAG_SEARCH_TOOL_NAME, RAG_SEARCH_TOOL_DESCRIPTION));
+    server.Start;
+    box := TLlmMcpToolbox.Create(server);
+    agent := TLlmAgent.Create(client, box, chatModel);
     try
-      resp := agent.Run(msgs);
-      ConsoleWrite(FormatUtf8('ANSWER: %', [resp.Content]), ccLightGreen);
-    except
-      on E: Exception do
-        ConsoleWrite(FormatUtf8('ERROR %: %', [E.ClassName, E.Message]), ccLightRed);
+      SetLength(msgs, 2);
+      msgs[0] := LlmMessage(lrSystem, RAG_AGENT_SYSTEM_PROMPT);
+      msgs[1] := LlmMessage(lrUser,
+        'Was kostet eine Dachsanierung und wie lange dauert sie? Antworte kurz.');
+      ConsoleWrite('--- agent run (retrieve-on-demand) ---', ccLightBlue);
+      try
+        resp := agent.Run(msgs);
+        ConsoleWrite(FormatUtf8('ANSWER: %', [resp.Content]), ccLightGreen);
+      except
+        on E: Exception do
+          ConsoleWrite(FormatUtf8('ERROR %: %', [E.ClassName, E.Message]), ccLightRed);
+      end;
+    finally
+      agent.Free;
+      box := nil; // release the bridge before the (unowned) server
     end;
   finally
-    agent.Free;
-    box := nil;   // release the bridge before the (unowned) server
     server.Free;
   end;
 end.

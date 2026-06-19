@@ -226,8 +226,10 @@ var
 begin
   result := nil;
   CheckDim(aQuery);
+  // a non-positive TopK means "no results requested" (vec0 also rejects k = 0);
+  // return empty rather than silently substituting the nearest hit
   if aTopK <= 0 then
-    aTopK := 1; // vec0 rejects k = 0; an empty result is the sensible answer
+    exit;
   blob := VectorToBlob(aQuery);
   r.Prepare(fDB.DB,
     'WITH matches AS (SELECT rowid, distance FROM vec_documents ' +
@@ -243,6 +245,10 @@ begin
     n := 0;
     while r.Step = SQLITE_ROW do
     begin
+      // defensive: vec0 returns at most k rows, but never write past the
+      // preallocated array should the extension/query ever return more
+      if n >= length(result) then
+        break;
       result[n].DocId := r.FieldInt(0);
       r.FieldUtf8(1, result[n].Text);
       result[n].Distance := r.FieldDouble(2);

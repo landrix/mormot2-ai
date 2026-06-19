@@ -86,7 +86,13 @@ begin
       while (cut > start) and (aText[cut] > ' ') do
         dec(cut);
       if cut > start then
-        stop := cut;
+        stop := cut
+      else
+        // no whitespace in the window (e.g. a long URL / German compound): back
+        // up to a UTF-8 character boundary so a multi-byte codepoint is not split
+        // (a continuation byte has the top bits 10xxxxxx)
+        while (stop > start) and ((ord(aText[stop + 1]) and $C0) = $80) do
+          dec(stop);
     end;
     n := stop - start + 1;
     SetLength(result, length(result) + 1);

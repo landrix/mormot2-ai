@@ -29,6 +29,7 @@ type
     procedure RequestHoistsSystem;
     procedure RequestToolsInputSchema;
     procedure RequestToolRoundTrip;
+    procedure RequestParallelToolResults;
     procedure RequestVision;
     procedure RequestVisionDefaultMedia;
     procedure ResponseTextAndUsage;
@@ -166,6 +167,43 @@ begin
   CheckEqual(tr^.U['type'], 'tool_result', 'tool_result block');
   CheckEqual(tr^.U['tool_use_id'], 'toolu_1', 'tool_use_id links the call');
   CheckEqual(tr^.U['content'], '{"temp":"22C"}', 'tool result content');
+end;
+
+procedure TTestLlmAnthropic.RequestParallelToolResults;
+var
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  json: RawUtf8;
+  messages, userMsg, content: PDocVariantData;
+begin
+  // the agent appends ONE lrTool message per parallel tool call; Anthropic
+  // requires all tool_result blocks of a turn in a SINGLE user message
+  SetLength(msgs, 4);
+  msgs[0] := LlmMessage(lrUser, 'weather in two cities?');
+  msgs[1] := LlmMessage(lrAssistant, '');
+  SetLength(msgs[1].ToolCalls, 2);
+  msgs[1].ToolCalls[0].Id := 'toolu_a';
+  msgs[1].ToolCalls[0].Name := 'get_weather';
+  msgs[1].ToolCalls[0].ArgumentsJson := '{"location":"NYC"}';
+  msgs[1].ToolCalls[1].Id := 'toolu_b';
+  msgs[1].ToolCalls[1].Name := 'get_weather';
+  msgs[1].ToolCalls[1].ArgumentsJson := '{"location":"LA"}';
+  msgs[2] := LlmMessage(lrTool, '{"temp":"22C"}');
+  msgs[2].ToolCallId := 'toolu_a';
+  msgs[3] := LlmMessage(lrTool, '{"temp":"28C"}');
+  msgs[3].ToolCallId := 'toolu_b';
+  req := LlmChatRequest('claude-opus-4-8', msgs);
+
+  json := AnthropicChatRequestJson(req, {stream=}false);
+  messages := _Safe(_Json(json))^.A['messages'];
+  // user, assistant, and ONE user message bundling both tool results
+  CheckEqual(messages^.Count, 3, 'two tool results coalesced into one user turn');
+  userMsg := messages^._[2];
+  CheckEqual(userMsg^.U['role'], 'user', 'tool results ride a single user message');
+  content := userMsg^.A['content'];
+  CheckEqual(content^.Count, 2, 'both tool_result blocks in one message');
+  CheckEqual(content^._[0]^.U['tool_use_id'], 'toolu_a', 'first result links call a');
+  CheckEqual(content^._[1]^.U['tool_use_id'], 'toolu_b', 'second result links call b');
 end;
 
 procedure TTestLlmAnthropic.RequestVision;
@@ -341,6 +379,9 @@ begin
     CheckEqual(s.FullText, 'Hello, world', 'stream accumulated content');
     CheckEqual(coll.FinishReason, 'stop', 'end_turn mapped to stop');
     CheckEqual(coll.DoneCount, 1, 'message_stop yields one Done');
+    // TotalTokens must combine input_tokens (message_start) + output_tokens
+    // (message_delta) = 10 + 5, not leave the prompt side at zero
+    CheckEqual(coll.UsageTotal, 15, 'stream usage total = input + output tokens');
     Check(s.Done, 'stream marked done');
   finally
     s.Free;

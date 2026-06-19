@@ -79,27 +79,30 @@ begin
   cfg.TimeoutMs := 120000;
   client := TAnthropicClient.Create(cfg);
   tools := TDemoTools.Create;
-  toolbox := TLlmCallbackToolbox.Create;
-  box := toolbox;
-  toolbox.Add(WeatherTool, tools.GetWeather);
-  agent := TLlmAgent.Create(client, box, model);
   try
-    SetLength(msgs, 2);
-    msgs[0] := LlmMessage(lrSystem,
-      'You are a helpful assistant. Use the get_weather tool when asked about weather.');
-    msgs[1] := LlmMessage(lrUser,
-      'What is the weather in Berlin? Answer in one short sentence.');
-    ConsoleWrite(FormatUtf8('>>> Anthropic Messages API  model=%', [model]), ccLightBlue);
-    ConsoleWrite('--- agent run ---', ccLightBlue);
+    toolbox := TLlmCallbackToolbox.Create;
+    box := toolbox;
+    toolbox.Add(WeatherTool, tools.GetWeather);
+    agent := TLlmAgent.Create(client, box, model);
     try
-      resp := agent.Run(msgs);
-      ConsoleWrite(FormatUtf8('ANSWER: %', [resp.Content]), ccLightGreen);
-    except
-      on E: Exception do
-        ConsoleWrite(FormatUtf8('ERROR %: %', [E.ClassName, E.Message]), ccLightRed);
+      SetLength(msgs, 2);
+      msgs[0] := LlmMessage(lrSystem,
+        'You are a helpful assistant. Use the get_weather tool when asked about weather.');
+      msgs[1] := LlmMessage(lrUser,
+        'What is the weather in Berlin? Answer in one short sentence.');
+      ConsoleWrite(FormatUtf8('>>> Anthropic Messages API  model=%', [model]), ccLightBlue);
+      ConsoleWrite('--- agent run ---', ccLightBlue);
+      try
+        resp := agent.Run(msgs);
+        ConsoleWrite(FormatUtf8('ANSWER: %', [resp.Content]), ccLightGreen);
+      except
+        on E: Exception do
+          ConsoleWrite(FormatUtf8('ERROR %: %', [E.ClassName, E.Message]), ccLightRed);
+      end;
+    finally
+      agent.Free;
     end;
   finally
-    agent.Free;
     tools.Free;
   end;
 end.

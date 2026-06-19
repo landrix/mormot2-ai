@@ -272,8 +272,13 @@ begin
     item := data^._[i];
     // the provider may return data[] out of order: the "index" field is the
     // authoritative slot, not the array position (else a batch maps the wrong
-    // vector to an input). Fall back to the position if index is missing/bogus.
-    idx := item^.I['index'];
+    // vector to an input). A MISSING index reads as 0 - identical to a real
+    // index 0 - which would collapse every vector onto slot 0, so fall back to
+    // the array position when the field is absent or out of range.
+    if item^.GetValueIndex('index') >= 0 then
+      idx := item^.I['index']
+    else
+      idx := i;
     if (idx < 0) or (idx >= data^.Count) then
       idx := i;
     emb := item^.A['embedding'];

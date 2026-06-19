@@ -83,6 +83,7 @@ type
   TAnthropicSseStream = class(TLlmSseStreamBase)
   protected
     fStreamError: RawUtf8;
+    fStreamPromptTokens: integer; // input_tokens from message_start, for TotalTokens
     procedure ProcessData(const aPayload: RawUtf8); override;
   public
     /// non-empty if the stream carried an Anthropic `error` event - an inband
@@ -159,12 +160,23 @@ begin
       'source', _ObjFast(['type', 'url', 'url', aImage.Data])]);
 end;
 
+// one Anthropic tool_result content block from a neutral lrTool message
+function AnthropicToolResultBlock(const aMsg: TLlmMessage): variant;
+begin
+  result := _ObjFast([
+    'type', 'tool_result',
+    'tool_use_id', aMsg.ToolCallId,
+    'content', aMsg.Content]);
+end;
+
 // translate one neutral message; system text is hoisted into aSystem, every
 // other message is appended to aMessages as an Anthropic message object
+// - lrTool is NOT handled here: the caller bundles consecutive tool results
+//   into a single user message (see AnthropicChatRequestJson)
 procedure AddAnthropicMessage(const aMessages: variant; var aSystem: RawUtf8;
   const aMsg: TLlmMessage);
 var
-  content, block, input: variant;
+  content, input: variant;
   i: PtrInt;
 begin
   case aMsg.Role of
@@ -218,31 +230,38 @@ begin
       else
         _Safe(aMessages)^.AddItem(
           _ObjFast(['role', 'assistant', 'content', aMsg.Content]));
-    lrTool:
-      begin
-        // a tool result is a tool_result block inside a user message; the API
-        // merges consecutive user turns, so one block per message is fine
-        block := _ObjFast([
-          'type', 'tool_result',
-          'tool_use_id', aMsg.ToolCallId,
-          'content', aMsg.Content]);
-        _Safe(aMessages)^.AddItem(
-          _ObjFast(['role', 'user', 'content', _Arr([block])]));
-      end;
   end;
 end;
 
 function AnthropicChatRequestJson(const aRequest: TLlmChatRequest;
   aStream: boolean): RawUtf8;
 var
-  body, messages, tools, tool: variant;
+  body, messages, tools, tool, content: variant;
   system: RawUtf8;
   maxTokens, i: integer;
 begin
   system := '';
   messages := _Arr([]);
-  for i := 0 to high(aRequest.Messages) do
-    AddAnthropicMessage(messages, system, aRequest.Messages[i]);
+  i := 0;
+  while i <= high(aRequest.Messages) do
+    if aRequest.Messages[i].Role = lrTool then
+    begin
+      // the agent appends one lrTool message per parallel tool call; Anthropic
+      // requires ALL tool_result blocks of one turn in a SINGLE user message
+      // (separate user messages are rejected) - so coalesce the consecutive run
+      content := _Arr([]);
+      repeat
+        _Safe(content)^.AddItem(AnthropicToolResultBlock(aRequest.Messages[i]));
+        inc(i);
+      until (i > high(aRequest.Messages)) or
+            (aRequest.Messages[i].Role <> lrTool);
+      _Safe(messages)^.AddItem(_ObjFast(['role', 'user', 'content', content]));
+    end
+    else
+    begin
+      AddAnthropicMessage(messages, system, aRequest.Messages[i]);
+      inc(i);
+    end;
   // max_tokens is mandatory on the Messages API
   if aRequest.MaxTokens > 0 then
     maxTokens := aRequest.MaxTokens
@@ -364,9 +383,13 @@ begin
     usage := msg^.O['usage'];
     if usage^.Count > 0 then
     begin
+      // remember the prompt tokens: message_delta later carries only output_tokens
+      fStreamPromptTokens := usage^.I['input_tokens'];
       delta.HasUsage := true;
-      delta.Usage.PromptTokens := usage^.I['input_tokens'];
+      delta.Usage.PromptTokens := fStreamPromptTokens;
       delta.Usage.CompletionTokens := usage^.I['output_tokens'];
+      delta.Usage.TotalTokens :=
+        delta.Usage.PromptTokens + delta.Usage.CompletionTokens;
     end;
   end
   else if etype = 'content_block_start' then
@@ -405,8 +428,13 @@ begin
     usage := d^.O['usage'];
     if usage^.Count > 0 then
     begin
+      // message_delta carries only output_tokens; pair it with the input_tokens
+      // from message_start so TotalTokens is complete for the consumer
       delta.HasUsage := true;
+      delta.Usage.PromptTokens := fStreamPromptTokens;
       delta.Usage.CompletionTokens := usage^.I['output_tokens'];
+      delta.Usage.TotalTokens :=
+        fStreamPromptTokens + delta.Usage.CompletionTokens;
     end;
   end
   else if etype = 'message_stop' then
