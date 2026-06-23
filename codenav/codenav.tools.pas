@@ -38,8 +38,9 @@ const
   // kuratierte Quell-Verzeichnisse (relativ zur Root) - inkl. der mORMot2-Lib
   // Synopse2; node_modules/generated/Binaer-Artefakte bleiben aussen vor
   // (siehe EXCLUDE_DIRS fuer schwere Unterordner innerhalb dieser Dirs)
-  CODE_DIRS: array[0..6] of string = (
+  CODE_DIRS: array[0..7] of string = (
     'backend/src',
+    'backend/tests',
     'shared/delphi/landrixai',
     'shared/delphi/client',
     'shared/delphi/dto',
