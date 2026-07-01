@@ -71,7 +71,8 @@ begin
 
   storeObj := TVec0Store.Create(':memory:', extdir, dim);
   store := storeObj;
-  emb := TLembedEmbedder.Create(store, storeObj.Database, extdir, model, 'embedder');
+  // shared, process-wide embedder: the model loads once, decoupled from the store
+  emb := SharedLembedEmbedder(extdir, model, 'embedder');
   client := TLlmClient.Create(cfg);
   rag := TLlmRag.Create(client, emb, store, chatModel);
   try

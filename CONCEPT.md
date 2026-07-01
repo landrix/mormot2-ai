@@ -65,9 +65,20 @@ mormot.ai.vectorstore.pgvector  ○ TPgVectorStore (IVectorStore) auf mormot.db.
 mormot.ai.embeddings            ✓ NUR IEmbedder (zieht nicht mehr den LLM-Client)
 mormot.ai.embed.provider        ✓ TProviderEmbedder (OpenAI-Wire)
 mormot.ai.embed.ollama          ○ TOllamaEmbedder (aus Merge §4)
-mormot.ai.embed.lembed          ✓ TLembedEmbedder (sqlite-lembed, lokal; lädt lembed0 via sqlitevec-Loader)
+mormot.ai.embed.lembed          ✓ TLembedEmbedder (sqlite-lembed, lokal; eigene :memory:-Connection) + SharedLembedEmbedder()
 ```
 (✓ = gebaut, Demos grün · ○ = offen, kommt mit dem Merge §4)
+
+**Embedder = Prozess-Service, nicht pro DB.** Embedding-Erzeugung (`text → vector`)
+ist orthogonal zur Vektor-**Speicherung** (`IVectorStore`, pro DB). Ein lokales
+GGUF-Modell (lembed) wird deshalb **einmal pro Prozess** geladen und von *N* Stores/
+DBs geteilt — **nie** an eine Store-Connection gekoppelt (sonst lädt jede DB ihr
+eigenes Modell in den RAM). `TLembedEmbedder` besitzt dazu eine **eigene, dedizierte
+`:memory:`-Connection** (hostet nur lembed0 + das Modell); `SharedLembedEmbedder()`
+gibt den **prozessweiten Singleton je logischem Modellnamen** zurück. Der
+lembed-Context ist nicht re-entrant → Embed/EmbedBatch serialisieren unter einem
+`TOSLightLock`; wenn Nebenläufigkeit dominiert, skaliert man über einen zweiten
+`IEmbedder`-Backend (Ollama, Merge §4), nicht über mehrere Modell-Loads.
 
 Regel (gilt jetzt durchgängig): **Die RAG-/Agent-Engine kennt nur die Interfaces.**
 Welches Backend (sqlite-vec im Single-Binary-Edge-Fall, pgvector im
