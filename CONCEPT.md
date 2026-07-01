@@ -179,8 +179,10 @@ Liste ist die konsolidierte Roadmap — DESIGN.md verweist hierher.
    - **Demo-Härtung** ✓: Die Streamable-Demo bindet jetzt **Loopback** und das
      `ask_claude`-Tool (lokale Claude-CLI) ist standardmäßig **deaktiviert**
      (`MCP_ENABLE_ASK_CLAUDE=1` als Opt-in). Neue `BindAddress`-Property am Transport.
-   - **Tests offen**: TVec0Store/TLembedEmbedder-Realtests + RAG-Atomar-Rollback
-     (brauchen die sqlite-vec/lembed-Runtime, s. Punkt 4) sowie der o. g. Parallel-Test.
+   - **Tests**: TVec0Store hat jetzt einen **env-gated Real-vec0-Test** (Keyed-Ops
+     `Upsert`/`Delete`/`Search`-Key, `test.llm.rag`, läuft bei gesetztem `SQLITE_EXT_DIR`,
+     sonst Skip). Offen bleiben: TLembedEmbedder-Realtest + RAG-Atomar-Rollback (brauchen
+     die lembed-Runtime, s. Punkt 4) sowie der o. g. Parallel-Test.
 
 **In diesem Review-Pass bereits behoben** (Build + Tests grün: MCP 202, LLM 256
 Assertions): JSON-RPC-Envelope-Validierung (`jsonrpc:"2.0"`, Params-Typ) + breiter

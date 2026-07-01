@@ -13,6 +13,7 @@ uses
   mormot.core.test,
   mormot.ai.llm.types,
   mormot.ai.vectorstore,
+  mormot.ai.vectorstore.sqlitevec,
   mormot.ai.rag;
 
 type
@@ -24,10 +25,21 @@ type
     procedure ChunkingUtf8Safe;
     procedure ChunkingUtf8LongToken;
     procedure VectorBlobRoundTrip;
+    procedure VectorStoreKeyedOps;
   end;
 
 
 implementation
+
+// build a 4-dim embedding inline (FPC-safe: no inline var / nested function)
+function V4(a, b, c, d: single): TLlmEmbedding;
+begin
+  SetLength(result, 4);
+  result[0] := a;
+  result[1] := b;
+  result[2] := c;
+  result[3] := d;
+end;
 
 procedure TTestLlmRag.ChunkingEmpty;
 begin
@@ -122,6 +134,55 @@ begin
   CheckSame(w[0], 1.5, 1e-6, 'first');
   CheckSame(w[1], -2.25, 1e-6, 'second');
   CheckSame(w[2], 3.75, 1e-6, 'third');
+end;
+
+procedure TTestLlmRag.VectorStoreKeyedOps;
+var
+  extdir: RawUtf8;
+  store: IVectorStore;
+  hits: TRagHitDynArray;
+  i: PtrInt;
+  hadAddr2: boolean;
+begin
+  // real-vec0 test: needs only the vec0 extension (no GGUF model). Runs when
+  // SQLITE_EXT_DIR points at a dir containing vec0; otherwise skipped so the
+  // suite stays green where the (gitignored) vendored binary is absent (CI).
+  extdir := StringToUtf8(GetEnvironmentVariable('SQLITE_EXT_DIR'));
+  if (extdir = '') or
+     not FileExists(Utf8ToString(extdir + '/vec0' + SqliteExtSuffix)) then
+  begin
+    Check(true, 'sqlite-vec (vec0) not available -> keyed-ops test skipped');
+    exit;
+  end;
+  store := TVec0Store.Create(':memory:', extdir, 4);
+  // three entity-keyed rows on an orthonormal basis (distinct nearest regions)
+  store.Upsert('addr-1', 'mueller hamburg', V4(1, 0, 0, 0));
+  store.Upsert('addr-2', 'schmidt berlin',  V4(0, 1, 0, 0));
+  store.Upsert('addr-3', 'meyer koeln',      V4(0, 0, 1, 0));
+  CheckEqual(store.Count, 3, 'three keyed rows stored');
+  // nearest to addr-1's vector is addr-1, and its external Key round-trips
+  hits := store.Search(V4(1, 0, 0, 0), 3);
+  Check(length(hits) >= 1, 'search returns hits');
+  CheckEqual(hits[0].Key, 'addr-1', 'top hit maps back to its external key');
+  CheckEqual(hits[0].Text, 'mueller hamburg', 'top hit text round-trips');
+  // Upsert on an existing id REPLACES text+vector in place (no new row)
+  store.Upsert('addr-1', 'mueller hamburg altona', V4(0, 0, 0, 1));
+  CheckEqual(store.Count, 3, 'upsert on existing id replaces, no new row');
+  hits := store.Search(V4(0, 0, 0, 1), 1);
+  CheckEqual(hits[0].Key, 'addr-1', 'replaced vector moved addr-1 to the new region');
+  CheckEqual(hits[0].Text, 'mueller hamburg altona', 'replaced text is visible');
+  // Delete removes only that entity; deleting an absent id is a no-op (idempotent)
+  store.Delete('addr-2');
+  CheckEqual(store.Count, 2, 'delete removed one row');
+  store.Delete('does-not-exist');
+  CheckEqual(store.Count, 2, 'deleting an absent id is a no-op');
+  // addr-2 must no longer appear among the hits for its old region
+  hits := store.Search(V4(0, 1, 0, 0), 3);
+  hadAddr2 := false;
+  for i := 0 to high(hits) do
+    if hits[i].Key = 'addr-2' then
+      hadAddr2 := true;
+  Check(not hadAddr2, 'deleted entity no longer appears in search results');
 end;
 
 end.

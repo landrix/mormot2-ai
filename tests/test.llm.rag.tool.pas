@@ -44,6 +44,8 @@ type
     function Add(const aText: RawUtf8; const aVector: TLlmEmbedding): Int64;
     function AddBatch(const aTexts: TRawUtf8DynArray;
       const aVectors: TLlmEmbeddingDynArray): integer;
+    procedure Upsert(const aId, aText: RawUtf8; const aVector: TLlmEmbedding);
+    procedure Delete(const aId: RawUtf8);
     function Search(const aQuery: TLlmEmbedding; aTopK: integer): TRagHitDynArray;
     function Count: Int64;
     property LastTopK: integer read fLastTopK;
@@ -121,6 +123,17 @@ function TFakeStore.AddBatch(const aTexts: TRawUtf8DynArray;
   const aVectors: TLlmEmbeddingDynArray): integer;
 begin
   result := length(aTexts); // not exercised by these tests
+end;
+
+procedure TFakeStore.Upsert(const aId, aText: RawUtf8;
+  const aVector: TLlmEmbedding);
+begin
+  // not exercised by the rag-tool tests (keyed ops are covered in test.llm.rag)
+end;
+
+procedure TFakeStore.Delete(const aId: RawUtf8);
+begin
+  // not exercised here
 end;
 
 function TFakeStore.Search(const aQuery: TLlmEmbedding;

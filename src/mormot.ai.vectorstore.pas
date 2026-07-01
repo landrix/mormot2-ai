@@ -24,10 +24,18 @@ type
     DocId: Int64;
     Text: RawUtf8;
     Distance: double;
+    /// the stable external key set via Upsert (empty for anonymous Add rows)
+    // - lets a hit map straight back to a domain entity (e.g. an address UUID)
+    //   without a caller-side id table
+    Key: RawUtf8;
   end;
   TRagHitDynArray = array of TRagHit;
 
   /// a local document + vector store (closest-first KNN)
+  // - two ways to store: anonymous documents (Add/AddBatch, e.g. RAG chunks) OR
+  //   entity-keyed rows (Upsert/Delete, keyed by a stable external id such as an
+  //   address UUID). Both live in the same store; Search returns TRagHit.Key for
+  //   the keyed rows (empty for anonymous ones).
   IVectorStore = interface
     ['{8C1A4F92-5D63-4E7B-9A20-3F4C5D6E7A8B}']
     /// store a text and its embedding; returns the assigned document id
@@ -39,7 +47,16 @@ type
     // - returns the number of pairs stored (= length(aTexts))
     function AddBatch(const aTexts: TRawUtf8DynArray;
       const aVectors: TLlmEmbeddingDynArray): integer;
+    /// store or REPLACE the text+vector for a stable external key (entity id)
+    // - first call for aId inserts, later calls replace text + vector in place
+    //   (the internal mapping stays stable), so re-embedding an entity is idempotent
+    // - aId must be non-empty; how the id maps to the backend row is the backend's
+    //   private detail (the SQLite backend keeps a small id->rowid map)
+    procedure Upsert(const aId, aText: RawUtf8; const aVector: TLlmEmbedding);
+    /// remove the row previously stored under aId (no-op if absent)
+    procedure Delete(const aId: RawUtf8);
     /// the aTopK documents nearest to a query vector, closest first
+    // - each hit carries TRagHit.Key for entity-keyed rows (empty otherwise)
     function Search(const aQuery: TLlmEmbedding; aTopK: integer): TRagHitDynArray;
     /// number of stored documents
     function Count: Int64;

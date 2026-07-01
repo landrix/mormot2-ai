@@ -54,8 +54,13 @@ type
     function Add(const aText: RawUtf8; const aVector: TLlmEmbedding): Int64;
     function AddBatch(const aTexts: TRawUtf8DynArray;
       const aVectors: TLlmEmbeddingDynArray): integer;
+    procedure Upsert(const aId, aText: RawUtf8; const aVector: TLlmEmbedding);
+    procedure Delete(const aId: RawUtf8);
     function Search(const aQuery: TLlmEmbedding; aTopK: integer): TRagHitDynArray;
     function Count: Int64;
+  protected
+    // resolve the internal rowid mapped to an external id (0 = not found)
+    function RowIdOfKey(const aId: RawUtf8): Int64;
     /// the underlying connection, shared e.g. with a TLembedEmbedder
     property Database: TSqlDataBase read fDB;
   end;
@@ -108,8 +113,13 @@ begin
   fDB := TSqlDataBase.Create(Utf8ToString(aDbPath), '');
   EnableSqliteExtensions(fDB.DB);
   LoadSqliteExtension(fDB.DB, aExtDir + '/vec0' + SqliteExtSuffix);
+  // ext_id is the OPTIONAL stable external key (entity id) for Upsert/Delete rows;
+  // NULL for anonymous Add rows. The partial UNIQUE index makes an id map to at most
+  // one row (and lets Upsert find + replace it) without constraining the Add rows.
   fDB.Execute('CREATE TABLE IF NOT EXISTS documents(' +
-    'id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL);');
+    'id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT NOT NULL, ext_id TEXT);');
+  fDB.Execute('CREATE UNIQUE INDEX IF NOT EXISTS documents_ext_id_idx ' +
+    'ON documents(ext_id) WHERE ext_id IS NOT NULL;');
   fDB.Execute(FormatUtf8(
     'CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents USING vec0(embedding float[%]);',
     [fDim]));
@@ -234,7 +244,7 @@ begin
   r.Prepare(fDB.DB,
     'WITH matches AS (SELECT rowid, distance FROM vec_documents ' +
     '  WHERE embedding MATCH ? AND k = ? ORDER BY distance) ' +
-    'SELECT d.id, d.content, m.distance FROM matches m ' +
+    'SELECT d.id, d.content, m.distance, d.ext_id FROM matches m ' +
     'JOIN documents d ON d.id = m.rowid ORDER BY m.distance;');
   try
     r.BindBlob(1, blob);
@@ -252,11 +262,124 @@ begin
       result[n].DocId := r.FieldInt(0);
       r.FieldUtf8(1, result[n].Text);
       result[n].Distance := r.FieldDouble(2);
+      // ext_id is NULL for anonymous Add rows -> FieldUtf8 yields '' (empty Key)
+      r.FieldUtf8(3, result[n].Key);
       inc(n);
     end;
     SetLength(result, n);
   finally
     r.Close;
+  end;
+end;
+
+function TVec0Store.RowIdOfKey(const aId: RawUtf8): Int64;
+var
+  r: TSqlRequest;
+begin
+  result := 0; // 0 = not found (documents.id is AUTOINCREMENT, starts at 1)
+  r.Prepare(fDB.DB, 'SELECT id FROM documents WHERE ext_id = ?;');
+  try
+    r.Bind(1, aId);
+    if r.Step = SQLITE_ROW then
+      result := r.FieldInt(0);
+  finally
+    r.Close;
+  end;
+end;
+
+procedure TVec0Store.Upsert(const aId, aText: RawUtf8;
+  const aVector: TLlmEmbedding);
+var
+  r: TSqlRequest;
+  blob: RawByteString;
+  rowid: Int64;
+begin
+  CheckDim(aVector);
+  if aId = '' then
+    ESynException.RaiseUtf8('%.Upsert: empty id', [self]);
+  blob := VectorToBlob(aVector);
+  // one transaction: the documents row and its vec_documents row must stay in sync
+  // (a half-applied replace would leave a stale or orphan vector)
+  fDB.TransactionBegin;
+  try
+    rowid := RowIdOfKey(aId);
+    if rowid <> 0 then
+    begin
+      // replace in place: keep the same rowid so the id->row mapping is stable
+      r.Prepare(fDB.DB, 'UPDATE documents SET content = ? WHERE id = ?;');
+      try
+        r.Bind(1, aText);
+        r.Bind(2, rowid);
+        r.Step;
+      finally
+        r.Close;
+      end;
+      // vec0 has no in-place embedding UPDATE across versions: delete + re-insert
+      // the same rowid (both inside this transaction)
+      r.Prepare(fDB.DB, 'DELETE FROM vec_documents WHERE rowid = ?;');
+      try
+        r.Bind(1, rowid);
+        r.Step;
+      finally
+        r.Close;
+      end;
+    end
+    else
+    begin
+      r.Prepare(fDB.DB, 'INSERT INTO documents(content, ext_id) VALUES (?, ?);');
+      try
+        r.Bind(1, aText);
+        r.Bind(2, aId);
+        r.Step;
+      finally
+        r.Close;
+      end;
+      rowid := fDB.LastInsertRowID;
+    end;
+    r.Prepare(fDB.DB, 'INSERT INTO vec_documents(rowid, embedding) VALUES (?, ?);');
+    try
+      r.Bind(1, rowid);
+      r.BindBlob(2, blob);
+      r.Step;
+    finally
+      r.Close;
+    end;
+    fDB.Commit;
+  except
+    fDB.RollBack;
+    raise;
+  end;
+end;
+
+procedure TVec0Store.Delete(const aId: RawUtf8);
+var
+  r: TSqlRequest;
+  rowid: Int64;
+begin
+  fDB.TransactionBegin;
+  try
+    rowid := RowIdOfKey(aId);
+    if rowid <> 0 then // absent id is a no-op (idempotent delete)
+    begin
+      r.Prepare(fDB.DB, 'DELETE FROM vec_documents WHERE rowid = ?;');
+      try
+        r.Bind(1, rowid);
+        r.Step;
+      finally
+        r.Close;
+      end;
+      r.Prepare(fDB.DB, 'DELETE FROM documents WHERE id = ?;');
+      try
+        r.Bind(1, rowid);
+        r.Step;
+      finally
+        r.Close;
+      end;
+    end;
+    fDB.Commit;
+  except
+    fDB.RollBack;
+    raise;
   end;
 end;
 
