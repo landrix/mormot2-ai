@@ -107,6 +107,28 @@ Original-Unit-Header bleiben erhalten. Details: [NOTICE](NOTICE),
 [LICENSE](LICENSE), [DESIGN.md](DESIGN.md). Vor einem Synopse-Contribution-Push
 mit flydev abstimmen (Namespace `mormot.ai.*` vs. flydevs `mormot.ext.mcp`).
 
+## Upstream-Contribution (Fahrplan)
+
+Wenn LandrixAI (AI-Agents, MCP, `sqlite-vec`/`lembed`-RAG) zurück ins mORMot-
+Ökosystem soll, gilt:
+
+- **Ablageort**: primär **[flydev-fr/mormot2-extensions](https://github.com/flydev-fr/mormot2-extensions)**
+  — dort leben schon MCP, OTP, Markdown; unser `_eval/mormot2-extensions`-Klon ist der
+  Referenzstand. mORMot-**core** (`src/net` für Agenten/API, `src/db` für die
+  SQLite-Vektor-Extensions) nur, falls Arnaud es dort haben will — vorher fragen, nicht
+  raten.
+- **Prozess, nicht PR-first**: zuerst einen **Thread im Synopse-Forum**
+  (synopse.info/forum) aufmachen, Nutzen mit einem ultrakurzen Code-Beispiel zeigen und
+  **Arnaud direkt fragen**, ob core oder extensions. **Kein** ungefragter Pull Request.
+  Claude-Unterstützung transparent nennen, aber als „manuell nach den mORMot-
+  Performance-Richtlinien refactored (RawUtf8/TDocVariant, keine Heap-Allokation) **und**
+  mit `TSynTestCase` abgesichert" framen. Die Idiom-Regeln stehen im Skill
+  `landrix-mormot2`.
+- **Konkreter Merge-Blocker (Native-Libs)**: `sqlite-vec`/`lembed` sind externe
+  `.so`/`.dll`. Die Testsuite muss den Dynamic-Load **defensiv** abfangen — fehlt die
+  Lib, sauber **skippen/failen**, nie die App abstürzen lassen. Plattformübergreifend
+  grün (Windows + Linux, ideal macOS) im mORMot-Test-Runner.
+
 ## Nächste Schritte
 
 1. landrix-spezifische MCP-Tools andocken (über die `TMcpServer`-Registry).
