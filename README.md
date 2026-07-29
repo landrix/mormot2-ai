@@ -1,9 +1,14 @@
-# LandrixAI — `mormot.ai.*` Extension (MCP)
+# mormot2-ai — `mormot.ai.*` Extension für mORMot2 (FPC)
 
-Eine **mORMot-native** AI-/LLM-Erweiterung. Erster Use-Case: ein robuster
-**MCP-Server** (Model Context Protocol). Die Server-Implementierung wurde aus
-[flydev-fr/mormot2-extensions](https://github.com/flydev-fr/mormot2-extensions)
+Eine **mORMot-native** AI-/LLM-Erweiterung für **Free Pascal**: MCP-Server,
+LLM-Clients, Embeddings, Vector-Stores, RAG. Die MCP-Server-Implementierung wurde
+aus [flydev-fr/mormot2-extensions](https://github.com/flydev-fr/mormot2-extensions)
 **adoptiert** (mORMot-lizenziert) und auf den `mormot.ai.*`-Namespace umbenannt.
+
+Das Repo ist aus dem Landrix-Monorepo **mit vollständiger Historie ausgelöst**
+(`git subtree split`); Landrix bindet es als Submodul unter
+`shared/delphi/landrixai` ein. Es hat **keine** Landrix-Abhängigkeit — die
+landrix-spezifische Bindung (Guards, TOrm-Memory, REST) lebt dort, nicht hier.
 
 > Status: **Phase A + Spec-Upgrade** — adoptiert, MCP **2025-11-25** mit Versions-
 > Negotiation, Build **+ alle Tests grün** (193 Assertions, aarch64-linux/FPC 3.2.2).
@@ -23,7 +28,7 @@ Eine **mORMot-native** AI-/LLM-Erweiterung. Erster Use-Case: ein robuster
 ## Struktur
 
 ```
-landrixai/
+mormot2-ai/
   src/    mormot.ai.mcp[.server|.stdio|.tools]  — Engine, Transporte, Beispiel-Tools
   tests/  test.mcp.core / test.mcp.transports + mcp.tests.dpr (mORMot TSynTests)
   demos/  stdio · http · jsonrpc · sse · streamable (inkl. Claude) + mcp.examples
@@ -37,12 +42,20 @@ landrixai/
 ## Bauen & Testen
 
 ```bash
-# in WSL (nativ aarch64), aus dem Repo-Root:
-bash shared/delphi/landrixai/scripts/run-fpc-tests.sh
+# in WSL/Linux, aus diesem Repo:
+bash scripts/run-fpc-tests.sh
 # VERBOSE=1 für vollen Compiler-/Testlog
 ```
-Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
-`shared/delphi/libs/_git_Synopse2`. Logs unter `bin/fpc/`.
+
+**mORMot2 finden**: Die Skripte erwarten den mORMot2-Quellbaum (`src/`, `static/`).
+Ohne Konfiguration nehmen sie den Submodul-Fall an — also
+`<konsument>/shared/delphi/libs/_git_Synopse2`, drei Ebenen über diesem Repo. Bei
+einem **eigenständigen Klon** den Pfad explizit setzen:
+
+```bash
+MORMOT2_ROOT=/pfad/zu/mORMot2 bash scripts/run-fpc-tests.sh
+```
+Logs unter `bin/fpc/`.
 
 ## MCP-Stand
 
@@ -85,8 +98,8 @@ Eigener Runner — baut + fährt `llm.tests.dpr` (alle LLM-Suiten: SSE, Client, 
 Agent-MCP, **Anthropic**, Structured, RAG, RAG-Tool):
 
 ```bash
-# in WSL, aus dem Repo-Root:
-bash shared/delphi/landrixai/scripts/run-fpc-llm-tests.sh
+# in WSL/Linux, aus diesem Repo:
+bash scripts/run-fpc-llm-tests.sh
 # VERBOSE=1 für vollen Compiler-/Testlog
 ```
 
@@ -103,9 +116,9 @@ Provider-Config kommt aus der Umgebung (`demos/.env`, kopiert aus
 oder geloggt:
 
 ```bash
-bash shared/delphi/landrixai/scripts/build-demo.sh llm/llm-anthropic.dpr
-set -a; . shared/delphi/landrixai/demos/.env; set +a   # ANTHROPIC_API_KEY[/_MODEL]
-shared/delphi/landrixai/bin/fpc/demos/llm-anthropic
+bash scripts/build-demo.sh llm/llm-anthropic.dpr
+set -a; . demos/.env; set +a   # ANTHROPIC_API_KEY[/_MODEL]
+bin/fpc/demos/llm-anthropic
 ```
 
 `llm-anthropic` ist der OpenAI-Tool-Loop-Demo (`llm-agent`) 1:1 nachgebaut — gleicher
@@ -118,13 +131,12 @@ MCP-Server-Units adoptiert von flydev-fr/mormot2-extensions (MPL/GPL/LGPL); die
 Original-Unit-Header bleiben erhalten. Details: [NOTICE](NOTICE),
 [LICENSE](LICENSE), [DESIGN.md](DESIGN.md).
 
-## Veröffentlichung als eigenständige Extension
+## Eigenständige Extension (vollzogen)
 
-**Kein Synopse-PR** (Begründung: [CONCEPT.md §1](CONCEPT.md)). Stattdessen wird der
-`mormot.ai.*`-Code aus dem Landrix-Monorepo in ein **eigenes Repository** ausgelöst
-(`git subtree split` mit Historie) und von Landrix als **Submodul** eingebunden —
-dasselbe Muster wie `_git_Synopse2`. Vollständiger Plan inkl. Checkliste:
-[CONCEPT.md §7](CONCEPT.md).
+**Kein Synopse-PR** (Begründung: [CONCEPT.md §1](CONCEPT.md)). Der `mormot.ai.*`-Code
+wurde per `git subtree split` **mit Historie** aus dem Landrix-Monorepo gelöst; dieses
+Repo ist das Ergebnis. Landrix bindet es als **Submodul** ein — dasselbe Muster wie
+`_git_Synopse2`. Hintergrund + Checkliste: [CONCEPT.md §7](CONCEPT.md).
 
 Weiter zu beachten:
 
@@ -135,8 +147,10 @@ Weiter zu beachten:
   flydev-Änderungen per Diff einarbeitbar bleiben, ist ihr **Commit-Stand gepinnt**:
   [UPSTREAM_BASE](UPSTREAM_BASE). **Regel: wer portiert, bumpt UPSTREAM_BASE im selben
   Commit.**
-- **`codenav/` gehört nicht zur Extension** — es ist ein Landrix-Entwicklerwerkzeug
-  und bleibt im Monorepo (CONCEPT §7).
+- **`codenav/` gehört nicht hierher** — der MCP-Code-Navigations-Server ist ein
+  Landrix-Entwicklerwerkzeug und blieb beim Split im Monorepo
+  (`shared/delphi/codenav/`); er *konsumiert* `mormot.ai.mcp.*` über das Submodul
+  (CONCEPT §7).
 - **Native-Libs defensiv behandeln**: `sqlite-vec`/`lembed` sind externe `.so`/`.dll`.
   Die Testsuite muss den Dynamic-Load **defensiv** abfangen — fehlt die Lib, sauber
   **skippen**, nie abstürzen (so gelöst im env-gated `VectorStoreKeyedOps`-Test).

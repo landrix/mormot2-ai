@@ -283,10 +283,20 @@ Stresstest der Session-Logik, Härtung des Legacy-SSE-Transports), weil die
 zugehörige Mechanik im Zielprotokoll nicht mehr existiert. **Bestehen bleibt** der
 offene Punkt **Auth-Resolver** — durch die Auth-Härtung der neuen Spec eher größer.
 
-## 7. Auslösung in ein eigenes Repository
+## 7. Auslösung in ein eigenes Repository — **vollzogen (2026-07-29)**
 
-Aus §1 folgt: der `mormot.ai.*`-Code verlässt das Landrix-Monorepo. Landrix wird
-dann **Konsument** der Extension — genau wie heute schon bei mORMot2 selbst.
+Aus §1 folgt: der `mormot.ai.*`-Code verlässt das Landrix-Monorepo. Landrix ist
+seither **Konsument** der Extension — genau wie schon bei mORMot2 selbst.
+
+> **Stand:** Repo [`landrix/mormot2-ai`](https://github.com/landrix/mormot2-ai)
+> (public), erzeugt per `git subtree split --prefix=shared/delphi/landrixai`
+> **mit vollständiger Historie** (33 Commits). Landrix bindet es als Submodul unter
+> `shared/delphi/landrixai` ein — der Pfad bleibt gleich, deshalb ändern sich die
+> `-Fu`-Build-Pfade der Konsumenten **nicht**. `codenav/` wurde vorher aus dem
+> Prefix nach `shared/delphi/codenav/` gehoben (s. u.).
+>
+> Der Repo-Name weicht bewusst von flydevs `mormot.ai` ab; der **Unit**-Namespace
+> `mormot.ai.*` bleibt (§4, Modus „Code-Übernahme").
 
 ### Was geht, was bleibt
 
@@ -313,12 +323,28 @@ Landrix bindet die Extension als **git submodule** ein — dasselbe Muster wie
 Die Historie ist wertvoll (Review-Härtungen, Design-Entscheidungen) — **nicht**
 per Copy-Paste in ein leeres Repo:
 
+So ist es gelaufen (zur Reproduktion bei weiteren Auslösungen):
+
 ```bash
-git subtree split --prefix=shared/delphi/landrixai -b landrixai-export
-# -> neues Repo anlegen, Branch pushen, dann im Monorepo:
+# 1. codenav VOR dem Split aus dem Prefix heben - sonst landet das
+#    Landrix-Werkzeug in der Extension und kollidiert mit dem Submodul-Mount
+git mv shared/delphi/landrixai/codenav shared/delphi/codenav
+
+# 2. Historie herausschneiden und in das leere Repo pushen
+git subtree split --prefix=shared/delphi/landrixai -b split/mormot2-ai
+git push https://github.com/landrix/mormot2-ai.git split/mormot2-ai:main
+
+# 3. im Monorepo den Pfad durch das Submodul ersetzen
 git rm -r shared/delphi/landrixai
-git submodule add <url> shared/delphi/landrixai
+git submodule add https://github.com/landrix/mormot2-ai.git shared/delphi/landrixai
 ```
+
+**Fallstrick beim Ersetzen**: Unter `shared/delphi/landrixai` liegen ~2 GB
+**gitignorierte** lokale Daten (`vendor/models` mit GGUF, `vendor/sqlite-ext`,
+`_eval/`, `bin/`, `_cleanroom/`). `git rm -r` fasst sie nicht an, aber
+`git submodule add` verweigert ein nicht-leeres Zielverzeichnis — also die
+ignorierten Ordner wegschieben, Submodul klonen, zurückschieben. Neu heruntergeladen
+werden müssten sonst mehrere GB.
 
 ### Nachzuziehen (Checkliste — hier hängt der Build dran)
 
@@ -381,14 +407,13 @@ Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP
 
 ## 9. Offene Punkte / Roadmap
 
-Die Engine-Funktionsfläche (Phase D) steht; offen sind die **Repo-Auslösung** (§7),
-der **flydev-Merge** (§4), der **MCP-Sprung auf 2026-07-28** (§6) und die
+Die Engine-Funktionsfläche (Phase D) steht, die **Repo-Auslösung** (§7) ist erledigt;
+offen sind der **flydev-Merge** (§4), der **MCP-Sprung auf 2026-07-28** (§6) und die
 **Evaluation von neural-api** (§5). Diese Liste ist die konsolidierte Roadmap —
 DESIGN.md verweist hierher.
 
-0. **Repo-Auslösung (§7) — zuerst.** `git subtree split` mit Historie, Einbindung als
-   Submodul, Build-/CI-Pfade nachziehen (Checkliste §7). Danach finden alle weiteren
-   Punkte im Extension-Repo statt.
+0. **Repo-Auslösung (§7)** ✓ **erledigt (2026-07-29)** — `landrix/mormot2-ai`, Historie
+   erhalten, Landrix zieht per Submodul. Alle weiteren Punkte finden **hier** statt.
 
 1. **Refactor §3** ✓ **umgesetzt** (Interface/Impl-Units getrennt: `vectorstore` +
    `vectorstore.sqlitevec`, `embeddings` + `embed.provider` + `embed.lembed`; Engine

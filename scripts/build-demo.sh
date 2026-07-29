@@ -10,13 +10,20 @@ set -euo pipefail
 #   build-demo.sh stdio/demo.mcp.stdio.dpr
 #   VERBOSE=1 build-demo.sh ...           # vollen Compilerlog zeigen
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
-MORMOT2="$ROOT/shared/delphi/libs/_git_Synopse2"
+# Wurzel dieser Extension (scripts/..) - unabhaengig vom Einbindungsort.
+LAI="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Konsumenten-Repo: im Submodul-Fall liegt die Extension unter
+# <konsument>/shared/delphi/landrixai, also drei Ebenen ueber LAI. Nur noch
+# fuer den mORMot2-Default unten relevant.
+ROOT="$(cd "$LAI/../../.." && pwd)"
+# mORMot2-Quellbaum: per MORMOT2_ROOT frei setzbar (Standalone-Klon dieser
+# Extension); ohne Override gilt der Submodul-Pfad im Konsumenten-Repo.
+MORMOT2="${MORMOT2_ROOT:-$ROOT/shared/delphi/libs/_git_Synopse2}"
 SRC="$MORMOT2/src"
 STATIC="$MORMOT2/static"
-LIB_SRC="$ROOT/shared/delphi/landrixai/src"
-DEMO_SRC="$ROOT/shared/delphi/landrixai/demos"
-OUT="$ROOT/shared/delphi/landrixai/bin/fpc"
+LIB_SRC="$LAI/src"
+DEMO_SRC="$LAI/demos"
+OUT="$LAI/bin/fpc"
 DEMO_OUT="$OUT/demos"
 UNIT_OUT="$OUT/lib"      # geteilt mit run-fpc-tests.sh (mORMot-Cache)
 TARGET="${TARGET:-linux}"
@@ -47,8 +54,8 @@ build_one() {
   set +e
   fpc -MDelphi -Sci -Ci -O2 -g -gl -gw2 \
     -T"$TARGET" -P"$ARCH" \
-    -Fi"$INCLUDES;$ROOT/shared/delphi/landrixai/vendor" \
-    -Fu"$LIB_SRC;$DEMO_SRC;$ROOT/shared/delphi/landrixai/vendor;$UNITS" \
+    -Fi"$INCLUDES;$LAI/vendor" \
+    -Fu"$LIB_SRC;$DEMO_SRC;$LAI/vendor;$UNITS" \
     -Fl"$STATIC/$ARCH-$TARGET" \
     -FU"$UNIT_OUT" \
     -FE"$DEMO_OUT" \
