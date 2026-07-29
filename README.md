@@ -8,12 +8,17 @@ Eine **mORMot-native** AI-/LLM-Erweiterung. Erster Use-Case: ein robuster
 > Status: **Phase A + Spec-Upgrade** — adoptiert, MCP **2025-11-25** mit Versions-
 > Negotiation, Build **+ alle Tests grün** (193 Assertions, aarch64-linux/FPC 3.2.2).
 
-## Warum mORMot-nativ
+## Warum mORMot-basiert — und warum eigenständig
 
-- **Eine Codebasis für FPC *und* Delphi** — mORMot ist dual + cross-platform.
+- **Eigene Extension, kein mORMot-PR** (Entscheidung 2026-07-29): ein Upstream-PR
+  würde uns auf mORMots Dual-Compiler-Anspruch (FPC + Delphi) festlegen und damit
+  **neural-api** (FPC-only) als Inferenz-Backend ausschließen. mORMot2 bleibt die
+  **Grundlage**, nicht das Abgabeziel. Begründung: [CONCEPT.md §1](CONCEPT.md).
+- **FPC-only** — kein Delphi-Zweig, keine `{$ifdef}`-Doppelpflege.
 - **Kein Diff-Nachbau-Ballast** — wir folgen den Specs (MCP, JSON-RPC).
 - **Robuster MCP-Stack** — `THttpAsyncServer`, WebSockets, RTTI-Schema-Generierung.
-- Langfristig **Contribution** an Synopse mORMot.
+- **Lizenz bleibt MPL/GPL/LGPL** (die adoptierten MCP-Units verlangen es; verträglich
+  mit MIT und LGPL+Linking-Exception).
 
 ## Struktur
 
@@ -41,11 +46,18 @@ Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
 
 ## MCP-Stand
 
-Server spricht MCP **2025-11-25** mit **Versions-Negotiation**: `initialize` echot
-die vom Client angefragte Version, wenn unterstützt (2024-11-05 / 2025-03-26 /
-2025-06-18 / 2025-11-25), sonst Fallback auf die neueste. Transporte: stdio, HTTP,
-SSE, Streamable HTTP, in-process. Tools: `TMcpServer.RegisterTool(IMcpTool)`,
-Input-Schema automatisch via RTTI aus typisiertem Record (`TMcpToolBase<T: record>`).
+> **Geplant: Sprung auf 2026-07-28 (Greenfield).** Die neue Spec macht MCP stateless
+> und entfernt `initialize`, Protokoll-Sessions/`Mcp-Session-Id`, SSE-Resumability und
+> den HTTP+SSE-Transport. Projektentscheidung: **nur 2026-07-28**, alles Entfernte
+> wird gelöscht (keine Multi-Version-Negotiation). Details + Bauliste:
+> [CONCEPT.md §6](CONCEPT.md).
+
+**Heute (Alt-Stand):** Server spricht MCP **2025-11-25** mit **Versions-Negotiation**:
+`initialize` echot die vom Client angefragte Version, wenn unterstützt (2024-11-05 /
+2025-03-26 / 2025-06-18 / 2025-11-25), sonst Fallback auf die neueste. Transporte:
+stdio, HTTP, SSE, Streamable HTTP, in-process. Tools:
+`TMcpServer.RegisterTool(IMcpTool)`, Input-Schema automatisch via RTTI aus
+typisiertem Record (`TMcpToolBase<T: record>`).
 
 ## LLM-Client (`mormot.ai.llm`) & Provider-Treiber
 
@@ -104,30 +116,32 @@ franca-Naht). OpenAI-/Ollama-Demos nutzen weiter die `LLM_*`-Vars derselben `.en
 
 MCP-Server-Units adoptiert von flydev-fr/mormot2-extensions (MPL/GPL/LGPL); die
 Original-Unit-Header bleiben erhalten. Details: [NOTICE](NOTICE),
-[LICENSE](LICENSE), [DESIGN.md](DESIGN.md). Vor einem Synopse-Contribution-Push
-mit flydev abstimmen (Namespace `mormot.ai.*` vs. flydevs `mormot.ext.mcp`).
+[LICENSE](LICENSE), [DESIGN.md](DESIGN.md).
 
-## Upstream-Contribution (Fahrplan)
+## Veröffentlichung als eigenständige Extension
 
-Wenn LandrixAI (AI-Agents, MCP, `sqlite-vec`/`lembed`-RAG) zurück ins mORMot-
-Ökosystem soll, gilt:
+**Kein Synopse-PR** (Begründung: [CONCEPT.md §1](CONCEPT.md)). Stattdessen wird der
+`mormot.ai.*`-Code aus dem Landrix-Monorepo in ein **eigenes Repository** ausgelöst
+(`git subtree split` mit Historie) und von Landrix als **Submodul** eingebunden —
+dasselbe Muster wie `_git_Synopse2`. Vollständiger Plan inkl. Checkliste:
+[CONCEPT.md §7](CONCEPT.md).
 
-- **Ablageort**: primär **[flydev-fr/mormot2-extensions](https://github.com/flydev-fr/mormot2-extensions)**
-  — dort leben schon MCP, OTP, Markdown; unser `_eval/mormot2-extensions`-Klon ist der
-  Referenzstand. mORMot-**core** (`src/net` für Agenten/API, `src/db` für die
-  SQLite-Vektor-Extensions) nur, falls Arnaud es dort haben will — vorher fragen, nicht
-  raten.
-- **Prozess, nicht PR-first**: zuerst einen **Thread im Synopse-Forum**
-  (synopse.info/forum) aufmachen, Nutzen mit einem ultrakurzen Code-Beispiel zeigen und
-  **Arnaud direkt fragen**, ob core oder extensions. **Kein** ungefragter Pull Request.
-  Claude-Unterstützung transparent nennen, aber als „manuell nach den mORMot-
-  Performance-Richtlinien refactored (RawUtf8/TDocVariant, keine Heap-Allokation) **und**
-  mit `TSynTestCase` abgesichert" framen. Die Idiom-Regeln stehen im Skill
-  `landrix-mormot2`.
-- **Konkreter Merge-Blocker (Native-Libs)**: `sqlite-vec`/`lembed` sind externe
-  `.so`/`.dll`. Die Testsuite muss den Dynamic-Load **defensiv** abfangen — fehlt die
-  Lib, sauber **skippen/failen**, nie die App abstürzen lassen. Plattformübergreifend
-  grün (Windows + Linux, ideal macOS) im mORMot-Test-Runner.
+Weiter zu beachten:
+
+- **Verhältnis zu flydev — Code-Übernahme, kein gemeinsames Repo**: Von
+  [flydev-fr/mormot.ai](https://github.com/flydev-fr/mormot.ai) wird **nur Code**
+  übernommen (kein Fork, keine PRs). Der Namespace `mormot.ai.*` **bleibt**, obwohl
+  flydev denselben nutzt — folgenlos, weil die Repos unabhängig sind. Damit spätere
+  flydev-Änderungen per Diff einarbeitbar bleiben, ist ihr **Commit-Stand gepinnt**:
+  [UPSTREAM_BASE](UPSTREAM_BASE). **Regel: wer portiert, bumpt UPSTREAM_BASE im selben
+  Commit.**
+- **`codenav/` gehört nicht zur Extension** — es ist ein Landrix-Entwicklerwerkzeug
+  und bleibt im Monorepo (CONCEPT §7).
+- **Native-Libs defensiv behandeln**: `sqlite-vec`/`lembed` sind externe `.so`/`.dll`.
+  Die Testsuite muss den Dynamic-Load **defensiv** abfangen — fehlt die Lib, sauber
+  **skippen**, nie abstürzen (so gelöst im env-gated `VectorStoreKeyedOps`-Test).
+  Mittelfristig entfällt das Problem, wenn **neural-api** (native Pascal-Inferenz,
+  CONCEPT §5) die Fremd-`.so` ersetzt.
 
 ## Nächste Schritte
 

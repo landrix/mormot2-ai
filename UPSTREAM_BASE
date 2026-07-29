@@ -12,14 +12,46 @@ extension and renamed/aligned to the mormot.ai.* namespace.
   Date:    2026-06-14   ("Merge pull request #7 from flydev-fr/feat/mcp-extension")
   License: MPL 1.1 / GPL 2.0 / LGPL 2.1 (follows mORMot) — headers retained.
 
+## Vendored upstream: flydev-fr/mormot.ai  (code adoption, NOT a fork)
+
+We adopt CODE only — no shared repository, no fork, no upstream PRs. Our namespace
+`mormot.ai.*` stays as-is even where it collides with theirs (CONCEPT.md §1/§4);
+adopted units are renamed/aligned into our tree.
+
+Tracking the base commit is what makes incremental updates possible: to pull later
+changes, diff THEIR repo between the pinned commit and their new HEAD, port what is
+relevant, then bump the commit below.
+
+  Project: flydev-fr/mormot.ai   (library: mormot2-pgvector)
+  URL:     https://github.com/flydev-fr/mormot.ai
+  Branch:  main
+  Commit:  9ab26e88171c98a24ae64fcdc75866440b7518a4   <-- BASELINE, not yet adopted
+  Date:    2026-07-28   ("chore: README")
+  License: MIT  (mormot2-pgvector/LICENSE) — copyright notice must be retained.
+  Scope:   mormot.ai.chunk, mormot.ai.embed.{base,ollama}, mormot.ai.llm.{base,ollama},
+           mormot.ai.rag.{history,service,stream}, mormot.db.pgvector.{binding,orm,base}
+
+  BLOCKED — do not adopt: the second library `mormot-ai-sdk` (LiteLLM port,
+  mormot.ai.litellm.*) carries NO license (repo metadata `license: null`, no LICENSE
+  file) => all rights reserved. A license request is pending; until it is granted,
+  that code must not be copied, derived from, or referenced.
+
+  Update procedure:
+    gh api repos/flydev-fr/mormot.ai/commits/HEAD --jq .sha        # their new HEAD
+    git -C <clone> diff <pinned-sha>..<new-sha> -- mormot2-pgvector # what changed
+    # port relevant changes, then update Commit/Date above in the same commit.
+
 ## Authoritative specifications we build against
 
-  MCP protocol: 2025-11-25 with version negotiation (adopted base was 2025-03-26)
-                — https://modelcontextprotocol.io
+  MCP protocol: 2026-07-28 ONLY (greenfield — no legacy versions, no negotiation;
+                what the spec removes, we delete). Previous stand: 2025-11-25.
+                See CONCEPT.md §6 — https://modelcontextprotocol.io
   JSON-RPC 2.0  — https://www.jsonrpc.org/specification
 
 ## Runtime foundation
 
   mORMot 2 — shared/delphi/libs/_git_Synopse2
 
-The gitignored _eval/ folder holds the flydev clone, pinned at the commit above.
+The gitignored _eval/ folder holds the flydev clones (mormot2-extensions and
+mormot.ai), pinned at the commits above — they are reference material for diffing,
+never a build input.

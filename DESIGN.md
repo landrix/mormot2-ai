@@ -245,8 +245,14 @@ Assertions, alle 15 Demos bauen):
   OK"); **Demo-Härtung**: Streamable-Demo bindet Loopback, `ask_claude` nur per
   `MCP_ENABLE_ASK_CLAUDE=1` (neue `BindAddress`-Property am Transport).
 
-## Lizenz / Contribution
+## Lizenz / Veröffentlichung
 
-Ziellizenz: mORMot-Drei-Lizenz (MPL 1.1 / GPL 2.0 / LGPL 2.1). Namespace
-`mormot.ai.*` und CLA/Coding-Style **vorab mit Synopse (Arnaud Bouchez) sowie mit
-flydev abstimmen** (Namespace `mormot.ai.*` vs. flydevs `mormot.ext.mcp`).
+> **Überholt (2026-07-29):** Ein Synopse-PR ist **nicht** mehr das Ziel — LandrixAI
+> wird eine **eigenständige FPC-only-Extension** in eigenem Repo. Begründung und Plan:
+> [CONCEPT.md §1 / §7](CONCEPT.md). Dieses Dokument ist ein historisches Bau-Log;
+> maßgeblich ist CONCEPT.md.
+
+Lizenz bleibt die mORMot-Drei-Lizenz (MPL 1.1 / GPL 2.0 / LGPL 2.1) — die adoptierten
+MCP-Units verlangen es. Namespace `mormot.ai.*` bleibt, ist aber bei
+[flydev](https://github.com/flydev-fr/mormot.ai) ebenfalls belegt → im Zuge der
+Vollintegration (CONCEPT §4) mit ihm abstimmen.
