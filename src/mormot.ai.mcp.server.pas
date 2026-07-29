@@ -36,8 +36,7 @@ uses
   mormot.core.data,
   mormot.core.variants,
   mormot.core.perf,
-  mormot.core.collections,
-  mormot.core.threads,
+  mormot.core.threads, // TOnNotifyThread, in the THttpAsyncServer constructor
   mormot.net.sock,
   mormot.net.http,
   mormot.net.server,
@@ -77,6 +76,14 @@ type
   /// HTTP transport using mORMot's async HTTP server
   // - handles POST requests with JSON-RPC payload
   // - supports CORS for browser clients
+  // - NOT the MCP-specified transport: the spec defines stdio and Streamable
+  //   HTTP only. This is plain JSON-RPC-over-HTTP for simple integrations, and
+  //   it deliberately answers 200 with the JSON-RPC error in the body (the
+  //   usual JSON-RPC convention) instead of the 400/404 the Streamable HTTP
+  //   transport MUST use. A spec-conforming client belongs on
+  //   TMcpStreamableHttpTransport, which does map the status codes.
+  // - the protocol itself is still enforced: it calls ExecuteRequest, which
+  //   runs the same PreflightRequest gate as every other entry point
   {$M+}
   TMcpHttpTransport = class(TMcpTransportBase)
   private
@@ -173,8 +180,15 @@ type
     // TMcpStreamableAsyncConnection.OnRead after the handler returned
     // HTTP_ASYNCRESPONSE. aBody is the request body; aOutHeaders carries the
     // CORS lines the handler prepared.
+    // - only ever reached for a request that already passed PreflightRequest in
+    //   mcp(), which is why this path can hardcode 200: every status other than
+    //   200 was answered before the stream was opened
     procedure StreamDeferredResponse(const aWrite: TMcpRawWrite;
       const aBody, aOutHeaders: RawUtf8);
+    // send a JSON-RPC error as a plain buffered JSON response with an explicit
+    // HTTP status — used for everything the protocol layer rejects up front
+    function SendProtocolError(var Ctxt: THttpServerRequest;
+      const aErrorJson: RawUtf8; aStatus: integer): cardinal;
     // -- GET/DELETE are gone with protocol sessions: answer 405 --
     function OnMethodNotAllowed(Ctxt: THttpServerRequestAbstract): cardinal;
   public
@@ -498,11 +512,26 @@ begin
   fActive := false;
 end;
 
+function TMcpStreamableHttpTransport.SendProtocolError(
+  var Ctxt: THttpServerRequest; const aErrorJson: RawUtf8;
+  aStatus: integer): cardinal;
+begin
+  // A rejected request never becomes an SSE stream: it is a buffered JSON body
+  // with the status the spec prescribes. Streaming it would force HTTP 200 (the
+  // stream head is written before the outcome is known), and the spec REQUIRES
+  // 400/404 here — a client that only sees 200 cannot tell a rejection from a
+  // result, and the backward-compatibility probe would misclassify the server.
+  Ctxt.OutContentType := JSON_CONTENT_TYPE_VAR;
+  Ctxt.OutContent := aErrorJson;
+  result := aStatus;
+end;
+
 function TMcpStreamableHttpTransport.mcp(Ctxt: THttpServerRequest): cardinal;
 var
-  body, contentType, headerError: RawUtf8;
+  body, contentType, headerError, errorJson: RawUtf8;
   doc: TDocVariantData;
   method: RawUtf8;
+  status: integer;
 begin
   // --- CORS headers on every response ---
   SetCorsHeaders(Ctxt);
@@ -534,23 +563,30 @@ begin
   // reference-counted string — modifying it in-place causes EInvalidPointer.
   // The body MUST be a single JSON-RPC request or notification: JSON-RPC
   // batching is not part of this revision, so an array is simply malformed.
+  // A rejected body still answers with a JSON-RPC error, never an empty 400:
+  // the spec's backward-compatibility probe treats a 400 whose body is "not a
+  // recognized modern JSON-RPC error" as evidence of a legacy server, and would
+  // downgrade to the removed initialize handshake against this very server.
   body := Ctxt.InContent;
   doc.InitJson(body, JSON_FAST);
   if not doc.IsObject then
-    exit(HTTP_BADREQUEST);
+    exit(SendProtocolError(Ctxt, fServer.Processor.CreateError(
+      Null, JSONRPC_INVALID_REQUEST,
+      'Request body must be a single JSON-RPC object ' +
+      '(batching is not part of this protocol revision)'),
+      HTTP_MCP_BAD_REQUEST));
   if not doc.GetAsRawUtf8('method', method) then
-    exit(HTTP_BADREQUEST);
+    exit(SendProtocolError(Ctxt, fServer.Processor.CreateError(
+      doc.GetValueOrNull('id'), JSONRPC_INVALID_REQUEST,
+      'Missing required member "method"'), HTTP_MCP_BAD_REQUEST));
 
   // --- Standard header validation (MUST, -32020 on mismatch) ---
   // Headers mirror body fields so intermediaries can route without parsing;
   // if the two disagree, a proxy and this server would act on different data.
   if not ValidateStandardHeaders(Ctxt, body, headerError) then
-  begin
-    Ctxt.OutContentType := JSON_CONTENT_TYPE_VAR;
-    Ctxt.OutContent := fServer.Processor.CreateError(
-      doc.GetValueOrNull('id'), MCP_ERROR_HEADER_MISMATCH, headerError);
-    exit(HTTP_BADREQUEST);
-  end;
+    exit(SendProtocolError(Ctxt, fServer.Processor.CreateError(
+      doc.GetValueOrNull('id'), MCP_ERROR_HEADER_MISMATCH, headerError),
+      HTTP_MCP_BAD_REQUEST));
 
   // --- Accept header validation skipped ---
   // mORMot's THttpAsyncServer filters standard headers (Accept, Content-Type,
@@ -558,6 +594,15 @@ begin
   // so the Accept value is not reliably available here: FindNameValuePointer
   // ('ACCEPT: ') may match ACCEPT-ENCODING instead. The spec requires clients to
   // send Accept: application/json, text/event-stream — we cannot enforce it.
+
+  // --- Protocol validation BEFORE anything executes ---
+  // This is the only place that can still choose an HTTP status: once we defer
+  // and the SSE head goes out, the response is 200 by construction. So the
+  // envelope, the mandatory _meta and the method's existence are all decided
+  // here — and a rejected request is answered as JSON with 400/404, never
+  // streamed. It also means no request reaches OnStreamCall unvalidated.
+  if not fServer.PreflightRequest(body, errorJson, status) then
+    exit(SendProtocolError(Ctxt, errorJson, status));
 
   // --- Notification (no id): process and return 202 with no body ---
   if VarIsVoid(doc.GetValueOrNull('id')) then
@@ -651,11 +696,15 @@ var
   // a value that is not header-safe travels as '=?base64?<b64>?=' — the server
   // MUST decode it before comparing, otherwise every non-ASCII tool name would
   // look like a mismatch
+  // - the markers are CASE-SENSITIVE per spec ("MUST appear exactly as shown
+  //   (lowercase)"): a case-insensitive match would decode '=?BASE64?x?=',
+  //   which is a literal name a client is required to send base64-encoded —
+  //   so accepting it would silently rewrite a legitimate value
   function DecodeSentinel(const aValue: RawUtf8): RawUtf8;
   begin
     result := aValue;
     if (length(aValue) > 11) and
-       IdemPChar(pointer(aValue), '=?BASE64?') and
+       (copy(aValue, 1, 9) = '=?base64?') and
        (copy(aValue, length(aValue) - 1, 2) = '?=') then
       result := Base64ToBin(copy(aValue, 10, length(aValue) - 11));
   end;
@@ -673,14 +722,25 @@ begin
     aErrorMsg := 'Missing required header MCP-Protocol-Version';
     exit;
   end;
-  if doc.GetAsDocVariant('params', params) and params^.IsObject then
-    if params^.GetAsDocVariant('_meta', params) and params^.IsObject then
-      if params^.U[MCP_META_PROTOCOL_VERSION] <> name then
-      begin
-        aErrorMsg := 'Header mismatch: MCP-Protocol-Version header value ''' +
-          name + ''' does not match the request body';
-        exit;
-      end;
+  // Compare against the body — but only for requests. The spec leaves header
+  // requirements for notification POSTs undefined, and a notification carries
+  // no _meta to compare against.
+  if not VarIsVoid(doc.GetValueOrNull('id')) then
+  begin
+    bodyName := '';
+    if doc.GetAsDocVariant('params', params) and params^.IsObject then
+      if params^.GetAsDocVariant('_meta', params) and params^.IsObject then
+        bodyName := params^.U[MCP_META_PROTOCOL_VERSION];
+    // An absent body value is a mismatch too, not a free pass: leaving the
+    // header unchecked is exactly the split-source-of-truth the -32020 rule
+    // exists to prevent (a proxy routes on the header, we execute the body).
+    if bodyName <> name then
+    begin
+      aErrorMsg := 'Header mismatch: MCP-Protocol-Version header value ''' +
+        name + ''' does not match request body value ''' + bodyName + '''';
+      exit;
+    end;
+  end;
 
   // Mcp-Method: REQUIRED on all requests, mirrors "method"
   method := Header('MCP-METHOD');
@@ -810,16 +870,33 @@ begin
   // shared emitter so a streaming tool can push intermediate token events
   emitter := TMcpStreamEmitter.Create(self, aWrite);
 
-  // The body is a single JSON-RPC request (batching is not part of this
-  // revision, and mcp() rejected anything else before deferring).
+  // The body is a single JSON-RPC request that mcp() already ran through
+  // PreflightRequest — a malformed envelope, bad _meta, an unsupported version
+  // or an unknown method never reaches this point, so the hook below always
+  // sees a request the protocol layer accepted.
   // Let a streaming hook handle it first — it pushes token events through the
   // emitter and supplies the final response; otherwise process normally.
   handled := false;
   responseJson := '';
-  if Assigned(fOnStreamCall) then
-    handled := fOnStreamCall(aBody, emitter, responseJson);
-  if not handled then
-    responseJson := fServer.ExecuteRequest(aBody);
+  // The hook is FOREIGN code and FinalizeResponseJson rejects a malformed
+  // result — neither may escape into the connection's OnRead, which has no
+  // handler and would tear down the worker mid-stream. ExecuteRequest already
+  // catches everything itself; this guard covers the hook path.
+  try
+    if Assigned(fOnStreamCall) then
+      handled := fOnStreamCall(aBody, emitter, responseJson);
+    if handled then
+      // a hook builds its response by hand and would otherwise ship a result
+      // without the mandatory resultType and without serverInfo
+      responseJson := fServer.Processor.FinalizeResponseJson(responseJson)
+    else
+      responseJson := fServer.ExecuteRequest(aBody);
+  except
+    on E: Exception do
+      responseJson := fServer.Processor.CreateError(
+        _Safe(_JsonFast(aBody))^.GetValueOrNull('id'), JSONRPC_INTERNAL_ERROR,
+        StringToUtf8(E.Message));
+  end;
 
   // final SSE event carrying the JSON-RPC response, which ends the stream
   if responseJson <> '' then

@@ -46,6 +46,15 @@ type
       const aAuthCtx: TMcpAuthContext): variant; override;
   end;
 
+  /// a tool returning a JSON ARRAY instead of the required result object
+  // - the protocol has no non-object result; this must surface as an error
+  //   rather than silently shipping an empty success (see ResultMustBeAnObject)
+  TArrayResultTool = class(TMcpToolBase<TCalcParams>)
+  protected
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  end;
+
   TTestMcpCore = class(TSynTestCase)
   protected
     procedure EnsureCalcParamsRtti;
@@ -75,6 +84,9 @@ type
     procedure DiscoverReportsVersionAndIdentity;
     procedure RequestMetaIsMandatory;
     procedure ResultsCarryResultTypeAndServerInfo;
+    procedure RequestParamsMergeExistingMeta;
+    procedure ResultMustBeAnObject;
+    procedure PreflightDecidesHttpStatus;
   end;
 
 implementation
@@ -109,6 +121,14 @@ function TThrowingTool.ExecuteTyped(const aParams: TCalcParams;
 begin
   // a plain RTL Exception (NOT ESynException): the dispatcher must still catch it
   raise Exception.Create('tool blew up');
+end;
+
+{ TArrayResultTool }
+
+function TArrayResultTool.ExecuteTyped(const aParams: TCalcParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := _ArrFast(['not', 'an', 'object']);
 end;
 
 { TTestMcpCore }
@@ -454,21 +474,26 @@ begin
     response := Exec(server, '{"jsonrpc":"2.0","id":2,"method":"nope"}');
     CheckErrorResponse(response, JSONRPC_METHOD_NOT_FOUND, 'Method not found');
 
-    response := Exec(server, 
+    // naming something that does not exist is INVALID PARAMS, not an internal
+    // error: 2026-07-28 removed the dedicated -32002 "resource not found", so
+    // an unknown tool/resource and a missing name are all -32602
+    response := Exec(server,
       '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Missing tool name');
+    CheckErrorResponse(response, JSONRPC_INVALID_PARAMS, 'Missing tool name');
 
-    response := Exec(server, 
+    response := Exec(server,
       '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"missing","arguments":{}}}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Tool not found');
+    CheckErrorResponse(response, JSONRPC_INVALID_PARAMS, 'Tool not found');
 
-    response := Exec(server, 
+    response := Exec(server,
       '{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{}}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Missing uri');
+    CheckErrorResponse(response, JSONRPC_INVALID_PARAMS, 'Missing uri');
 
-    response := Exec(server, 
+    response := Exec(server,
       '{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"missing://info"}}');
-    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Resource not found');
+    CheckErrorResponse(response, JSONRPC_INVALID_PARAMS, 'Resource not found');
+    // -32603 stays reserved for a genuine server-side failure: a tool that
+    // throws still lands there (see ToolExceptionBecomesError)
   finally
     server.Free;
   end;
@@ -547,18 +572,14 @@ begin
   // params present but not an object = a deliberately malformed envelope:
   // hand it over untouched, that is exactly what such a test asserts
   if doc.GetValueIndex('params') >= 0 then
-  begin
     if not doc.GetAsDocVariant('params', params) or
        not params^.IsObject then
       exit(aServer.ExecuteRequest(aJson));
-  end
-  else
-  begin
-    doc.AddValue('params', _ObjFast([]));
-    if not doc.GetAsDocVariant('params', params) then
-      exit(aServer.ExecuteRequest(aJson));
-  end;
-  params^.AddValue('_meta', McpRequestMeta('mcp.tests', '1.0'));
+  // build params through the SAME production helper a real client uses, so the
+  // tests exercise McpRequestParams instead of a second, divergent copy of the
+  // _meta rules (McpPost in test.mcp.transports does the same)
+  doc.AddOrUpdateValue('params',
+    McpRequestParams(doc.GetValueOrNull('params'), 'mcp.tests', '1.0'));
   result := aServer.ExecuteRequest(doc.ToJson);
 end;
 
@@ -656,6 +677,144 @@ begin
     errv := _Safe(rv)^.GetValueOrNull('error');
     Check(_Safe(errv)^.IsObject, 'error object');
     Check(VarIsVoid(_Safe(rv)^.GetValueOrNull('result')), 'no result on error');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.RequestParamsMergeExistingMeta;
+var
+  server: TMcpServer;
+  params, wrapped: variant;
+  doc, meta: PDocVariantData;
+  tmp: RawUtf8;
+  n: integer;
+  i: PtrInt;
+begin
+  // A caller that already put its own key into _meta (a progressToken, say)
+  // must end up with ONE merged _meta. Appending a second one would be
+  // invisible: TDocVariantData stores duplicates but every lookup returns the
+  // first, so the server would reject the request for missing protocol fields.
+  params := _ObjFast([
+    'name', 'calc',
+    '_meta', _ObjFast(['progressToken', 'tok-1'])]);
+  wrapped := McpRequestParams(params, 'mcp.tests', '1.0');
+  doc := _Safe(wrapped);
+  n := 0;
+  for i := 0 to doc^.Count - 1 do
+    if doc^.Names[i] = '_meta' then
+      inc(n);
+  CheckEqual(n, 1, 'exactly one _meta, never a second appended one');
+  Check(doc^.GetAsRawUtf8('name', tmp), 'caller params preserved');
+  CheckEqual(tmp, 'calc');
+  Check(doc^.GetAsDocVariant('_meta', meta), '_meta is an object');
+  Check(meta^.GetAsRawUtf8('progressToken', tmp), 'caller _meta key preserved');
+  CheckEqual(tmp, 'tok-1');
+  Check(meta^.GetAsRawUtf8(MCP_META_PROTOCOL_VERSION, tmp), 'version merged in');
+  CheckEqual(tmp, MCP_PROTOCOL_VERSION);
+  Check(meta^.GetValueIndex(MCP_META_CLIENT_CAPABILITIES) >= 0,
+    'capabilities merged in');
+
+  // and the server actually accepts what the helper produced
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
+    server.Start;
+    EnsureCalcParamsRtti;
+    wrapped := _ObjFast(['jsonrpc', '2.0', 'id', 1, 'method', 'tools/call',
+      'params', McpRequestParams(_ObjFast([
+        'name', 'calc',
+        'arguments', _ObjFast(['A', 2, 'B', 3]),
+        '_meta', _ObjFast(['progressToken', 'tok-1'])]))]);
+    tmp := server.ExecuteRequest(_Safe(wrapped)^.ToJson);
+    Check(PosEx('"error"', tmp) = 0, 'a merged _meta passes validation');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.ResultMustBeAnObject;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TArrayResultTool.Create('arr', 'Returns an array'));
+    server.Start;
+    // Copying nothing (the old behaviour) turned a broken handler into an empty
+    // success response; the caller then saw resultType:complete and no content.
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"arr"}}');
+    CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'must be a JSON object');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.PreflightDecidesHttpStatus;
+var
+  server: TMcpServer;
+  errorJson: RawUtf8;
+  status: integer;
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    // Preflight is what lets a Streamable HTTP transport pick the status BEFORE
+    // it opens a stream — once the SSE head is written the answer is 200 by
+    // construction, so every non-200 outcome has to be decided here.
+
+    // valid request -> dispatchable, 200
+    Check(server.PreflightRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":' +
+      '{"' + MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '",' +
+      '"' + MCP_META_CLIENT_CAPABILITIES + '":{}}}}', errorJson, status),
+      'valid request passes');
+    CheckEqual(status, HTTP_MCP_SUCCESS);
+    CheckEqual(errorJson, '');
+
+    // unimplemented method -> spec REQUIRES 404 (not 400), so a client can tell
+    // "this method does not exist" from "this request was refused"
+    Check(not server.PreflightRequest(
+      '{"jsonrpc":"2.0","id":2,"method":"nope","params":{"_meta":' +
+      '{"' + MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '",' +
+      '"' + MCP_META_CLIENT_CAPABILITIES + '":{}}}}', errorJson, status),
+      'unknown method rejected');
+    CheckEqual(status, HTTP_MCP_NOT_FOUND);
+    CheckErrorResponse(errorJson, JSONRPC_METHOD_NOT_FOUND, 'Method not found');
+
+    // missing _meta -> 400
+    Check(not server.PreflightRequest(
+      '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}',
+      errorJson, status), 'missing _meta rejected');
+    CheckEqual(status, HTTP_MCP_BAD_REQUEST);
+    CheckErrorResponse(errorJson, JSONRPC_INVALID_PARAMS, '');
+    // ...and it still tells a first-contact client which version to use: there
+    // is no handshake left, and server/discover needs valid _meta itself
+    Check(PosEx(MCP_PROTOCOL_VERSION, errorJson) > 0,
+      'the rejection names the supported version');
+
+    // unsupported version -> 400 with the MCP-specific code
+    Check(not server.PreflightRequest(
+      '{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{"_meta":' +
+      '{"' + MCP_META_PROTOCOL_VERSION + '":"2025-11-25",' +
+      '"' + MCP_META_CLIENT_CAPABILITIES + '":{}}}}', errorJson, status),
+      'unsupported version rejected');
+    CheckEqual(status, HTTP_MCP_BAD_REQUEST);
+    CheckErrorResponse(errorJson, MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION, '');
+
+    // malformed envelope -> 400
+    Check(not server.PreflightRequest('{', errorJson, status),
+      'malformed envelope rejected');
+    CheckEqual(status, HTTP_MCP_BAD_REQUEST);
+
+    // a notification carries no _meta and is never rejected here
+    Check(server.PreflightRequest(
+      '{"jsonrpc":"2.0","method":"notifications/cancelled"}', errorJson, status),
+      'notification passes preflight');
+    CheckEqual(status, HTTP_MCP_SUCCESS);
   finally
     server.Free;
   end;

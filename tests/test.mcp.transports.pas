@@ -80,6 +80,10 @@ type
     procedure EnsureCalcParamsRtti;
     function StartStreamableTransport(const aServer: TMcpServer;
       out aTransport: TMcpStreamableHttpTransport): integer;
+    /// assert a buffered response body is a JSON-RPC error with that code
+    procedure CheckErrorCode(const aBody: RawUtf8; aExpectedCode: integer);
+    /// the payload of the last `data:` line of an SSE response
+    function SseDataJson(const aBody: RawUtf8): RawUtf8;
   published
     /// a plain POST is answered without any session handshake
     procedure PostDiscover;
@@ -90,6 +94,10 @@ type
     procedure MissingAcceptHeader;
     procedure WrongContentType;
     procedure PostStreamsChunked;
+    procedure HeaderValidationFailures;
+    procedure ProtocolErrorsUseHttpStatus;
+    procedure ConcurrentPosts;
+    procedure StreamHookIsValidatedAndContained;
   end;
 
 implementation
@@ -107,7 +115,7 @@ function McpPost(aClient: THttpClientSocket; const aEndpoint, aJson: RawUtf8): i
 var
   doc: TDocVariantData;
   params: PDocVariantData;
-  meta: PDocVariantData;
+  wrapped: variant;
   method, name, headers, body: RawUtf8;
 begin
   doc.InitJson(aJson, JSON_FAST);
@@ -135,16 +143,14 @@ begin
           exit(aClient.Post(aEndpoint, aJson, JSON_CONTENT_TYPE,
             HTTP_KEEPALIVE_MS, headers));
       end;
-      // merge into an existing _meta (e.g. a progressToken) instead of adding
-      // a second key of the same name, which would shadow the protocol fields
-      if params^.GetAsDocVariant('_meta', meta) and meta^.IsObject then
-      begin
-        meta^.AddValue(MCP_META_PROTOCOL_VERSION,
-          RawUtf8ToVariant(MCP_PROTOCOL_VERSION));
-        meta^.AddValue(MCP_META_CLIENT_CAPABILITIES, _ObjFast([]));
-      end
-      else
-        params^.AddValue('_meta', McpRequestMeta('mcp.tests', '1.0'));
+      // build params through the SAME production helper a real client uses —
+      // it merges into an existing _meta (e.g. a progressToken) instead of
+      // appending a second key that would shadow the protocol fields
+      // materialize first: AddOrUpdateValue may reallocate the values array and
+      // invalidate the params pointer we would still be reading from
+      wrapped := McpRequestParams(variant(params^), 'mcp.tests', '1.0');
+      doc.AddOrUpdateValue('params', wrapped);
+      doc.GetAsDocVariant('params', params);
       name := '';
       if method = 'resources/read' then
         name := params^.U['uri']
@@ -794,6 +800,34 @@ begin
       'A,B:integer Enabled:boolean Name:RawUtf8');
 end;
 
+function TTestMcpStreamableTransport.SseDataJson(const aBody: RawUtf8): RawUtf8;
+var
+  lines: TRawUtf8DynArray;
+  i: PtrInt;
+begin
+  result := '';
+  lines := CsvToRawUtf8DynArray(aBody, #10);
+  for i := 0 to high(lines) do
+    if IdemPChar(pointer(lines[i]), 'DATA: ') then
+      result := TrimU(copy(lines[i], 7, MaxInt));
+end;
+
+procedure TTestMcpStreamableTransport.CheckErrorCode(const aBody: RawUtf8;
+  aExpectedCode: integer);
+var
+  docVar, errVar: variant;
+  err: PDocVariantData;
+  code: Int64;
+begin
+  docVar := _JsonFast(aBody);
+  errVar := _Safe(docVar)^.GetValueOrNull('error');
+  err := _Safe(errVar);
+  if CheckFailed(err^.IsObject, 'response carries a JSON-RPC error object') then
+    exit;
+  Check(VariantToInt64(err^.GetValueOrDefault('code', 0), code), 'error code');
+  CheckEqual(integer(code), aExpectedCode, 'error code');
+end;
+
 function TTestMcpStreamableTransport.StartStreamableTransport(
   const aServer: TMcpServer;
   out aTransport: TMcpStreamableHttpTransport): integer;
@@ -1019,9 +1053,17 @@ begin
     server.Start;
     port := StartStreamableTransport(server, transport);
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    // GET was the standalone notification stream, DELETE the session teardown.
+    // Both verbs are gone with protocol sessions; the spec asks for 405 so an
+    // older client can tell "removed" from "never existed". DELETE is routed
+    // explicitly because RunMethods does not publish it at all — which is
+    // exactly why it needs its own assertion here.
     status := client.Get(transport.Endpoint, HTTP_KEEPALIVE_MS,
       'Accept: text/event-stream');
     CheckEqual(status, HTTP_NOTALLOWED, 'GET should return 405');
+    status := client.Request(transport.Endpoint, 'DELETE', HTTP_KEEPALIVE_MS,
+      'Accept: text/event-stream');
+    CheckEqual(status, HTTP_NOTALLOWED, 'DELETE should return 405');
   finally
     client.Free;
     if transport <> nil then
@@ -1124,6 +1166,330 @@ begin
     CheckEqual(status, 415, 'wrong content-type should return 415');
   finally
     client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpStreamableTransport.HeaderValidationFailures;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  request, base: RawUtf8;
+
+  // POST with fully controlled headers — the point of these cases is what the
+  // headers say, so McpPost (which derives them) must not be used here
+  function RawPost(const aBody, aHeaders: RawUtf8): integer;
+  begin
+    result := client.Post(transport.Endpoint, aBody, JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json'#13#10 +
+        aHeaders);
+  end;
+
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    base := '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{' +
+      MCP_TEST_META + '}}';
+
+    // Every one of these MUST be 400 + a -32020 body. The headers exist so an
+    // intermediary can route without parsing; if header and body disagree, the
+    // proxy and this server would act on different data — which is the exact
+    // split-source-of-truth the rule prevents.
+
+    // 1. MCP-Protocol-Version missing entirely
+    status := RawPost(base, 'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'missing MCP-Protocol-Version -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // 2. Mcp-Method missing
+    status := RawPost(base, 'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION);
+    CheckEqual(status, HTTP_BADREQUEST, 'missing Mcp-Method -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // 3. Mcp-Method disagrees with the body
+    status := RawPost(base, 'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION +
+      #13#10 + 'Mcp-Method: resources/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'Mcp-Method mismatch -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // 4. protocol version header disagrees with _meta
+    status := RawPost(base, 'MCP-Protocol-Version: 2025-11-25'#13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'version header mismatch -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // 5. header present, but the body carries no _meta at all: an absent body
+    // value is a mismatch too, otherwise the header would go unchecked
+    status := RawPost('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}',
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'absent _meta version -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // 6. tools/call without the required Mcp-Name
+    request := '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":' +
+      '{"name":"calc","arguments":{"a":1,"b":2},' + MCP_TEST_META + '}}';
+    status := RawPost(request, 'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION +
+      #13#10 + 'Mcp-Method: tools/call');
+    CheckEqual(status, HTTP_BADREQUEST, 'missing Mcp-Name -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // 7. Mcp-Name disagrees with params.name
+    status := RawPost(request, 'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION +
+      #13#10 + 'Mcp-Method: tools/call'#13#10 + 'Mcp-Name: other');
+    CheckEqual(status, HTTP_BADREQUEST, 'Mcp-Name mismatch -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // 8. the base64 sentinel decodes and then matches
+    status := RawPost(request, 'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION +
+      #13#10 + 'Mcp-Method: tools/call'#13#10 +
+      'Mcp-Name: =?base64?' + BinToBase64('calc') + '?=');
+    CheckEqual(status, HTTP_SUCCESS, 'a base64 sentinel Mcp-Name is accepted');
+
+    // 9. the sentinel markers are CASE-SENSITIVE per spec: '=?BASE64?..?=' is
+    // a literal name a client is required to send base64-encoded, so decoding
+    // it would silently rewrite a legitimate value
+    status := RawPost(request, 'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION +
+      #13#10 + 'Mcp-Method: tools/call'#13#10 +
+      'Mcp-Name: =?BASE64?' + BinToBase64('calc') + '?=');
+    CheckEqual(status, HTTP_BADREQUEST, 'uppercase sentinel must NOT decode');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+  finally
+    client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpStreamableTransport.ProtocolErrorsUseHttpStatus;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    // A protocol rejection must NOT be streamed: the SSE head is written before
+    // the outcome is known, so a streamed rejection is HTTP 200 by construction
+    // and a client can no longer tell a refusal from a result. Each case below
+    // therefore asserts a buffered JSON body with the status the spec requires.
+
+    // unimplemented method -> 404 (spec: "MUST respond with 404 Not Found and a
+    // JSON-RPC error with code -32601"), which also distinguishes this server
+    // from a legacy one that simply does not host the endpoint
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/nope"}');
+    CheckEqual(status, HTTP_NOTFOUND, 'unknown method -> 404');
+    CheckErrorCode(client.Content, JSONRPC_METHOD_NOT_FOUND);
+    Check(PosEx('text/event-stream', client.ContentType) = 0,
+      'a rejection is buffered JSON, never a stream');
+
+    // unsupported protocol version -> 400 + -32022, listing what we speak
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"' +
+      MCP_META_PROTOCOL_VERSION + '":"2025-11-25","' +
+      MCP_META_CLIENT_CAPABILITIES + '":{}}}}', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: application/json'#13#10 +
+      'MCP-Protocol-Version: 2025-11-25'#13#10 + 'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'unsupported version -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION);
+    Check(PosEx(MCP_PROTOCOL_VERSION, client.Content) > 0,
+      'the error names the supported version');
+
+    // missing _meta -> 400 + -32602
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":3,"method":"tools/list"}', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'missing _meta -> 400');
+
+    // a JSON-RPC batch (array body) is not part of this revision — and the
+    // rejection must still be a recognizable JSON-RPC error, because the spec's
+    // compatibility probe reads an unrecognizable 400 body as "legacy server"
+    // and would downgrade to the removed initialize handshake
+    status := client.Post(transport.Endpoint,
+      '[{"jsonrpc":"2.0","id":4,"method":"tools/list"}]', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'array body -> 400');
+    CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
+
+    // a request that IS dispatchable still streams as before
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":5,"method":"tools/list"}');
+    CheckEqual(status, HTTP_SUCCESS, 'a valid request -> 200');
+    Check(PosEx('text/event-stream', client.ContentType) > 0,
+      'a valid request is streamed');
+  finally
+    client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
+  end;
+end;
+
+type
+  /// OnStreamCall hooks used by StreamHookIsValidatedAndContained
+  TStreamHookProbe = class
+  public
+    Called: boolean;
+    /// answers with a bare result — no resultType, no serverInfo
+    function Bare(const aRequestJson: RawUtf8; const aEmitter: IMcpStreamEmitter;
+      out aResponseJson: RawUtf8): boolean;
+    /// raises, the way a buggy or hostile hook would
+    function Throws(const aRequestJson: RawUtf8;
+      const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+  end;
+
+function TStreamHookProbe.Bare(const aRequestJson: RawUtf8;
+  const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+begin
+  Called := true;
+  aResponseJson := '{"jsonrpc":"2.0","id":1,"result":{"content":"from-hook"}}';
+  result := true;
+end;
+
+function TStreamHookProbe.Throws(const aRequestJson: RawUtf8;
+  const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+begin
+  aResponseJson := '';
+  result := false; // never reached — keeps the compiler from warning
+  raise EMcpException.CreateU('hook blew up');
+end;
+
+procedure TTestMcpStreamableTransport.StreamHookIsValidatedAndContained;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  probe: TStreamHookProbe;
+  port, status: integer;
+  client: THttpClientSocket;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  probe := TStreamHookProbe.Create;
+  try
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    // 1. A hook must never see a request the protocol layer rejects. Before
+    // the preflight moved ahead of the deferral, a hook answering `true` ran
+    // on unvalidated input — for the Claude demo that means executing the
+    // local CLI for a request the server was supposed to refuse.
+    transport.OnStreamCall := probe.Bare;
+    probe.Called := false;
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list"}', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'invalid request -> 400');
+    Check(not probe.Called, 'the hook must not run on a rejected request');
+
+    // 2. A hook that IS reached still cannot ship a result without the
+    // mandatory protocol fields: the transport finalizes what it returns.
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list"}');
+    CheckEqual(status, HTTP_SUCCESS, 'valid request reaches the hook');
+    Check(probe.Called, 'the hook ran');
+    Check(PosEx('from-hook', client.Content) > 0, 'the hook answer is used');
+    Check(PosEx('"resultType":"' + MCP_RESULT_COMPLETE + '"', client.Content) > 0,
+      'a hook result is stamped with resultType');
+    Check(PosEx(MCP_META_SERVER_INFO, client.Content) > 0,
+      'a hook result carries serverInfo');
+
+    // 3. A hook that raises must not escape into the connection's OnRead: it
+    // has no exception handler and would tear the worker down mid-stream.
+    transport.OnStreamCall := probe.Throws;
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
+    CheckEqual(status, HTTP_SUCCESS, 'a throwing hook still answers');
+    CheckErrorCode(SseDataJson(client.Content), JSONRPC_INTERNAL_ERROR);
+    // and the server is still alive afterwards
+    transport.OnStreamCall := nil;
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":3,"method":"tools/list"}');
+    CheckEqual(status, HTTP_SUCCESS, 'transport survives a throwing hook');
+  finally
+    client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
+    probe.Free;
+  end;
+end;
+
+procedure TTestMcpStreamableTransport.ConcurrentPosts;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, i, status: integer;
+  clients: array[0..3] of THttpClientSocket;
+  request: RawUtf8;
+begin
+  // The session registry that used to serialize concurrent access is gone, and
+  // THttpAsyncServer runs handlers on several worker threads. Nothing else in
+  // this suite exercises more than one connection at a time, so a regression in
+  // the shared tool/resource registry (or in the deferred streaming path) would
+  // go unnoticed until production. Keep-alive reuse is covered too: each client
+  // issues two requests on the same socket.
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  FillCharFast(clients, SizeOf(clients), 0);
+  try
+    server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    for i := 0 to high(clients) do
+      clients[i] := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    request := '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":' +
+      '{"name":"calc","arguments":{"a":2,"b":3,"enabled":true,"name":"x"}}}';
+    for i := 0 to high(clients) do
+    begin
+      status := McpPost(clients[i], transport.Endpoint, request);
+      CheckEqual(status, HTTP_SUCCESS, 'concurrent call');
+      Check(PosEx('2 + 3 = 5', clients[i].Content) > 0, 'concurrent result');
+    end;
+    // second round on the SAME sockets: the chunked stream must have terminated
+    // cleanly enough for the connection to be reusable
+    for i := 0 to high(clients) do
+    begin
+      status := McpPost(clients[i], transport.Endpoint,
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
+      CheckEqual(status, HTTP_SUCCESS, 'keep-alive reuse after a stream');
+      Check(PosEx('"calc"', clients[i].Content) > 0, 'reused connection result');
+    end;
+  finally
+    for i := 0 to high(clients) do
+      clients[i].Free;
     if transport <> nil then
       transport.Stop;
     transport.Free;

@@ -96,6 +96,24 @@ const
   /// interim result: the server needs more input (Multi Round-Trip Request)
   MCP_RESULT_INPUT_REQUIRED = 'input_required';
 
+  /// HTTP status codes an MCP-over-HTTP transport MUST use, as decided by the
+  // protocol layer in TMcpServer.PreflightRequest
+  // - declared here (and not taken from mormot.net.http) so this unit stays
+  //   transport-agnostic: it names the status, the transport sends it
+  /// the request is dispatchable, or its error is a plain application error
+  HTTP_MCP_SUCCESS = 200;
+  /// malformed envelope, bad/absent _meta, unsupported version, header mismatch
+  // - the spec REQUIRES 400 for -32020/-32021/-32022 and tells clients to look
+  //   for a "recognized modern JSON-RPC error" in a 400 body before falling
+  //   back to the legacy handshake era
+  HTTP_MCP_BAD_REQUEST = 400;
+  /// the server does not implement the requested RPC method (-32601)
+  // - spec: "it MUST respond with 404 Not Found and a JSON-RPC error with code
+  //   -32601", which distinguishes it from a legacy server's bare 404
+  HTTP_MCP_NOT_FOUND = 404;
+  /// the server cannot serve the request at all (not active)
+  HTTP_MCP_SERVER_ERROR = 500;
+
 type
   /// Authentication context passed to tool/resource execution
   // - provides user identity and authorization information
@@ -131,6 +149,25 @@ type
 
   /// raised when a JSON-RPC method is not implemented (mapped to -32601)
   EMcpMethodNotFound = class(EMcpException);
+
+  /// raised when the params of a request are unusable (mapped to -32602)
+  // - this covers "the named thing does not exist": since 2026-07-28 a missing
+  //   resource is NOT its own error code anymore (the former -32002 was
+  //   removed), it is a plain Invalid params
+  EMcpInvalidParams = class(EMcpException);
+
+  /// the JSON-RPC methods this server dispatches
+  // - resolved once from the wire name, then used by BOTH the pre-dispatch
+  //   validation and the dispatch itself, so the two can never disagree about
+  //   what "an implemented method" is (a transport MUST answer 404 for an
+  //   unimplemented one, and it decides that before dispatching)
+  TMcpMethod = (
+    mcpUnknown,
+    mcpDiscover,
+    mcpToolsList,
+    mcpToolsCall,
+    mcpResourcesList,
+    mcpResourcesRead);
 
 
 { ************ IInvokable Interfaces for Tools and Resources }
@@ -216,8 +253,17 @@ type
     /// stamp `resultType` and `_meta.serverInfo` onto a handler payload
     // - resultType is REQUIRED on every result since 2026-07-28; serverInfo is
     //   a SHOULD that replaces the identity formerly sent once in `initialize`
+    // - raises EMcpException if aResult is neither void nor a JSON object: the
+    //   spec has no non-object result, and silently dropping such a payload
+    //   would ship an empty success response instead of surfacing the bug
     function FinalizeResult(const aResult: variant;
       const aResultType: RawUtf8): variant;
+    /// stamp the mandatory result fields onto an already-serialized response
+    // - for responses produced OUTSIDE the normal dispatch (a streaming hook):
+    //   they must not be able to put a result on the wire without resultType
+    //   and serverInfo just because they bypassed CreateSuccessResponse
+    // - error responses and non-responses are returned unchanged
+    function FinalizeResponseJson(const aResponseJson: RawUtf8): RawUtf8;
     /// validate the per-request protocol metadata in `params._meta`
     // - since the protocol is stateless, EVERY request must carry its version
     //   and the client capabilities; there is no connection state to fall back on
@@ -295,6 +341,11 @@ type
     fProcessor: TMcpJsonRpcProcessor;
     fActive: boolean;
     fSafe: TLightLock;
+    /// the actual preflight — hands the parsed request back so the dispatch
+    // does not have to parse the very same body a second time
+    function Preflight(const aRequestJson: RawUtf8; out aMethod: RawUtf8;
+      out aParams, aRequestId: variant; out aErrorJson: RawUtf8;
+      out aHttpStatus: integer): boolean;
     function ExecuteToolCall(const aParams: variant; const aAuthCtx: TMcpAuthContext): variant;
     function ExecuteResourceRead(const aParams: variant): variant;
     function ListTools: variant;
@@ -323,7 +374,22 @@ type
     // - no session parameter: protocol-level sessions were removed in
     //   2026-07-28. State that must span requests is passed as explicit,
     //   server-minted handles in the tool arguments instead.
+    // - runs PreflightRequest first, so no dispatch can ever happen on a
+    //   request the protocol layer would reject
     function ExecuteRequest(const aRequestJson: RawUtf8): RawUtf8;
+    /// validate a request WITHOUT dispatching it
+    // - checks the JSON-RPC envelope, the mandatory per-request _meta and
+    //   whether the method exists at all — everything that decides the HTTP
+    //   status of a Streamable HTTP response
+    // - returns true when the request may be dispatched (aHttpStatus 200)
+    // - returns false with the ready-to-send JSON-RPC error in aErrorJson and
+    //   the status the transport MUST use: 400 for a malformed envelope, bad
+    //   _meta or an unsupported version, 404 for an unimplemented method
+    // - transports MUST call this before handing a request to any streaming
+    //   hook: a hook that answers a request the protocol layer rejects would
+    //   execute unvalidated input (and skip resultType/serverInfo entirely)
+    function PreflightRequest(const aRequestJson: RawUtf8;
+      out aErrorJson: RawUtf8; out aHttpStatus: integer): boolean;
     /// check if server is active
     function IsActive: boolean;
     /// the JSON-RPC processor, for transports that must emit protocol-level
@@ -331,6 +397,14 @@ type
     // before the body is ever dispatched)
     property Processor: TMcpJsonRpcProcessor read fProcessor;
   end;
+
+
+{ ************ Method Resolution }
+
+/// resolve a JSON-RPC method name to the handler this server implements
+// - returns mcpUnknown for anything not implemented, which a Streamable HTTP
+//   transport MUST turn into 404 + -32601 (spec: Protocol Version Header)
+function McpMethodFromName(const aMethod: RawUtf8): TMcpMethod;
 
 
 { ************ Client-side Request Metadata Helper }
@@ -569,18 +643,44 @@ begin
   src := _Safe(aResult);
   if src^.IsObject then
     for i := 0 to src^.Count - 1 do
-      doc.AddValue(src^.Names[i], src^.Values[i]);
+      doc.AddValue(src^.Names[i], src^.Values[i])
+  else if not VarIsVoid(aResult) then
+    // an array or a scalar cannot be a result: every MCP result is an object.
+    // Copying nothing (the previous behaviour) turned a broken handler into a
+    // silently empty success — fail loudly instead, it becomes -32603.
+    raise EMcpException.CreateUtf8(
+      'MCP result must be a JSON object, got %', [VariantToUtf8(aResult)]);
 
-  doc.AddValue('resultType', RawUtf8ToVariant(aResultType));
+  // AddOrUpdateValue, not AddValue: TDocVariantData happily stores a SECOND
+  // entry under an existing name, and every later lookup would still see the
+  // handler's stale value while the wire carries both.
+  doc.AddOrUpdateValue('resultType', RawUtf8ToVariant(aResultType));
 
   // merge into an existing _meta rather than replacing it: a handler may
   // already have attached its own keys (e.g. a subscriptionId)
   if doc.GetAsDocVariant('_meta', meta) and meta^.IsObject then
-    meta^.AddValue(MCP_META_SERVER_INFO, ServerInfo)
+    meta^.AddOrUpdateValue(MCP_META_SERVER_INFO, ServerInfo)
   else
-    doc.AddValue('_meta', _ObjFast([MCP_META_SERVER_INFO, ServerInfo]));
+    doc.AddOrUpdateValue('_meta', _ObjFast([MCP_META_SERVER_INFO, ServerInfo]));
 
   result := variant(doc);
+end;
+
+function TMcpJsonRpcProcessor.FinalizeResponseJson(
+  const aResponseJson: RawUtf8): RawUtf8;
+var
+  doc: TDocVariantData;
+  idx: PtrInt;
+begin
+  result := aResponseJson;
+  if aResponseJson = '' then
+    exit; // a hook may legitimately answer nothing (notification-like)
+  doc.InitJson(aResponseJson, JSON_FAST);
+  idx := doc.GetValueIndex('result');
+  if idx < 0 then
+    exit; // an error response (or not a response at all) — leave it alone
+  doc.Values[idx] := FinalizeResult(doc.Values[idx], MCP_RESULT_COMPLETE);
+  result := doc.ToJson;
 end;
 
 function TMcpJsonRpcProcessor.ValidateRequestMeta(const aParams: variant;
@@ -591,7 +691,13 @@ var
   i: PtrInt;
 begin
   result := false;
-  aError.Data := Null;
+  // Always report what we speak, on EVERY _meta rejection — not just on
+  // -32022. A client that does not know this server's version has nowhere
+  // else to learn it: server/discover is itself a request and needs valid
+  // _meta, so an error without the version list would leave a first-contact
+  // client with no way forward but guessing.
+  aError.Data := _ObjFast([
+    'supported', _ArrFast([MCP_PROTOCOL_VERSION])]);
 
   // _meta lives inside params; a request without params cannot carry the
   // required protocol fields and is malformed
@@ -918,14 +1024,16 @@ var
 begin
   if _Safe(aParams, doc) then
     if not doc.GetAsRawUtf8('name', toolName) then
-      raise EMcpException.CreateU('Missing tool name in tools/call');
+      raise EMcpInvalidParams.CreateU('Missing tool name in tools/call');
 
   args := doc.GetValueOrDefault('arguments',  Null);
 
   fSafe.Lock;
   try
     if not fTools.TryGetValue(toolName, tool) then
-      raise EMcpException.CreateUtf8('Tool not found: %', [toolName]);
+      // -32602, not -32603: naming something that does not exist is bad input,
+      // not a server failure (and -32002 was removed in 2026-07-28)
+      raise EMcpInvalidParams.CreateUtf8('Tool not found: %', [toolName]);
   finally
     fSafe.UnLock;
   end;
@@ -942,12 +1050,14 @@ var
 begin
   if _Safe(aParams, doc) then
     if not doc.GetAsRawUtf8('uri', uri) then
-      raise EMcpException.CreateU('Missing uri in resources/read');
+      raise EMcpInvalidParams.CreateU('Missing uri in resources/read');
 
   fSafe.Lock;
   try
     if not fResources.TryGetValue(uri, resource) then
-      raise EMcpException.CreateUtf8('Resource not found: %', [uri]);
+      // -32602: the dedicated "resource not found" code (-32002) was removed
+      // in 2026-07-28 — an unknown URI is Invalid params like any other
+      raise EMcpInvalidParams.CreateUtf8('Resource not found: %', [uri]);
   finally
     fSafe.UnLock;
   end;
@@ -970,45 +1080,93 @@ begin
   result := variant(result_doc);
 end;
 
-function TMcpServer.ExecuteRequest(const aRequestJson: RawUtf8): RawUtf8;
+function TMcpServer.PreflightRequest(const aRequestJson: RawUtf8;
+  out aErrorJson: RawUtf8; out aHttpStatus: integer): boolean;
 var
   method: RawUtf8;
-  params, requestId, resultData: variant;
-  authCtx: TMcpAuthContext;
-  metaError: TMcpError;
-  isNotification: boolean;
+  params, requestId: variant;
 begin
-  requestId := Null;
-  isNotification := false;
+  result := Preflight(aRequestJson, method, params, requestId,
+    aErrorJson, aHttpStatus);
+end;
+
+function TMcpServer.Preflight(const aRequestJson: RawUtf8;
+  out aMethod: RawUtf8; out aParams, aRequestId: variant;
+  out aErrorJson: RawUtf8; out aHttpStatus: integer): boolean;
+var
+  metaError: TMcpError;
+begin
+  result := false;
+  aErrorJson := '';
+  aMethod := '';
+  aParams := Null;
+  aRequestId := Null;
+  aHttpStatus := HTTP_MCP_BAD_REQUEST;
+
   if not fActive then
   begin
-    result := fProcessor.CreateError(Null, JSONRPC_INTERNAL_ERROR, 'Server not active');
+    aErrorJson := fProcessor.CreateError(Null, JSONRPC_INTERNAL_ERROR,
+      'Server not active');
+    aHttpStatus := HTTP_MCP_SERVER_ERROR;
     exit;
   end;
 
   // Parse request: a malformed envelope (bad JSON / missing or wrong jsonrpc /
   // scalar params) is an Invalid Request — answer with -32600 and no id (we
   // could not reliably extract one), never dispatch it.
-  if not fProcessor.ParseRequest(aRequestJson, method, params, requestId) then
+  if not fProcessor.ParseRequest(aRequestJson, aMethod, aParams, aRequestId) then
   begin
-    result := fProcessor.CreateError(Null, JSONRPC_INVALID_REQUEST,
+    aErrorJson := fProcessor.CreateError(Null, JSONRPC_INVALID_REQUEST,
       'Invalid JSON-RPC request');
     exit;
   end;
 
-  isNotification := VarIsVoid(requestId);
+  // Notifications are exempt from everything below: the per-request _meta is
+  // specified for requests, an unknown notification is silently ignored per
+  // JSON-RPC, and there is no response to carry an error in anyway.
+  if VarIsVoid(aRequestId) then
+  begin
+    aHttpStatus := HTTP_MCP_SUCCESS;
+    exit(true);
+  end;
 
   // Every request must carry its protocol version and client capabilities:
-  // stateless means there is no earlier handshake that could have supplied
-  // them. Notifications are exempt — the per-request fields are specified for
-  // requests, and a notification has no response to carry the error in.
-  if not isNotification then
-    if not fProcessor.ValidateRequestMeta(params, metaError) then
-    begin
-      result := fProcessor.CreateError(requestId, metaError.Code,
-        metaError.Message, metaError.Data);
-      exit;
-    end;
+  // stateless means there is no earlier handshake that could have supplied them
+  if not fProcessor.ValidateRequestMeta(aParams, metaError) then
+  begin
+    aErrorJson := fProcessor.CreateError(aRequestId, metaError.Code,
+      metaError.Message, metaError.Data);
+    exit; // 400 — both -32602 and -32022 are "modern JSON-RPC errors" the spec
+  end;    // tells clients to recognize on a 400 before falling back to legacy
+
+  // An unimplemented method MUST be 404 (not 400), so a client can tell it
+  // apart from a request this server refused to accept.
+  if McpMethodFromName(aMethod) = mcpUnknown then
+  begin
+    aErrorJson := fProcessor.CreateError(aRequestId, JSONRPC_METHOD_NOT_FOUND,
+      'Method not found: ' + aMethod);
+    aHttpStatus := HTTP_MCP_NOT_FOUND;
+    exit;
+  end;
+
+  aHttpStatus := HTTP_MCP_SUCCESS;
+  result := true;
+end;
+
+function TMcpServer.ExecuteRequest(const aRequestJson: RawUtf8): RawUtf8;
+var
+  method: RawUtf8;
+  params, requestId, resultData: variant;
+  authCtx: TMcpAuthContext;
+  isNotification: boolean;
+  status: integer;
+begin
+  // Single validation gate, shared with the transports: whatever Preflight
+  // rejects never reaches a handler, here or anywhere else. It hands the parsed
+  // request back, so the body is parsed exactly once per dispatch.
+  if not Preflight(aRequestJson, method, params, requestId, result, status) then
+    exit;
+  isNotification := VarIsVoid(requestId);
 
   // Auth context. Identity must be injected by a backend auth resolver before
   // any tool may trust IsAuthenticated/Roles; until then we stay fail-closed.
@@ -1020,20 +1178,22 @@ begin
   try
     // Dispatch to handler — any handler/tool exception is mapped to a JSON-RPC
     // error below, so it never escapes into the HTTP worker.
-    if method = 'server/discover' then
-      resultData := fProcessor.HandleDiscover
-    else if method = 'tools/list' then
-      resultData := ListTools
-    else if method = 'tools/call' then
-      resultData := ExecuteToolCall(params, authCtx)
-    else if method = 'resources/list' then
-      resultData := ListResources
-    else if method = 'resources/read' then
-      resultData := ExecuteResourceRead(params)
-    else if isNotification then
-      resultData := Null
+    case McpMethodFromName(method) of
+      mcpDiscover:
+        resultData := fProcessor.HandleDiscover;
+      mcpToolsList:
+        resultData := ListTools;
+      mcpToolsCall:
+        resultData := ExecuteToolCall(params, authCtx);
+      mcpResourcesList:
+        resultData := ListResources;
+      mcpResourcesRead:
+        resultData := ExecuteResourceRead(params);
     else
-      raise EMcpMethodNotFound.CreateUtf8('Method not found: %', [method]);
+      // only reachable for a notification: Preflight turned every unknown
+      // *request* method into -32601 before we got here
+      resultData := Null;
+    end;
 
     // Create success response (unless notification)
     if isNotification then
@@ -1045,6 +1205,12 @@ begin
     // Catch EVERY exception (not just ESynException): tools may raise plain
     // Exception, EConvertError, DB/OS errors. Translate to a JSON-RPC error so
     // the transport stays alive and the client gets a well-formed response.
+    on E: EMcpInvalidParams do
+      if isNotification then
+        result := ''
+      else
+        result := fProcessor.CreateError(requestId, JSONRPC_INVALID_PARAMS,
+          StringToUtf8(E.Message));
     on E: EMcpMethodNotFound do
       if isNotification then
         result := ''
@@ -1058,6 +1224,27 @@ begin
         result := fProcessor.CreateError(requestId, JSONRPC_INTERNAL_ERROR,
           StringToUtf8(E.Message));
   end;
+end;
+
+
+{ ************ Method Resolution }
+
+function McpMethodFromName(const aMethod: RawUtf8): TMcpMethod;
+begin
+  // one place decides what this server implements; both PreflightRequest (which
+  // must answer 404 for anything else) and the dispatch read it from here
+  if aMethod = 'server/discover' then
+    result := mcpDiscover
+  else if aMethod = 'tools/list' then
+    result := mcpToolsList
+  else if aMethod = 'tools/call' then
+    result := mcpToolsCall
+  else if aMethod = 'resources/list' then
+    result := mcpResourcesList
+  else if aMethod = 'resources/read' then
+    result := mcpResourcesRead
+  else
+    result := mcpUnknown;
 end;
 
 
@@ -1080,16 +1267,35 @@ end;
 function McpRequestParams(const aParams: variant;
   const aClientName, aClientVersion: RawUtf8): variant;
 var
-  doc: TDocVariantData;
-  src: PDocVariantData;
+  doc, meta: TDocVariantData;
+  src, srcMeta: PDocVariantData;
+  required: variant;
   i: PtrInt;
 begin
   doc.InitObject([], JSON_FAST);
   src := _Safe(aParams);
   if src^.IsObject then
     for i := 0 to src^.Count - 1 do
-      doc.AddValue(src^.Names[i], src^.Values[i]);
-  doc.AddValue('_meta', McpRequestMeta(aClientName, aClientVersion));
+      if src^.Names[i] <> '_meta' then
+        doc.AddValue(src^.Names[i], src^.Values[i]);
+
+  // Merge into the caller's own _meta instead of appending a second one:
+  // TDocVariantData stores duplicate names happily, but every lookup returns
+  // the FIRST — so an appended _meta would be invisible to the server, which
+  // would then reject the request for missing protocol fields. Caller keys
+  // (e.g. a progressToken) survive; the protocol fields are authoritative.
+  meta.InitObject([], JSON_FAST);
+  if src^.GetAsDocVariant('_meta', srcMeta) and srcMeta^.IsObject then
+    for i := 0 to srcMeta^.Count - 1 do
+      meta.AddValue(srcMeta^.Names[i], srcMeta^.Values[i]);
+  // keep the mandatory fields in a named local: _Safe() on a function result
+  // would point into a temporary the compiler may release before the loop ends
+  required := McpRequestMeta(aClientName, aClientVersion);
+  srcMeta := _Safe(required);
+  for i := 0 to srcMeta^.Count - 1 do
+    meta.AddOrUpdateValue(srcMeta^.Names[i], srcMeta^.Values[i]);
+
+  doc.AddValue('_meta', variant(meta));
   result := variant(doc);
 end;
 
