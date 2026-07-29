@@ -147,7 +147,9 @@ type
   //   stream is scoped to its request and is not resumable (no Last-Event-ID,
   //   no event ids) — a broken stream means the client re-issues the request
   // - stateless: no Mcp-Session-Id is minted, echoed or required
-  // - supports JSON-RPC batch input (array of messages)
+  // - NO batching: the body must be a single JSON-RPC request or notification;
+  //   an array is rejected with 400 (batch input left the protocol with this
+  //   revision)
   {$M+}
   TMcpStreamableHttpTransport = class(TMcpTransportBase)
   private
@@ -878,7 +880,7 @@ begin
   // emitter and supplies the final response; otherwise process normally.
   handled := false;
   responseJson := '';
-  // The hook is FOREIGN code and FinalizeResponseJson rejects a malformed
+  // The hook is FOREIGN code and FinalizeHookResponse rejects a malformed
   // result — neither may escape into the connection's OnRead, which has no
   // handler and would tear down the worker mid-stream. ExecuteRequest already
   // catches everything itself; this guard covers the hook path.
@@ -887,8 +889,9 @@ begin
       handled := fOnStreamCall(aBody, emitter, responseJson);
     if handled then
       // a hook builds its response by hand and would otherwise ship a result
-      // without the mandatory resultType and without serverInfo
-      responseJson := fServer.Processor.FinalizeResponseJson(responseJson)
+      // without the mandatory resultType, serverInfo and caching hints
+      responseJson := fServer.FinalizeHookResponse(responseJson,
+        _Safe(_JsonFast(aBody))^.U['method'])
     else
       responseJson := fServer.ExecuteRequest(aBody);
   except

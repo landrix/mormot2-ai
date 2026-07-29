@@ -96,6 +96,13 @@ const
   /// interim result: the server needs more input (Multi Round-Trip Request)
   MCP_RESULT_INPUT_REQUIRED = 'input_required';
 
+  /// default freshness hint: 0 = immediately stale, i.e. never reuse
+  // - deliberately conservative. The registry can change at any moment via
+  //   RegisterTool, and without subscriptions/listen there is no invalidation
+  //   signal to correct a stale client. An embedder whose registry is static
+  //   raises this; a wrong-but-fast default would hand out stale tool lists.
+  MCP_CACHE_TTL_DEFAULT = 0;
+
   /// HTTP status codes an MCP-over-HTTP transport MUST use, as decided by the
   // protocol layer in TMcpServer.PreflightRequest
   // - declared here (and not taken from mormot.net.http) so this unit stays
@@ -156,6 +163,32 @@ type
   //   removed), it is a plain Invalid params
   EMcpInvalidParams = class(EMcpException);
 
+  /// who may cache a result, i.e. the `cacheScope` field of a cacheable result
+  // - an enumeration, not a string: the wire accepts exactly two values, and a
+  //   free-form string lets a typo ship a successful but spec-invalid response.
+  //   It also keeps the field out of the refcounted-string world, so a server
+  //   reconfigured while requests are in flight cannot corrupt one (a RawUtf8
+  //   read/written concurrently is not safe under FPC; a byte-sized enum is).
+  TMcpCacheScope = (
+    /// the response may only be reused within the SAME authorization context
+    // - the safe default, and what the spec asks for on results that depend on
+    //   the authenticated caller
+    mcsPrivate,
+    /// the response holds no user-specific data: ANY shared gateway or proxy
+    // may store it and serve it to ANY other user
+    // - the spec warns explicitly that this crosses authorization contexts: a
+    //   `public` tools/list from an authenticated endpoint may be replayed to
+    //   a different access token. Only choose it where the answer is identical
+    //   for every caller.
+    mcsPublic);
+
+const
+  /// the wire values of TMcpCacheScope, in enum order
+  MCP_CACHE_SCOPE: array[TMcpCacheScope] of RawUtf8 = (
+    'private',
+    'public');
+
+type
   /// the JSON-RPC methods this server dispatches
   // - resolved once from the wire name, then used by BOTH the pre-dispatch
   //   validation and the dispatch itself, so the two can never disagree about
@@ -258,12 +291,8 @@ type
     //   would ship an empty success response instead of surfacing the bug
     function FinalizeResult(const aResult: variant;
       const aResultType: RawUtf8): variant;
-    /// stamp the mandatory result fields onto an already-serialized response
-    // - for responses produced OUTSIDE the normal dispatch (a streaming hook):
-    //   they must not be able to put a result on the wire without resultType
-    //   and serverInfo just because they bypassed CreateSuccessResponse
-    // - error responses and non-responses are returned unchanged
-    function FinalizeResponseJson(const aResponseJson: RawUtf8): RawUtf8;
+    // (a response produced outside the dispatch is finalized by
+    // TMcpServer.FinalizeHookResponse, which also knows the caching config)
     /// validate the per-request protocol metadata in `params._meta`
     // - since the protocol is stateless, EVERY request must carry its version
     //   and the client capabilities; there is no connection state to fall back on
@@ -341,11 +370,18 @@ type
     fProcessor: TMcpJsonRpcProcessor;
     fActive: boolean;
     fSafe: TLightLock;
+    fListCacheTtlMs: integer;
+    fReadCacheTtlMs: integer;
+    fListCacheScope: TMcpCacheScope;
+    fReadCacheScope: TMcpCacheScope;
     /// the actual preflight — hands the parsed request back so the dispatch
     // does not have to parse the very same body a second time
     function Preflight(const aRequestJson: RawUtf8; out aMethod: RawUtf8;
       out aParams, aRequestId: variant; out aErrorJson: RawUtf8;
       out aHttpStatus: integer): boolean;
+    /// stamp the mandatory caching hints onto a cacheable result
+    // - does nothing for the methods the spec does not list as cacheable
+    procedure AddCacheHints(var aResult: variant; aMethod: TMcpMethod);
     function ExecuteToolCall(const aParams: variant; const aAuthCtx: TMcpAuthContext): variant;
     function ExecuteResourceRead(const aParams: variant): variant;
     function ListTools: variant;
@@ -377,6 +413,13 @@ type
     // - runs PreflightRequest first, so no dispatch can ever happen on a
     //   request the protocol layer would reject
     function ExecuteRequest(const aRequestJson: RawUtf8): RawUtf8;
+    /// finalize a response produced OUTSIDE the dispatch (a streaming hook)
+    // - a hook answering e.g. tools/call replaces the handler, not the
+    //   protocol: its result still needs resultType, serverInfo and — when the
+    //   method is a cacheable one — the mandatory caching hints
+    // - aMethod is the JSON-RPC method of the request the hook answered
+    function FinalizeHookResponse(const aResponseJson,
+      aMethod: RawUtf8): RawUtf8;
     /// validate a request WITHOUT dispatching it
     // - checks the JSON-RPC envelope, the mandatory per-request _meta and
     //   whether the method exists at all — everything that decides the HTTP
@@ -396,6 +439,33 @@ type
     // errors themselves (e.g. a -32020 header mismatch, which is detected
     // before the body is ever dispatched)
     property Processor: TMcpJsonRpcProcessor read fProcessor;
+    /// freshness hint (ms) for server/discover, tools/list and resources/list
+    // - the spec REQUIRES a caching hint on those results; 0 (the default)
+    //   means "immediately stale", which is always correct, just not cheap
+    // - raise it only if the registry is effectively static for that long:
+    //   there is no invalidation signal until subscriptions/listen exists
+    property ListCacheTtlMs: integer
+      read fListCacheTtlMs write fListCacheTtlMs;
+    /// freshness hint (ms) for resources/read
+    // - separate from the list TTL because resource CONTENT usually changes on
+    //   a different timescale than the set of resources
+    property ReadCacheTtlMs: integer
+      read fReadCacheTtlMs write fReadCacheTtlMs;
+    /// who may cache server/discover, tools/list and resources/list
+    // - defaults to mcsPrivate because this server cannot know whether a host
+    //   application filters tools or resources per caller. Announcing public
+    //   lets a shared proxy replay one caller's list to another caller, across
+    //   authorization contexts — choose it only when every caller sees the same
+    //   answer. It is a caching hint either way, never an access control.
+    property ListCacheScope: TMcpCacheScope
+      read fListCacheScope write fListCacheScope;
+    /// who may cache resources/read
+    // - deliberately SEPARATE from ListCacheScope: a static tool list is a
+    //   reasonable candidate for public, while resource CONTENT is exactly what
+    //   the spec names as typically per-user. One shared knob would force an
+    //   operator who wants a cacheable tool list to publish resource bodies too.
+    property ReadCacheScope: TMcpCacheScope
+      read fReadCacheScope write fReadCacheScope;
   end;
 
 
@@ -666,23 +736,6 @@ begin
   result := variant(doc);
 end;
 
-function TMcpJsonRpcProcessor.FinalizeResponseJson(
-  const aResponseJson: RawUtf8): RawUtf8;
-var
-  doc: TDocVariantData;
-  idx: PtrInt;
-begin
-  result := aResponseJson;
-  if aResponseJson = '' then
-    exit; // a hook may legitimately answer nothing (notification-like)
-  doc.InitJson(aResponseJson, JSON_FAST);
-  idx := doc.GetValueIndex('result');
-  if idx < 0 then
-    exit; // an error response (or not a response at all) — leave it alone
-  doc.Values[idx] := FinalizeResult(doc.Values[idx], MCP_RESULT_COMPLETE);
-  result := doc.ToJson;
-end;
-
 function TMcpJsonRpcProcessor.ValidateRequestMeta(const aParams: variant;
   out aError: TMcpError): boolean;
 var
@@ -870,6 +923,49 @@ begin
   fTools := Collections.NewPlainKeyValue<RawUtf8, IMcpTool>;
   fResources := Collections.NewPlainKeyValue<RawUtf8, IMcpResource>;
   fActive := false;
+  fListCacheTtlMs := MCP_CACHE_TTL_DEFAULT;
+  fReadCacheTtlMs := MCP_CACHE_TTL_DEFAULT;
+  // never assume a shared cache is safe: both default to private
+  fListCacheScope := mcsPrivate;
+  fReadCacheScope := mcsPrivate;
+end;
+
+procedure TMcpServer.AddCacheHints(var aResult: variant; aMethod: TMcpMethod);
+var
+  doc: PDocVariantData;
+  ttl: integer;
+  scope: TMcpCacheScope;
+begin
+  // "Servers MUST include caching hints on results with resultType 'complete'
+  // returned by server/discover, tools/list, prompts/list, resources/list,
+  // resources/templates/list and resources/read." Deciding that here — in one
+  // place keyed on the method — keeps a new handler from silently omitting
+  // them, and keeps the list next to the spec sentence it implements.
+  // Read each setting exactly once into a local: a server reconfigured while
+  // requests are in flight then yields the old or the new value, never a mix.
+  case aMethod of
+    mcpDiscover,
+    mcpToolsList,
+    mcpResourcesList:
+      begin
+        ttl := fListCacheTtlMs;
+        scope := fListCacheScope;
+      end;
+    mcpResourcesRead:
+      begin
+        ttl := fReadCacheTtlMs;
+        scope := fReadCacheScope;
+      end;
+  else
+    exit; // tools/call is not cacheable: it has side effects
+  end;
+  if ttl < 0 then
+    ttl := 0; // spec: servers MUST provide a ttlMs >= 0
+  doc := _Safe(aResult);
+  if not doc^.IsObject then
+    exit; // FinalizeResult rejects that anyway, with a better message
+  doc^.AddOrUpdateValue('ttlMs', ttl);
+  doc^.AddOrUpdateValue('cacheScope', RawUtf8ToVariant(MCP_CACHE_SCOPE[scope]));
 end;
 
 destructor TMcpServer.Destroy;
@@ -1080,6 +1176,26 @@ begin
   result := variant(result_doc);
 end;
 
+function TMcpServer.FinalizeHookResponse(const aResponseJson,
+  aMethod: RawUtf8): RawUtf8;
+var
+  doc: TDocVariantData;
+  idx: PtrInt;
+  res: variant;
+begin
+  result := aResponseJson;
+  if aResponseJson = '' then
+    exit;
+  doc.InitJson(aResponseJson, JSON_FAST);
+  idx := doc.GetValueIndex('result');
+  if idx < 0 then
+    exit; // an error response — nothing to stamp
+  res := doc.Values[idx];
+  AddCacheHints(res, McpMethodFromName(aMethod));
+  doc.Values[idx] := fProcessor.FinalizeResult(res, MCP_RESULT_COMPLETE);
+  result := doc.ToJson;
+end;
+
 function TMcpServer.PreflightRequest(const aRequestJson: RawUtf8;
   out aErrorJson: RawUtf8; out aHttpStatus: integer): boolean;
 var
@@ -1199,7 +1315,11 @@ begin
     if isNotification then
       result := ''
     else
+    begin
+      // caching hints belong on the complete result, before it is finalized
+      AddCacheHints(resultData, McpMethodFromName(method));
       result := fProcessor.CreateSuccessResponse(requestId, resultData);
+    end;
 
   except
     // Catch EVERY exception (not just ESynException): tools may raise plain

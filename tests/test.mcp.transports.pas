@@ -1423,6 +1423,11 @@ begin
       'a hook result is stamped with resultType');
     Check(PosEx(MCP_META_SERVER_INFO, client.Content) > 0,
       'a hook result carries serverInfo');
+    // tools/list is a cacheable method: answering it through a hook does not
+    // exempt the response from the hints the spec requires on that result
+    Check(PosEx('"ttlMs"', client.Content) > 0, 'a hook result carries ttlMs');
+    Check(PosEx('"cacheScope"', client.Content) > 0,
+      'a hook result carries cacheScope');
 
     // 3. A hook that raises must not escape into the connection's OnRead: it
     // has no exception handler and would tear the worker down mid-stream.

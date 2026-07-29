@@ -87,6 +87,7 @@ type
     procedure RequestParamsMergeExistingMeta;
     procedure ResultMustBeAnObject;
     procedure PreflightDecidesHttpStatus;
+    procedure CacheableResultsCarryHints;
   end;
 
 implementation
@@ -677,6 +678,100 @@ begin
     errv := _Safe(rv)^.GetValueOrNull('error');
     Check(_Safe(errv)^.IsObject, 'error object');
     Check(VarIsVoid(_Safe(rv)^.GetValueOrNull('result')), 'no result on error');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.CacheableResultsCarryHints;
+var
+  server: TMcpServer;
+  rv, resv: variant;
+  rd: PDocVariantData;
+  tmp: RawUtf8;
+  ttl: Int64;
+
+  // read the hints off one result; aTtl < 0 asserts they are ABSENT
+  procedure CheckHints(const aRequest: RawUtf8; aTtl: integer;
+    const aScope, aWhat: RawUtf8);
+  begin
+    rv := _JsonFast(Exec(server, aRequest));
+    resv := _Safe(rv)^.GetValueOrNull('result');
+    rd := _Safe(resv);
+    if CheckFailed(rd^.IsObject, aWhat) then
+      exit;
+    if aTtl < 0 then
+    begin
+      Check(rd^.GetValueIndex('ttlMs') < 0, aWhat + ' must carry no ttlMs');
+      Check(rd^.GetValueIndex('cacheScope') < 0,
+        aWhat + ' must carry no cacheScope');
+      exit;
+    end;
+    Check(VariantToInt64(rd^.GetValueOrDefault('ttlMs', -1), ttl),
+      aWhat + ' has ttlMs');
+    CheckEqual(integer(ttl), aTtl, aWhat + ' ttlMs');
+    Check(rd^.GetAsRawUtf8('cacheScope', tmp), aWhat + ' has cacheScope');
+    CheckEqual(tmp, aScope, aWhat + ' cacheScope');
+  end;
+
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
+    server.RegisterResource(TVersionResource.Create('version://info', 'Version',
+      'Server version information', 'application/json'));
+    server.Start;
+
+    // The spec REQUIRES caching hints on exactly these four results (of the
+    // methods we implement); a client that gets none must assume ttl 0 anyway,
+    // but "MUST include" is not satisfied by omission.
+    // Defaults are deliberately conservative: never reuse, never share.
+    CheckEqual(server.ListCacheTtlMs, MCP_CACHE_TTL_DEFAULT, 'default list ttl');
+    CheckEqual(MCP_CACHE_SCOPE[server.ListCacheScope], MCP_CACHE_SCOPE[mcsPrivate],
+      'default scope is private: this server cannot know whether the host '  +
+      'filters per caller, and public crosses authorization contexts');
+    CheckHints('{"jsonrpc":"2.0","id":1,"method":"server/discover"}',
+      0, MCP_CACHE_SCOPE[mcsPrivate], 'server/discover');
+    CheckHints('{"jsonrpc":"2.0","id":2,"method":"tools/list"}',
+      0, MCP_CACHE_SCOPE[mcsPrivate], 'tools/list');
+    CheckHints('{"jsonrpc":"2.0","id":3,"method":"resources/list"}',
+      0, MCP_CACHE_SCOPE[mcsPrivate], 'resources/list');
+    CheckHints('{"jsonrpc":"2.0","id":4,"method":"resources/read",' +
+      '"params":{"uri":"version://info"}}', 0, MCP_CACHE_SCOPE[mcsPrivate],
+      'resources/read');
+
+    // tools/call has side effects and is NOT in the cacheable list
+    CheckHints('{"jsonrpc":"2.0","id":5,"method":"tools/call","params":' +
+      '{"name":"calc","arguments":{"A":1,"B":2}}}', -1, '', 'tools/call');
+
+    // configured values reach the wire, and list vs read are independent
+    server.ListCacheTtlMs := 300000;
+    server.ReadCacheTtlMs := 60000;
+    server.ListCacheScope := mcsPublic;
+    server.ReadCacheScope := mcsPublic;
+    CheckHints('{"jsonrpc":"2.0","id":6,"method":"tools/list"}',
+      300000, MCP_CACHE_SCOPE[mcsPublic], 'configured tools/list');
+    CheckHints('{"jsonrpc":"2.0","id":7,"method":"resources/read",' +
+      '"params":{"uri":"version://info"}}', 60000, MCP_CACHE_SCOPE[mcsPublic],
+      'configured resources/read');
+
+    // The two scopes are independent ON PURPOSE: publishing a static tool list
+    // must not drag resource CONTENT into shared proxy caches, which is exactly
+    // what the spec calls out as typically per-user. A single knob would force
+    // that trade-off on the operator.
+    server.ReadCacheScope := mcsPrivate;
+    CheckHints('{"jsonrpc":"2.0","id":8,"method":"tools/list"}',
+      300000, MCP_CACHE_SCOPE[mcsPublic], 'list stays public');
+    CheckHints('{"jsonrpc":"2.0","id":9,"method":"resources/read",' +
+      '"params":{"uri":"version://info"}}', 60000, MCP_CACHE_SCOPE[mcsPrivate],
+      'read can stay private while the list is public');
+
+    // a negative TTL would be a spec violation on the wire ("servers MUST
+    // provide a ttlMs value that is >= 0"), so it is clamped, not forwarded
+    server.ListCacheTtlMs := -1;
+    CheckHints('{"jsonrpc":"2.0","id":10,"method":"tools/list"}',
+      0, MCP_CACHE_SCOPE[mcsPublic], 'negative ttl is clamped');
   finally
     server.Free;
   end;
