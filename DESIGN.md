@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**402 Assertions** MCP-Suite + **272 Assertions** LLM-Suite. Offen ist die
+**483 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -79,11 +79,45 @@ Konsequenzen, die die ganze Implementierung prägen:
   Speicher wachsen zu lassen. `Stop` bricht alle Streams ab, **bevor** es den
   HTTP-Server herunterfährt: dessen Shutdown wartet nur begrenzt auf Worker und
   räumt danach zwangsweise ab.
+- **MRTR (Multi Round-Trip Requests)** ersetzt die server-initiierten Requests der
+  alten Revisionen: braucht ein Handler mehr Input, wirft er `EMcpInputRequired`
+  und der Server antwortet mit `resultType: "input_required"` samt `inputRequests`
+  (Map server-vergebener Keys → `elicitation/create`/`sampling/createMessage`/
+  `roots/list`) und/oder `requestState`. Der Client sammelt den Input und **wiederholt
+  den Original-Request** mit `inputResponses` + `requestState` — beides liegt direkt
+  in `params`, **nicht** in `_meta`. Handler nehmen die Retry-Felder über
+  `IMcpInteractiveTool`/`IMcpInteractiveResource` entgegen (optional; wer sie nicht
+  implementiert, wird unverändert über `Execute`/`Read` gerufen).
+  Der Server erzwingt zentral, was die Spec dem Server verbietet: nur auf
+  `tools/call`/`resources/read`, mindestens eines von `inputRequests`/`requestState`,
+  nur die drei erlaubten Request-Methoden, und **keine** Anforderung einer Capability,
+  die der Client nicht deklariert hat. Deren Fehlen ergibt `-32021` **mit
+  `data.requiredCapabilities`** (die Spec fordert die Liste ausdrücklich — eine
+  Freitext-Meldung kann ein Client nicht auswerten) und **HTTP 400**. Dieser Status
+  ist der einzige, den der Preflight **nicht** entscheiden kann: ob eine Capability
+  gebraucht wird, zeigt sich erst im Handler. Deshalb führt der Streamable-Transport
+  einen Request **ohne** `OnStreamCall`-Hook erst aus und legt den Status danach fest
+  (`McpHttpStatus`); nur mit Hook muss der SSE-Kopf vorher raus, weil der Hook
+  Zwischenevents senden darf.
+  Ein Interim-Result trägt **keine** Caching-Hints (die Spec fordert sie nur auf
+  `complete`), und ein Retry wird nie als `public`/wiederverwendbar markiert — die
+  Antwort ist per Definition von genau diesem Aufrufer geprägt. Maßgeblich ist die
+  **Anwesenheit** der Retry-Felder, nicht ihr Inhalt: `VarIsVoid()` hält ein leeres
+  Objekt für leer, eine Wert-Prüfung ließe `inputResponses:{}` als teilbar durch.
+  Beide Felder sind typgeprüft (`-32602`) — ein `requestState` als Zahl würde sonst
+  stillschweigend zu einem String, den dieser Server nie ausgegeben hat.
+  `requestState` ist **attacker-controlled**: der Server reicht ihn roh durch (nur
+  der Handler weiß, was er kodiert hat) und bietet dafür `TMcpRequestStateCodec` —
+  HMAC-SHA256 über eine Payload, die Principal, Request-Bindung und Deadline
+  mitsigniert, also genau die drei Replay-Abwehren, die die Spec verlangt.
 - **Validierung entscheidet den HTTP-Status, und zwar bevor gestreamt wird**:
   `PreflightRequest` prüft Envelope, `_meta` und Methodenexistenz. Abgelehnte
   Anfragen gehen als gepuffertes JSON mit **400** (bzw. **404** für `-32601`) raus,
-  niemals als SSE-Stream — dessen Kopf steht vor dem Ergebnis fest und wäre immer
-  `200`. Ein `OnStreamCall`-Hook sieht deshalb nur bereits validierte Anfragen.
+  niemals als SSE-Stream. Ein `OnStreamCall`-Hook sieht deshalb nur bereits
+  validierte Anfragen. Was der Preflight nicht wissen kann (`-32021`, s. o.),
+  entscheidet `McpHttpStatus` an der fertigen Antwort — der SSE-Kopf geht ohne Hook
+  erst danach raus. **Mit** Hook bleibt es bei `200`, weil der Hook vorher
+  Zwischenevents senden darf; das ist der bewusste Preis des Streamings.
 - Streamable HTTP: **nur POST** (GET/DELETE → 405), kein Batching, keine
   Resumability (`Last-Event-ID`), keine `Mcp-Session-Id`; die Standard-Header
   `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` sind Pflicht und werden gegen den
@@ -128,9 +162,9 @@ Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
 Die Tests nutzen mORMots **`TSynTests`** (nicht FPCUnit) — passend zum
 Contribution-Ziel. Zwei Runner:
 - `tests/mcp.tests.lpr` — MCP-Suite (Core + Transporte + Streamable),
-  **402 Assertions** grün; `scripts/run-fpc-tests.sh`.
+  **483 Assertions** grün; `scripts/run-fpc-tests.sh`.
 - `tests/llm.tests.lpr` — LLM-Suite (SSE, Client, Agent, Agent-MCP, **Anthropic**,
-  Structured, RAG, RAG-Tool, Vision), **272 Assertions** grün;
+  Structured, RAG, RAG-Tool, Vision), **273 Assertions** grün;
   `scripts/run-fpc-llm-tests.sh`.
 
 Neue Tests im passenden Runner ergänzen.
@@ -146,7 +180,7 @@ Neue Tests im passenden Runner ergänzen.
   oben. (Zwischenstand 2025-11-25 mit Versions-Negotiation ist damit überholt.)
 - **Phase D** ✓ — Clean-Room LLM-Client (`mormot.ai.llm.*`): Provider-Treiber +
   Agent-/Tool-Calling-Loop + Embeddings/RAG + zweiter Provider (Anthropic) +
-  Vision. Komplett gebaut, review-gehärtet, **272 Assertions** grün
+  Vision. Komplett gebaut, review-gehärtet, **273 Assertions** grün
   (`llm.tests.lpr`); Streaming/Tool-Loop/RAG/Vision live verifiziert. Details unten.
 - **Phase E** (offen) — Schichtung/Merge/Backend-Bindung, siehe
   **[CONCEPT.md](CONCEPT.md)** (Single Source of Truth für die offenen Punkte) und
@@ -167,7 +201,7 @@ Neue Tests im passenden Runner ergänzen.
   - **Callback = Methoden-Pointer (`of object`)**, NICHT `reference to`/Closures —
     FPC 3.2.2 kennt die Modeswitches `functionreferences`/`anonymousfunctions`
     nicht (erst 3.3.1).
-  - **Stand**: vollständig gebaut + review-gehärtet, **272 Assertions** grün
+  - **Stand**: vollständig gebaut + review-gehärtet, **273 Assertions** grün
     (`llm.tests`, `scripts/run-fpc-llm-tests.sh`). Bausteine:
     - `mormot.ai.llm.types` — provider-neutrale Records.
     - `mormot.ai.llm.sse` — `TLlmSseStream` (Streaming-Parser; whole/1-byte/tool-call).
@@ -284,12 +318,12 @@ Neue Tests im passenden Runner ergänzen.
        deckt jetzt `ConcurrentPosts` ab (4 parallele Clients + Keep-Alive-Reuse).
        Offen bleiben TVec0Store/lembed-Realtests + RAG-Atomar-Rollback (brauchen die
        sqlite-vec-Runtime).
-    7. **MCP-Features nach Phase 1+2**: `CacheableResult`
-       (`ttlMs`/`cacheScope`), `x-mcp-header`, MRTR (`InputRequiredResult`,
-       `resultType:input_required`), Extensions-Framework, JSON Schema 2020-12 im
-       `inputSchema`, OTel-`_meta`-Keys. `MCP_ERROR_MISSING_CLIENT_CAPABILITY`
-       (`-32021`) ist dafür bereits vorgesehen, wird aber erst mit MRTR ausgelöst —
-       heute verlangt kein Pfad eine Client-Capability.
+    7. **MCP-Features nach Phase 1+2**: `CacheableResult` (`ttlMs`/`cacheScope`),
+       `subscriptions/listen` und **MRTR** sind **gebaut** (siehe Protokoll-Abschnitt
+       oben); `-32021` wird jetzt vom MRTR-Capability-Gate ausgelöst. Offen bleiben
+       `x-mcp-header`, Extensions-Framework, JSON Schema 2020-12 im `inputSchema`,
+       OTel-`_meta`-Keys, deterministische `tools/list`-Reihenfolge (SHOULD) sowie
+       Prompts/Completion/Pagination/Auth.
 
 ### Review-Härtung (kritischer Review, behoben — Build + Tests grün)
 
@@ -348,6 +382,36 @@ Multi-Angle-Review des Umbaus (5 Claude-Angles + Codex als modellfremder Zweitle
   `build-demo.sh` und wurde nie gebaut.
 - **Delphi-Artefakte entfernt**: `.dproj`/`.groupproj` gelöscht (die Projektgruppe
   referenzierte noch die gelöschte SSE-Demo), `.dpr` → `.lpr`. Das Repo ist FPC-only.
+
+### Review-Härtung Runde 3 (MRTR, MCP **483** Assertions grün)
+
+Zwei Claude-Angles + Codex auf den MRTR-Diff. Der Kern-Befund zieht sich durch alle drei:
+**alles, was der Preflight nicht entscheiden kann, war unbehandelt geblieben.**
+
+- **`-32021` kam als HTTP 200** und **ohne `data.requiredCapabilities`** — beides
+  MUSS-Regeln. Es ist der einzige Statusfall, den der Preflight nicht sehen kann (ob eine
+  Capability fehlt, zeigt erst der Handler). Neu leitet `McpHttpStatus` den Status aus der
+  **fertigen Antwort** ab; der Streamable-Transport führt ohne Hook deshalb erst aus und
+  schreibt den Kopf danach, der einfache HTTP-Transport setzt den Status ebenso.
+- **`OnStreamCall` umging die MRTR-Regeln** — dieselbe Klasse wie in Runde 2, zum dritten
+  Mal: `FinalizeHookResponse` stempelte hart `complete` (ein Hook konnte also gar keinen
+  Round Trip beantworten: der Client bekäme ein „fertiges" Result mit `requestState`, das
+  er nie ansieht) und kannte die Retry-Felder nicht. Es bekommt jetzt den **Request-Body**
+  statt nur des Methodennamens und leitet beides selbst ab.
+- **`VarIsVoid` hält ein leeres Objekt für leer**: `inputResponses: {}` galt damit als
+  „nicht vorhanden" und die personalisierte Antwort wäre als `public` cachebar gewesen.
+  Jetzt entscheidet die **Anwesenheit** des Feldes (`HasInputResponses`/`HasRequestState`).
+- **Retry-Felder ohne Typprüfung**: `requestState: 42` wurde stillschweigend zu `"42"`.
+  Beide Felder sind jetzt typgeprüft (`-32602`).
+- **`inputRequests` als Array rutschte als „requestState-only" durch** und wurde still
+  verworfen → der Client hätte ewig ohne den erwarteten Input wiederholt. Nur ein
+  wirklich abwesender Wert zählt jetzt als abwesend.
+- **`McpInputRequest` akzeptierte `params: null`** — der Server hätte eine Nachricht
+  erzeugt, die sein eigener Parser ablehnt.
+- **Eigener Folgefehler**: die Typprüfung machte `CallContext` werfend, das aber
+  **außerhalb** des `try` in `ExecuteRequest` stand — die Exception wäre in den
+  HTTP-Worker entkommen. (Angle A hatte die Stelle als Beobachtung notiert und mangels
+  Wurf-Pfad verworfen; der Fix hat genau diesen Pfad geschaffen.)
 
 ## Lizenz / Veröffentlichung
 

@@ -55,6 +55,30 @@ type
       const aAuthCtx: TMcpAuthContext): variant; override;
   end;
 
+  /// a tool doing a Multi Round-Trip Request: it asks for a name on the first
+  /// round and completes once the client hands one back
+  TElicitingTool = class(TMcpToolBase<TCalcParams>, IMcpInteractiveTool)
+  protected
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  public
+    /// what the tool asks for; the tests vary it to exercise the server gate
+    InputMethod: RawUtf8;
+    /// set when the second round really saw the client's answers
+    SawResponses: RawUtf8;
+    function ExecuteInteractive(const Args: variant;
+      const Context: TMcpCallContext): variant;
+  end;
+
+  /// a resource that always needs input — resources/read is the second method
+  /// the spec allows an InputRequiredResult on
+  TGatedResource = class(TMcpResourceBase, IMcpInteractiveResource)
+  protected
+    function GetContent: RawUtf8; override;
+  public
+    function ReadInteractive(const Context: TMcpCallContext): RawUtf8;
+  end;
+
   TTestMcpCore = class(TSynTestCase)
   protected
     procedure EnsureCalcParamsRtti;
@@ -71,6 +95,11 @@ type
     //   passed through untouched so the negative tests still exercise the
     //   parser and the notification path
     function Exec(aServer: TMcpServer; const aJson: RawUtf8): RawUtf8;
+    /// like Exec, but with client capabilities the caller chooses
+    // - Exec goes through McpRequestParams, which declares NO capabilities; the
+    //   MRTR gate is precisely about what the client did or did not declare
+    function ExecCaps(aServer: TMcpServer; const aJson: RawUtf8;
+      const aCapabilities: variant): RawUtf8;
   published
     procedure SchemaFromRecord;
     procedure JsonRpcProcessor;
@@ -89,6 +118,11 @@ type
     procedure PreflightDecidesHttpStatus;
     procedure CacheableResultsCarryHints;
     procedure SubscriptionFilterAndFanout;
+    procedure InputRequiredRoundTrip;
+    procedure InputRequiredNeedsClientCapability;
+    procedure InputRequiredRejectsMalformedResults;
+    procedure MrtrRetryFieldsAreTypedAndCountAsPresent;
+    procedure RequestStateCodecBindsAndExpires;
   end;
 
 implementation
@@ -131,6 +165,63 @@ function TArrayResultTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
 begin
   result := _ArrFast(['not', 'an', 'object']);
+end;
+
+{ TElicitingTool }
+
+function TElicitingTool.ExecuteTyped(const aParams: TCalcParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  // never reached: the server prefers ExecuteInteractive on this tool
+  raise Exception.Create('ExecuteTyped must not be called on an interactive tool');
+end;
+
+function TElicitingTool.ExecuteInteractive(const Args: variant;
+  const Context: TMcpCallContext): variant;
+var
+  answers, who, content: PDocVariantData;
+  name: RawUtf8;
+  builder: TMcpResponseBuilder;
+begin
+  // the value under our own key is an ElicitResult: {action, content{…}}
+  answers := _Safe(Context.InputResponses);
+  if not answers^.GetAsDocVariant('who', who) or
+     not who^.GetAsDocVariant('content', content) or
+     not content^.GetAsRawUtf8('name', name) then
+  begin
+    // first round: nothing to work with yet. The state carries what we already
+    // know, so this handler keeps nothing server-side between the rounds.
+    SawResponses := '';
+    raise EMcpInputRequired.Create(
+      _ObjFast(['who', McpInputRequest(InputMethod, _ObjFast([
+        'mode', 'form',
+        'message', 'Who is asking?']))]),
+      'round-1-state');
+  end;
+  SawResponses := name;
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText('hello ' + name + ' (' + Context.RequestState + ')');
+    result := builder.Build;
+  finally
+    builder.Free;
+  end;
+end;
+
+{ TGatedResource }
+
+function TGatedResource.GetContent: RawUtf8;
+begin
+  result := '{"gated":true}';
+end;
+
+function TGatedResource.ReadInteractive(const Context: TMcpCallContext): RawUtf8;
+begin
+  if Context.RequestState = '' then
+    // requestState only, no inputRequests: the spec allows that shape, and it
+    // means "retry immediately, carrying this back"
+    raise EMcpInputRequired.Create(Null, 'resource-state');
+  result := '{"gated":false,"state":"' + Context.RequestState + '"}';
 end;
 
 { TTestMcpCore }
@@ -1031,6 +1122,427 @@ begin
   finally
     server.Free;
   end;
+end;
+
+function TTestMcpCore.ExecCaps(aServer: TMcpServer; const aJson: RawUtf8;
+  const aCapabilities: variant): RawUtf8;
+var
+  doc, params, meta: TDocVariantData;
+  src: PDocVariantData;
+  i: PtrInt;
+begin
+  doc.InitJson(aJson, JSON_FAST);
+  // Build a FRESH params document instead of writing through the pointer
+  // GetAsDocVariant hands back: that pointer aliases doc's own storage, so
+  // storing it back under 'params' frees the value while the copy source still
+  // points at it. Same rule as McpRequestParams, for the same reason.
+  params.InitObject([], JSON_FAST);
+  if doc.GetAsDocVariant('params', src) and src^.IsObject then
+    for i := 0 to src^.Count - 1 do
+      if src^.Names[i] <> '_meta' then
+        params.AddValue(src^.Names[i], src^.Values[i]);
+  meta.InitObject([
+    MCP_META_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION,
+    MCP_META_CLIENT_CAPABILITIES, aCapabilities], JSON_FAST);
+  params.AddValue('_meta', variant(meta));
+  doc.AddOrUpdateValue('params', variant(params));
+  result := aServer.ExecuteRequest(doc.ToJson);
+end;
+
+procedure TTestMcpCore.InputRequiredRoundTrip;
+var
+  server: TMcpServer;
+  tool: TElicitingTool;
+  rv, resv: variant;
+  rd, requests, entry: PDocVariantData;
+  tmp: RawUtf8;
+  caps: variant;
+begin
+  EnsureCalcParamsRtti;
+  caps := _ObjFast(['elicitation', _ObjFast([])]);
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    tool := TElicitingTool.Create('greet', 'Greet the caller');
+    tool.InputMethod := MCP_INPUT_ELICITATION;
+    server.RegisterTool(tool);
+    server.RegisterResource(TGatedResource.Create('gate://one', 'Gate',
+      'Needs a round trip', 'application/json'));
+    // a read that WOULD be cacheable, to prove the retry is not
+    server.ReadCacheTtlMs := 60000;
+    server.ReadCacheScope := mcsPublic;
+    server.Start;
+
+    // --- round 1: the tool has nothing to work with and asks -----------------
+    rv := _JsonFast(ExecCaps(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":' +
+      '{"name":"greet","arguments":{}}}', caps));
+    resv := _Safe(rv)^.GetValueOrNull('result');
+    rd := _Safe(resv);
+    if CheckFailed(rd^.IsObject, 'round 1 is a result, not an error') then
+      exit;
+    Check(rd^.GetAsRawUtf8('resultType', tmp), 'round 1 has resultType');
+    CheckEqual(tmp, MCP_RESULT_INPUT_REQUIRED, 'round 1 resultType');
+    Check(rd^.GetAsRawUtf8('requestState', tmp), 'round 1 carries requestState');
+    CheckEqual(tmp, 'round-1-state', 'requestState reaches the client verbatim');
+    if not CheckFailed(rd^.GetAsDocVariant('inputRequests', requests),
+         'round 1 carries inputRequests') then
+    begin
+      CheckEqual(requests^.Count, 1, 'one input request');
+      CheckEqual(requests^.Names[0], 'who', 'server-assigned identifier');
+      if not CheckFailed(_Safe(requests^.Values[0], entry), 'request object') then
+      begin
+        Check(entry^.GetAsRawUtf8('method', tmp), 'input request has a method');
+        CheckEqual(tmp, MCP_INPUT_ELICITATION, 'input request method');
+      end;
+    end;
+    // An interim result is NOT a completed one, and the caching sentence of the
+    // spec is scoped to resultType 'complete'. Hints here would tell a proxy to
+    // replay "I need input" — the client would then loop on its own cache.
+    Check(rd^.GetValueIndex('ttlMs') < 0, 'no ttlMs on an interim result');
+    Check(rd^.GetValueIndex('cacheScope') < 0, 'no cacheScope on an interim result');
+    CheckEqual(tool.SawResponses, '', 'round 1 saw no answers');
+
+    // --- round 2: the client answers and echoes the state back ---------------
+    // note the different id: "The JSON-RPC id MUST be different between the
+    // initial request and the retry, as they are independent requests."
+    rv := _JsonFast(ExecCaps(server,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":' +
+      '{"name":"greet","arguments":{},"requestState":"round-1-state",' +
+      '"inputResponses":{"who":{"action":"accept","content":{"name":"octocat"}}}}}',
+      caps));
+    resv := _Safe(rv)^.GetValueOrNull('result');
+    rd := _Safe(resv);
+    if CheckFailed(rd^.IsObject, 'round 2 is a result') then
+      exit;
+    Check(rd^.GetAsRawUtf8('resultType', tmp), 'round 2 has resultType');
+    CheckEqual(tmp, MCP_RESULT_COMPLETE, 'round 2 completes');
+    CheckEqual(tool.SawResponses, 'octocat',
+      'the handler received the client answers, keyed by its own identifier');
+    Check(PosEx('round-1-state', VariantSaveJson(resv)) > 0,
+      'the handler also received the state it issued');
+
+    // --- resources/read: the requestState-only shape, and its cacheability ---
+    rv := _JsonFast(ExecCaps(server,
+      '{"jsonrpc":"2.0","id":3,"method":"resources/read",' +
+      '"params":{"uri":"gate://one"}}', caps));
+    rd := _Safe(_Safe(rv)^.GetValueOrNull('result'));
+    Check(rd^.GetAsRawUtf8('resultType', tmp), 'gated read has resultType');
+    CheckEqual(tmp, MCP_RESULT_INPUT_REQUIRED, 'gated read asks for a retry');
+    Check(rd^.GetValueIndex('inputRequests') < 0,
+      'a requestState-only result omits inputRequests rather than sending {}');
+    Check(rd^.GetAsRawUtf8('requestState', tmp), 'gated read carries state');
+
+    rv := _JsonFast(ExecCaps(server,
+      '{"jsonrpc":"2.0","id":4,"method":"resources/read",' +
+      '"params":{"uri":"gate://one","requestState":"resource-state"}}', caps));
+    rd := _Safe(_Safe(rv)^.GetValueOrNull('result'));
+    Check(rd^.GetAsRawUtf8('resultType', tmp), 'retried read has resultType');
+    CheckEqual(tmp, MCP_RESULT_COMPLETE, 'retried read completes');
+    // The server is configured for a shareable read cache, yet this particular
+    // answer was shaped by one caller's round trip: handing a proxy `public`
+    // on it is the cross-authorization-context replay the spec warns about.
+    Check(rd^.GetAsRawUtf8('cacheScope', tmp), 'retried read has cacheScope');
+    CheckEqual(tmp, MCP_CACHE_SCOPE[mcsPrivate],
+      'an MRTR retry is never shareable, whatever the server was configured for');
+    CheckEqual(VariantToIntegerDef(rd^.GetValueOrDefault('ttlMs', -1), -1), 0,
+      'an MRTR retry is never reusable either');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.InputRequiredNeedsClientCapability;
+var
+  server: TMcpServer;
+  tool: TElicitingTool;
+  response: RawUtf8;
+  rv: variant;
+  data, required: PDocVariantData;
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    tool := TElicitingTool.Create('greet', 'Greet the caller');
+    tool.InputMethod := MCP_INPUT_ELICITATION;
+    server.RegisterTool(tool);
+    server.Start;
+
+    // "Servers MUST NOT send an inputRequests that the client has not declared
+    // support for in its capabilities." The client here declared none at all,
+    // so the elicitation request must never reach the wire — -32021 is the code
+    // the spec reserved for exactly this.
+    response := ExecCaps(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":' +
+      '{"name":"greet","arguments":{}}}', _ObjFast([]));
+    CheckErrorResponse(response, MCP_ERROR_MISSING_CLIENT_CAPABILITY,
+      'elicitation');
+    // "the server MUST return a MissingRequiredClientCapabilityError (-32021)
+    // whose data.requiredCapabilities lists the missing capabilities" — the
+    // free-text message is for humans; only this field lets a client fix itself.
+    rv := _JsonFast(response);
+    if not CheckFailed(_Safe(_Safe(rv)^.GetValueOrNull('error'))^.
+         GetAsDocVariant('data', data), '-32021 carries data') then
+      if not CheckFailed(data^.GetAsArray('requiredCapabilities', required),
+           'data.requiredCapabilities is present') then
+      begin
+        CheckEqual(required^.Count, 1, 'one missing capability');
+        CheckEqual(VariantToUtf8(required^.Values[0]), 'elicitation',
+          'and it names the one the client must add');
+      end;
+    // the status a transport MUST send for it: "On HTTP, the response status
+    // MUST be 400 Bad Request". It cannot be decided before the handler ran,
+    // so it is derived from the finished response.
+    CheckEqual(McpHttpStatus(response), 400, '-32021 is an HTTP 400');
+    CheckEqual(McpHttpStatus('{"jsonrpc":"2.0","id":1,"result":{}}'), 200,
+      'an ordinary result is 200');
+    CheckEqual(McpHttpStatus(''), 200, 'a notification leaves the status alone');
+
+    // a client declaring a DIFFERENT capability is still missing this one
+    CheckErrorResponse(ExecCaps(server,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":' +
+      '{"name":"greet","arguments":{}}}',
+      _ObjFast(['sampling', _ObjFast([])])),
+      MCP_ERROR_MISSING_CLIENT_CAPABILITY, 'elicitation');
+
+    // the same tool asking for sampling now goes through, since that IS declared
+    tool.InputMethod := MCP_INPUT_SAMPLING;
+    Check(PosEx('"resultType":"input_required"', ExecCaps(server,
+      '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":' +
+      '{"name":"greet","arguments":{}}}',
+      _ObjFast(['sampling', _ObjFast([])]))) > 0,
+      'a declared capability lets the input request through');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.InputRequiredRejectsMalformedResults;
+var
+  server: TMcpServer;
+  tool: TElicitingTool;
+  caps: variant;
+  raised: boolean;
+begin
+  EnsureCalcParamsRtti;
+  caps := _ObjFast(['elicitation', _ObjFast([]), 'roots', _ObjFast([])]);
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    tool := TElicitingTool.Create('greet', 'Greet the caller');
+    tool.InputMethod := MCP_INPUT_ELICITATION;
+    server.RegisterTool(tool);
+    server.Start;
+
+    // A typo in the method name must fail where it is written, not ship a
+    // request object no client can dispatch.
+    raised := false;
+    try
+      McpInputRequest('elicitation/created', _ObjFast([]));
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'McpInputRequest rejects a method outside the allowed three');
+
+    // Neither field set: "Servers MUST include at least one of inputRequests or
+    // requestState in every InputRequiredResult" — a client receiving neither
+    // could only retry the identical request, forever. Our own handler is at
+    // fault, so it surfaces as an internal error, not as a malformed result.
+    raised := false;
+    try
+      server.ValidateInputRequests(Null, '', mcpToolsCall, caps);
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'an empty InputRequiredResult is rejected');
+
+    // The spec lists exactly three methods that may answer with an
+    // InputRequiredResult; tools/list is not one of them.
+    raised := false;
+    try
+      server.ValidateInputRequests(
+        _ObjFast(['who', McpInputRequest(MCP_INPUT_ROOTS, _ObjFast([]))]),
+        '', mcpToolsList, caps);
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'tools/list may not answer with an InputRequiredResult');
+
+    // A present-but-wrong-shaped inputRequests must NOT be silently treated as
+    // "requestState-only": it would be dropped from the result and the client
+    // would retry without the input the handler is waiting for — a round trip
+    // that never terminates, instead of a defect anybody notices.
+    raised := false;
+    try
+      server.ValidateInputRequests(_ArrFast(['not', 'a', 'map']),
+        'some-state', mcpToolsCall, caps);
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'an inputRequests that is not an object is rejected, even '  +
+      'when a requestState would have carried the result on its own');
+
+    // params of a server-to-client request is an object; null would produce a
+    // message this server's own parser rejects
+    raised := false;
+    try
+      McpInputRequest(MCP_INPUT_ELICITATION, Null);
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'McpInputRequest rejects non-object params');
+
+    // a well-formed one on an allowed method passes
+    server.ValidateInputRequests(
+      _ObjFast(['who', McpInputRequest(MCP_INPUT_ROOTS, _ObjFast([]))]),
+      '', mcpResourcesRead, caps);
+    Check(true, 'a valid InputRequiredResult passes the gate');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.MrtrRetryFieldsAreTypedAndCountAsPresent;
+var
+  server: TMcpServer;
+  rv: variant;
+  rd: PDocVariantData;
+  tmp: RawUtf8;
+  caps: variant;
+
+  // read the cacheScope off a resources/read answer
+  function ScopeOf(const aParams: RawUtf8): RawUtf8;
+  begin
+    rv := _JsonFast(ExecCaps(server, '{"jsonrpc":"2.0","id":1,' +
+      '"method":"resources/read","params":' + aParams + '}', caps));
+    rd := _Safe(_Safe(rv)^.GetValueOrNull('result'));
+    result := '';
+    rd^.GetAsRawUtf8('cacheScope', result);
+  end;
+
+begin
+  caps := _ObjFast([]);
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterResource(TVersionResource.Create('version://info', 'Version',
+      'Server version information', 'application/json'));
+    server.ReadCacheTtlMs := 60000;
+    server.ReadCacheScope := mcsPublic;
+    server.Start;
+
+    // baseline: a plain read really is shareable with this configuration
+    CheckEqual(ScopeOf('{"uri":"version://info"}'), MCP_CACHE_SCOPE[mcsPublic],
+      'a plain read follows the configured cache scope');
+
+    // PRESENCE decides, not content. VarIsVoid() treats an EMPTY object as
+    // void, so testing the value would let this exact request through as
+    // shareable — and a proxy could then replay one caller's round-trip answer
+    // to everyone else.
+    CheckEqual(ScopeOf('{"uri":"version://info","inputResponses":{}}'),
+      MCP_CACHE_SCOPE[mcsPrivate],
+      'an empty inputResponses is still a retry, and still personal');
+    CheckEqual(ScopeOf('{"uri":"version://info","requestState":""}'),
+      MCP_CACHE_SCOPE[mcsPrivate],
+      'an empty requestState is present, not absent');
+
+    // Both fields are typed on the wire. Accepting a number as requestState
+    // would stringify it and hand a handler a state this server never issued.
+    CheckErrorResponse(ExecCaps(server, '{"jsonrpc":"2.0","id":2,' +
+      '"method":"resources/read","params":{"uri":"version://info",' +
+      '"requestState":42}}', caps), JSONRPC_INVALID_PARAMS, 'requestState');
+    CheckErrorResponse(ExecCaps(server, '{"jsonrpc":"2.0","id":3,' +
+      '"method":"resources/read","params":{"uri":"version://info",' +
+      '"inputResponses":["nope"]}}', caps),
+      JSONRPC_INVALID_PARAMS, 'inputResponses');
+
+    // Retry fields on a method that cannot take part in a round trip are
+    // meaningless — they must not quietly degrade that method's cacheability.
+    rv := _JsonFast(ExecCaps(server, '{"jsonrpc":"2.0","id":4,' +
+      '"method":"tools/list","params":{"requestState":"stray"}}', caps));
+    rd := _Safe(_Safe(rv)^.GetValueOrNull('result'));
+    Check(rd^.GetAsRawUtf8('cacheScope', tmp), 'tools/list still has a scope');
+    CheckEqual(tmp, MCP_CACHE_SCOPE[server.ListCacheScope],
+      'a stray requestState on tools/list changes nothing');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.RequestStateCodecBindsAndExpires;
+var
+  codec, other: TMcpRequestStateCodec;
+  blob, tampered: RawUtf8;
+  state: variant;
+  dot: PtrInt;
+  weak: boolean;
+begin
+  codec := TMcpRequestStateCodec.Create('0123456789abcdef0123456789abcdef');
+  try
+    blob := codec.Encode(_ObjFast(['step', 1]), 'user-42',
+      'tools/call:greet');
+
+    // the happy path: same principal, same request, inside the TTL
+    Check(codec.Decode(blob, 'user-42', 'tools/call:greet', state),
+      'a freshly issued state verifies');
+    CheckEqual(VariantToIntegerDef(_Safe(state)^.GetValueOrDefault('step', 0), 0),
+      1, 'the handler gets its own state back');
+
+    // "servers MUST treat requestState as an attacker-controlled input" — the
+    // three replay defences the spec asks for, each on its own:
+    Check(not codec.Decode(blob, 'user-43', 'tools/call:greet', state),
+      'state presented by a different principal is rejected');
+    Check(not codec.Decode(blob, 'user-42', 'tools/call:other', state),
+      'state presented on a different request is rejected');
+
+    // flipping a single payload byte must break the signature. The payload is
+    // the part before the dot; corrupting the last character of it is enough.
+    dot := PosExChar('.', blob);
+    tampered := copy(blob, 1, dot - 2) + 'X' + copy(blob, dot - 1, maxInt);
+    Check(not codec.Decode(tampered, 'user-42', 'tools/call:greet', state),
+      'a tampered payload fails verification');
+    Check(not codec.Decode(copy(blob, 1, dot - 1), 'user-42',
+      'tools/call:greet', state), 'a blob without a signature is rejected');
+    Check(not codec.Decode('', 'user-42', 'tools/call:greet', state),
+      'an empty blob is rejected');
+
+    // a state signed with someone else's secret is not ours, however
+    // well-formed it looks — this is the cross-server forgery case
+    other := TMcpRequestStateCodec.Create('fedcba9876543210fedcba9876543210');
+    try
+      Check(not codec.Decode(other.Encode(_ObjFast(['step', 9]), 'user-42',
+        'tools/call:greet'), 'user-42', 'tools/call:greet', state),
+        'a state signed with a different secret is rejected');
+    finally
+      other.Free;
+    end;
+  finally
+    codec.Free;
+  end;
+
+  // the deadline is inside the signed payload, so it cannot be pushed out
+  codec := TMcpRequestStateCodec.Create('0123456789abcdef0123456789abcdef', 1);
+  try
+    blob := codec.Encode(_ObjFast(['step', 1]), 'user-42', 'tools/call:greet');
+    SleepHiRes(1100);
+    Check(not codec.Decode(blob, 'user-42', 'tools/call:greet', state),
+      'state presented after its TTL lapsed is rejected');
+  finally
+    codec.Free;
+  end;
+
+  // a secret too short to be unguessable is refused outright: signing with it
+  // would look like protection while providing none
+  weak := false;
+  try
+    TMcpRequestStateCodec.Create('short').Free;
+  except
+    on EMcpException do
+      weak := true;
+  end;
+  Check(weak, 'a weak secret is refused at construction');
 end;
 
 end.

@@ -455,9 +455,12 @@ DESIGN.md verweist hierher.
      der Backend-Auth befüllt, bevor ein Tool Identität gewährt. Die 2026-07-28-
      Auth-Härtung (`iss`/RFC 9207, Client ID Metadata Documents, Issuer-Bindung)
      kommt obendrauf.
-   - **Neu zu bauen**: `server/discover`, `_meta`-Transport der Protokollversion,
-     `subscriptions/listen`, `resultType`, MRTR, `ttlMs`/`cacheScope`, neue Header +
-     Error-Codes (Details §6).
+   - **Gebaut** (Details in [DESIGN.md](DESIGN.md), Abschnitt „Protokoll"):
+     `server/discover`, `_meta`-Transport der Protokollversion, `subscriptions/listen`,
+     `resultType`, **MRTR**, `ttlMs`/`cacheScope`, neue Header + Error-Codes.
+   - **Neu zu bauen**: `x-mcp-header`, Extensions-Framework, JSON Schema 2020-12 im
+     `inputSchema`, OTel-`_meta`-Keys, deterministische `tools/list`-Reihenfolge,
+     Prompts/Completion/Pagination (Details §6).
    - **Demo-Härtung** ✓ (bleibt gültig): Streamable-Demo bindet **Loopback**,
      `ask_claude` standardmäßig **deaktiviert** (`MCP_ENABLE_ASK_CLAUDE=1` als Opt-in).
 7. **neural-api integrieren** (§5) — Units `mormot.ai.embed.neuralapi` /

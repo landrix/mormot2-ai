@@ -346,7 +346,11 @@ begin
   if responseBody = '' then
     exit(HTTP_NOCONTENT);
 
-  result := Ctxt.SetOutJson(responseBody);
+  Ctxt.SetOutJson(responseBody);
+  // The status comes from the response, not from the fact that we produced one:
+  // the spec pins -32021 (and -32020/-32022/-32601) to a status of their own,
+  // and -32021 can only be decided after the handler ran.
+  result := McpHttpStatus(responseBody);
 end;
 
 procedure TMcpHttpTransport.Start;
@@ -954,30 +958,37 @@ procedure TMcpStreamableHttpTransport.StreamDeferredResponse(
 var
   responseJson: RawUtf8;
   emitter: IMcpStreamEmitter;
-  handled: boolean;
-begin
-  // HTTP response head: chunked, NO Content-Length. We deliberately keep the
+  handled, headWritten: boolean;
+  status: integer;
+
+  // the SSE response head: chunked, NO Content-Length. We deliberately keep the
   // connection alive (no 'Connection: close') so a client can reuse the socket
   // for subsequent requests — the terminating 0-chunk delimits this response.
   // aOutHeaders carries the CORS lines (each CRLF-terminated); the trailing
   // CRLF below ends the header block. X-Accel-Buffering keeps reverse proxies
   // from holding events back, which would defeat streaming.
-  aWrite('HTTP/1.1 200 OK'#13#10 +
-    'Content-Type: text/event-stream'#13#10 +
-    'Cache-Control: no-cache'#13#10 +
-    'X-Accel-Buffering: no'#13#10 +
-    'Transfer-Encoding: chunked'#13#10 +
-    aOutHeaders +
-    #13#10);
+  procedure WriteStreamHead;
+  begin
+    if headWritten then
+      exit;
+    headWritten := true;
+    aWrite('HTTP/1.1 200 OK'#13#10 +
+      'Content-Type: text/event-stream'#13#10 +
+      'Cache-Control: no-cache'#13#10 +
+      'X-Accel-Buffering: no'#13#10 +
+      'Transfer-Encoding: chunked'#13#10 +
+      aOutHeaders +
+      #13#10);
+  end;
 
-  // shared emitter so a streaming tool can push intermediate token events
-  emitter := TMcpStreamEmitter.Create(self, aWrite);
-
+begin
+  headWritten := false;
   // subscriptions/listen is not a request/response: it keeps this stream open
   // and pushes notifications onto it until one side ends it.
   if McpMethodFromName(_Safe(_JsonFast(aBody))^.U['method']) =
        mcpSubscriptionsListen then
   begin
+    WriteStreamHead;
     StreamSubscription(aWrite, aBody);
     aWrite('0'#13#10#13#10);
     exit;
@@ -987,8 +998,6 @@ begin
   // PreflightRequest — a malformed envelope, bad _meta, an unsupported version
   // or an unknown method never reaches this point, so the hook below always
   // sees a request the protocol layer accepted.
-  // Let a streaming hook handle it first — it pushes token events through the
-  // emitter and supplies the final response; otherwise process normally.
   handled := false;
   responseJson := '';
   // The hook is FOREIGN code and FinalizeHookResponse rejects a malformed
@@ -997,19 +1006,53 @@ begin
   // catches everything itself; this guard covers the hook path.
   try
     if Assigned(fOnStreamCall) then
+    begin
+      // A hook may push intermediate token events, so its stream head has to go
+      // out BEFORE it runs — which fixes the response at 200. That is the price
+      // of streaming, and only a hook pays it.
+      WriteStreamHead;
+      emitter := TMcpStreamEmitter.Create(self, aWrite);
       handled := fOnStreamCall(aBody, emitter, responseJson);
-    if handled then
-      // a hook builds its response by hand and would otherwise ship a result
-      // without the mandatory resultType, serverInfo and caching hints
-      responseJson := fServer.FinalizeHookResponse(responseJson,
-        _Safe(_JsonFast(aBody))^.U['method'])
+      if handled then
+        // a hook builds its response by hand and would otherwise ship a result
+        // without the mandatory resultType, serverInfo and caching hints
+        responseJson := fServer.FinalizeHookResponse(responseJson, aBody)
+      else
+        responseJson := fServer.ExecuteRequest(aBody);
+    end
     else
+    begin
+      // No hook: nothing can be emitted before the final response, so we run
+      // the request FIRST and only then commit to a status. That is what lets
+      // -32021 carry the 400 the spec requires — it depends on what the handler
+      // turned out to need and cannot be known at preflight time.
       responseJson := fServer.ExecuteRequest(aBody);
+      status := McpHttpStatus(responseJson);
+      if status <> HTTP_MCP_SUCCESS then
+      begin
+        // A rejection is a buffered JSON body with its own status, never a
+        // stream — exactly as SendProtocolError does for preflight failures.
+        aWrite(FormatUtf8('HTTP/1.1 % %'#13#10 +
+          'Content-Type: application/json'#13#10 +
+          'Content-Length: %'#13#10 +
+          aOutHeaders + #13#10 + '%',
+          [status, StatusCodeToText(status)^, length(responseJson),
+           responseJson]));
+        exit;
+      end;
+      WriteStreamHead;
+    end;
   except
     on E: Exception do
+    begin
+      // Once anything has been written we are committed to the stream, so an
+      // escaped error can only be delivered as its final event. WriteStreamHead
+      // is idempotent, and covers the no-hook path where nothing went out yet.
+      WriteStreamHead;
       responseJson := fServer.Processor.CreateError(
         _Safe(_JsonFast(aBody))^.GetValueOrNull('id'), JSONRPC_INTERNAL_ERROR,
         StringToUtf8(E.Message));
+    end;
   end;
 
   // final SSE event carrying the JSON-RPC response, which ends the stream

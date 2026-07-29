@@ -99,6 +99,7 @@ type
     procedure ConcurrentPosts;
     procedure StreamHookIsValidatedAndContained;
     procedure SubscriptionStreamDelivers;
+    procedure CapabilityErrorUsesHttpStatus;
   end;
 
 implementation
@@ -1364,6 +1365,9 @@ type
     /// raises, the way a buggy or hostile hook would
     function Throws(const aRequestJson: RawUtf8;
       const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+    /// answers a Multi Round-Trip Request: a hook may do that too
+    function NeedsInput(const aRequestJson: RawUtf8;
+      const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
   end;
 
 function TStreamHookProbe.Bare(const aRequestJson: RawUtf8;
@@ -1380,6 +1384,16 @@ begin
   aResponseJson := '';
   result := false; // never reached — keeps the compiler from warning
   raise EMcpException.CreateU('hook blew up');
+end;
+
+function TStreamHookProbe.NeedsInput(const aRequestJson: RawUtf8;
+  const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+begin
+  Called := true;
+  aResponseJson := '{"jsonrpc":"2.0","id":1,"result":{' +
+    '"resultType":"' + MCP_RESULT_INPUT_REQUIRED + '",' +
+    '"requestState":"hook-state"}}';
+  result := true;
 end;
 
 procedure TTestMcpStreamableTransport.StreamHookIsValidatedAndContained;
@@ -1437,6 +1451,22 @@ begin
       '{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
     CheckEqual(status, HTTP_SUCCESS, 'a throwing hook still answers');
     CheckErrorCode(SseDataJson(client.Content), JSONRPC_INTERNAL_ERROR);
+
+    // 4. A hook may answer a Multi Round-Trip Request, and finalization must
+    // not flatten that: overwriting `input_required` with `complete` would hand
+    // the client a "finished" result still carrying requestState, which it
+    // would never look at — the round trip would stall with no error anywhere.
+    transport.OnStreamCall := probe.NeedsInput;
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":' +
+      '{"name":"whatever"}}');
+    CheckEqual(status, HTTP_SUCCESS, 'an interim hook result still answers 200');
+    Check(PosEx('"resultType":"' + MCP_RESULT_INPUT_REQUIRED + '"',
+      client.Content) > 0, 'the hook keeps its own resultType');
+    Check(PosEx('hook-state', client.Content) > 0, 'and its requestState');
+    Check(PosEx('"ttlMs"', client.Content) = 0,
+      'an interim result carries no caching hints, whoever produced it');
+
     // and the server is still alive afterwards
     transport.OnStreamCall := nil;
     status := McpPost(client, transport.Endpoint,
@@ -1607,6 +1637,101 @@ begin
   finally
     for i := 0 to high(clients) do
       clients[i].Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
+  end;
+end;
+
+type
+  /// a tool that needs an input type the test client will not declare
+  // - implements IMcpTool directly rather than deriving from TMcpToolBase<T>:
+  //   this test is about the transport's status code, not about RTTI schemas
+  TCapabilityHungryTool = class(TInterfacedObject, IMcpTool, IMcpInteractiveTool)
+  public
+    function GetName: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetInputSchema: variant;
+    function Execute(const Args: variant;
+      const AuthCtx: TMcpAuthContext): variant;
+    function ExecuteInteractive(const Args: variant;
+      const Context: TMcpCallContext): variant;
+  end;
+
+function TCapabilityHungryTool.GetName: RawUtf8;
+begin
+  result := 'needs_elicitation';
+end;
+
+function TCapabilityHungryTool.GetDescription: RawUtf8;
+begin
+  result := 'Always asks the client for input';
+end;
+
+function TCapabilityHungryTool.GetInputSchema: variant;
+begin
+  result := _ObjFast(['type', 'object', 'additionalProperties', false]);
+end;
+
+function TCapabilityHungryTool.Execute(const Args: variant;
+  const AuthCtx: TMcpAuthContext): variant;
+begin
+  result := Null; // never called: the server prefers ExecuteInteractive
+end;
+
+function TCapabilityHungryTool.ExecuteInteractive(const Args: variant;
+  const Context: TMcpCallContext): variant;
+begin
+  result := Null;
+  raise EMcpInputRequired.Create(
+    _ObjFast(['who', McpInputRequest(MCP_INPUT_ELICITATION,
+      _ObjFast(['mode', 'form', 'message', 'Who is asking?']))]),
+    'state');
+end;
+
+procedure TTestMcpStreamableTransport.CapabilityErrorUsesHttpStatus;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.RegisterTool(TCapabilityHungryTool.Create);
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    // "If processing a request requires a capability the client did not include
+    // in io.modelcontextprotocol/clientCapabilities, the server MUST return a
+    // MissingRequiredClientCapabilityError (-32021) ... On HTTP, the response
+    // status MUST be 400 Bad Request."
+    // This is the one required status that CANNOT be decided by the preflight:
+    // whether a capability is needed only emerges once the handler runs. So the
+    // transport must run the request BEFORE committing to a status — writing
+    // the SSE head first would pin every such answer at 200.
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":' +
+      '{"name":"needs_elicitation","arguments":{}}}');
+    CheckEqual(status, HTTP_BADREQUEST, '-32021 -> 400, decided after dispatch');
+    CheckErrorCode(client.Content, MCP_ERROR_MISSING_CLIENT_CAPABILITY);
+    Check(PosEx('text/event-stream', client.ContentType) = 0,
+      'and it is buffered JSON, not a stream a client would read as success');
+    Check(PosEx('requiredCapabilities', client.Content) > 0,
+      'the body names the capability the client has to add');
+
+    // an ordinary request still streams, and still answers 200
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
+    CheckEqual(status, HTTP_SUCCESS, 'a normal request is unaffected');
+    Check(PosEx('text/event-stream', client.ContentType) > 0,
+      'and is still streamed');
+  finally
+    client.Free;
     if transport <> nil then
       transport.Stop;
     transport.Free;

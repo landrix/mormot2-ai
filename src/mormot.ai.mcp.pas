@@ -35,7 +35,8 @@ uses
   mormot.core.json,
   mormot.core.collections,
   mormot.core.threads,
-  mormot.core.interfaces;
+  mormot.core.interfaces,
+  mormot.crypt.core; // HmacSha256 for the MRTR requestState envelope
 
 
 { ************ Core Types and Authentication Context }
@@ -95,6 +96,39 @@ const
   MCP_RESULT_COMPLETE = 'complete';
   /// interim result: the server needs more input (Multi Round-Trip Request)
   MCP_RESULT_INPUT_REQUIRED = 'input_required';
+
+  /// the retry fields a client echoes back on a Multi Round-Trip Request
+  // - both live directly in `params`, NOT in params._meta (see the tools/call
+  //   retry example of the spec)
+  /// map of client answers, keyed by the identifiers the server assigned
+  MCP_PARAM_INPUT_RESPONSES = 'inputResponses';
+  /// the opaque blob the server handed out, echoed back verbatim
+  MCP_PARAM_REQUEST_STATE = 'requestState';
+
+  /// the ONLY three server-to-client request methods an InputRequiredResult may
+  // ask for — "inputRequests values are request objects that MUST be one of
+  // ElicitRequest, CreateMessageRequest, or ListRootsRequest"
+  MCP_INPUT_ELICITATION = 'elicitation/create';
+  MCP_INPUT_SAMPLING = 'sampling/createMessage';
+  MCP_INPUT_ROOTS = 'roots/list';
+
+  /// the clientCapabilities key each input request method requires, in the same
+  // order as MCP_INPUT_METHODS
+  // - "Servers MUST NOT send an inputRequests that the client has not declared
+  //   support for in its capabilities."
+  MCP_INPUT_METHODS: array[0..2] of RawUtf8 = (
+    MCP_INPUT_ELICITATION,
+    MCP_INPUT_SAMPLING,
+    MCP_INPUT_ROOTS);
+  MCP_INPUT_CAPABILITIES: array[0..2] of RawUtf8 = (
+    'elicitation',
+    'sampling',
+    'roots');
+
+  /// how long an encoded requestState stays acceptable, in seconds
+  // - the spec asks for "a short expiry (TTL)" inside the integrity-protected
+  //   payload: it bounds the replay window of a state blob that leaked
+  MCP_REQUEST_STATE_TTL_SEC = 300;
 
   /// how many notifications may queue up on one subscription before it is
   // dropped as unable to keep up
@@ -168,6 +202,91 @@ type
   //   resource is NOT its own error code anymore (the former -32002 was
   //   removed), it is a plain Invalid params
   EMcpInvalidParams = class(EMcpException);
+
+  /// raised when the client cannot serve an input request the server needs
+  // (mapped to -32021 MissingRequiredClientCapability)
+  // - not a server fault and not bad params: the request is well-formed, the
+  //   client simply lacks a capability this call turned out to need
+  EMcpInputCapabilityMissing = class(EMcpException)
+  protected
+    fCapabilities: TRawUtf8DynArray;
+  public
+    /// name the capability the client is missing, and what needed it
+    // - the spec REQUIRES the error to carry `data.requiredCapabilities`: a
+    //   client cannot act on a free-text message, and telling it which
+    //   capability to add is the only way the retry can ever succeed
+    constructor CreateCapability(const aCapability, aForMethod: RawUtf8);
+    /// the missing capability names, for `error.data.requiredCapabilities`
+    property Capabilities: TRawUtf8DynArray
+      read fCapabilities;
+  end;
+
+  /// what a handler knows about the request it is serving, beyond its arguments
+  // - carries the two Multi Round-Trip Request (MRTR) retry fields, so a
+  //   handler that asked for input on a previous round can pick the answers up
+  //   on this one
+  TMcpCallContext = record
+    /// the JSON-RPC method being served ('tools/call', 'resources/read', …)
+    Method: RawUtf8;
+    /// identity of the caller, as resolved by the backend's auth resolver
+    Auth: TMcpAuthContext;
+    /// what the client declared it can do, from _meta.clientCapabilities
+    // - a handler MUST consult this before asking for an input type: requesting
+    //   something the client cannot serve is a protocol violation. The server
+    //   enforces it as a backstop (see TMcpServer.ValidateInputRequests), but
+    //   failing there costs the caller a round trip for nothing.
+    ClientCapabilities: variant;
+    /// the client's answers to a previous InputRequiredResult, or void
+    // - keys are the identifiers this server assigned in `inputRequests`
+    // - "If additional, unexpected parameters are provided in the
+    //   InputResponses object, the server SHOULD ignore any information it does
+    //   not recognize or need."
+    InputResponses: variant;
+    /// the opaque blob this server handed out earlier, echoed back verbatim
+    // - UNVERIFIED and attacker-controlled: the client is free to forge it.
+    //   "If requestState influences authorization, resource access, or business
+    //   logic, servers MUST protect its integrity" — decode it through
+    //   TMcpRequestStateCodec (or an equivalent) instead of trusting it. The
+    //   server cannot do that for you: only the handler knows what it encoded.
+    RequestState: RawUtf8;
+    /// whether the request carried an `inputResponses` field at all
+    // - presence, not content: an empty `{}` is a client that answered with
+    //   nothing, which is still a retry and still shapes a caller-specific
+    //   answer. Deciding on the value would let `{}` slip past as "absent"
+    //   and let a personalized result be cached as shareable.
+    HasInputResponses: boolean;
+    /// whether the request carried a `requestState` field at all
+    // - same reasoning: an empty string is a present-but-empty state
+    HasRequestState: boolean;
+  end;
+
+  /// raised by a handler to answer with an InputRequiredResult instead of a
+  // result: the server needs more input before it can complete the request
+  // - an exception, not a return value, so it works for every handler shape
+  //   (a tool returning a variant and a resource returning RawUtf8 alike) and
+  //   cannot be confused with a completed result
+  // - the server turns this into `resultType: "input_required"`, and rejects it
+  //   on any method where the spec forbids it
+  EMcpInputRequired = class(EMcpException)
+  protected
+    fInputRequests: variant;
+    fRequestState: RawUtf8;
+  public
+    /// ask the client for input, and/or carry state into the retry
+    // - at least one of the two MUST be given: "Servers MUST include at least
+    //   one of inputRequests or requestState in every InputRequiredResult"
+    // - aInputRequests is an object whose keys are server-assigned identifiers
+    //   and whose values are {method, params} request objects; build it with
+    //   McpInputRequest for the method-name and shape checks
+    constructor Create(const aInputRequests: variant;
+      const aRequestState: RawUtf8 = ''); reintroduce;
+    /// the server-initiated requests the client must fulfil (may be void)
+    property InputRequests: variant
+      read fInputRequests;
+    /// opaque state the client MUST echo back on the retry (may be '')
+    property RequestState: RawUtf8
+      read fRequestState;
+  end;
 
   /// who may cache a result, i.e. the `cacheScope` field of a cacheable result
   // - an enumeration, not a string: the wire accepts exactly two values, and a
@@ -303,6 +422,86 @@ type
     function Read: RawUtf8;
   end;
 
+  /// a tool that takes part in Multi Round-Trip Requests
+  // - optional: the server calls ExecuteInteractive when the tool implements
+  //   this, and plain IMcpTool.Execute otherwise, so existing tools keep
+  //   working untouched
+  // - raise EMcpInputRequired from ExecuteInteractive to ask for input
+  IMcpInteractiveTool = interface(IMcpTool)
+    ['{1C4A6F2D-9B37-4E58-8A0D-6F3B2E9C4D71}']
+    /// execute with the full request context, including any input responses
+    function ExecuteInteractive(const Args: variant;
+      const Context: TMcpCallContext): variant;
+  end;
+
+  /// a resource that takes part in Multi Round-Trip Requests
+  // - resources/read is one of the three methods that may answer with an
+  //   InputRequiredResult, so a resource may need the retry fields too
+  IMcpInteractiveResource = interface(IMcpResource)
+    ['{5B8E1A3C-4D62-4F79-B1E5-8C2A7D0F3B94}']
+    /// read with the full request context, including any input responses
+    function ReadInteractive(const Context: TMcpCallContext): RawUtf8;
+  end;
+
+
+{ ************ Multi Round-Trip Request State }
+
+type
+  /// integrity-protected encoder for the opaque MRTR `requestState` blob
+  // - requestState travels through the client, which "could attempt to modify
+  //   it to alter server behavior, bypass authorization checks, or corrupt
+  //   server logic". This wraps the handler's own state in an HMAC-SHA256
+  //   envelope that also binds it to the caller, to the request, and to a
+  //   deadline — the three replay defences the spec asks for.
+  // - it is a tool, not a policy: the server never decodes requestState itself
+  //   (it cannot know what a handler encoded). A handler that keeps no
+  //   security-relevant state may skip it, which the spec permits only when
+  //   "tampering can cause nothing worse than request failure".
+  TMcpRequestStateCodec = class
+  protected
+    fSecret: RawByteString;
+    fTtlSec: integer;
+    function Mac(const aPayload: RawByteString): TSha256Digest;
+  public
+    /// initialize with the signing secret shared by every server instance
+    // - MUST be the same on all instances behind a load balancer: MCP is
+    //   stateless, so the retry may well land on a different one than the round
+    //   that issued the state
+    // - raises EMcpException on an empty or too short secret: a codec that
+    //   silently signs with nothing at all is worse than none
+    constructor Create(const aSecret: RawByteString;
+      aTtlSec: integer = MCP_REQUEST_STATE_TTL_SEC); reintroduce;
+    /// wrap the handler's state into a signed, bound, expiring blob
+    // - aPrincipal is the authenticated caller the state belongs to; a blob
+    //   issued for one principal is rejected when presented by another
+    // - aBinding identifies the originating request: pass the method plus a
+    //   digest of the salient parameters, so state cannot be moved to a
+    //   different call
+    function Encode(const aState: variant; const aPrincipal, aBinding: RawUtf8): RawUtf8;
+    /// verify a blob and recover the handler's state
+    // - returns false — without telling the caller why — when the signature,
+    //   the principal, the binding or the deadline does not check out
+    function Decode(const aRequestState, aPrincipal, aBinding: RawUtf8;
+      out aState: variant): boolean;
+    /// how long an encoded blob stays valid, in seconds
+    property TtlSec: integer
+      read fTtlSec;
+  end;
+
+/// the HTTP status an MCP-over-HTTP transport MUST send for a finished response
+// - the spec pins three of its own error codes to 400 and -32601 to 404. Two of
+//   those can only be decided AFTER a handler ran (-32021 depends on what the
+//   handler turned out to need), so a transport cannot rely on the preflight
+//   alone: it has to look at the response it is about to send.
+// - every other outcome, including an application-level -32602 or -32603, is a
+//   perfectly ordinary 200 carrying a JSON-RPC error
+function McpHttpStatus(const aResponseJson: RawUtf8): integer;
+
+/// build one entry of an InputRequiredResult's `inputRequests` map
+// - rejects any method other than the three the spec allows, so a typo becomes
+//   a loud server-side failure instead of a response no client understands
+function McpInputRequest(const aMethod: RawUtf8; const aParams: variant): variant;
+
 
 { ************ RTTI-based Schema Generation }
 
@@ -339,7 +538,10 @@ type
     /// create a successful JSON-RPC response
     // - stamps the mandatory `resultType` and the server identity into the
     //   result, so every handler can return its payload unadorned
-    function CreateSuccessResponse(const aRequestId, aResult: variant): RawUtf8;
+    // - aResultType is the mandatory `resultType` field; it stays 'complete'
+    //   except for the interim result of a Multi Round-Trip Request
+    function CreateSuccessResponse(const aRequestId, aResult: variant;
+      const aResultType: RawUtf8 = MCP_RESULT_COMPLETE): RawUtf8;
     /// create an error JSON-RPC response
     function CreateError(const aRequestId: variant; aErrorCode: integer;
       const aErrorMsg: RawUtf8): RawUtf8; overload;
@@ -455,9 +657,23 @@ type
       out aHttpStatus: integer): boolean;
     /// stamp the mandatory caching hints onto a cacheable result
     // - does nothing for the methods the spec does not list as cacheable
-    procedure AddCacheHints(var aResult: variant; aMethod: TMcpMethod);
-    function ExecuteToolCall(const aParams: variant; const aAuthCtx: TMcpAuthContext): variant;
-    function ExecuteResourceRead(const aParams: variant): variant;
+    // - aPersonalized forces the conservative hint on a result that was shaped
+    //   by MRTR input responses (see the implementation for why)
+    procedure AddCacheHints(var aResult: variant; aMethod: TMcpMethod;
+      aPersonalized: boolean = false);
+    /// gather everything a handler may need beyond its own arguments
+    function CallContext(const aParams: variant; const aMethod: RawUtf8;
+      const aAuthCtx: TMcpAuthContext): TMcpCallContext;
+    /// turn a handler's EMcpInputRequired into the interim result document
+    function InputRequiredResult(const aInputRequests: variant;
+      const aRequestState: RawUtf8): variant;
+    /// build the -32021 response, carrying the capabilities the spec requires
+    function CapabilityError(const aRequestId: variant;
+      aError: EMcpInputCapabilityMissing): RawUtf8;
+    function ExecuteToolCall(const aParams: variant;
+      const aContext: TMcpCallContext): variant;
+    function ExecuteResourceRead(const aParams: variant;
+      const aContext: TMcpCallContext): variant;
     function ListTools: variant;
     function ListResources: variant;
   public
@@ -521,9 +737,12 @@ type
     // - a hook answering e.g. tools/call replaces the handler, not the
     //   protocol: its result still needs resultType, serverInfo and — when the
     //   method is a cacheable one — the mandatory caching hints
-    // - aMethod is the JSON-RPC method of the request the hook answered
+    // - takes the whole REQUEST body, not just its method name: the MRTR rules
+    //   (no caching hints on an interim result, no shareable cache on a retry)
+    //   depend on the request's params, and a hook that answers a round trip
+    //   must obey them exactly as the dispatcher does
     function FinalizeHookResponse(const aResponseJson,
-      aMethod: RawUtf8): RawUtf8;
+      aRequestJson: RawUtf8): RawUtf8;
     /// validate a request WITHOUT dispatching it
     // - checks the JSON-RPC envelope, the mandatory per-request _meta and
     //   whether the method exists at all — everything that decides the HTTP
@@ -537,6 +756,17 @@ type
     //   execute unvalidated input (and skip resultType/serverInfo entirely)
     function PreflightRequest(const aRequestJson: RawUtf8;
       out aErrorJson: RawUtf8; out aHttpStatus: integer): boolean;
+    /// reject an InputRequiredResult the spec would not allow on the wire
+    // - the server calls this on every EMcpInputRequired before answering, so a
+    //   handler cannot put a malformed or forbidden interim result on the wire
+    // - public so a handler can check its own construction up front: failing
+    //   here costs a round trip, failing at raise-time costs the whole call
+    // - raises EMcpInputCapabilityMissing when the client did not declare the
+    //   needed capability (-32021), and EMcpException on anything else, which
+    //   is a defect in the calling handler and becomes -32603
+    procedure ValidateInputRequests(const aInputRequests: variant;
+      const aRequestState: RawUtf8; aMethod: TMcpMethod;
+      const aClientCapabilities: variant);
     /// check if server is active
     function IsActive: boolean;
     /// the JSON-RPC processor, for transports that must emit protocol-level
@@ -629,6 +859,162 @@ type
 
 
 implementation
+
+
+{ ************ Multi Round-Trip Request State }
+
+constructor EMcpInputRequired.Create(const aInputRequests: variant;
+  const aRequestState: RawUtf8);
+begin
+  // The message is diagnostic only: this exception never reaches a client as an
+  // error, the server converts it into an InputRequiredResult.
+  inherited CreateU('MCP handler requires additional input');
+  fInputRequests := aInputRequests;
+  fRequestState := aRequestState;
+end;
+
+constructor EMcpInputCapabilityMissing.CreateCapability(
+  const aCapability, aForMethod: RawUtf8);
+begin
+  CreateUtf8('The client did not declare the "%" capability that % requires',
+    [aCapability, aForMethod]);
+  AddRawUtf8(fCapabilities, aCapability);
+end;
+
+function McpHttpStatus(const aResponseJson: RawUtf8): integer;
+var
+  doc: TDocVariantData;
+  err: PDocVariantData;
+  code: Int64;
+begin
+  result := HTTP_MCP_SUCCESS;
+  if aResponseJson = '' then
+    exit; // a notification: the transport decides (202), not the payload
+  doc.InitJson(aResponseJson, JSON_FAST);
+  if not doc.GetAsDocVariant('error', err) or
+     not VariantToInt64(err^.GetValueOrDefault('code', 0), code) then
+    exit;
+  case code of
+    MCP_ERROR_HEADER_MISMATCH,
+    MCP_ERROR_MISSING_CLIENT_CAPABILITY,
+    MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION:
+      result := HTTP_MCP_BAD_REQUEST;
+    JSONRPC_METHOD_NOT_FOUND:
+      result := HTTP_MCP_NOT_FOUND;
+  end;
+  // deliberately NOT -32602/-32603: those are ordinary application outcomes
+  // (unknown tool, handler failure) and the spec pins no status to them. Only
+  // the codes it names get a status of their own.
+end;
+
+function McpInputRequest(const aMethod: RawUtf8; const aParams: variant): variant;
+var
+  i: PtrInt;
+begin
+  // params of a JSON-RPC request is an object (none of the three allowed
+  // requests takes positional params). Letting a null or a scalar through
+  // would have this server emit a message its own parser rejects.
+  if not _Safe(aParams)^.IsObject then
+    raise EMcpException.CreateUtf8(
+      'inputRequests params for % must be a JSON object', [aMethod]);
+  for i := 0 to high(MCP_INPUT_METHODS) do
+    if MCP_INPUT_METHODS[i] = aMethod then
+    begin
+      result := _ObjFast(['method', aMethod, 'params', aParams]);
+      exit;
+    end;
+  // fail here, at the point of the typo, rather than shipping a request object
+  // no client can dispatch
+  raise EMcpException.CreateUtf8(
+    '% is not a valid inputRequests method: MCP allows only %, % and %',
+    [aMethod, MCP_INPUT_ELICITATION, MCP_INPUT_SAMPLING, MCP_INPUT_ROOTS]);
+end;
+
+
+{ TMcpRequestStateCodec }
+
+const
+  /// shortest secret we accept, in bytes
+  // - HMAC-SHA256 with a key shorter than this is not meaningfully unguessable,
+  //   and the whole point of the envelope is that a client cannot forge one
+  MCP_REQUEST_STATE_MIN_SECRET = 32;
+
+constructor TMcpRequestStateCodec.Create(const aSecret: RawByteString;
+  aTtlSec: integer);
+begin
+  inherited Create;
+  if length(aSecret) < MCP_REQUEST_STATE_MIN_SECRET then
+    raise EMcpException.CreateUtf8(
+      'TMcpRequestStateCodec needs a secret of at least % bytes, got %',
+      [MCP_REQUEST_STATE_MIN_SECRET, length(aSecret)]);
+  if aTtlSec <= 0 then
+    raise EMcpException.CreateUtf8(
+      'TMcpRequestStateCodec needs a positive TTL, got %', [aTtlSec]);
+  fSecret := aSecret;
+  fTtlSec := aTtlSec;
+end;
+
+function TMcpRequestStateCodec.Mac(const aPayload: RawByteString): TSha256Digest;
+begin
+  HmacSha256(fSecret, aPayload, result);
+end;
+
+function TMcpRequestStateCodec.Encode(const aState: variant;
+  const aPrincipal, aBinding: RawUtf8): RawUtf8;
+var
+  payload: RawByteString;
+begin
+  // Everything the spec asks to verify on receipt travels INSIDE the signed
+  // payload: the principal it was issued to, the request it belongs to, and
+  // the moment it stops being acceptable. Signing the envelope rather than
+  // just the state is what makes those three unforgeable.
+  payload := ToUtf8(_ObjFast([
+    'p', aPrincipal,
+    'b', aBinding,
+    'e', UnixTimeUtc + fTtlSec,
+    's', aState]));
+  result := BinToBase64uri(payload) + '.' + BinToBase64uri(Mac(payload));
+end;
+
+function TMcpRequestStateCodec.Decode(const aRequestState, aPrincipal,
+  aBinding: RawUtf8; out aState: variant): boolean;
+var
+  dot: PtrInt;
+  payload, sig: RawByteString;
+  doc: TDocVariantData;
+  expected: TSha256Digest;
+begin
+  result := false;
+  VarClear(aState);
+  dot := PosExChar('.', aRequestState);
+  if dot <= 1 then
+    exit;
+  payload := Base64uriToBin(copy(aRequestState, 1, dot - 1));
+  sig := Base64uriToBin(copy(aRequestState, dot + 1, maxInt));
+  if (payload = '') or
+     (length(sig) <> SizeOf(expected)) then
+    exit;
+
+  // Verify BEFORE parsing: a forged payload must never reach the JSON parser,
+  // let alone the handler. IsEqual is the constant-time compare — a byte-wise
+  // one would leak how much of a guessed signature was right.
+  expected := Mac(payload);
+  if not IsEqual(PSha256Digest(pointer(sig))^, expected) then
+    exit;
+
+  doc.InitJson(RawUtf8(payload), JSON_FAST);
+  if not doc.IsObject then
+    exit;
+  // Bind checks are separate from the signature: a blob can be perfectly
+  // authentic and still be replayed by another user, onto another call, or
+  // after it should have lapsed.
+  if (doc.U['p'] <> aPrincipal) or
+     (doc.U['b'] <> aBinding) or
+     (doc.I['e'] <= UnixTimeUtc) then
+    exit;
+  aState := doc.GetValueOrDefault('s', Null);
+  result := true;
+end;
 
 
 { ************ TMcpSchemaGenerator Implementation }
@@ -929,12 +1315,13 @@ begin
         'subscribe', true])])]);
 end;
 
-function TMcpJsonRpcProcessor.CreateSuccessResponse(const aRequestId, aResult: variant): RawUtf8;
+function TMcpJsonRpcProcessor.CreateSuccessResponse(const aRequestId, aResult: variant;
+  const aResultType: RawUtf8): RawUtf8;
 var
   response: variant;
 begin
   response := CreateResponse(aRequestId);
-  _ObjAddProp('result', FinalizeResult(aResult, MCP_RESULT_COMPLETE), response);
+  _ObjAddProp('result', FinalizeResult(aResult, aResultType), response);
   result := ToUtf8(response);
 end;
 
@@ -1228,7 +1615,8 @@ begin
   result := fProcessor.CreateSuccessResponse(aSubscription.Id, res);
 end;
 
-procedure TMcpServer.AddCacheHints(var aResult: variant; aMethod: TMcpMethod);
+procedure TMcpServer.AddCacheHints(var aResult: variant; aMethod: TMcpMethod;
+  aPersonalized: boolean);
 var
   doc: PDocVariantData;
   ttl: integer;
@@ -1259,6 +1647,15 @@ begin
   end;
   if ttl < 0 then
     ttl := 0; // spec: servers MUST provide a ttlMs >= 0
+  if aPersonalized then
+  begin
+    // A resources/read whose answer was shaped by this caller's input responses
+    // is by definition not the same answer for the next caller. Handing a proxy
+    // `public` on it is exactly the cross-authorization-context replay the spec
+    // warns about, so a retry never carries a shareable or reusable hint.
+    ttl := 0;
+    scope := mcsPrivate;
+  end;
   doc := _Safe(aResult);
   if not doc^.IsObject then
     exit; // FinalizeResult rejects that anyway, with a better message
@@ -1435,13 +1832,148 @@ begin
   result := variant(doc);
 end;
 
+function TMcpServer.CallContext(const aParams: variant; const aMethod: RawUtf8;
+  const aAuthCtx: TMcpAuthContext): TMcpCallContext;
+var
+  doc, meta: PDocVariantData;
+  i: PtrInt;
+begin
+  Finalize(result);
+  FillCharFast(result, SizeOf(result), 0);
+  result.Method := aMethod;
+  result.Auth := aAuthCtx;
+  doc := _Safe(aParams);
+  // inputResponses and requestState sit directly in params, NOT in _meta:
+  // _meta is the protocol's own envelope, these two are request payload.
+  // Both are typed on the wire, and a handler must not have to defend against
+  // a client that sends something else: an InputResponses is an object, and a
+  // requestState is the string this server handed out — accepting a number
+  // here would silently stringify it and hand the handler a state it never
+  // issued. Anything else is Invalid params, before any handler runs.
+  i := doc^.GetValueIndex(MCP_PARAM_INPUT_RESPONSES);
+  if i >= 0 then
+  begin
+    if not _Safe(doc^.Values[i])^.IsObject then
+      raise EMcpInvalidParams.CreateUtf8('% must be a JSON object',
+        [MCP_PARAM_INPUT_RESPONSES]);
+    result.InputResponses := doc^.Values[i];
+    result.HasInputResponses := true;
+  end;
+  i := doc^.GetValueIndex(MCP_PARAM_REQUEST_STATE);
+  if i >= 0 then
+  begin
+    if not VarIsString(doc^.Values[i]) then
+      raise EMcpInvalidParams.CreateUtf8('% must be a string',
+        [MCP_PARAM_REQUEST_STATE]);
+    VariantToUtf8(doc^.Values[i], result.RequestState);
+    result.HasRequestState := true;
+  end;
+  if doc^.GetAsDocVariant('_meta', meta) then
+    result.ClientCapabilities :=
+      meta^.GetValueOrDefault(MCP_META_CLIENT_CAPABILITIES, Null);
+end;
+
+procedure TMcpServer.ValidateInputRequests(const aInputRequests: variant;
+  const aRequestState: RawUtf8; aMethod: TMcpMethod;
+  const aClientCapabilities: variant);
+var
+  requests, entry, caps: PDocVariantData;
+  i, k: PtrInt;
+  m: RawUtf8;
+begin
+  // "Servers MUST NOT send InputRequiredResult responses on any other client
+  // requests" than prompts/get, resources/read and tools/call. Only two of
+  // those exist here; asking for input from tools/list would produce a result
+  // no conforming client would act on.
+  if not (aMethod in [mcpToolsCall, mcpResourcesRead]) then
+    raise EMcpException.CreateU('An InputRequiredResult is only allowed on ' +
+      'tools/call and resources/read');
+
+  requests := _Safe(aInputRequests);
+  // "Servers MUST include at least one of inputRequests or requestState in
+  // every InputRequiredResult" — otherwise the client learns nothing and can
+  // only retry the identical request, forever.
+  if (aRequestState = '') and
+     not (requests^.IsObject and (requests^.Count > 0)) then
+    raise EMcpException.CreateU('An InputRequiredResult needs at least one of ' +
+      'inputRequests or requestState');
+  if not requests^.IsObject then
+  begin
+    // Only a genuinely absent value means "requestState-only". A present but
+    // wrong-shaped one (an array, a string) would be dropped by
+    // InputRequiredResult, and the client would retry without the input the
+    // handler is waiting for — an endless round trip instead of a loud defect.
+    if not VarIsVoid(aInputRequests) then
+      raise EMcpException.CreateU('inputRequests must be a JSON object ' +
+        'mapping server-assigned identifiers to request objects');
+    exit;
+  end;
+
+  caps := _Safe(aClientCapabilities);
+  for i := 0 to requests^.Count - 1 do
+  begin
+    entry := _Safe(requests^.Values[i]);
+    if not (entry^.IsObject and entry^.GetAsRawUtf8('method', m)) then
+      raise EMcpException.CreateUtf8(
+        'inputRequests["%"] must be an object with a method', [requests^.Names[i]]);
+    k := 0;
+    while (k <= high(MCP_INPUT_METHODS)) and
+          (MCP_INPUT_METHODS[k] <> m) do
+      inc(k);
+    if k > high(MCP_INPUT_METHODS) then
+      raise EMcpException.CreateUtf8(
+        'inputRequests["%"] asks for %, which is not one of the three allowed ' +
+        'server-to-client requests', [requests^.Names[i], m]);
+    // "Servers MUST NOT send an inputRequests that the client has not declared
+    // support for in its capabilities." Enforced here rather than trusting the
+    // handler: the capabilities are protocol state, and this is the last point
+    // where the violation can still be turned into the error the spec reserved
+    // for it instead of a response the client cannot answer.
+    if caps^.GetValueIndex(MCP_INPUT_CAPABILITIES[k]) < 0 then
+      raise EMcpInputCapabilityMissing.CreateCapability(MCP_INPUT_CAPABILITIES[k], m);
+  end;
+end;
+
+function TMcpServer.CapabilityError(const aRequestId: variant;
+  aError: EMcpInputCapabilityMissing): RawUtf8;
+var
+  caps: TDocVariantData;
+begin
+  caps.InitArrayFrom(aError.Capabilities, JSON_FAST);
+  // "the server MUST return a MissingRequiredClientCapabilityError (-32021)
+  // whose data.requiredCapabilities lists the missing capabilities". The
+  // message alone is not machine-readable, and a client that cannot tell WHICH
+  // capability to add can only fail the same way on every retry.
+  result := fProcessor.CreateError(aRequestId,
+    MCP_ERROR_MISSING_CLIENT_CAPABILITY, StringToUtf8(aError.Message),
+    _ObjFast(['requiredCapabilities', variant(caps)]));
+end;
+
+function TMcpServer.InputRequiredResult(const aInputRequests: variant;
+  const aRequestState: RawUtf8): variant;
+var
+  doc: TDocVariantData;
+begin
+  // Both fields are optional individually (ValidateInputRequests has already
+  // established that at least one is there), so each is emitted only when set:
+  // an empty `inputRequests: {}` would tell a client to gather nothing and
+  // retry, which is not what a handler that only passes state along means.
+  doc.InitObject([], JSON_FAST);
+  if _Safe(aInputRequests)^.IsObject then
+    doc.AddValue('inputRequests', aInputRequests);
+  if aRequestState <> '' then
+    doc.AddValue(MCP_PARAM_REQUEST_STATE, RawUtf8ToVariant(aRequestState));
+  result := variant(doc);
+end;
+
 function TMcpServer.ExecuteToolCall(const aParams: variant;
-  const aAuthCtx: TMcpAuthContext): variant;
+  const aContext: TMcpCallContext): variant;
 var
   doc: PDocVariantData;
   toolName: RawUtf8;
   args: variant;
   tool: IMcpTool;
+  interactive: IMcpInteractiveTool;
 begin
   if _Safe(aParams, doc) then
     if not doc.GetAsRawUtf8('name', toolName) then
@@ -1459,14 +1991,21 @@ begin
     fSafe.UnLock;
   end;
 
-  result := tool.Execute(args, aAuthCtx);
+  // A tool that opted into Multi Round-Trip Requests gets the full context;
+  // every other tool keeps the two-argument call it was written against.
+  if Supports(tool, IMcpInteractiveTool, interactive) then
+    result := interactive.ExecuteInteractive(args, aContext)
+  else
+    result := tool.Execute(args, aContext.Auth);
 end;
 
-function TMcpServer.ExecuteResourceRead(const aParams: variant): variant;
+function TMcpServer.ExecuteResourceRead(const aParams: variant;
+  const aContext: TMcpCallContext): variant;
 var
   doc: PDocVariantData;
   uri, content: RawUtf8;
   resource: IMcpResource;
+  interactive: IMcpInteractiveResource;
   result_doc, contentsList, contentItem: TDocVariantData;
 begin
   if _Safe(aParams, doc) then
@@ -1483,7 +2022,10 @@ begin
     fSafe.UnLock;
   end;
 
-  content := resource.Read;
+  if Supports(resource, IMcpInteractiveResource, interactive) then
+    content := interactive.ReadInteractive(aContext)
+  else
+    content := resource.Read;
 
   // Build response
   result_doc.InitObject([], JSON_FAST);
@@ -1502,22 +2044,47 @@ begin
 end;
 
 function TMcpServer.FinalizeHookResponse(const aResponseJson,
-  aMethod: RawUtf8): RawUtf8;
+  aRequestJson: RawUtf8): RawUtf8;
 var
-  doc: TDocVariantData;
+  doc, req: TDocVariantData;
+  params: PDocVariantData;
   idx: PtrInt;
   res: variant;
+  method, resultType: RawUtf8;
+  m: TMcpMethod;
+  personalized: boolean;
 begin
   result := aResponseJson;
   if aResponseJson = '' then
     exit;
+  req.InitJson(aRequestJson, JSON_FAST);
+  method := req.U['method'];
+  m := McpMethodFromName(method);
+  // A hook answers the SAME request the dispatcher would have, so it inherits
+  // the same rules — including the MRTR ones. Deriving both from the request
+  // body (rather than being handed a method name) is what keeps a hook from
+  // quietly bypassing them; that has now happened twice in this transport.
+  personalized := (m in [mcpToolsCall, mcpResourcesRead]) and
+                  req.GetAsDocVariant('params', params) and
+                  ((params^.GetValueIndex(MCP_PARAM_INPUT_RESPONSES) >= 0) or
+                   (params^.GetValueIndex(MCP_PARAM_REQUEST_STATE) >= 0));
+
   doc.InitJson(aResponseJson, JSON_FAST);
   idx := doc.GetValueIndex('result');
   if idx < 0 then
     exit; // an error response — nothing to stamp
   res := doc.Values[idx];
-  AddCacheHints(res, McpMethodFromName(aMethod));
-  doc.Values[idx] := fProcessor.FinalizeResult(res, MCP_RESULT_COMPLETE);
+  // Respect a resultType the hook set itself: a hook may legitimately answer a
+  // Multi Round-Trip Request, and overwriting `input_required` with `complete`
+  // would hand the client a "finished" result still carrying inputRequests —
+  // which it would never look at, so the round trip would silently stall.
+  if not _Safe(res)^.GetAsRawUtf8('resultType', resultType) or
+     (resultType <> MCP_RESULT_INPUT_REQUIRED) then
+  begin
+    resultType := MCP_RESULT_COMPLETE;
+    AddCacheHints(res, m, personalized);
+  end;
+  doc.Values[idx] := fProcessor.FinalizeResult(res, resultType);
   result := doc.ToJson;
 end;
 
@@ -1599,8 +2166,10 @@ var
   method: RawUtf8;
   params, requestId, resultData: variant;
   authCtx: TMcpAuthContext;
-  isNotification: boolean;
+  callCtx: TMcpCallContext;
+  isNotification, personalized: boolean;
   status: integer;
+  m: TMcpMethod;
 begin
   // Single validation gate, shared with the transports: whatever Preflight
   // rejects never reaches a handler, here or anywhere else. It hands the parsed
@@ -1608,6 +2177,7 @@ begin
   if not Preflight(aRequestJson, method, params, requestId, result, status) then
     exit;
   isNotification := VarIsVoid(requestId);
+  m := McpMethodFromName(method);
 
   // Auth context. Identity must be injected by a backend auth resolver before
   // any tool may trust IsAuthenticated/Roles; until then we stay fail-closed.
@@ -1615,21 +2185,35 @@ begin
   // protocol sessions no longer exist, so there is nothing to carry.)
   FillCharFast(authCtx, SizeOf(authCtx), 0);
   authCtx.IsAuthenticated := false;
+  personalized := false;
 
   try
+    // INSIDE the try: CallContext type-checks the MRTR retry fields and raises
+    // EMcpInvalidParams on a malformed one. Building it before the try would
+    // let that escape into the HTTP worker, which has no handler for it.
+    callCtx := CallContext(params, method, authCtx);
+    // A request carrying MRTR retry fields produced a caller-specific answer.
+    // Presence decides, not content — VarIsVoid() considers an EMPTY object
+    // void, so testing the value would let `inputResponses: {}` be cached as
+    // shareable. Only the two methods that may take part in a round trip
+    // count: retry fields elsewhere are meaningless and must not degrade
+    // their cacheability.
+    personalized := (m in [mcpToolsCall, mcpResourcesRead]) and
+                    (callCtx.HasRequestState or callCtx.HasInputResponses);
+
     // Dispatch to handler — any handler/tool exception is mapped to a JSON-RPC
     // error below, so it never escapes into the HTTP worker.
-    case McpMethodFromName(method) of
+    case m of
       mcpDiscover:
         resultData := fProcessor.HandleDiscover;
       mcpToolsList:
         resultData := ListTools;
       mcpToolsCall:
-        resultData := ExecuteToolCall(params, authCtx);
+        resultData := ExecuteToolCall(params, callCtx);
       mcpResourcesList:
         resultData := ListResources;
       mcpResourcesRead:
-        resultData := ExecuteResourceRead(params);
+        resultData := ExecuteResourceRead(params, callCtx);
       mcpSubscriptionsListen:
         // Only a streaming transport can serve this: it is a long-lived
         // response stream, not a request/response. The Streamable HTTP
@@ -1651,14 +2235,42 @@ begin
     else
     begin
       // caching hints belong on the complete result, before it is finalized
-      AddCacheHints(resultData, McpMethodFromName(method));
+      AddCacheHints(resultData, m, personalized);
       result := fProcessor.CreateSuccessResponse(requestId, resultData);
     end;
 
   except
+    // A handler asking for more input is not a failure: it is the interim half
+    // of a Multi Round-Trip Request. It carries NO caching hints — the spec
+    // mandates those only on results with resultType 'complete', and caching an
+    // "I need input" answer would make the client re-ask itself forever.
+    on E: EMcpInputRequired do
+      if isNotification then
+        result := ''
+      else
+        try
+          ValidateInputRequests(E.InputRequests, E.RequestState, m,
+            callCtx.ClientCapabilities);
+          result := fProcessor.CreateSuccessResponse(requestId,
+            InputRequiredResult(E.InputRequests, E.RequestState),
+            MCP_RESULT_INPUT_REQUIRED);
+        except
+          on C: EMcpInputCapabilityMissing do
+            result := CapabilityError(requestId, C);
+          on V: Exception do
+            // our own handler built something the spec forbids: that is a
+            // server defect, and -32603 is what says so
+            result := fProcessor.CreateError(requestId, JSONRPC_INTERNAL_ERROR,
+              StringToUtf8(V.Message));
+        end;
     // Catch EVERY exception (not just ESynException): tools may raise plain
     // Exception, EConvertError, DB/OS errors. Translate to a JSON-RPC error so
     // the transport stays alive and the client gets a well-formed response.
+    on E: EMcpInputCapabilityMissing do
+      if isNotification then
+        result := ''
+      else
+        result := CapabilityError(requestId, E);
     on E: EMcpInvalidParams do
       if isNotification then
         result := ''
