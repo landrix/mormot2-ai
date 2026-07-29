@@ -6,8 +6,8 @@ set -euo pipefail
 # sind schnell.
 #
 #   build-demo.sh                         # ALLE Demos (MCP-Transporte + LLM + RAG)
-#   build-demo.sh mcp.examples.dpr        # eine Demo (Pfad relativ zu demos/)
-#   build-demo.sh stdio/demo.mcp.stdio.dpr
+#   build-demo.sh mcp.examples.lpr        # eine Demo (Pfad relativ zu demos/)
+#   build-demo.sh stdio/demo.mcp.stdio.lpr
 #   VERBOSE=1 build-demo.sh ...           # vollen Compilerlog zeigen
 
 # Wurzel dieser Extension (scripts/..) - unabhaengig vom Einbindungsort.
@@ -39,16 +39,16 @@ if [ "$#" -ge 1 ] && [ "$1" != "all" ]; then
 else
   # WICHTIG: hier ALLE Demos auflisten, sonst meldet der "all"-Build faelschlich
   # "ALL DEMOS OK", obwohl LLM-/RAG-Demos nie gebaut (und evtl. kaputt) sind.
-  DEMOS=(mcp.examples.dpr stdio/demo.mcp.stdio.dpr http/demo.mcp.http.dpr \
-         streamable/demo.mcp.streamable.dpr \
-         llm/llm-chat.dpr llm/llm-agent.dpr llm/llm-structured.dpr \
-         llm/llm-embed.dpr llm/llm-vision.dpr llm/llm-anthropic.dpr \
-         rag/rag-spike.dpr rag/rag-chat.dpr rag/rag-agent.dpr)
+  DEMOS=(mcp.examples.lpr stdio/demo.mcp.stdio.lpr http/demo.mcp.http.lpr \
+         jsonrpc/demo.mcp.jsonrpc.lpr streamable/demo.mcp.streamable.lpr \
+         llm/llm-chat.lpr llm/llm-agent.lpr llm/llm-structured.lpr \
+         llm/llm-embed.lpr llm/llm-vision.lpr llm/llm-anthropic.lpr \
+         rag/rag-spike.lpr rag/rag-chat.lpr rag/rag-agent.lpr)
 fi
 
 build_one() {
-  local dpr="$1"
-  local name; name="$(basename "$dpr" .dpr)"
+  local lpr="$1"
+  local name; name="$(basename "$lpr" .lpr)"
   local log="$DEMO_OUT/$name.buildlog"
   echo ">>> demo $name ($ARCH-$TARGET)"
   set +e
@@ -60,7 +60,7 @@ build_one() {
     -FU"$UNIT_OUT" \
     -FE"$DEMO_OUT" \
     -o"$DEMO_OUT/$name" \
-    "$DEMO_SRC/$dpr" > "$log" 2>&1
+    "$DEMO_SRC/$lpr" > "$log" 2>&1
   local rc=$?
   set -e
   if [ "${VERBOSE:-0}" = "1" ]; then

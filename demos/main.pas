@@ -244,7 +244,7 @@ begin
     // Test server/discover
     request := '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}';
     response := server.ExecuteRequest(request);
-    ConsoleWrite('Step 1/5 - Initialize:'#13#10+'%', [response], ccLightMagenta);
+    ConsoleWrite('Step 1/5 - Discover:'#13#10+'%', [response], ccLightMagenta);
     ConsoleWriteLn;
 
     // Test tools/list
@@ -253,9 +253,11 @@ begin
     ConsoleWrite('Step 2/5 - Tools list:'#13#10+'%', [response], ccLightCyan);
     ConsoleWriteLn;
 
-    // Test tools/call
-    request := '{"jsonrpc":"2.0","id":3,"method":"tools/call",' +
-      '"params":{"name":"add","arguments":{"a":5,"b":3}}}';
+    // Test tools/call — like every request since 2026-07-28, it must carry its
+    // own protocol version and client capabilities (there is no handshake)
+    request := _Safe(_ObjFast(['jsonrpc', '2.0', 'id', 3, 'method', 'tools/call',
+      'params', McpRequestParams(_ObjFast([
+        'name', 'add', 'arguments', _ObjFast(['a', 5, 'b', 3])]))]))^.ToJson;
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 3/5 - Tool call:'#13#10+'%', [response], ccLightBlue);
     ConsoleWriteLn;
@@ -267,8 +269,9 @@ begin
     ConsoleWriteLn;
 
     // Test resources/read
-    request := '{"jsonrpc":"2.0","id":5,"method":"resources/read",' +
-      '"params":{"uri":"version://info"}}';
+    request := _Safe(_ObjFast(['jsonrpc', '2.0', 'id', 5,
+      'method', 'resources/read',
+      'params', McpRequestParams(_ObjFast(['uri', 'version://info']))]))^.ToJson;
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 5/5 - Resource read:'#13#10+'%', [response], ccGreen);
     ConsoleWriteLn;

@@ -30,7 +30,7 @@ landrix-spezifische Bindung (Guards, TOrm-Memory, REST) lebt dort, nicht hier.
 ```
 mormot2-ai/
   src/    mormot.ai.mcp[.server|.stdio|.tools]  — Engine, Transporte, Beispiel-Tools
-  tests/  test.mcp.core / test.mcp.transports + mcp.tests.dpr (mORMot TSynTests)
+  tests/  test.mcp.core / test.mcp.transports + mcp.tests.lpr (mORMot TSynTests)
   demos/  stdio · http · jsonrpc · sse · streamable (inkl. Claude) + mcp.examples
           demos/_deps/  adoptierte mormot.ext.os (flydev) — Demo-Dependency
   scripts/run-fpc-tests.sh   — Build + Test (WSL/FPC)
@@ -87,14 +87,14 @@ LiteLLM / Ollama ab); ein Provider mit echt abweichendem Wire bekommt einen
 **Vision/multimodal:** `TLlmMessage.Images` (`LlmImageMessage`/`LlmImageBase64`/
 `LlmImageUrl`) trägt Bild-Anhänge; beide Wires serialisieren sie (OpenAI `image_url`
 inkl. base64-`data:`-URI, Anthropic `image`-Block mit typisiertem `source`; leerer
-`MediaType` fällt auf `image/png` zurück). Demo `demos/llm/llm-vision.dpr` ist
+`MediaType` fällt auf `image/png` zurück). Demo `demos/llm/llm-vision.lpr` ist
 provider-agnostisch (`VISION_PROVIDER=openai|anthropic`, Bild via `VISION_IMAGE_B64`/
 `_MEDIA` oder `VISION_IMAGE_URL`) — **live** gegen `gpt-4o-mini` **und** `claude-opus-4-8`
 geprüft (beide erkennen denselben inline-base64-Kreis).
 
 ### Tests (LLM-Suite, inkl. Anthropic)
 
-Eigener Runner — baut + fährt `llm.tests.dpr` (alle LLM-Suiten: SSE, Client, Agent,
+Eigener Runner — baut + fährt `llm.tests.lpr` (alle LLM-Suiten: SSE, Client, Agent,
 Agent-MCP, **Anthropic**, Structured, RAG, RAG-Tool):
 
 ```bash
@@ -116,7 +116,7 @@ Provider-Config kommt aus der Umgebung (`demos/.env`, kopiert aus
 oder geloggt:
 
 ```bash
-bash scripts/build-demo.sh llm/llm-anthropic.dpr
+bash scripts/build-demo.sh llm/llm-anthropic.lpr
 set -a; . demos/.env; set +a   # ANTHROPIC_API_KEY[/_MODEL]
 bin/fpc/demos/llm-anthropic
 ```

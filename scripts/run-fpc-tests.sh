@@ -4,7 +4,7 @@ set -euo pipefail
 # Baut + laeuft die mORMot-Testsuite der mormot.ai.* Extension (LandrixAI MCP)
 # unter Linux/FPC, i. d. R. ueber WSL. Modelliert nach
 # backend/scripts/run-fpc-tests.sh (gleiche mORMot-Pfad-/Static-Verdrahtung),
-# aber der Runner ist ein mORMot-TSynTests-Programm (mcp.tests.dpr), kein
+# aber der Runner ist ein mORMot-TSynTests-Programm (mcp.tests.lpr), kein
 # FPCUnit-consoletestrunner.
 #
 #   run-fpc-tests.sh            # bauen + ausfuehren
@@ -51,7 +51,7 @@ fpc -MDelphi -Sci -Ci -O2 -g -gl -gw2 \
   -FU"$UNIT_OUT" \
   -FE"$OUT" \
   -o"$OUT/$PROG" \
-  "$TEST_SRC/$PROG.dpr" > "$BUILDLOG" 2>&1
+  "$TEST_SRC/$PROG.lpr" > "$BUILDLOG" 2>&1
 rc=$?
 set -e
 

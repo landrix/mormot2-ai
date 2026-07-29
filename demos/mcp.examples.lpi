@@ -60,7 +60,7 @@
     </RequiredPackages>
     <Units>
       <Unit>
-        <Filename Value="mcp.examples.dpr"/>
+        <Filename Value="mcp.examples.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit>
     </Units>

@@ -30,7 +30,7 @@ fpc -MDelphi -Sci -Ci -O2 -Tlinux -P"$ARCH" \
   -FU"$UNIT_OUT" \
   -FE"$OUT" \
   -o"$OUT/rag-spike" \
-  "$DEMO_SRC/rag/rag-spike.dpr" > "$OUT/build.log" 2>&1 \
+  "$DEMO_SRC/rag/rag-spike.lpr" > "$OUT/build.log" 2>&1 \
   || { echo "FAIL(compile)"; tail -25 "$OUT/build.log"; exit 1; }
 echo "OK build: $OUT/rag-spike"
 

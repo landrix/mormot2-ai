@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Baut + laeuft die mORMot-Testsuite des LLM-Clients (mormot.ai.llm.*) unter
 # Linux/FPC, i. d. R. ueber WSL. Modelliert nach run-fpc-tests.sh (gleiche
-# mORMot-Pfad-/Static-Verdrahtung); Runner ist mORMot-TSynTests (llm.tests.dpr).
+# mORMot-Pfad-/Static-Verdrahtung); Runner ist mORMot-TSynTests (llm.tests.lpr).
 #
 #   run-fpc-llm-tests.sh            # bauen + ausfuehren
 #   VERBOSE=1 run-fpc-llm-tests.sh  # vollen Compiler-/Testlog zeigen
@@ -49,7 +49,7 @@ fpc -MDelphi -Sci -Ci -O2 -g -gl -gw2 \
   -FU"$UNIT_OUT" \
   -FE"$OUT" \
   -o"$OUT/$PROG" \
-  "$TEST_SRC/$PROG.dpr" > "$BUILDLOG" 2>&1
+  "$TEST_SRC/$PROG.lpr" > "$BUILDLOG" 2>&1
 rc=$?
 set -e
 

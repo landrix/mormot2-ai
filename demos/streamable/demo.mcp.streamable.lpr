@@ -56,7 +56,8 @@ begin
         streamer := TClaudeStreamer.Create;
         transport.OnStreamCall := streamer.HandleStreamCall;
       end;
-      ConsoleWrite('MCP Streamable HTTP Demo (protocol 2025-03-26)', ccLightCyan);
+      ConsoleWrite('MCP Streamable HTTP Demo (protocol ' +
+        MCP_PROTOCOL_VERSION + ', stateless)', ccLightCyan);
       ConsoleWrite('Single endpoint: http://127.0.0.1:%/mcp (loopback only)', [port], ccLightGreen);
       if allowClaude then
       begin
@@ -77,27 +78,44 @@ begin
       ConsoleWrite('', ccLightGray);
       ConsoleWrite('Connect MCP Inspector (Streamable HTTP) to the URL above, ' +
         'or test with curl:', ccLightGray);
-      ConsoleWrite('  1. Initialize:', ccYellow);
-      ConsoleWrite('     curl -X POST http://localhost:%/mcp \', [port], ccWhite);
-      ConsoleWrite('       -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" \', ccWhite);
+      // Every POST mirrors method (and, for tools/call, the tool name) into the
+      // standard headers — the server REQUIRES them and answers 400 + -32020
+      // otherwise, so an example without them would simply not run.
+      ConsoleWrite('  1. Discover (replaces the removed `initialize` handshake):', ccYellow);
+      ConsoleWrite('     curl -X POST http://localhost:%/mcp -i \', [port], ccWhite);
+      ConsoleWrite('       -H "Content-Type: application/json" \', ccWhite);
       ConsoleWrite('       -H "Accept: text/event-stream, application/json" \', ccWhite);
-      ConsoleWrite('       -d ''{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}},"clientInfo":{"name":"curl","version":"1.0"}}}'' -i', ccWhite);
+      ConsoleWrite('       -H "MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + '" \', ccWhite);
+      ConsoleWrite('       -H "Mcp-Method: server/discover" \', ccWhite);
+      ConsoleWrite('       -d ''{"jsonrpc":"2.0","id":1,"method":"server/discover",' +
+        '"params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"' +
+        MCP_PROTOCOL_VERSION + '","io.modelcontextprotocol/clientCapabilities":{},' +
+        '"io.modelcontextprotocol/clientInfo":{"name":"curl","version":"1.0"}}}}''', ccWhite);
       ConsoleWrite('', ccLightGray);
       ConsoleWrite('  2. List tools (no session needed - every request stands alone):', ccYellow);
       ConsoleWrite('     curl -X POST http://localhost:%/mcp \', [port], ccWhite);
-      ConsoleWrite('       -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" \', ccWhite);
+      ConsoleWrite('       -H "Content-Type: application/json" \', ccWhite);
       ConsoleWrite('       -H "Accept: text/event-stream, application/json" \', ccWhite);
-      ConsoleWrite('       -d ''{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}''', ccWhite);
+      ConsoleWrite('       -H "MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + '" \', ccWhite);
+      ConsoleWrite('       -H "Mcp-Method: tools/list" \', ccWhite);
+      ConsoleWrite('       -d ''{"jsonrpc":"2.0","id":2,"method":"tools/list","params":' +
+        '{"_meta":{"io.modelcontextprotocol/protocolVersion":"' + MCP_PROTOCOL_VERSION +
+        '","io.modelcontextprotocol/clientCapabilities":{}}}}''', ccWhite);
       ConsoleWrite('', ccLightGray);
       ConsoleWrite('  3. Ask Claude (streams the CLI answer back as SSE):', ccYellow);
       ConsoleWrite('     curl -N -X POST http://localhost:%/mcp \', [port], ccWhite);
-      ConsoleWrite('       -H "Content-Type: application/json" -H "MCP-Protocol-Version: 2026-07-28" \', ccWhite);
+      ConsoleWrite('       -H "Content-Type: application/json" \', ccWhite);
       ConsoleWrite('       -H "Accept: text/event-stream, application/json" \', ccWhite);
+      ConsoleWrite('       -H "MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + '" \', ccWhite);
+      ConsoleWrite('       -H "Mcp-Method: tools/call" -H "Mcp-Name: ask_claude" \', ccWhite);
       ConsoleWrite('       -d ''{"jsonrpc":"2.0","id":3,"method":"tools/call","params":' +
-        '{"name":"ask_claude","arguments":{"prompt":"What is mORMot in one sentence?"}}}''', ccWhite);
+        '{"name":"ask_claude","arguments":{"prompt":"What is mORMot in one sentence?"},' +
+        '"_meta":{"io.modelcontextprotocol/protocolVersion":"' + MCP_PROTOCOL_VERSION +
+        '","io.modelcontextprotocol/clientCapabilities":{}}}}''', ccWhite);
       ConsoleWrite('', ccLightGray);
-      ConsoleWrite('  4. Terminate session:', ccYellow);
-      ConsoleWrite('     curl -X DELETE http://localhost:%/mcp \', [port], ccWhite);
+      ConsoleWrite('  4. There is nothing to terminate: sessions were removed in ' +
+        MCP_PROTOCOL_VERSION + '.', ccYellow);
+      ConsoleWrite('     GET and DELETE on the endpoint answer 405 Method Not Allowed.', ccLightGray);
       ConsoleWrite('', ccLightGray);
       ConsoleWrite('Press ENTER to stop.', ccLightGray);
       ConsoleWaitForEnterKey;

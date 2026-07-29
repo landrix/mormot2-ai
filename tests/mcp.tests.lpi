@@ -101,7 +101,7 @@
     </RequiredPackages>
     <Units Count="5">
       <Unit0>
-        <Filename Value="mcp.tests.dpr"/>
+        <Filename Value="mcp.tests.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit0>
       <Unit1>
