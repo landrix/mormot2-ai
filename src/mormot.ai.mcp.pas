@@ -96,6 +96,12 @@ const
   /// interim result: the server needs more input (Multi Round-Trip Request)
   MCP_RESULT_INPUT_REQUIRED = 'input_required';
 
+  /// how many notifications may queue up on one subscription before it is
+  // dropped as unable to keep up
+  // - a bound is required, not a nicety: without one a stalled client turns
+  //   every resource update into permanent memory growth
+  MCP_SUBSCRIPTION_MAX_PENDING = 256;
+
   /// default freshness hint: 0 = immediately stale, i.e. never reuse
   // - deliberately conservative. The registry can change at any moment via
   //   RegisterTool, and without subscriptions/listen there is no invalidation
@@ -189,6 +195,66 @@ const
     'public');
 
 type
+  /// which notification types a `subscriptions/listen` request opted into
+  // - the server MUST NOT send a type the client did not ask for, so this is a
+  //   whitelist, never a default-on set
+  TMcpNotificationFilter = record
+    /// notifications/tools/list_changed
+    ToolsListChanged: boolean;
+    /// notifications/prompts/list_changed (accepted, never raised: no prompts)
+    PromptsListChanged: boolean;
+    /// notifications/resources/list_changed
+    ResourcesListChanged: boolean;
+    /// resource URIs to watch, delivering notifications/resources/updated
+    ResourceSubscriptions: TRawUtf8DynArray;
+  end;
+
+  /// one live `subscriptions/listen` stream, identified by its request id
+  // - deliberately holds NO connection pointer: notifications are queued here
+  //   by whichever thread produces them, and the thread that owns the stream
+  //   drains the queue. That is what keeps a server-side push from ever
+  //   touching a connection object it does not own — the use-after-free shape
+  //   that the deleted session registry had.
+  TMcpSubscription = class
+  protected
+    fId: variant;
+    fFilter: TMcpNotificationFilter;
+    fPending: TRawUtf8DynArray;
+    fPendingCount: integer;
+    fCancelled: boolean;
+    fSafe: TLightLock;
+    function GetCancelled: boolean;
+  public
+    /// initialize for the given subscriptions/listen request id and filter
+    constructor Create(const aId: variant;
+      const aFilter: TMcpNotificationFilter); reintroduce;
+    /// release the queue and its lock
+    destructor Destroy; override;
+    /// queue one ready-made JSON-RPC notification for delivery
+    // - called from arbitrary threads (whoever changed the tool list)
+    // - a client that does not keep up must not be able to exhaust memory:
+    //   past MCP_SUBSCRIPTION_MAX_PENDING the subscription is cancelled and
+    //   the queue dropped. Ending the stream is the honest outcome — the
+    //   client reconnects and re-reads the current state, which is exactly
+    //   what it would have to do after any dropped stream.
+    procedure Push(const aJson: RawUtf8);
+    /// take everything queued so far; false when nothing was pending
+    function Drain(out aJson: TRawUtf8DynArray): boolean;
+    /// whether this filter asked for notifications about that resource URI
+    function WatchesResource(const aUri: RawUtf8): boolean;
+    /// mark as cancelled so the owning stream stops at its next turn
+    procedure Cancel;
+    /// the JSON-RPC id of the originating request — also the subscription id
+    property Id: variant read fId;
+    /// the notification types this stream opted into
+    property Filter: TMcpNotificationFilter read fFilter;
+    /// set once the stream should end
+    // - read through the lock: the flag is written by another thread, and on
+    //   a weakly ordered architecture (our aarch64 target) an unsynchronized
+    //   read has no visibility guarantee — a cancelled stream could run on
+    property Cancelled: boolean read GetCancelled;
+  end;
+
   /// the JSON-RPC methods this server dispatches
   // - resolved once from the wire name, then used by BOTH the pre-dispatch
   //   validation and the dispatch itself, so the two can never disagree about
@@ -200,7 +266,8 @@ type
     mcpToolsList,
     mcpToolsCall,
     mcpResourcesList,
-    mcpResourcesRead);
+    mcpResourcesRead,
+    mcpSubscriptionsListen);
 
 
 { ************ IInvokable Interfaces for Tools and Resources }
@@ -374,6 +441,13 @@ type
     fReadCacheTtlMs: integer;
     fListCacheScope: TMcpCacheScope;
     fReadCacheScope: TMcpCacheScope;
+    fSubscriptions: array of TMcpSubscription;
+    fSubscriptionSafe: TLightLock;
+    fMaxSubscriptions: integer;
+    /// queue one notification on every subscription that opted into it
+    // - aUri selects the watchers for notifications/resources/updated and is
+    //   ignored (and empty) for the list-changed notifications
+    procedure Broadcast(const aNotification, aUri: RawUtf8);
     /// the actual preflight — hands the parsed request back so the dispatch
     // does not have to parse the very same body a second time
     function Preflight(const aRequestJson: RawUtf8; out aMethod: RawUtf8;
@@ -413,6 +487,36 @@ type
     // - runs PreflightRequest first, so no dispatch can ever happen on a
     //   request the protocol layer would reject
     function ExecuteRequest(const aRequestJson: RawUtf8): RawUtf8;
+    /// open a subscriptions/listen stream for an already-validated request
+    // - the caller (a transport) owns the returned object and MUST pass it to
+    //   CloseSubscription when its stream ends, whatever ends it
+    // - returns nil when MaxSubscriptions is already reached: an unbounded
+    //   number of long-lived streams would exhaust the HTTP worker pool, so
+    //   refusing is a availability guard, not a protocol decision
+    function OpenSubscription(const aRequestId, aParams: variant): TMcpSubscription;
+    /// end a subscription and release it
+    procedure CloseSubscription(aSubscription: TMcpSubscription);
+    /// how many subscriptions/listen streams are currently open
+    function SubscriptionCount: integer;
+    /// ask every open stream to end, without waiting for them
+    // - for an orderly shutdown: each owning thread notices at its next turn,
+    //   sends the graceful-closure response and releases its subscription
+    procedure CancelAllSubscriptions;
+    /// the first message on a stream: what the server agreed to deliver
+    // - MUST precede every notification of that subscription
+    function SubscriptionAcknowledgement(
+      aSubscription: TMcpSubscription): RawUtf8;
+    /// the empty result that ends a subscription gracefully
+    // - lets a client tell an orderly shutdown from a dropped connection
+    function SubscriptionEndResponse(aSubscription: TMcpSubscription): RawUtf8;
+    /// tell subscribers the tool list changed
+    // - call after RegisterTool/UnregisterTool; only streams that opted into
+    //   toolsListChanged receive it
+    procedure NotifyToolsListChanged;
+    /// tell subscribers the resource list changed
+    procedure NotifyResourcesListChanged;
+    /// tell subscribers watching that URI that the resource changed
+    procedure NotifyResourceUpdated(const aUri: RawUtf8);
     /// finalize a response produced OUTSIDE the dispatch (a streaming hook)
     // - a hook answering e.g. tools/call replaces the handler, not the
     //   protocol: its result still needs resultType, serverInfo and — when the
@@ -459,6 +563,13 @@ type
     //   answer. It is a caching hint either way, never an access control.
     property ListCacheScope: TMcpCacheScope
       read fListCacheScope write fListCacheScope;
+    /// how many subscriptions/listen streams may be open at once (default 8)
+    // - each open stream occupies one HTTP worker thread for its whole life
+    //   (the transport drains its queue there), so an unbounded number would
+    //   let a single client starve the pool and take the API down. Raise it
+    //   only together with the transport's ServerThreadPoolCount.
+    property MaxSubscriptions: integer
+      read fMaxSubscriptions write fMaxSubscriptions;
     /// who may cache resources/read
     // - deliberately SEPARATE from ListCacheScope: a static tool list is a
     //   reasonable candidate for public, while resource CONTENT is exactly what
@@ -475,6 +586,11 @@ type
 // - returns mcpUnknown for anything not implemented, which a Streamable HTTP
 //   transport MUST turn into 404 + -32601 (spec: Protocol Version Header)
 function McpMethodFromName(const aMethod: RawUtf8): TMcpMethod;
+
+/// read the `notifications` filter of a subscriptions/listen request
+// - an absent or malformed filter yields an all-false filter: the server MUST
+//   NOT send a type the client did not explicitly request
+function McpParseNotificationFilter(const aParams: variant): TMcpNotificationFilter;
 
 
 { ************ Client-side Request Metadata Helper }
@@ -801,11 +917,16 @@ begin
   // Servers MUST implement server/discover. It reports what a client would
   // otherwise have learned from `initialize`: versions, capabilities, identity.
   // (serverInfo lands in _meta via FinalizeResult, where the spec puts it.)
+  // listChanged/subscribe are advertised because the registry raises those
+  // notifications itself (see RegisterTool/RegisterResource) — a client that
+  // opens subscriptions/listen for them will really be told about changes.
   result := _ObjFast([
     'supportedVersions', _ArrFast([MCP_PROTOCOL_VERSION]),
     'capabilities', _ObjFast([
-      'tools', _ObjFast([]),
-      'resources', _ObjFast([])])]);
+      'tools', _ObjFast(['listChanged', true]),
+      'resources', _ObjFast([
+        'listChanged', true,
+        'subscribe', true])])]);
 end;
 
 function TMcpJsonRpcProcessor.CreateSuccessResponse(const aRequestId, aResult: variant): RawUtf8;
@@ -928,6 +1049,183 @@ begin
   // never assume a shared cache is safe: both default to private
   fListCacheScope := mcsPrivate;
   fReadCacheScope := mcsPrivate;
+  fSubscriptionSafe.Init;
+  fMaxSubscriptions := 8; // see the property: each one holds a worker thread
+end;
+
+function TMcpServer.OpenSubscription(const aRequestId,
+  aParams: variant): TMcpSubscription;
+var
+  n: PtrInt;
+begin
+  result := nil;
+  fSubscriptionSafe.Lock;
+  try
+    n := length(fSubscriptions);
+    if n >= fMaxSubscriptions then
+      exit; // caller turns this into an error response
+    result := TMcpSubscription.Create(aRequestId,
+      McpParseNotificationFilter(aParams));
+    SetLength(fSubscriptions, n + 1);
+    fSubscriptions[n] := result;
+  finally
+    fSubscriptionSafe.UnLock;
+  end;
+end;
+
+procedure TMcpServer.CloseSubscription(aSubscription: TMcpSubscription);
+var
+  i, n: PtrInt;
+begin
+  if aSubscription = nil then
+    exit;
+  fSubscriptionSafe.Lock;
+  try
+    n := length(fSubscriptions);
+    for i := 0 to n - 1 do
+      if fSubscriptions[i] = aSubscription then
+      begin
+        // remove BEFORE freeing, and while holding the lock: a concurrent
+        // Broadcast must never reach an object that is about to be released
+        if i < n - 1 then
+          MoveFast(fSubscriptions[i + 1], fSubscriptions[i],
+            (n - 1 - i) * SizeOf(pointer));
+        SetLength(fSubscriptions, n - 1);
+        break;
+      end;
+  finally
+    fSubscriptionSafe.UnLock;
+  end;
+  aSubscription.Cancel;
+  aSubscription.Free;
+end;
+
+function TMcpServer.SubscriptionCount: integer;
+begin
+  fSubscriptionSafe.Lock;
+  try
+    result := length(fSubscriptions);
+  finally
+    fSubscriptionSafe.UnLock;
+  end;
+end;
+
+procedure TMcpServer.CancelAllSubscriptions;
+var
+  i: PtrInt;
+begin
+  fSubscriptionSafe.Lock;
+  try
+    for i := 0 to high(fSubscriptions) do
+      fSubscriptions[i].Cancel;
+  finally
+    fSubscriptionSafe.UnLock;
+  end;
+end;
+
+procedure TMcpServer.Broadcast(const aNotification, aUri: RawUtf8);
+var
+  i: PtrInt;
+  sub: TMcpSubscription;
+  wants: boolean;
+  json: RawUtf8;
+begin
+  fSubscriptionSafe.Lock;
+  try
+    // Push() under the registry lock on purpose: it is a short append into the
+    // subscription's own queue, and holding the lock is what guarantees the
+    // object is still alive (CloseSubscription unlinks under the same lock).
+    for i := 0 to high(fSubscriptions) do
+    begin
+      sub := fSubscriptions[i];
+      if aNotification = 'notifications/tools/list_changed' then
+        wants := sub.Filter.ToolsListChanged
+      else if aNotification = 'notifications/resources/list_changed' then
+        wants := sub.Filter.ResourcesListChanged
+      else if aNotification = 'notifications/resources/updated' then
+        wants := sub.WatchesResource(aUri)
+      else
+        wants := false;
+      if not wants then
+        continue;
+      // every message on the stream carries the subscription id, which is the
+      // id of the listen request — that is how a client demultiplexes stdio
+      json := _Safe(_ObjFast([
+        'jsonrpc', '2.0',
+        'method', aNotification,
+        'params', _ObjFast([
+          '_meta', _ObjFast([MCP_META_SUBSCRIPTION_ID, sub.Id])])]))^.ToJson;
+      if aUri <> '' then
+        json := _Safe(_ObjFast([
+          'jsonrpc', '2.0',
+          'method', aNotification,
+          'params', _ObjFast([
+            '_meta', _ObjFast([MCP_META_SUBSCRIPTION_ID, sub.Id]),
+            'uri', aUri])]))^.ToJson;
+      sub.Push(json);
+    end;
+  finally
+    fSubscriptionSafe.UnLock;
+  end;
+end;
+
+procedure TMcpServer.NotifyToolsListChanged;
+begin
+  Broadcast('notifications/tools/list_changed', '');
+end;
+
+procedure TMcpServer.NotifyResourcesListChanged;
+begin
+  Broadcast('notifications/resources/list_changed', '');
+end;
+
+procedure TMcpServer.NotifyResourceUpdated(const aUri: RawUtf8);
+begin
+  if aUri <> '' then
+    Broadcast('notifications/resources/updated', aUri);
+end;
+
+function TMcpServer.SubscriptionAcknowledgement(
+  aSubscription: TMcpSubscription): RawUtf8;
+var
+  agreed: TDocVariantData;
+  uris: TDocVariantData;
+  i: PtrInt;
+begin
+  // "The notifications field in the acknowledgment reflects the subset the
+  // server agreed to honor. Notification types the server does not support are
+  // omitted." promptsListChanged is therefore never echoed: there are no
+  // prompts in this server, so it could never fire.
+  agreed.InitObject([], JSON_FAST);
+  if aSubscription.Filter.ToolsListChanged then
+    agreed.AddValue('toolsListChanged', true);
+  if aSubscription.Filter.ResourcesListChanged then
+    agreed.AddValue('resourcesListChanged', true);
+  if aSubscription.Filter.ResourceSubscriptions <> nil then
+  begin
+    uris.InitArray([], JSON_FAST);
+    for i := 0 to high(aSubscription.Filter.ResourceSubscriptions) do
+      uris.AddItem(aSubscription.Filter.ResourceSubscriptions[i]);
+    agreed.AddValue('resourceSubscriptions', variant(uris));
+  end;
+  result := _Safe(_ObjFast([
+    'jsonrpc', '2.0',
+    'method', 'notifications/subscriptions/acknowledged',
+    'params', _ObjFast([
+      '_meta', _ObjFast([MCP_META_SUBSCRIPTION_ID, aSubscription.Id]),
+      'notifications', variant(agreed)])]))^.ToJson;
+end;
+
+function TMcpServer.SubscriptionEndResponse(
+  aSubscription: TMcpSubscription): RawUtf8;
+var
+  res: variant;
+begin
+  // the JSON-RPC response to the long-lived request: an empty result that says
+  // "this ended on purpose", as opposed to a stream that just stops
+  res := _ObjFast(['_meta',
+    _ObjFast([MCP_META_SUBSCRIPTION_ID, aSubscription.Id])]);
+  result := fProcessor.CreateSuccessResponse(aSubscription.Id, res);
 end;
 
 procedure TMcpServer.AddCacheHints(var aResult: variant; aMethod: TMcpMethod);
@@ -969,11 +1267,30 @@ begin
 end;
 
 destructor TMcpServer.Destroy;
+var
+  i: PtrInt;
 begin
   Stop;
+  // Release any stream still registered. Reaching this with a non-empty list
+  // means a transport was not stopped first — its worker would then drain a
+  // queue belonging to a freed server, so callers MUST free the transport
+  // before the server (as the demos and tests do). Cancel first, so a thread
+  // that is between two turns leaves its loop instead of touching the object.
+  fSubscriptionSafe.Lock;
+  try
+    for i := 0 to high(fSubscriptions) do
+    begin
+      fSubscriptions[i].Cancel;
+      fSubscriptions[i].Free;
+    end;
+    fSubscriptions := nil;
+  finally
+    fSubscriptionSafe.UnLock;
+  end;
   fTools := nil;
   fResources := nil;
   fProcessor.Free;
+  fSubscriptionSafe.Done;
   fSafe.Done;
   inherited;
 end;
@@ -991,6 +1308,9 @@ begin
   finally
     fSafe.UnLock;
   end;
+  // outside the registry lock: the fan-out takes a different lock, and telling
+  // subscribers is what makes the advertised listChanged capability true
+  NotifyToolsListChanged;
 end;
 
 procedure TMcpServer.RegisterResource(const aResource: IMcpResource);
@@ -1006,6 +1326,7 @@ begin
   finally
     fSafe.UnLock;
   end;
+  NotifyResourcesListChanged;
 end;
 
 function TMcpServer.UnregisterTool(const aName: RawUtf8): boolean;
@@ -1016,6 +1337,8 @@ begin
   finally
     fSafe.UnLock;
   end;
+  if result then
+    NotifyToolsListChanged;
 end;
 
 function TMcpServer.UnregisterResource(const aUri: RawUtf8): boolean;
@@ -1026,6 +1349,8 @@ begin
   finally
     fSafe.UnLock;
   end;
+  if result then
+    NotifyResourcesListChanged;
 end;
 
 procedure TMcpServer.Start;
@@ -1305,6 +1630,15 @@ begin
         resultData := ListResources;
       mcpResourcesRead:
         resultData := ExecuteResourceRead(params);
+      mcpSubscriptionsListen:
+        // Only a streaming transport can serve this: it is a long-lived
+        // response stream, not a request/response. The Streamable HTTP
+        // transport intercepts it before we get here; reaching this point
+        // means the caller is stdio or the plain HTTP transport, where the
+        // honest answer is "not available", NOT the empty success response
+        // this would otherwise fall through to.
+        raise EMcpMethodNotFound.CreateU('subscriptions/listen requires a ' +
+          'streaming transport and is not available on this one');
     else
       // only reachable for a notification: Preflight turned every unknown
       // *request* method into -32601 before we got here
@@ -1363,8 +1697,123 @@ begin
     result := mcpResourcesList
   else if aMethod = 'resources/read' then
     result := mcpResourcesRead
+  else if aMethod = 'subscriptions/listen' then
+    result := mcpSubscriptionsListen
   else
     result := mcpUnknown;
+end;
+
+function McpParseNotificationFilter(const aParams: variant): TMcpNotificationFilter;
+var
+  filter, uris: PDocVariantData;
+  i: PtrInt;
+  uri: RawUtf8;
+begin
+  Finalize(result);
+  FillCharFast(result, SizeOf(result), 0);
+  if not _Safe(aParams)^.GetAsDocVariant('notifications', filter) or
+     not filter^.IsObject then
+    exit; // no filter at all: a stream that receives nothing, which is legal
+  result.ToolsListChanged := filter^.B['toolsListChanged'];
+  result.PromptsListChanged := filter^.B['promptsListChanged'];
+  result.ResourcesListChanged := filter^.B['resourcesListChanged'];
+  if filter^.GetAsDocVariant('resourceSubscriptions', uris) and
+     uris^.IsArray then
+    for i := 0 to uris^.Count - 1 do
+    begin
+      uri := VariantToUtf8(uris^.Values[i]);
+      if uri <> '' then
+        AddRawUtf8(result.ResourceSubscriptions, uri);
+    end;
+end;
+
+
+{ ************ TMcpSubscription }
+
+constructor TMcpSubscription.Create(const aId: variant;
+  const aFilter: TMcpNotificationFilter);
+begin
+  inherited Create;
+  fSafe.Init;
+  fId := aId;
+  fFilter := aFilter;
+end;
+
+destructor TMcpSubscription.Destroy;
+begin
+  fPending := nil;
+  fSafe.Done;
+  inherited;
+end;
+
+function TMcpSubscription.GetCancelled: boolean;
+begin
+  fSafe.Lock;
+  try
+    result := fCancelled;
+  finally
+    fSafe.UnLock;
+  end;
+end;
+
+procedure TMcpSubscription.Push(const aJson: RawUtf8);
+begin
+  if aJson = '' then
+    exit;
+  fSafe.Lock;
+  try
+    if fCancelled then
+      exit; // do not grow a queue nobody will drain
+    if fPendingCount >= MCP_SUBSCRIPTION_MAX_PENDING then
+    begin
+      // Backpressure: the reader is not keeping up (a stalled client, or a
+      // burst of resource updates). Without a bound this queue would grow
+      // until the process dies, and MaxSubscriptions only caps how MANY
+      // queues exist, not how large one gets. Drop the stream instead.
+      fCancelled := true;
+      fPending := nil;
+      fPendingCount := 0;
+      exit;
+    end;
+    if fPendingCount = length(fPending) then
+      SetLength(fPending, NextGrow(fPendingCount));
+    fPending[fPendingCount] := aJson;
+    inc(fPendingCount);
+  finally
+    fSafe.UnLock;
+  end;
+end;
+
+function TMcpSubscription.Drain(out aJson: TRawUtf8DynArray): boolean;
+begin
+  fSafe.Lock;
+  try
+    result := fPendingCount > 0;
+    if not result then
+      exit;
+    SetLength(fPending, fPendingCount); // hand over exactly what is queued
+    aJson := fPending;
+    fPending := nil;
+    fPendingCount := 0;
+  finally
+    fSafe.UnLock;
+  end;
+end;
+
+function TMcpSubscription.WatchesResource(const aUri: RawUtf8): boolean;
+begin
+  // the filter is immutable after Create, so this needs no lock
+  result := FindRawUtf8(fFilter.ResourceSubscriptions, aUri) >= 0;
+end;
+
+procedure TMcpSubscription.Cancel;
+begin
+  fSafe.Lock;
+  try
+    fCancelled := true;
+  finally
+    fSafe.UnLock;
+  end;
 end;
 
 

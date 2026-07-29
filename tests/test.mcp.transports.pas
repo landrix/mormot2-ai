@@ -98,6 +98,7 @@ type
     procedure ProtocolErrorsUseHttpStatus;
     procedure ConcurrentPosts;
     procedure StreamHookIsValidatedAndContained;
+    procedure SubscriptionStreamDelivers;
   end;
 
 implementation
@@ -1448,6 +1449,117 @@ begin
     transport.Free;
     server.Free;
     probe.Free;
+  end;
+end;
+
+type
+  /// drives a live subscription stream from outside the blocked POST
+  // - the client's POST does not return until the stream ends, so the events
+  //   under test have to be produced from another thread
+  TSubscriptionDriver = class(TThread)
+  public
+    Server: TMcpServer;
+    Opened: boolean;
+    procedure Execute; override;
+  end;
+
+procedure TSubscriptionDriver.Execute;
+var
+  waited: integer;
+begin
+  // Wait for the stream to actually register, do NOT guess with a sleep: if
+  // the POST were slower than a fixed delay, both notifications would be lost
+  // and CancelAllSubscriptions would hit nothing — leaving the stream open and
+  // the test HANGING instead of failing. Poll the real state with a deadline.
+  waited := 0;
+  while (Server.SubscriptionCount = 0) and
+        (waited < 5000) do
+  begin
+    SleepHiRes(10);
+    inc(waited, 10);
+  end;
+  Opened := Server.SubscriptionCount > 0;
+  if Opened then
+  begin
+    Server.NotifyToolsListChanged;
+    Server.NotifyResourceUpdated('version://info');
+  end;
+  // Tear down either way: a stream left open would block the test forever.
+  // The loop polls Cancelled every 50ms, so this returns promptly.
+  Server.CancelAllSubscriptions;
+end;
+
+procedure TTestMcpStreamableTransport.SubscriptionStreamDelivers;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  driver: TSubscriptionDriver;
+  port, status: integer;
+  client: THttpClientSocket;
+  request, body: RawUtf8;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  driver := nil;
+  try
+    // no resource needs to exist: subscribing to a URI is an opt-in filter,
+    // not a lookup — the notification is raised through the server API
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    driver := TSubscriptionDriver.Create(true);
+    driver.Server := server;
+    driver.FreeOnTerminate := false;
+    driver.Start;
+
+    // subscriptions/listen replaces the removed GET stream and
+    // resources/subscribe: one long-lived POST response carrying every
+    // notification the client opted into.
+    request := '{"jsonrpc":"2.0","id":7,"method":"subscriptions/listen",' +
+      '"params":{"notifications":{"toolsListChanged":true,' +
+      '"resourceSubscriptions":["version://info"]}}}';
+    status := McpPost(client, transport.Endpoint, request);
+    CheckEqual(status, HTTP_SUCCESS, 'listen stream completes');
+    Check(driver.Opened, 'the subscription registered before the driver fired');
+    body := client.Content;
+
+    // 1. the acknowledgement MUST come first, before any notification
+    Check(PosEx('notifications/subscriptions/acknowledged', body) > 0,
+      'stream is acknowledged');
+    Check(PosEx('notifications/subscriptions/acknowledged', body) <
+          PosEx('notifications/tools/list_changed', body),
+      'the acknowledgement precedes every notification');
+
+    // 2. both opted-in notification types arrive, tagged with the
+    // subscription id (= the id of the listen request), which is how a stdio
+    // client demultiplexes concurrent streams
+    Check(PosEx('notifications/tools/list_changed', body) > 0,
+      'tools/list_changed delivered');
+    Check(PosEx('notifications/resources/updated', body) > 0,
+      'resources/updated delivered for the watched URI');
+    Check(PosEx(MCP_META_SUBSCRIPTION_ID, body) > 0,
+      'messages carry the subscription id');
+
+    // 3. a type the client did NOT request must never appear
+    Check(PosEx('notifications/resources/list_changed', body) = 0,
+      'the server must not send an unrequested notification type');
+
+    // 4. server-side teardown ends with the empty response to the listen
+    // request, so the client can tell this from a dropped connection
+    Check(PosEx('"id":7', body) > 0, 'graceful closure response, correlated');
+  finally
+    if driver <> nil then
+    begin
+      driver.WaitFor;
+      driver.Free;
+    end;
+    client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
   end;
 end;
 

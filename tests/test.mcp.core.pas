@@ -88,6 +88,7 @@ type
     procedure ResultMustBeAnObject;
     procedure PreflightDecidesHttpStatus;
     procedure CacheableResultsCarryHints;
+    procedure SubscriptionFilterAndFanout;
   end;
 
 implementation
@@ -680,6 +681,123 @@ begin
     Check(VarIsVoid(_Safe(rv)^.GetValueOrNull('result')), 'no result on error');
   finally
     server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.SubscriptionFilterAndFanout;
+var
+  server: TMcpServer;
+  tools, res, none, extra: TMcpSubscription;
+  queued: TRawUtf8DynArray;
+  ack: RawUtf8;
+  doc, params, meta, agreed: PDocVariantData;
+  dv: variant;
+  i: PtrInt;
+
+  // JSON-RPC method of the single queued notification, '' when none
+  function DrainedMethod(aSub: TMcpSubscription): RawUtf8;
+  var
+    d: variant;
+  begin
+    result := '';
+    if not aSub.Drain(queued) then
+      exit;
+    CheckEqual(length(queued), 1, 'exactly one notification');
+    d := _JsonFast(queued[0]);
+    _Safe(d)^.GetAsRawUtf8('method', result);
+  end;
+
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    // Three streams with different filters. The spec is strict: "The server
+    // MUST NOT send notification types the client has not explicitly
+    // requested" — so this is a whitelist, and `none` must stay empty.
+    tools := server.OpenSubscription(1,
+      _ObjFast(['notifications', _ObjFast(['toolsListChanged', true])]));
+    res := server.OpenSubscription(2, _ObjFast(['notifications', _ObjFast([
+      'resourcesListChanged', true,
+      'resourceSubscriptions', _ArrFast(['version://info'])])]));
+    none := server.OpenSubscription(3, _ObjFast([]));
+    Check(tools <> nil, 'first stream opens');
+    Check(none <> nil, 'a stream without any filter is legal');
+
+    // acknowledgement: first message, carries the subscription id, and echoes
+    // only the subset the server actually honors
+    ack := server.SubscriptionAcknowledgement(res);
+    dv := _JsonFast(ack);
+    doc := _Safe(dv);
+    Check(doc^.GetAsRawUtf8('method', ack), 'ack method');
+    CheckEqual(ack, 'notifications/subscriptions/acknowledged');
+    Check(doc^.GetAsDocVariant('params', params), 'ack params');
+    Check(params^.GetAsDocVariant('_meta', meta), 'ack _meta');
+    CheckEqual(VariantToUtf8(meta^.GetValueOrNull(MCP_META_SUBSCRIPTION_ID)),
+      '2', 'ack carries the listen request id as subscription id');
+    Check(params^.GetAsDocVariant('notifications', agreed), 'agreed filter');
+    Check(agreed^.GetValueIndex('resourcesListChanged') >= 0, 'echoes what we honor');
+    Check(agreed^.GetValueIndex('toolsListChanged') < 0,
+      'does not echo a type this stream did not request');
+    Check(agreed^.GetValueIndex('promptsListChanged') < 0,
+      'never echoes a type the server cannot raise at all');
+
+    // fan-out follows the filters, not the connection
+    server.NotifyToolsListChanged;
+    CheckEqual(DrainedMethod(tools), 'notifications/tools/list_changed');
+    Check(not res.Drain(queued), 'unsubscribed stream gets nothing');
+    Check(not none.Drain(queued), 'empty filter gets nothing');
+
+    server.NotifyResourcesListChanged;
+    CheckEqual(DrainedMethod(res), 'notifications/resources/list_changed');
+    Check(not tools.Drain(queued), 'tools stream unaffected');
+
+    // resource updates are per URI, not per stream
+    server.NotifyResourceUpdated('version://info');
+    CheckEqual(DrainedMethod(res), 'notifications/resources/updated');
+    server.NotifyResourceUpdated('other://thing');
+    Check(not res.Drain(queued), 'a URI nobody watches notifies nobody');
+
+    // every message carries the subscription id so a stdio client can
+    // demultiplex several streams on one channel
+    server.NotifyResourceUpdated('version://info');
+    Check(res.Drain(queued), 'queued');
+    dv := _JsonFast(queued[0]);
+    Check(_Safe(dv)^.GetAsDocVariant('params', params));
+    Check(params^.GetAsDocVariant('_meta', meta));
+    CheckEqual(VariantToUtf8(meta^.GetValueOrNull(MCP_META_SUBSCRIPTION_ID)), '2');
+    CheckEqual(params^.U['uri'], 'version://info', 'the updated URI');
+
+    // the graceful-closure response is the JSON-RPC answer to the long-lived
+    // request, so a client can tell an orderly end from a dropped connection
+    dv := _JsonFast(server.SubscriptionEndResponse(tools));
+    doc := _Safe(dv);
+    CheckEqual(VariantToUtf8(doc^.GetValueOrNull('id')), '1', 'correlated by id');
+    Check(doc^.GetValueIndex('result') >= 0, 'carries an (empty) result');
+
+    // the cap exists so one client cannot take every HTTP worker thread
+    CheckEqual(server.MaxSubscriptions, 8, 'bounded by default');
+    for i := 4 to 8 do
+      Check(server.OpenSubscription(i, _ObjFast([])) <> nil, 'below the cap');
+    extra := server.OpenSubscription(99, _ObjFast([]));
+    Check(extra = nil, 'refused past the cap instead of starving the pool');
+
+    // Backpressure: a stream nobody drains must not grow without bound —
+    // MaxSubscriptions caps how MANY queues exist, not how large one gets.
+    // Past the limit the subscription is dropped, which the owning stream
+    // turns into a closed stream; the client reconnects and re-reads state.
+    Check(not res.Cancelled, 'still live before the flood');
+    for i := 0 to MCP_SUBSCRIPTION_MAX_PENDING + 10 do
+      server.NotifyResourceUpdated('version://info');
+    Check(res.Cancelled, 'a stream that cannot keep up is dropped');
+    Check(not res.Drain(queued), 'and its queue is released, not retained');
+    Check(not tools.Cancelled, 'the flood does not affect other streams');
+
+    // a closed stream stops receiving, and closing is safe while others live
+    server.CloseSubscription(tools);
+    server.NotifyToolsListChanged; // must not touch the freed subscription
+    Check(not res.Drain(queued), 'still nothing for the resource stream');
+  finally
+    server.Free; // frees whatever is still registered
   end;
 end;
 

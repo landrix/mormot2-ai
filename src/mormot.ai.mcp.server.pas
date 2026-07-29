@@ -191,6 +191,12 @@ type
     // HTTP status — used for everything the protocol layer rejects up front
     function SendProtocolError(var Ctxt: THttpServerRequest;
       const aErrorJson: RawUtf8; aStatus: integer): cardinal;
+    // Hold a subscriptions/listen stream open: acknowledge, then deliver
+    // queued notifications until the client disconnects or the server ends it.
+    // Runs on the connection's own thread for the lifetime of the stream (see
+    // TMcpServer.MaxSubscriptions for why that is bounded).
+    procedure StreamSubscription(const aWrite: TMcpRawWrite;
+      const aBody: RawUtf8);
     // -- GET/DELETE are gone with protocol sessions: answer 405 --
     function OnMethodNotAllowed(Ctxt: THttpServerRequestAbstract): cardinal;
   public
@@ -228,6 +234,16 @@ type
 
 
 implementation
+
+const
+  /// how often a subscription stream looks for queued notifications
+  // - small enough that a change reaches the client promptly, large enough
+  //   that an idle stream costs nothing measurable
+  MCP_SUBSCRIPTION_POLL_MS = 50;
+  /// how long a subscription stream may stay silent before a keep-alive
+  // - an SSE comment line; also the probe that detects a client which
+  //   disappeared without closing the socket
+  MCP_SUBSCRIPTION_KEEPALIVE_MS = 15000;
 
 type
   TMcpStreamableAsyncServer = class(THttpAsyncServer)
@@ -505,13 +521,23 @@ begin
   if not fActive then
     exit;
 
+  // Order matters, and getting it wrong is a use-after-free:
+  // THttpAsyncServer.Shutdown waits only a bounded time (10s in
+  // mormot.net.async) for each worker to leave, then force-frees threads and
+  // sockets. A subscription stream sits in its loop on such a worker, so it
+  // MUST be told to leave BEFORE the shutdown starts — otherwise the wait can
+  // expire while the stream is still writing to a connection being freed.
+  // Clearing fActive and cancelling makes every stream exit within one poll
+  // interval (50ms), far inside that budget.
+  fActive := false;
+  if fServer <> nil then
+    fServer.CancelAllSubscriptions;
+
   if fHttpServer <> nil then
   begin
     fHttpServer.Shutdown;
     FreeAndNil(fHttpServer);
   end;
-
-  fActive := false;
 end;
 
 function TMcpStreamableHttpTransport.SendProtocolError(
@@ -848,6 +874,81 @@ begin
     fTransport.FormatSseEvent('message', aJsonMessage)));
 end;
 
+procedure TMcpStreamableHttpTransport.StreamSubscription(
+  const aWrite: TMcpRawWrite; const aBody: RawUtf8);
+var
+  doc: TDocVariantData;
+  requestId: variant;
+  sub: TMcpSubscription;
+  pending: TRawUtf8DynArray;
+  i: PtrInt;
+  idle: integer;
+  alive: boolean;
+begin
+  doc.InitJson(aBody, JSON_FAST);
+  requestId := doc.GetValueOrNull('id');
+  sub := fServer.OpenSubscription(requestId, doc.GetValueOrNull('params'));
+  if sub = nil then
+  begin
+    // At the cap: refuse rather than take the last worker thread. The stream
+    // head is already out, so this has to travel as an SSE event.
+    // It carries the subscription id like every other message on a listen
+    // stream — in `data`, the only place a JSON-RPC error can hold it — so a
+    // client demultiplexing several streams can still tell which one failed.
+    aWrite(SseChunk(FormatSseEvent('message', fServer.Processor.CreateError(
+      requestId, JSONRPC_INTERNAL_ERROR,
+      'Too many concurrent subscriptions',
+      _ObjFast(['_meta', _ObjFast([MCP_META_SUBSCRIPTION_ID, requestId])])))));
+    exit;
+  end;
+  try
+    // MUST be the first message on the stream, before any notification
+    if not aWrite(SseChunk(FormatSseEvent('message',
+        fServer.SubscriptionAcknowledgement(sub)))) then
+      exit;
+    idle := 0;
+    alive := true;
+    while alive and fActive do
+    begin
+      // Drain BEFORE testing for cancellation: an orderly shutdown must still
+      // deliver what is already queued. Testing first would silently drop
+      // notifications that were produced microseconds before the cancel.
+      if sub.Drain(pending) then
+      begin
+        idle := 0;
+        for i := 0 to high(pending) do
+        begin
+          alive := aWrite(SseChunk(FormatSseEvent('message', pending[i])));
+          if not alive then
+            break; // client hung up: closing the stream IS the cancellation
+        end;
+        continue; // more may have arrived while we were writing
+      end;
+      if sub.Cancelled then
+        break; // nothing left to deliver, and we were asked to stop
+      SleepHiRes(MCP_SUBSCRIPTION_POLL_MS);
+      inc(idle, MCP_SUBSCRIPTION_POLL_MS);
+      if idle < MCP_SUBSCRIPTION_KEEPALIVE_MS then
+        continue;
+      idle := 0;
+      // an SSE comment line: keeps intermediaries and idle timeouts from
+      // dropping a quiet stream, and is the only way we notice a client that
+      // vanished without a FIN (the write then fails)
+      alive := aWrite(SseChunk(':'#13#10));
+    end;
+    // Graceful end: the empty response to the long-lived request tells the
+    // client this closed on purpose rather than the connection dropping. It is
+    // sent for a server-side cancellation too — that is exactly the shutdown
+    // case the spec asks for it in. Only a client that already vanished
+    // (alive=false) gets nothing, because there is nobody left to tell.
+    if alive then
+      aWrite(SseChunk(FormatSseEvent('message',
+        fServer.SubscriptionEndResponse(sub))));
+  finally
+    fServer.CloseSubscription(sub);
+  end;
+end;
+
 procedure TMcpStreamableHttpTransport.StreamDeferredResponse(
   const aWrite: TMcpRawWrite; const aBody, aOutHeaders: RawUtf8);
 var
@@ -871,6 +972,16 @@ begin
 
   // shared emitter so a streaming tool can push intermediate token events
   emitter := TMcpStreamEmitter.Create(self, aWrite);
+
+  // subscriptions/listen is not a request/response: it keeps this stream open
+  // and pushes notifications onto it until one side ends it.
+  if McpMethodFromName(_Safe(_JsonFast(aBody))^.U['method']) =
+       mcpSubscriptionsListen then
+  begin
+    StreamSubscription(aWrite, aBody);
+    aWrite('0'#13#10#13#10);
+    exit;
+  end;
 
   // The body is a single JSON-RPC request that mcp() already ran through
   // PreflightRequest — a malformed envelope, bad _meta, an unsupported version

@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**353 Assertions** MCP-Suite + **272 Assertions** LLM-Suite. Offen ist die
+**402 Assertions** MCP-Suite + **272 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -63,6 +63,22 @@ Konsequenzen, die die ganze Implementierung prägen:
   ausdrücklich, eine Antwort **über Autorisierungs-Kontexte hinweg** an andere
   Aufrufer auszuliefern. `cacheScope` ist ein Cache-Hinweis, **nie** eine
   Zugriffskontrolle.
+- **`subscriptions/listen`** ersetzt den GET-Stream und `resources/subscribe`: ein
+  langlebiger POST-Response-Stream, der nur die Notification-Typen liefert, die der
+  Client im Filter angefordert hat (Whitelist — der Server darf nichts anderes
+  senden). Erste Nachricht ist die Acknowledgement, jede Nachricht trägt
+  `_meta.subscriptionId` (= id des listen-Requests), Abschluss ist das leere Result
+  auf denselben Request. `RegisterTool`/`RegisterResource` lösen die
+  list_changed-Notifications selbst aus, deshalb meldet `server/discover`
+  `listChanged`/`subscribe` — die Ankündigung deckt sich mit dem Verhalten.
+  **Nur der Streamable-HTTP-Transport** kann das; stdio und der einfache
+  HTTP-Transport antworten mit `-32601` statt einer leeren Erfolgsantwort.
+  Zwei Grenzen sind bewusst gesetzt: `MaxSubscriptions` (Default 8), weil jeder
+  offene Stream einen Worker-Thread hält, und `MCP_SUBSCRIPTION_MAX_PENDING`
+  (256) pro Stream — ein Client, der nicht mitkommt, wird abgeworfen statt den
+  Speicher wachsen zu lassen. `Stop` bricht alle Streams ab, **bevor** es den
+  HTTP-Server herunterfährt: dessen Shutdown wartet nur begrenzt auf Worker und
+  räumt danach zwangsweise ab.
 - **Validierung entscheidet den HTTP-Status, und zwar bevor gestreamt wird**:
   `PreflightRequest` prüft Envelope, `_meta` und Methodenexistenz. Abgelehnte
   Anfragen gehen als gepuffertes JSON mit **400** (bzw. **404** für `-32601`) raus,
@@ -112,7 +128,7 @@ Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
 Die Tests nutzen mORMots **`TSynTests`** (nicht FPCUnit) — passend zum
 Contribution-Ziel. Zwei Runner:
 - `tests/mcp.tests.lpr` — MCP-Suite (Core + Transporte + Streamable),
-  **353 Assertions** grün; `scripts/run-fpc-tests.sh`.
+  **402 Assertions** grün; `scripts/run-fpc-tests.sh`.
 - `tests/llm.tests.lpr` — LLM-Suite (SSE, Client, Agent, Agent-MCP, **Anthropic**,
   Structured, RAG, RAG-Tool, Vision), **272 Assertions** grün;
   `scripts/run-fpc-llm-tests.sh`.
@@ -268,7 +284,7 @@ Neue Tests im passenden Runner ergänzen.
        deckt jetzt `ConcurrentPosts` ab (4 parallele Clients + Keep-Alive-Reuse).
        Offen bleiben TVec0Store/lembed-Realtests + RAG-Atomar-Rollback (brauchen die
        sqlite-vec-Runtime).
-    7. **MCP-Features nach Phase 1+2**: `subscriptions/listen`, `CacheableResult`
+    7. **MCP-Features nach Phase 1+2**: `CacheableResult`
        (`ttlMs`/`cacheScope`), `x-mcp-header`, MRTR (`InputRequiredResult`,
        `resultType:input_required`), Extensions-Framework, JSON Schema 2020-12 im
        `inputSchema`, OTel-`_meta`-Keys. `MCP_ERROR_MISSING_CLIENT_CAPABILITY`
@@ -295,7 +311,7 @@ Assertions, alle 15 Demos bauen):
   OK"); **Demo-Härtung**: Streamable-Demo bindet Loopback, `ask_claude` nur per
   `MCP_ENABLE_ASK_CLAUDE=1` (neue `BindAddress`-Property am Transport).
 
-### Review-Härtung Runde 2 (nach dem 2026-07-28-Umbau, MCP **353** Assertions grün)
+### Review-Härtung Runde 2 (nach dem 2026-07-28-Umbau, MCP **402** Assertions grün)
 
 Multi-Angle-Review des Umbaus (5 Claude-Angles + Codex als modellfremder Zweitleser):
 
