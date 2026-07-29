@@ -100,6 +100,7 @@ type
     procedure StreamHookIsValidatedAndContained;
     procedure SubscriptionStreamDelivers;
     procedure CapabilityErrorUsesHttpStatus;
+    procedure BearerAuthGuardsTheEndpoint;
   end;
 
 implementation
@@ -1740,6 +1741,217 @@ begin
     CheckEqual(status, HTTP_SUCCESS, 'a normal request is unaffected');
     Check(PosEx('text/event-stream', client.ContentType) > 0,
       'and is still streamed');
+  finally
+    client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
+  end;
+end;
+
+type
+  /// accepts exactly one token, and only for one audience
+  TTransportVerifier = class(TInterfacedObject, IMcpTokenVerifier)
+  public
+    function VerifyToken(const aToken, aResource: RawUtf8;
+      out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+  end;
+
+function TTransportVerifier.VerifyToken(const aToken, aResource: RawUtf8;
+  out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+begin
+  if aToken = 'expired-token' then
+    exit(mtrExpired);
+  if aToken = 'other-audience' then
+    exit(mtrWrongAudience);
+  if (aToken <> 'good-token') and
+     (aToken <> 'narrow-token') then
+    exit(mtrInvalid);
+  aAuthCtx.IsAuthenticated := true;
+  aAuthCtx.UserID := 'user-1';
+  aAuthCtx.Issuer := 'https://as.example.com';
+  if aToken = 'good-token' then
+    AddRawUtf8(aAuthCtx.Scopes, 'files');
+  result := mtrValid;
+end;
+
+type
+  /// echoes back who the server thinks is calling
+  // - the whole point of the verifier naht: if the transport drops the context,
+  //   this tool reports an unauthenticated caller for a perfectly valid token
+  TIdentityEchoTool = class(TInterfacedObject, IMcpTool, IMcpInteractiveTool)
+  public
+    function GetName: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetInputSchema: variant;
+    function Execute(const Args: variant;
+      const AuthCtx: TMcpAuthContext): variant;
+    function ExecuteInteractive(const Args: variant;
+      const Context: TMcpCallContext): variant;
+  end;
+
+function TIdentityEchoTool.GetName: RawUtf8;
+begin
+  result := 'whoami';
+end;
+
+function TIdentityEchoTool.GetDescription: RawUtf8;
+begin
+  result := 'Reports the authenticated caller';
+end;
+
+function TIdentityEchoTool.GetInputSchema: variant;
+begin
+  result := _ObjFast(['type', 'object', 'additionalProperties', false]);
+end;
+
+function TIdentityEchoTool.Execute(const Args: variant;
+  const AuthCtx: TMcpAuthContext): variant;
+begin
+  result := Null; // the server prefers ExecuteInteractive
+end;
+
+function TIdentityEchoTool.ExecuteInteractive(const Args: variant;
+  const Context: TMcpCallContext): variant;
+begin
+  // a per-operation scope requirement — the only way such a decision can reach
+  // the transport, since the token was checked before the method was known
+  if not McpScopeSatisfied(Context.Auth.Scopes, 'files:write') then
+    raise EMcpInsufficientScope.CreateScope('files:write');
+  result := _ObjFast(['content', _ArrFast([_ObjFast([
+    'type', 'text',
+    'text', 'authenticated=' + BOOL_UTF8[Context.Auth.IsAuthenticated] +
+      ' user=' + Context.Auth.UserID +
+      ' issuer=' + Context.Auth.Issuer])])]);
+end;
+
+procedure TTestMcpStreamableTransport.BearerAuthGuardsTheEndpoint;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  scopes, authServers: TRawUtf8DynArray;
+
+  // POST a tools/list with an explicit Authorization header
+  // - hand-built rather than routed through McpPost, because the token has to
+  //   ride along and the point of the test is what the transport does with it
+  function PostAs(const aToken: RawUtf8; aId: integer;
+    const aTool: RawUtf8 = ''): integer;
+  var
+    hdr, body, method: RawUtf8;
+    doc: TDocVariantData;
+    params: variant;
+  begin
+    if aTool = '' then
+    begin
+      method := 'tools/list';
+      params := Null;
+    end
+    else
+    begin
+      method := 'tools/call';
+      params := _ObjFast(['name', aTool, 'arguments', _ObjFast([])]);
+    end;
+    doc.InitJson('{"jsonrpc":"2.0"}', JSON_FAST);
+    doc.AddOrUpdateValue('id', aId);
+    doc.AddOrUpdateValue('method', method);
+    doc.AddOrUpdateValue('params', McpRequestParams(params, 'mcp.tests', '1.0'));
+    body := doc.ToJson;
+    hdr := 'Accept: application/json, text/event-stream'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: ' + method;
+    if aTool <> '' then
+      hdr := hdr + #13#10 + 'Mcp-Name: ' + aTool;
+    if aToken <> '' then
+      hdr := hdr + #13#10 + 'Authorization: Bearer ' + aToken;
+    result := client.Post(transport.Endpoint, body, JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, hdr);
+  end;
+
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.AuthResource := 'https://mcp.example.com/mcp';
+    AddRawUtf8(scopes, 'mcp:use');
+    server.ScopesSupported := scopes;
+    AddRawUtf8(authServers, 'https://as.example.com');
+    server.AuthorizationServers := authServers;
+    server.TokenVerifier := TTransportVerifier.Create;
+    server.RegisterTool(TIdentityEchoTool.Create);
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    // --- no token: 401 with a challenge that says how to come back ---------
+    status := PostAs('', 1);
+    CheckEqual(status, HTTP_UNAUTHORIZED, 'an unauthenticated request -> 401');
+    Check(PosEx('Bearer', client.Headers) > 0,
+      'the refusal carries a WWW-Authenticate challenge');
+    Check(PosEx(MCP_WELL_KNOWN_RESOURCE, client.Headers) > 0,
+      'pointing at the metadata that names the authorization server');
+    Check(PosEx('tools', client.Content) = 0,
+      'and no data whatsoever reaches an unauthorized caller');
+
+    // --- a token for a DIFFERENT resource is not merely too weak -----------
+    // "MCP servers MUST only accept tokens specifically intended for
+    // themselves": this is what stops a token stolen from another service.
+    status := PostAs('other-audience', 2);
+    CheckEqual(status, HTTP_UNAUTHORIZED, 'a token for another audience -> 401');
+    status := PostAs('expired-token', 3);
+    CheckEqual(status, HTTP_UNAUTHORIZED, 'an expired token -> 401');
+    status := PostAs('nonsense', 4);
+    CheckEqual(status, HTTP_UNAUTHORIZED, 'an unknown token -> 401');
+
+    // --- the good token gets through, and still streams as before ---------
+    // this also proves the transport reads the header at all: mORMot parses it
+    // into Ctxt.AuthBearer, and if that were empty every request would 401
+    status := PostAs('good-token', 5);
+    CheckEqual(status, HTTP_SUCCESS, 'a valid token is served');
+    Check(PosEx('text/event-stream', client.ContentType) > 0,
+      'and the response streams exactly as on an open server');
+
+    // --- the verified identity REACHES the handler -------------------------
+    // Without this the whole verifier naht is decorative: the transport would
+    // check the token and then hand the tool an unauthenticated context.
+    status := PostAs('good-token', 6, 'whoami');
+    CheckEqual(status, HTTP_SUCCESS, 'the scoped call is served');
+    Check(PosEx('authenticated=true', client.Content) > 0,
+      'the tool sees the caller as authenticated, not fail-closed');
+    Check(PosEx('user=user-1', client.Content) > 0,
+      'and receives the principal the verifier resolved');
+    Check(PosEx('issuer=https://as.example.com', client.Content) > 0,
+      'and the issuer that minted the token');
+
+    // --- a token that lacks the scope gets 403 plus what to ask for --------
+    // "the server SHOULD respond with HTTP 403 Forbidden ... scope=... the
+    // minimum scopes needed for the operation"
+    status := PostAs('narrow-token', 7, 'whoami');
+    CheckEqual(status, HTTP_FORBIDDEN,
+      'a valid token lacking the scope -> 403, not a 200 with an error body');
+    Check(PosEx('insufficient_scope', client.Headers) > 0,
+      'the challenge says why');
+    Check(PosEx('files:write', client.Headers) > 0,
+      'and names the scope to step up to — without it the client can only ' +
+      'retry the same failing request');
+
+    // --- the discovery document is public: it is read WITHOUT a token ------
+    // both forms are routed, and the spec has clients probe the path form
+    // first: for a resource at /mcp the document lives at the well-known path
+    // with /mcp appended, NOT at the resource path with /.well-known appended
+    status := client.Get(McpResourceMetadataPath(server.AuthResource));
+    CheckEqual(status, HTTP_SUCCESS, 'the path form is served');
+    Check(PosEx('authorization_servers', client.Content) > 0,
+      'and names where to authenticate');
+    status := client.Get(MCP_WELL_KNOWN_RESOURCE);
+    CheckEqual(status, HTTP_SUCCESS, 'the metadata is served unauthenticated');
+    Check(PosEx('https://mcp.example.com/mcp', client.Content) > 0,
+      'and names this resource, so a client can request a token for it');
+    Check(PosEx('bearer_methods_supported', client.Content) > 0,
+      'and how to present it');
   finally
     client.Free;
     if transport <> nil then

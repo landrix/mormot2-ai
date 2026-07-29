@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**487 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
+**560 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -123,6 +123,41 @@ Konsequenzen, die die ganze Implementierung prägen:
   entscheidet `McpHttpStatus` an der fertigen Antwort — der SSE-Kopf geht ohne Hook
   erst danach raus. **Mit** Hook bleibt es bei `200`, weil der Hook vorher
   Zwischenevents senden darf; das ist der bewusste Preis des Streamings.
+- **Authorization (OAuth 2.1 Resource Server)** — der Server ist **ausschließlich**
+  Resource Server: OAuth-Flow, PKCE, Redirects und Client Registration sind Sache des
+  Authorization Servers und des Clients, **nicht** unsere. (Die frühere Notiz „RFC 9207 /
+  Client ID Metadata Documents / Issuer-Bindung" in CONCEPT.md war ein Irrtum — das sind
+  Client-/AS-Pflichten.) Unsere vier Pflichten:
+  1. **RFC 9728 Protected Resource Metadata** (MUSS) unter dem well-known-Pfad. Achtung:
+     RFC 9728 **fügt** das Segment zwischen Host und Pfad **ein** — `https://host/mcp`
+     publiziert unter `https://host/.well-known/oauth-protected-resource/mcp`, nicht
+     umgekehrt. Beide Formen (Pfad + Root) sind geroutet, weil Clients beide probieren.
+     Das Dokument MUSS mindestens einen `authorization_servers`-Eintrag nennen; `Start`
+     lehnt eine Konfiguration ohne ab, solange es noch ein Entwicklerfehler ist.
+  2. **Token validieren, bevor irgendetwas verarbeitet wird** — in beiden HTTP-Transporten
+     vor dem Body. Die Prüfung selbst macht `IMcpTokenVerifier`: die **einzige** Naht, an
+     der ein Deployment andockt. Das Submodul kennt keine Keys, kein JWKS, keinen
+     User-Store und bleibt so landrix-frei.
+  3. **Audience** (MUSS): nur Tokens akzeptieren, die für **diese** Resource ausgestellt
+     sind. Ein Token für einen anderen Dienst ergibt **401**, nicht 403 — es ist hier
+     nicht zu schwach, es gehört gar nicht her. Ein Verifier ohne gesetzte `AuthResource`
+     ist ein Startfehler: ohne kanonische URI ist die Prüfung undefiniert, und „alles
+     akzeptieren" wäre die einzige inakzeptable Auslegung.
+  4. **Challenges**: 401/403/400 mit `WWW-Authenticate` (`resource_metadata`, bei
+     Scope-Mangel zusätzlich `error="insufficient_scope"` + **alle** benötigten Scopes in
+     **einer** Challenge — inkrementelles Nachfordern kostet je einen Autorisierungs-
+     Roundtrip). Ein Handler löst das über `EMcpInsufficientScope` aus; der Transport
+     macht daraus 403 samt Challenge, statt die Exception in den Worker zu lassen.
+  Der verifizierte `TMcpAuthContext` wird **an `ExecuteRequest` durchgereicht** und
+  erreicht den Handler — sonst wäre die ganze Naht dekorativ. Auth-Konfiguration ist
+  **Startup-Konfiguration**: `TokenVerifier`/`AuthResource`/`ScopesSupported` sind nach
+  `Start` gesperrt, weil ein Tausch unter laufenden Requests ein Data-Race ist, das kein
+  Lock sinnvoll macht. Ein `subscriptions/listen`-Stream überlebt ein Token leicht —
+  er endet selbst, sobald `ExpiresUnix` erreicht ist.
+  **Ohne Verifier bleibt der Server offen** (Auth ist laut Spec `OPTIONAL`), und
+  `ExecuteRequest` selbst ist bewusst ungeschützt: Autorisierung ist transportgebunden,
+  stdio SOLL sie laut Spec **nicht** verwenden, und ein In-Process-Aufrufer hält das
+  Serverobjekt ohnehin. Wer einen **neuen** Transport baut, muss `Authorize` dort rufen.
 - Streamable HTTP: **nur POST** (GET/DELETE → 405), kein Batching, keine
   Resumability (`Last-Event-ID`), keine `Mcp-Session-Id`; die Standard-Header
   `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` sind Pflicht und werden gegen den
@@ -167,7 +202,7 @@ Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
 Die Tests nutzen mORMots **`TSynTests`** (nicht FPCUnit) — passend zum
 Contribution-Ziel. Zwei Runner:
 - `tests/mcp.tests.lpr` — MCP-Suite (Core + Transporte + Streamable),
-  **487 Assertions** grün; `scripts/run-fpc-tests.sh`.
+  **560 Assertions** grün; `scripts/run-fpc-tests.sh`.
 - `tests/llm.tests.lpr` — LLM-Suite (SSE, Client, Agent, Agent-MCP, **Anthropic**,
   Structured, RAG, RAG-Tool, Vision), **273 Assertions** grün;
   `scripts/run-fpc-llm-tests.sh`.
@@ -417,6 +452,40 @@ Zwei Claude-Angles + Codex auf den MRTR-Diff. Der Kern-Befund zieht sich durch a
   **außerhalb** des `try` in `ExecuteRequest` stand — die Exception wäre in den
   HTTP-Worker entkommen. (Angle A hatte die Stelle als Beobachtung notiert und mangels
   Wurf-Pfad verworfen; der Fix hat genau diesen Pfad geschaffen.)
+
+### Review-Härtung Runde 4 (Auth/Resource-Server, MCP **560** Assertions grün)
+
+Zwei Claude-Angles + Codex. Der schwerste Befund kam von **allen dreien unabhängig**:
+
+- **Der verifizierte Auth-Kontext erreichte den Handler nie.** Beide Transporte prüften
+  das Token und warfen das Ergebnis weg; `ExecuteRequest` baute sich intern einen
+  fail-closed Kontext. Jedes Tool sah also für **jeden** gültigen Token einen
+  unauthentifizierten Aufrufer — die ganze Naht war dekorativ, und `Scopes`/`Issuer`
+  kamen nirgends an. `ExecuteRequest` nimmt den Kontext jetzt entgegen; der
+  Streamable-Pfad löst ihn vor dem Deferral erneut auf, weil er die Hand-off nicht
+  überlebt.
+- **Die well-known-URL war falsch konstruiert**: RFC 9728 **fügt** das Segment zwischen
+  Host und Pfad **ein** (`https://host/.well-known/oauth-protected-resource/mcp`), wir
+  hängten es an. Jeder Client wäre auf ein 404 gelaufen — und ohne Metadata findet er
+  den Authorization Server nicht. Der eigene Test hatte den Fehler mitzementiert.
+- **`authorization_servers` fehlte** — laut Spec ein MUSS mit mindestens einem Eintrag.
+  `Start` lehnt eine Konfiguration ohne jetzt ab, solange es ein Entwicklerfehler ist.
+- **Das Scope-Gate war strukturell unerreichbar**: `mtrInsufficientScope`, der
+  `aScope`-Parameter und `McpScopeSatisfied` existierten, aber kein Pfad führte dorthin.
+  Neu: `EMcpInsufficientScope` aus dem Handler → 403 + Challenge mit **allen** nötigen
+  Scopes auf einmal.
+- **Ein `subscriptions/listen`-Stream lief nach der einmaligen Prüfung unbegrenzt
+  weiter** — auch wenn das Token längst abgelaufen war. Der Stream endet jetzt selbst,
+  sobald `TMcpAuthContext.ExpiresUnix` erreicht ist.
+- **CORS hätte jeden Browser-Client ausgesperrt**: `Authorization` war nicht erlaubt
+  (Preflight scheitert) und `WWW-Authenticate` nicht exponiert (die Challenge ist für
+  JavaScript unlesbar). Ein geschützter Server wäre aus dem Browser unbenutzbar gewesen.
+- **Verifier-Tausch zur Laufzeit** war ein Data-Race (Interface-Read + AddRef ist nicht
+  atomar) — mein eigener Kommentar behauptete, das sei abgedeckt. Auth ist jetzt
+  Startup-Konfiguration und nach `Start` gesperrt.
+- **Die `:`-Scope-Hierarchie ist eine Konvention, keine OAuth-Regel** (Codex): wo `admin`
+  und `admin:delete` unabhängig sind, würde die erste die zweite still gewähren. Exakte
+  Prüfung ist jetzt anforderbar.
 
 ## Lizenz / Veröffentlichung
 

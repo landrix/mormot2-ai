@@ -70,6 +70,23 @@ type
       const Context: TMcpCallContext): variant;
   end;
 
+  /// a token verifier the tests drive into every refusal reason
+  // - the real one lives in the backend: this unit must stay free of any
+  //   particular identity system, which is exactly what the interface is for
+  TFakeVerifier = class(TInterfacedObject, IMcpTokenVerifier)
+  public
+    /// the token that verifies; anything else is mtrInvalid
+    GoodToken: RawUtf8;
+    /// what the good token is scoped for
+    Scopes: TRawUtf8DynArray;
+    /// force a specific outcome for the good token (mtrValid = no override)
+    Force: TMcpTokenResult;
+    /// the resource the server passed in, recorded for the audience assertion
+    SeenResource: RawUtf8;
+    function VerifyToken(const aToken, aResource: RawUtf8;
+      out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+  end;
+
   /// a resource that always needs input — resources/read is the second method
   /// the spec allows an InputRequiredResult on
   TGatedResource = class(TMcpResourceBase, IMcpInteractiveResource)
@@ -123,6 +140,8 @@ type
     procedure InputRequiredRejectsMalformedResults;
     procedure MrtrRetryFieldsAreTypedAndCountAsPresent;
     procedure RequestStateCodecBindsAndExpires;
+    procedure ScopeHierarchyAndBearerParsing;
+    procedure ProtectedResourceMetadataAndChallenges;
   end;
 
 implementation
@@ -206,6 +225,26 @@ begin
   finally
     builder.Free;
   end;
+end;
+
+{ TFakeVerifier }
+
+function TFakeVerifier.VerifyToken(const aToken, aResource: RawUtf8;
+  out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+begin
+  SeenResource := aResource;
+  // write a principal BEFORE deciding, on purpose: a real verifier may well do
+  // that, and the server must not leak a half-filled context on a refusal
+  aAuthCtx.UserID := 'someone';
+  if aToken <> GoodToken then
+    exit(mtrInvalid);
+  if Force <> mtrValid then
+    exit(Force);
+  aAuthCtx.IsAuthenticated := true;
+  aAuthCtx.UserID := 'user-1';
+  aAuthCtx.Issuer := 'https://as.example.com';
+  aAuthCtx.Scopes := Scopes;
+  result := mtrValid;
 end;
 
 { TGatedResource }
@@ -1543,6 +1582,210 @@ begin
       weak := true;
   end;
   Check(weak, 'a weak secret is refused at construction');
+end;
+
+procedure TTestMcpCore.ScopeHierarchyAndBearerParsing;
+var
+  granted: TRawUtf8DynArray;
+begin
+  // "Servers MUST account for scope hierarchies, where a broader scope implies
+  // narrower ones."
+  granted := nil;
+  AddRawUtf8(granted, 'files');
+  AddRawUtf8(granted, 'tools:call');
+  Check(McpScopeSatisfied(granted, 'files'), 'an exact grant satisfies');
+  Check(McpScopeSatisfied(granted, 'files:read'),
+    'a broader scope implies the narrower ones below it');
+  Check(McpScopeSatisfied(granted, 'files:read:meta'),
+    'and every level below, not just one');
+  Check(McpScopeSatisfied(granted, 'tools:call'), 'a deeper exact grant works');
+  // the implication runs ONE way: reading it backwards would silently turn
+  // every narrow grant into the broad one it was carved out of
+  Check(not McpScopeSatisfied(granted, 'tools'),
+    'a narrow grant must NOT imply the broader scope above it');
+  // the boundary is ':' and nothing else, or 'file' would cover 'files:write'
+  Check(not McpScopeSatisfied(granted, 'filesystem'),
+    'a prefix that does not end on a separator is a different scope');
+  Check(not McpScopeSatisfied(granted, 'admin'), 'an unrelated scope fails');
+  Check(not McpScopeSatisfied(nil, 'files'),
+    'no grants satisfy nothing: an unauthorized request must fail every check');
+  // The ':' hierarchy is a convention, not an OAuth rule. A deployment where
+  // `admin` and `admin:delete` are unrelated permissions must be able to turn
+  // it off, or the first would silently grant the second.
+  Check(not McpScopeSatisfied(granted, 'files:read', {hierarchical=}false),
+    'exact matching can be demanded where the convention does not hold');
+  Check(McpScopeSatisfied(granted, 'files', {hierarchical=}false),
+    'and an exact grant still satisfies then');
+  Check(McpScopeSatisfied(nil, ''), 'an operation requiring nothing passes');
+
+  // RFC 7235: the scheme is case-insensitive, the token is not
+  CheckEqual(McpBearerToken('Bearer abc123'), 'abc123', 'a plain bearer header');
+  CheckEqual(McpBearerToken('bearer abc123'), 'abc123', 'scheme is case-insensitive');
+  CheckEqual(McpBearerToken('  Bearer   abc123  '), 'abc123',
+    'surrounding and inner whitespace is tolerated');
+  CheckEqual(McpBearerToken('Basic abc123'), '', 'another scheme yields nothing');
+  CheckEqual(McpBearerToken('Bearer'), '', 'a scheme without a token is no token');
+  CheckEqual(McpBearerToken('Bearer   '), '', 'nor is one with only spaces');
+  CheckEqual(McpBearerToken(''), '', 'an absent header yields nothing');
+  CheckEqual(McpBearerToken('BearerToken xyz'), '',
+    'the space after the scheme is required');
+end;
+
+procedure TTestMcpCore.ProtectedResourceMetadataAndChallenges;
+var
+  server: TMcpServer;
+  verifier: TFakeVerifier;
+  doc: TDocVariantData;
+  authCtx: TMcpAuthContext;
+  scopes, servers: TRawUtf8DynArray;
+  tmp: RawUtf8;
+  raised: boolean;
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    // --- an open server stays open: authorization is OPTIONAL in MCP --------
+    Check(not server.IsProtected, 'no verifier means no protection');
+    CheckEqual(ord(server.Authorize('', authCtx)), ord(mtrValid),
+      'an unprotected server accepts an unauthenticated request');
+
+    // --- switching protection on ------------------------------------------
+    verifier := TFakeVerifier.Create;
+    verifier.GoodToken := 'good';
+    AddRawUtf8(verifier.Scopes, 'mcp:use');
+    server.TokenVerifier := verifier;
+    Check(server.IsProtected, 'a verifier switches protection on');
+
+    // Without a canonical URI there is nothing to validate an audience
+    // against, so the server refuses to guess rather than accept everything.
+    raised := false;
+    try
+      server.Authorize('Bearer good', authCtx);
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'a protected server without AuthResource fails closed');
+
+    server.AuthResource := 'https://mcp.example.com/mcp';
+    scopes := nil;
+    AddRawUtf8(scopes, 'mcp:use');
+    server.ScopesSupported := scopes;
+    servers := nil;
+    AddRawUtf8(servers, 'https://as.example.com');
+    server.AuthorizationServers := servers;
+
+    // "The Protected Resource Metadata document ... MUST include the
+    // authorization_servers field containing at least one authorization
+    // server" — a protected server without one publishes a document no client
+    // can act on, so Start refuses it while it is still a developer's problem.
+    raised := false;
+    try
+      server.AuthorizationServers := nil;
+      server.Start;
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'a protected server with no authorization server is refused');
+    server.AuthorizationServers := servers;
+
+    // --- the RFC 9728 document --------------------------------------------
+    doc.InitJson(server.ProtectedResourceMetadata, JSON_FAST);
+    Check(doc.IsObject, 'the metadata document is an object');
+    CheckEqual(doc.U['resource'], 'https://mcp.example.com/mcp',
+      'resource is the canonical URI clients put in the RFC 8707 parameter');
+    Check(doc.GetValueIndex('authorization_servers') >= 0,
+      'it names where to authenticate — without this a client is stuck');
+    Check(doc.GetValueIndex('scopes_supported') >= 0, 'and the base scopes');
+    Check(PosEx('header', doc.ToJson) > 0,
+      'bearer_methods_supported says header: a token MUST NOT ride in the query');
+
+    // "MCP Servers SHOULD NOT include offline_access in ... scopes_supported"
+    raised := false;
+    try
+      scopes := nil;
+      AddRawUtf8(scopes, 'offline_access');
+      server.ScopesSupported := scopes;
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'offline_access is a client concern and is refused here');
+
+    // --- refusals ----------------------------------------------------------
+    CheckEqual(ord(server.Authorize('', authCtx)), ord(mtrMissing),
+      'no header is a missing token');
+    CheckEqual(ord(server.Authorize('Bearer wrong', authCtx)), ord(mtrInvalid),
+      'an unknown token is invalid');
+    CheckEqual(verifier.SeenResource, 'https://mcp.example.com/mcp',
+      'the verifier is told which audience to check against');
+    // a verifier may write a principal before it decides to refuse; the server
+    // must not pass that on, or a caller checking only the context sees an
+    // identity that was never authenticated
+    Check(not authCtx.IsAuthenticated, 'a refused context is not authenticated');
+    CheckEqual(authCtx.UserID, '',
+      'and carries no principal the verifier may have written before refusing');
+
+    // --- statuses ----------------------------------------------------------
+    // "401 Unauthorized — Authorization required or token invalid",
+    // "403 Forbidden — Invalid scopes or insufficient permissions"
+    CheckEqual(server.AuthHttpStatus(mtrMissing), 401, 'missing token -> 401');
+    CheckEqual(server.AuthHttpStatus(mtrInvalid), 401, 'invalid token -> 401');
+    CheckEqual(server.AuthHttpStatus(mtrExpired), 401, 'expired token -> 401');
+    // a token minted for another service is not merely too weak here — it does
+    // not belong to this server at all, so it is a 401 and not a 403
+    CheckEqual(server.AuthHttpStatus(mtrWrongAudience), 401,
+      'a token for another resource -> 401, not 403');
+    CheckEqual(server.AuthHttpStatus(mtrInsufficientScope), 403,
+      'a valid token lacking a scope -> 403');
+    CheckEqual(server.AuthHttpStatus(mtrValid), 200, 'a good token -> 200');
+
+    // --- challenges --------------------------------------------------------
+    tmp := server.AuthChallenge(mtrMissing);
+    Check(IdemPChar(pointer(tmp), 'BEARER'), 'the challenge names the scheme');
+    // RFC 9728 INSERTS the well-known segment between host and path — it does
+    // not append it. Appending would send every client to a 404, and a client
+    // that cannot read the metadata never finds the authorization server.
+    Check(PosEx('resource_metadata="https://mcp.example.com' +
+      MCP_WELL_KNOWN_RESOURCE + '/mcp"', tmp) > 0,
+      'and points at the document naming the authorization server');
+    CheckEqual(McpResourceMetadataUrl('https://mcp.example.com/public/mcp'),
+      'https://mcp.example.com' + MCP_WELL_KNOWN_RESOURCE + '/public/mcp',
+      'the resource path becomes a SUFFIX of the well-known path');
+    CheckEqual(McpResourceMetadataUrl('https://mcp.example.com'),
+      'https://mcp.example.com' + MCP_WELL_KNOWN_RESOURCE,
+      'a resource without a path keeps the root form');
+    CheckEqual(McpResourceMetadataUrl('https://mcp.example.com/'),
+      'https://mcp.example.com' + MCP_WELL_KNOWN_RESOURCE,
+      'and a bare trailing slash is not a path');
+    CheckEqual(McpResourceMetadataPath('https://mcp.example.com/mcp'),
+      MCP_WELL_KNOWN_RESOURCE + '/mcp', 'the transport routes that same path');
+    Check(PosEx('error=', tmp) = 0, 'a plain 401 carries no error code');
+
+    tmp := server.AuthChallenge(mtrInsufficientScope, 'files:write tools:call');
+    Check(PosEx('error="insufficient_scope"', tmp) > 0,
+      'a scope refusal says so');
+    Check(PosEx('scope="files:write tools:call"', tmp) > 0,
+      'and names ALL scopes the operation needs, in one challenge');
+    Check(tmp[length(tmp)] <> ',', 'the challenge has no trailing comma');
+
+    // --- ExecuteRequest itself is NOT gated, on purpose --------------------
+    // Authorization lives in the HTTP transports, because it IS transport-level
+    // ("The Model Context Protocol provides authorization capabilities at the
+    // transport level"). stdio must stay usable on a protected server — the
+    // spec says stdio SHOULD NOT use this scheme and take credentials from the
+    // environment instead — and an in-process caller already holds the server
+    // object, so there is nothing left to authorize.
+    // Anyone exposing ExecuteRequest over a NEW transport must call Authorize
+    // there, exactly as the two HTTP transports do.
+    server.Start;
+    Check(PosEx('"result"', Exec(server,
+      '{"jsonrpc":"2.0","id":9,"method":"tools/list"}')) > 0,
+      'in-process dispatch stays open on a protected server: authorization is ' +
+      'a transport concern, and stdio SHOULD NOT use it at all');
+  finally
+    server.Free;
+  end;
 end;
 
 end.

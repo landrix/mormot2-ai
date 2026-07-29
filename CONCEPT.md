@@ -449,12 +449,15 @@ DESIGN.md verweist hierher.
      im Zielprotokoll nicht mehr.
    - ~~Legacy-SSE-Transport härten oder entfernen~~ → **entfernen** (offiziell
      *Deprecated*), Entscheidung getroffen.
-   - **Offen und wichtiger denn je: echte Auth.** Der Core ist **fail-closed**
-     (eine Session-ID ist keine Identität, [mormot.ai.mcp.pas](src/mormot.ai.mcp.pas));
-     es fehlt weiterhin ein **verpflichtender Auth-Resolver**, der Identität/Rollen aus
-     der Backend-Auth befüllt, bevor ein Tool Identität gewährt. Die 2026-07-28-
-     Auth-Härtung (`iss`/RFC 9207, Client ID Metadata Documents, Issuer-Bindung)
-     kommt obendrauf.
+   - **Auth: die Mechanik steht, der Resolver fehlt.** Der Server ist jetzt
+     OAuth-2.1-**Resource-Server** (RFC-9728-Metadata, Token-Prüfung vor dem Dispatch,
+     Audience-Bindung, 401/403-Challenges — Details in [DESIGN.md](DESIGN.md)). Die
+     Naht ist `IMcpTokenVerifier`; **offen** ist deren Landrix-Implementierung im
+     Backend (`backend/src/landrix.server.ai.*`): JWT-Prüfung gegen die bestehende
+     Auth, Rollen aus `GetRolesForUser`, Scope→Permission-Abbildung.
+     **Korrektur zur früheren Fassung**: `iss`/RFC 9207, Client ID Metadata Documents
+     und Issuer-Bindung sind **Client-/Authorization-Server-Pflichten**, nicht die des
+     MCP-Servers — sie stehen hier nicht mehr an.
    - **Gebaut** (Details in [DESIGN.md](DESIGN.md), Abschnitt „Protokoll"):
      `server/discover`, `_meta`-Transport der Protokollversion, `subscriptions/listen`,
      `resultType`, **MRTR**, `ttlMs`/`cacheScope`, neue Header + Error-Codes.

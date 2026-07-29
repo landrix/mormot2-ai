@@ -57,6 +57,9 @@ type
   public
     /// initialize with MCP server instance
     constructor Create(aServer: TMcpServer); reintroduce; virtual;
+    /// the MCP server this transport fronts
+    property Server: TMcpServer
+      read fServer;
     /// start the transport
     procedure Start; virtual; abstract;
     /// stop the transport
@@ -92,6 +95,8 @@ type
     fCorsEnabled: boolean;
     fCorsOrigins: RawUtf8;
     procedure SetCorsHeaders(var Ctxt: THttpServerRequest);
+    // serve the RFC 9728 Protected Resource Metadata, unauthenticated
+    function OnResourceMetadata(Ctxt: THttpServerRequestAbstract): cardinal;
   public
     /// initialize HTTP transport
     constructor Create(aServer: TMcpServer); override;
@@ -186,19 +191,25 @@ type
     //   mcp(), which is why this path can hardcode 200: every status other than
     //   200 was answered before the stream was opened
     procedure StreamDeferredResponse(const aWrite: TMcpRawWrite;
-      const aBody, aOutHeaders: RawUtf8);
+      const aBody, aOutHeaders: RawUtf8; const aAuthCtx: TMcpAuthContext);
     // send a JSON-RPC error as a plain buffered JSON response with an explicit
     // HTTP status — used for everything the protocol layer rejects up front
     function SendProtocolError(var Ctxt: THttpServerRequest;
       const aErrorJson: RawUtf8; aStatus: integer): cardinal;
+    // refuse a request at the HTTP layer with the RFC 6750 challenge that tells
+    // the client how to come back — scheme, scopes, and where the metadata is
+    function SendAuthChallenge(var Ctxt: THttpServerRequest;
+      aResult: TMcpTokenResult; const aScope: RawUtf8 = ''): cardinal;
     // Hold a subscriptions/listen stream open: acknowledge, then deliver
     // queued notifications until the client disconnects or the server ends it.
     // Runs on the connection's own thread for the lifetime of the stream (see
     // TMcpServer.MaxSubscriptions for why that is bounded).
     procedure StreamSubscription(const aWrite: TMcpRawWrite;
-      const aBody: RawUtf8);
+      const aBody: RawUtf8; const aAuthCtx: TMcpAuthContext);
     // -- GET/DELETE are gone with protocol sessions: answer 405 --
     function OnMethodNotAllowed(Ctxt: THttpServerRequestAbstract): cardinal;
+    // serve the RFC 9728 Protected Resource Metadata, unauthenticated
+    function OnResourceMetadata(Ctxt: THttpServerRequestAbstract): cardinal;
   public
     /// initialize with MCP server instance
     constructor Create(aServer: TMcpServer); override;
@@ -307,13 +318,32 @@ begin
   Ctxt.OutCustomHeaders := Ctxt.OutCustomHeaders +
     'Access-Control-Allow-Origin: ' + fCorsOrigins + #13#10 +
     'Access-Control-Allow-Methods: POST, GET, OPTIONS' + #13#10 +
-    'Access-Control-Allow-Headers: Content-Type' + #13#10 +
+    // Authorization must be allowed or a browser client's preflight fails and
+    // the authenticated POST never leaves the page; WWW-Authenticate must be
+    // exposed or its JavaScript cannot read the challenge that tells it where
+    // to authenticate — a protected server would be unusable from a browser
+    // without either.
+    'Access-Control-Allow-Headers: Content-Type, Authorization' + #13#10 +
+    'Access-Control-Expose-Headers: WWW-Authenticate' + #13#10 +
     'Access-Control-Max-Age: 86400' + #13#10;
+end;
+
+function TMcpHttpTransport.OnResourceMetadata(
+  Ctxt: THttpServerRequestAbstract): cardinal;
+begin
+  // public by construction: a client fetches this precisely because it has no
+  // token yet, so requiring one would make discovery impossible
+  Ctxt.SetOutCustomHeader(['Access-Control-Allow-Origin', '*']);
+  if not fServer.IsProtected then
+    exit(HTTP_NOTFOUND); // nothing to discover on an open server
+  result := Ctxt.SetOutJson(fServer.ProtectedResourceMetadata);
 end;
 
 function TMcpHttpTransport.mcp(ctxt: THttpServerRequest): cardinal;
 var
-  requestBody, responseBody: RawUtf8;
+  requestBody, responseBody, scopeChallenge: RawUtf8;
+  tokenResult: TMcpTokenResult;
+  authCtx: TMcpAuthContext;
 begin
   // Set CORS headers
   SetCorsHeaders(Ctxt);
@@ -336,12 +366,35 @@ begin
     exit(HTTP_BADREQUEST);
   end;
 
+  // Authorization before the body is even read: "MCP servers MUST validate
+  // access tokens before processing the request". A no-op unless a verifier
+  // is plugged in.
+  tokenResult := fServer.AuthorizeToken(Ctxt.AuthBearer, authCtx);
+  if tokenResult <> mtrValid then
+  begin
+    Ctxt.SetOutCustomHeader(['WWW-Authenticate', fServer.AuthChallenge(tokenResult)]);
+    Ctxt.SetOutJson('{"error":"' + MCP_TOKEN_ERROR[tokenResult] + '"}');
+    exit(fServer.AuthHttpStatus(tokenResult));
+  end;
+
   // Read request body
   requestBody := Ctxt.InContent;
-  
-  // Execute MCP request
-  responseBody := fServer.ExecuteRequest(requestBody);
-  
+
+  // Execute MCP request ON BEHALF OF the caller we just verified: without
+  // handing the context down, every tool would see an unauthenticated caller
+  // no matter what token was presented.
+  responseBody := fServer.ExecuteRequest(requestBody, authCtx, scopeChallenge);
+
+  // a handler that refused for lack of scope wants 403 + the challenge naming
+  // what to ask for, not a 200 carrying a JSON-RPC error
+  if scopeChallenge <> '' then
+  begin
+    Ctxt.SetOutCustomHeader(['WWW-Authenticate',
+      fServer.AuthChallenge(mtrInsufficientScope, scopeChallenge)]);
+    Ctxt.SetOutJson(responseBody);
+    exit(HTTP_MCP_FORBIDDEN);
+  end;
+
   // Send response
   if responseBody = '' then
     exit(HTTP_NOCONTENT);
@@ -354,6 +407,8 @@ begin
 end;
 
 procedure TMcpHttpTransport.Start;
+var
+  wellKnown: RawUtf8;
 begin
   if fActive then
     exit;
@@ -380,6 +435,11 @@ begin
   // use default routing using RTTI on the TRawAsyncServer published methods
   fHttpServer.Route.RunMethods(
     [urmGet, urmPost, urmOptions, urmPut, urmDelete, urmPatch], self);
+  // the RFC 9728 discovery document, on both forms a client may probe
+  fHttpServer.Route.Get(MCP_WELL_KNOWN_RESOURCE, OnResourceMetadata);
+  wellKnown := McpResourceMetadataPath(fServer.AuthResource);
+  if wellKnown <> MCP_WELL_KNOWN_RESOURCE then
+    fHttpServer.Route.Get(wellKnown, OnResourceMetadata);
   // wait for the server to be ready and raise exception e.g. on binding issue
   fHttpServer.WaitStarted;
   
@@ -431,6 +491,7 @@ end;
 function TMcpStreamableAsyncConnection.OnRead: TPollAsyncSocketOnReadWrite;
 var
   transport: TMcpStreamableHttpTransport;
+  authCtx: TMcpAuthContext;
 begin
   result := inherited OnRead;
   // The published mcp() handler defers request batches by returning
@@ -451,8 +512,14 @@ begin
     // connection open across the many writes (see AfterWrite override).
     fStreaming := true;
     fStreamWriteFailed := false;
+    // Re-resolve the caller here. mcp() already refused an unauthorized request
+    // before deferring, but its context did not survive the hand-off — and a
+    // handler reached through this path must see the same identity as one
+    // reached through the buffered path, or authorization would depend on which
+    // transport happened to answer.
+    transport.Server.AuthorizeToken(fRequest.AuthBearer, authCtx);
     transport.StreamDeferredResponse(WriteRaw, fHttp.Content,
-      fRequest.OutCustomHeaders);
+      fRequest.OutCustomHeaders, authCtx);
     fStreaming := false;
     // finalize once: hrsResponseDone lets the inherited AfterWrite run the
     // standard cleanup (fCurrentProcess) and either keep-alive (parser reset,
@@ -485,7 +552,7 @@ end;
 
 procedure TMcpStreamableHttpTransport.Start;
 var
-  bind: RawUtf8;
+  bind, wellKnown: RawUtf8;
 begin
   if fActive then
     exit;
@@ -516,6 +583,19 @@ begin
   // DELETE used to terminate a session; sessions are gone, so it is routed
   // explicitly only to answer 405 (RunMethods does not route DELETE at all)
   fHttpServer.Route.Delete(fEndpoint, OnMethodNotAllowed);
+  // The discovery document. RFC 9728 INSERTS the resource's path after the
+  // well-known segment, so a server at https://host/mcp publishes at
+  // /.well-known/oauth-protected-resource/mcp — and the spec has clients probe
+  // that form first, the root form second. Both are routed, since either may
+  // be what a given client tries.
+  fHttpServer.Route.Get(MCP_WELL_KNOWN_RESOURCE, OnResourceMetadata);
+  fHttpServer.Route.Options(MCP_WELL_KNOWN_RESOURCE, OnResourceMetadata);
+  wellKnown := McpResourceMetadataPath(fServer.AuthResource);
+  if wellKnown <> MCP_WELL_KNOWN_RESOURCE then
+  begin
+    fHttpServer.Route.Get(wellKnown, OnResourceMetadata);
+    fHttpServer.Route.Options(wellKnown, OnResourceMetadata);
+  end;
   fHttpServer.WaitStarted;
   fActive := true;
 end;
@@ -544,6 +624,42 @@ begin
   end;
 end;
 
+function TMcpStreamableHttpTransport.SendAuthChallenge(
+  var Ctxt: THttpServerRequest; aResult: TMcpTokenResult;
+  const aScope: RawUtf8): cardinal;
+begin
+  // RFC 6750: a refusal carries the challenge that tells the client HOW to come
+  // back — which scheme, which scopes, and where to find the metadata naming
+  // the authorization server. A bare 401 leaves a first-contact client stuck.
+  Ctxt.SetOutCustomHeader(['WWW-Authenticate', fServer.AuthChallenge(aResult, aScope)]);
+  Ctxt.OutContentType := JSON_CONTENT_TYPE_VAR;
+  // The body is deliberately NOT a JSON-RPC error: this refusal happens at the
+  // HTTP layer, before the body was even read, so there is no request id to
+  // correlate it with — and inventing one would be a lie.
+  Ctxt.OutContent := '{"error":"' + MCP_TOKEN_ERROR[aResult] + '"}';
+  result := fServer.AuthHttpStatus(aResult);
+end;
+
+function TMcpStreamableHttpTransport.OnResourceMetadata(
+  Ctxt: THttpServerRequestAbstract): cardinal;
+begin
+  // RFC 9728, served WITHOUT authorization: a client reads this document
+  // precisely because it does not have a token yet. Requiring one would make
+  // discovery impossible — the metadata is public by construction.
+  // Registered explicitly rather than by RTTI: the well-known path contains
+  // dots and dashes, which no Pascal method name can carry.
+  Ctxt.SetOutCustomHeader(['Access-Control-Allow-Origin', '*']);
+  if Ctxt.Method = 'OPTIONS' then
+    exit(HTTP_NOCONTENT);
+  if Ctxt.Method <> 'GET' then
+    exit(HTTP_NOTALLOWED);
+  if not fServer.IsProtected then
+    // nothing to discover: an open server has no authorization server to name,
+    // and publishing an empty document would suggest otherwise
+    exit(HTTP_NOTFOUND);
+  result := Ctxt.SetOutJson(fServer.ProtectedResourceMetadata);
+end;
+
 function TMcpStreamableHttpTransport.SendProtocolError(
   var Ctxt: THttpServerRequest; const aErrorJson: RawUtf8;
   aStatus: integer): cardinal;
@@ -564,6 +680,8 @@ var
   doc: TDocVariantData;
   method: RawUtf8;
   status: integer;
+  tokenResult: TMcpTokenResult;
+  authCtx: TMcpAuthContext;
 begin
   // --- CORS headers on every response ---
   SetCorsHeaders(Ctxt);
@@ -582,6 +700,17 @@ begin
   // --- Origin validation (DNS rebinding protection) ---
   if not ValidateOrigin(Ctxt) then
     exit(HTTP_FORBIDDEN);
+
+  // --- Authorization, BEFORE anything is parsed or dispatched ---
+  // "MCP servers MUST validate access tokens before processing the request,
+  // ensuring the access token is issued specifically for the MCP server, and
+  // take all necessary steps to ensure no data is returned to unauthorized
+  // parties." Ahead of the body on purpose: a refused caller must not be able
+  // to reach the JSON parser, let alone a handler.
+  // On an unprotected server this is a no-op returning mtrValid.
+  tokenResult := fServer.AuthorizeToken(Ctxt.AuthBearer, authCtx);
+  if tokenResult <> mtrValid then
+    exit(SendAuthChallenge(Ctxt, tokenResult));
 
   // --- Validate Content-Type ---
   // mORMot parses Content-Type out of headers into Ctxt.InContentType
@@ -673,8 +802,11 @@ begin
   Ctxt.OutCustomHeaders := Ctxt.OutCustomHeaders +
     'Access-Control-Allow-Origin: ' + fCorsOrigins + #13#10 +
     'Access-Control-Allow-Methods: POST, OPTIONS' + #13#10 +
-    'Access-Control-Allow-Headers: Content-Type, MCP-Protocol-Version, ' +
-      'Mcp-Method, Mcp-Name' + #13#10 +
+    'Access-Control-Allow-Headers: Content-Type, Authorization, ' +
+      'MCP-Protocol-Version, Mcp-Method, Mcp-Name' + #13#10 +
+    // without this a browser client cannot read the 401 challenge at all, and
+    // so can never discover where to obtain a token
+    'Access-Control-Expose-Headers: WWW-Authenticate' + #13#10 +
     'Access-Control-Max-Age: 86400' + #13#10;
 end;
 
@@ -879,7 +1011,8 @@ begin
 end;
 
 procedure TMcpStreamableHttpTransport.StreamSubscription(
-  const aWrite: TMcpRawWrite; const aBody: RawUtf8);
+  const aWrite: TMcpRawWrite; const aBody: RawUtf8;
+  const aAuthCtx: TMcpAuthContext);
 var
   doc: TDocVariantData;
   requestId: variant;
@@ -930,6 +1063,16 @@ begin
       end;
       if sub.Cancelled then
         break; // nothing left to deliver, and we were asked to stop
+      // A stream outlives a token easily: the one check at connect time was
+      // minutes ago, and "take all necessary steps to ensure no data is
+      // returned to unauthorized parties" does not stop applying because the
+      // connection stayed open. A verifier that reports no expiry opts out.
+      if (aAuthCtx.ExpiresUnix > 0) and
+         (UnixTimeUtc >= aAuthCtx.ExpiresUnix) then
+      begin
+        sub.Cancel('the access token presented for this stream has expired');
+        break;
+      end;
       SleepHiRes(MCP_SUBSCRIPTION_POLL_MS);
       inc(idle, MCP_SUBSCRIPTION_POLL_MS);
       if idle < MCP_SUBSCRIPTION_KEEPALIVE_MS then
@@ -965,9 +1108,10 @@ begin
 end;
 
 procedure TMcpStreamableHttpTransport.StreamDeferredResponse(
-  const aWrite: TMcpRawWrite; const aBody, aOutHeaders: RawUtf8);
+  const aWrite: TMcpRawWrite; const aBody, aOutHeaders: RawUtf8;
+  const aAuthCtx: TMcpAuthContext);
 var
-  responseJson: RawUtf8;
+  responseJson, scopeChallenge: RawUtf8;
   emitter: IMcpStreamEmitter;
   handled, headWritten: boolean;
   status: integer;
@@ -1000,7 +1144,7 @@ begin
        mcpSubscriptionsListen then
   begin
     WriteStreamHead;
-    StreamSubscription(aWrite, aBody);
+    StreamSubscription(aWrite, aBody, aAuthCtx);
     aWrite('0'#13#10#13#10);
     exit;
   end;
@@ -1029,7 +1173,7 @@ begin
         // without the mandatory resultType, serverInfo and caching hints
         responseJson := fServer.FinalizeHookResponse(responseJson, aBody)
       else
-        responseJson := fServer.ExecuteRequest(aBody);
+        responseJson := fServer.ExecuteRequest(aBody, aAuthCtx, scopeChallenge);
     end
     else
     begin
@@ -1037,18 +1181,34 @@ begin
       // the request FIRST and only then commit to a status. That is what lets
       // -32021 carry the 400 the spec requires — it depends on what the handler
       // turned out to need and cannot be known at preflight time.
-      responseJson := fServer.ExecuteRequest(aBody);
+      responseJson := fServer.ExecuteRequest(aBody, aAuthCtx, scopeChallenge);
       status := McpHttpStatus(responseJson);
+      if scopeChallenge <> '' then
+        // a handler refused for lack of scope: 403 with the challenge naming
+        // what to ask for, which is what a client steps up with
+        status := HTTP_MCP_FORBIDDEN;
       if status <> HTTP_MCP_SUCCESS then
       begin
         // A rejection is a buffered JSON body with its own status, never a
         // stream — exactly as SendProtocolError does for preflight failures.
-        aWrite(FormatUtf8('HTTP/1.1 % %'#13#10 +
-          'Content-Type: application/json'#13#10 +
-          'Content-Length: %'#13#10 +
-          aOutHeaders + #13#10 + '%',
-          [status, StatusCodeToText(status)^, length(responseJson),
-           responseJson]));
+        if scopeChallenge <> '' then
+          // RFC 6750: the 403 MUST carry what the client has to ask for, or it
+          // cannot step up and will simply retry the same failing request
+          aWrite(FormatUtf8('HTTP/1.1 % %'#13#10 +
+            'Content-Type: application/json'#13#10 +
+            'WWW-Authenticate: %'#13#10 +
+            'Content-Length: %'#13#10 +
+            aOutHeaders + #13#10 + '%',
+            [status, StatusCodeToText(status)^,
+             fServer.AuthChallenge(mtrInsufficientScope, scopeChallenge),
+             length(responseJson), responseJson]))
+        else
+          aWrite(FormatUtf8('HTTP/1.1 % %'#13#10 +
+            'Content-Type: application/json'#13#10 +
+            'Content-Length: %'#13#10 +
+            aOutHeaders + #13#10 + '%',
+            [status, StatusCodeToText(status)^, length(responseJson),
+             responseJson]));
         exit;
       end;
       WriteStreamHead;

@@ -160,6 +160,17 @@ const
   HTTP_MCP_NOT_FOUND = 404;
   /// the server cannot serve the request at all (not active)
   HTTP_MCP_SERVER_ERROR = 500;
+  /// no token, or one this server cannot accept
+  // - spec table: "401 Unauthorized — Authorization required or token invalid"
+  HTTP_MCP_UNAUTHORIZED = 401;
+  /// a valid token that does not carry the scopes this operation needs
+  // - spec table: "403 Forbidden — Invalid scopes or insufficient permissions"
+  HTTP_MCP_FORBIDDEN = 403;
+
+  /// the well-known location of the Protected Resource Metadata document
+  // - "MCP servers MUST implement OAuth 2.0 Protected Resource Metadata
+  //   (RFC9728)"; it is how a client finds the authorization server at all
+  MCP_WELL_KNOWN_RESOURCE = '/.well-known/oauth-protected-resource';
 
 type
   /// Authentication context passed to tool/resource execution
@@ -179,6 +190,22 @@ type
     UserName: RawUtf8;
     /// assigned roles for authorization
     Roles: TRawUtf8DynArray;
+    /// OAuth scopes the presented access token actually carries
+    // - what the token was GRANTED, not what the caller is; a scope is an
+    //   upper bound on the delegation, never a role. Empty on an unauthorized
+    //   request, and empty is what a scope check must fail closed on.
+    Scopes: TRawUtf8DynArray;
+    /// when the presented token stops being valid, as Unix seconds (0 = never)
+    // - a subscriptions/listen stream can stay open for far longer than a token
+    //   lives, and the one check at connect time would then keep feeding a
+    //   caller whose authorization has since lapsed. The stream watches this and
+    //   ends itself; a verifier that leaves it 0 opts out of that.
+    ExpiresUnix: Int64;
+    /// the issuer that minted the token, as established by the verifier
+    // - recorded for auditing: two deployments may share a principal name
+    //   while trusting different issuers, and a log line without this cannot
+    //   tell them apart
+    Issuer: RawUtf8;
   end;
 
   /// MCP-specific error information
@@ -191,6 +218,60 @@ type
     Data: variant;
   end;
 
+  /// why a presented access token was refused
+  // - the distinction drives the HTTP status: everything here except
+  //   mtrInsufficientScope is a 401, that one is a 403
+  TMcpTokenResult = (
+    /// the token verified, and this server is among its intended audiences
+    mtrValid,
+    /// no Authorization header, or not a Bearer one
+    mtrMissing,
+    /// signature, format or issuer did not check out
+    mtrInvalid,
+    /// well-formed and authentic, but past its expiry
+    mtrExpired,
+    /// authentic, but minted for a DIFFERENT resource
+    // - "MCP servers MUST only accept tokens specifically intended for
+    //   themselves and MUST reject tokens that do not include them in the
+    //   audience claim". A 401, not a 403: the token is not merely too weak
+    //   here, it does not belong to this server at all.
+    mtrWrongAudience,
+    /// authentic and ours, but lacking a scope the operation needs
+    mtrInsufficientScope);
+
+  /// verifies the bearer tokens presented to this MCP server
+  // - the ONE place a deployment plugs its identity into the protocol layer:
+  //   this unit deliberately knows no keys, no JWKS and no user store, so it
+  //   can stay generic while the backend decides what a valid token is
+  // - "MCP servers MUST validate access tokens before processing the request"
+  //   — the transport calls this ahead of any dispatch, never after
+  IMcpTokenVerifier = interface(IInvokable)
+    ['{2F8B5C1A-7D34-4E96-A0B2-9C5E1D7A3F60}']
+    /// check one bearer token and, on success, fill in who is calling
+    // - aResource is this server's canonical URI: the verifier MUST confirm the
+    //   token was issued for it and return mtrWrongAudience otherwise, which is
+    //   what stops a token stolen from another service from working here
+    // - aAuthCtx is only meaningful when the result is mtrValid
+    function VerifyToken(const aToken, aResource: RawUtf8;
+      out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+  end;
+
+const
+  /// the OAuth error code that goes with each refusal, in enum order
+  // - RFC 6750 defines exactly three: invalid_request, invalid_token and
+  //   insufficient_scope. An expired or wrong-audience token is `invalid_token`
+  //   — the client cannot fix either by asking for more scope, it needs a new
+  //   token, which is what that code tells it to do.
+  MCP_TOKEN_ERROR: array[TMcpTokenResult] of RawUtf8 = (
+    '',
+    'invalid_request',
+    'invalid_token',
+    'invalid_token',
+    'invalid_token',
+    'insufficient_scope');
+
+type
+
   /// MCP-specific exception class
   EMcpException = class(ESynException);
 
@@ -202,6 +283,26 @@ type
   //   resource is NOT its own error code anymore (the former -32002 was
   //   removed), it is a plain Invalid params
   EMcpInvalidParams = class(EMcpException);
+
+  /// raised by a handler whose caller lacks the OAuth scope it requires
+  // - the only way a per-operation scope decision can reach the transport: the
+  //   token was checked before the body was read, so which scope this call
+  //   needs is not yet knowable there. The transport turns this into the 403
+  //   plus WWW-Authenticate challenge the spec prescribes, and the named scopes
+  //   are what the client asks for in its step-up authorization.
+  // - name EVERY scope the operation needs at once: "Challenging incrementally
+  //   (returning one missing scope, then another on the subsequent retry)
+  //   forces multiple authorization round-trips for a single operation"
+  EMcpInsufficientScope = class(EMcpException)
+  protected
+    fScope: RawUtf8;
+  public
+    /// aScope is the space-separated set the operation requires
+    constructor CreateScope(const aScope: RawUtf8); reintroduce;
+    /// the scopes to put in the challenge, space-separated per RFC 6750
+    property Scope: RawUtf8
+      read fScope;
+  end;
 
   /// raised when the client cannot serve an input request the server needs
   // (mapped to -32021 MissingRequiredClientCapability)
@@ -494,6 +595,41 @@ type
       read fTtlSec;
   end;
 
+/// where the Protected Resource Metadata of that resource identifier lives
+// - RFC 9728 INSERTS the well-known segment between host and path, it does not
+//   append it: `https://example.com/public/mcp` publishes its metadata at
+//   `https://example.com/.well-known/oauth-protected-resource/public/mcp`.
+//   Appending would send every client to a 404 — and a client that cannot read
+//   the metadata cannot find the authorization server at all.
+// - a resource without a path keeps the plain root form
+function McpResourceMetadataUrl(const aResource: RawUtf8): RawUtf8;
+
+/// the path part of the well-known URL, i.e. what a transport must route
+function McpResourceMetadataPath(const aResource: RawUtf8): RawUtf8;
+
+/// does a granted scope set satisfy the scope an operation requires?
+// - "Servers MUST account for scope hierarchies, where a broader scope implies
+//   narrower ones": `files` covers `files:read`, and `a:b` covers `a:b:c`. The
+//   separator is ':', the convention OAuth deployments use for hierarchy.
+// - the implication runs one way only: holding `files:read` does NOT grant
+//   `files`. Reading that backwards would turn every narrow grant into a broad
+//   one, which is the whole point of scoping something narrowly.
+// - an empty granted set satisfies nothing: a request without a token must fail
+//   every check, not pass the ones nobody thought to guard
+// - the ':' hierarchy is a CONVENTION, not something OAuth defines: scope
+//   values are implementation-defined, and a deployment where `admin` and
+//   `admin:delete` are unrelated permissions would see the first silently grant
+//   the second. Pass aHierarchical=false there and require exact matches.
+// - this is a helper for handlers to call, never a policy the server applies
+//   behind your back: nothing in this unit checks scopes on its own
+function McpScopeSatisfied(const aGranted: TRawUtf8DynArray;
+  const aRequired: RawUtf8; aHierarchical: boolean = true): boolean;
+
+/// extract the token of an `Authorization: Bearer …` header value
+// - returns '' when the header is absent, empty, or not the Bearer scheme;
+//   the scheme name is case-insensitive per RFC 7235, the token is not
+function McpBearerToken(const aAuthorizationHeader: RawUtf8): RawUtf8;
+
 /// the HTTP status an MCP-over-HTTP transport MUST send for a finished response
 // - the spec pins three of its own error codes to 400 and -32601 to 404. Two of
 //   those can only be decided AFTER a handler ran (-32021 depends on what the
@@ -652,6 +788,15 @@ type
     fSubscriptions: array of TMcpSubscription;
     fSubscriptionSafe: TLightLock;
     fMaxSubscriptions: integer;
+    fTokenVerifier: IMcpTokenVerifier;
+    fAuthResource: RawUtf8;
+    fAuthorizationServers: TRawUtf8DynArray;
+    fScopesSupported: TRawUtf8DynArray;
+    procedure SetScopesSupported(const aScopes: TRawUtf8DynArray);
+    procedure SetTokenVerifier(const aVerifier: IMcpTokenVerifier);
+    procedure SetAuthResource(const aResource: RawUtf8);
+    /// refuse an authorization setting once requests can already be running
+    procedure CheckNotStarted(const aWhat: RawUtf8);
     /// queue one notification on every subscription that opted into it
     // - aUri selects the watchers for notifications/resources/updated and is
     //   ignored (and empty) for the list-changed notifications
@@ -708,7 +853,22 @@ type
     //   server-minted handles in the tool arguments instead.
     // - runs PreflightRequest first, so no dispatch can ever happen on a
     //   request the protocol layer would reject
-    function ExecuteRequest(const aRequestJson: RawUtf8): RawUtf8;
+    function ExecuteRequest(const aRequestJson: RawUtf8): RawUtf8; overload;
+    /// dispatch on behalf of an already-authenticated caller
+    // - the transport verified the token; without handing the resulting context
+    //   down, every tool would see an unauthenticated caller no matter what was
+    //   presented, and Scopes/Roles/Issuer would exist but never arrive
+    function ExecuteRequest(const aRequestJson: RawUtf8;
+      const aAuthCtx: TMcpAuthContext): RawUtf8; overload;
+    /// dispatch, reporting a per-operation scope refusal back to the transport
+    // - a handler raising EMcpInsufficientScope cannot be answered with a
+    //   JSON-RPC error: the spec wants HTTP 403 plus a WWW-Authenticate naming
+    //   the missing scopes, and only the transport can send those. Returning it
+    //   explicitly beats letting the exception escape into the HTTP worker.
+    // - aScopeChallenge is non-empty exactly when the caller must answer 403
+    function ExecuteRequest(const aRequestJson: RawUtf8;
+      const aAuthCtx: TMcpAuthContext; out aScopeChallenge: RawUtf8): RawUtf8;
+      overload;
     /// open a subscriptions/listen stream for an already-validated request
     // - the caller (a transport) owns the returned object and MUST pass it to
     //   CloseSubscription when its stream ends, whatever ends it
@@ -778,6 +938,36 @@ type
     procedure ValidateInputRequests(const aInputRequests: variant;
       const aRequestState: RawUtf8; aMethod: TMcpMethod;
       const aClientCapabilities: variant);
+    /// whether this server refuses unauthenticated requests
+    // - simply "a verifier is plugged in": authorization is OPTIONAL in MCP,
+    //   and every auth path below is a no-op while this is false
+    function IsProtected: boolean;
+    /// the RFC 9728 Protected Resource Metadata document, as JSON
+    // - "MCP servers MUST implement OAuth 2.0 Protected Resource Metadata";
+    //   it is served unauthenticated at MCP_WELL_KNOWN_RESOURCE, since a client
+    //   reads it precisely because it does not have a token yet
+    function ProtectedResourceMetadata: RawUtf8;
+    /// the WWW-Authenticate value for a refusal, per RFC 6750
+    // - aScope names what the operation needed, and the spec asks for all of it
+    //   in ONE challenge: dribbling out one missing scope at a time costs a
+    //   full authorization round trip per scope
+    function AuthChallenge(aResult: TMcpTokenResult;
+      const aScope: RawUtf8 = ''): RawUtf8;
+    /// verify one Authorization header before anything is dispatched
+    // - "MCP servers MUST validate access tokens before processing the
+    //   request": a transport calls this alongside the preflight, never after
+    // - returns mtrValid (and a filled aAuthCtx) on an open server too, so a
+    //   caller does not need to special-case protection being off
+    function Authorize(const aAuthorizationHeader: RawUtf8;
+      out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+    /// same, for a transport that already parsed the Bearer scheme itself
+    // - mORMot's HTTP server extracts the token into Ctxt.AuthBearer, so
+    //   re-splitting the header there would only add a second parser to keep
+    //   in step with the first
+    function AuthorizeToken(const aToken: RawUtf8;
+      out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+    /// the HTTP status that refusal reason must be answered with
+    function AuthHttpStatus(aResult: TMcpTokenResult): integer;
     /// check if server is active
     function IsActive: boolean;
     /// the JSON-RPC processor, for transports that must emit protocol-level
@@ -818,6 +1008,41 @@ type
     //   operator who wants a cacheable tool list to publish resource bodies too.
     property ReadCacheScope: TMcpCacheScope
       read fReadCacheScope write fReadCacheScope;
+    /// plug in the deployment's token verification to protect this server
+    // - authorization is OPTIONAL in MCP: leaving this nil keeps the server
+    //   open, which is the right default for stdio (the spec says stdio SHOULD
+    //   NOT use this at all and take credentials from the environment) and for
+    //   a loopback demo. Setting it is what turns protection on — one switch,
+    //   so "is this server protected?" has a single, readable answer.
+    // - settable only BEFORE Start: swapping a verifier under live requests is
+    //   a data race no lock can make meaningful (half the requests would run
+    //   against each), and an interface read concurrent with a write can even
+    //   see a refcount already dropped to zero. Auth is startup configuration.
+    property TokenVerifier: IMcpTokenVerifier
+      read fTokenVerifier write SetTokenVerifier;
+    /// this server's canonical URI, i.e. the audience tokens must be minted for
+    // - RFC 8707/9728 resource identifier, e.g. 'https://mcp.example.com/mcp':
+    //   absolute, no fragment, and conventionally no trailing slash
+    // - REQUIRED once TokenVerifier is set: without it there is nothing to
+    //   check an audience against, and a server that cannot tell its own tokens
+    //   from another service's is exactly what the audience rule exists for
+    // - settable only BEFORE Start, for the same reason as TokenVerifier: a
+    //   resource changed mid-flight would validate audiences against one value
+    //   while the published metadata still names another
+    property AuthResource: RawUtf8
+      read fAuthResource write SetAuthResource;
+    /// issuer URLs of the authorization servers a client may obtain a token from
+    // - published in the Protected Resource Metadata; this is how a client
+    //   discovers where to authenticate at all
+    property AuthorizationServers: TRawUtf8DynArray
+      read fAuthorizationServers write fAuthorizationServers;
+    /// the scopes advertised as needed for basic functionality
+    // - "intended to represent the minimal set of scopes necessary for basic
+    //   functionality", with anything further requested through a step-up
+    // - `offline_access` is rejected here: refresh tokens are a client concern
+    //   and the spec says a protected resource SHOULD NOT ask for it
+    property ScopesSupported: TRawUtf8DynArray
+      read fScopesSupported write SetScopesSupported;
   end;
 
 
@@ -884,12 +1109,111 @@ begin
   fRequestState := aRequestState;
 end;
 
+constructor EMcpInsufficientScope.CreateScope(const aScope: RawUtf8);
+begin
+  CreateUtf8('This operation requires the scope(s): %', [aScope]);
+  fScope := aScope;
+end;
+
 constructor EMcpInputCapabilityMissing.CreateCapability(
   const aCapability, aForMethod: RawUtf8);
 begin
   CreateUtf8('The client did not declare the "%" capability that % requires',
     [aCapability, aForMethod]);
   AddRawUtf8(fCapabilities, aCapability);
+end;
+
+function McpResourceMetadataPath(const aResource: RawUtf8): RawUtf8;
+var
+  p: PUtf8Char;
+  slash: PtrInt;
+begin
+  result := MCP_WELL_KNOWN_RESOURCE;
+  // find the '/' that ends the authority: skip 'scheme://' first, or a host
+  // containing no slash at all would make us treat the scheme's own '//' as
+  // the path
+  p := pointer(aResource);
+  if p = nil then
+    exit;
+  slash := PosEx('://', aResource);
+  if slash = 0 then
+    exit; // not an absolute URI: nothing to split, keep the root form
+  slash := PosEx('/', aResource, slash + 3);
+  if slash = 0 then
+    exit; // no path component — the metadata lives at the root
+  // insert, do NOT append: the path of the resource becomes a SUFFIX of the
+  // well-known path (RFC 9728 §3.1, same construction as RFC 8414)
+  result := MCP_WELL_KNOWN_RESOURCE + copy(aResource, slash, maxInt);
+  // a trailing slash on the resource would produce a doubled one here
+  while (length(result) > 1) and
+        (result[length(result)] = '/') do
+    SetLength(result, length(result) - 1);
+end;
+
+function McpResourceMetadataUrl(const aResource: RawUtf8): RawUtf8;
+var
+  slash: PtrInt;
+begin
+  result := aResource;
+  if result = '' then
+    exit;
+  slash := PosEx('://', aResource);
+  if slash = 0 then
+    exit(aResource + MCP_WELL_KNOWN_RESOURCE);
+  slash := PosEx('/', aResource, slash + 3);
+  if slash = 0 then
+    result := aResource // scheme://host, no path
+  else
+    result := copy(aResource, 1, slash - 1); // strip the path, keep the origin
+  result := result + McpResourceMetadataPath(aResource);
+end;
+
+function McpScopeSatisfied(const aGranted: TRawUtf8DynArray;
+  const aRequired: RawUtf8; aHierarchical: boolean): boolean;
+var
+  i, n: PtrInt;
+begin
+  result := true;
+  if aRequired = '' then
+    exit; // the operation asks for nothing
+  result := false;
+  for i := 0 to high(aGranted) do
+  begin
+    n := length(aGranted[i]);
+    if n = 0 then
+      continue;
+    if aGranted[i] = aRequired then
+      exit(true);
+    // a broader scope implies the narrower ones BELOW it: the granted string
+    // must be a prefix of the required one AND end exactly on a ':' boundary,
+    // or `file` would silently cover `files:write`
+    if aHierarchical and
+       (length(aRequired) > n) and
+       (aRequired[n + 1] = ':') and
+       CompareMem(pointer(aGranted[i]), pointer(aRequired), n) then
+      exit(true);
+  end;
+end;
+
+function McpBearerToken(const aAuthorizationHeader: RawUtf8): RawUtf8;
+var
+  p: PUtf8Char;
+begin
+  result := '';
+  p := pointer(aAuthorizationHeader);
+  if p = nil then
+    exit;
+  while p^ = ' ' do
+    inc(p);
+  // RFC 7235: the scheme is case-insensitive ("bearer" is as valid as "Bearer")
+  if not IdemPChar(p, 'BEARER ') then
+    exit;
+  inc(p, 7);
+  while p^ = ' ' do
+    inc(p);
+  FastSetString(result, p, StrLen(p));
+  // a lone "Bearer" with no token is a missing token, not an empty one
+  TrimSelf(result);
 end;
 
 function McpHttpStatus(const aResponseJson: RawUtf8): integer;
@@ -1788,6 +2112,24 @@ end;
 
 procedure TMcpServer.Start;
 begin
+  // Validate the authorization configuration HERE, where it is still a startup
+  // error a developer sees — not on the first request, where it would be a
+  // runtime failure in front of a user, or worse, silently serve a metadata
+  // document no client can act on.
+  if fTokenVerifier <> nil then
+  begin
+    if fAuthResource = '' then
+      raise EMcpException.CreateU('A protected server needs AuthResource: ' +
+        'without a canonical URI there is no audience to validate against');
+    if fAuthorizationServers = nil then
+      // "The Protected Resource Metadata document returned by the MCP server
+      // MUST include the authorization_servers field containing at least one
+      // authorization server." A document without it tells a client nothing
+      // about where to obtain a token, so it could never come back with one.
+      raise EMcpException.CreateU('A protected server MUST name at least one ' +
+        'entry in AuthorizationServers: a client has no other way to learn ' +
+        'where to authenticate');
+  end;
   fSafe.Lock;
   try
     fActive := true;
@@ -1967,6 +2309,149 @@ begin
     // for it instead of a response the client cannot answer.
     if caps^.GetValueIndex(MCP_INPUT_CAPABILITIES[k]) < 0 then
       raise EMcpInputCapabilityMissing.CreateCapability(MCP_INPUT_CAPABILITIES[k], m);
+  end;
+end;
+
+procedure TMcpServer.CheckNotStarted(const aWhat: RawUtf8);
+begin
+  if fActive then
+    raise EMcpException.CreateUtf8('% must be set before Start: authorization ' +
+      'is startup configuration, and changing it under live requests would ' +
+      'have some of them run against the old value and some against the new',
+      [aWhat]);
+end;
+
+procedure TMcpServer.SetTokenVerifier(const aVerifier: IMcpTokenVerifier);
+begin
+  CheckNotStarted('TokenVerifier');
+  fTokenVerifier := aVerifier;
+end;
+
+procedure TMcpServer.SetAuthResource(const aResource: RawUtf8);
+begin
+  CheckNotStarted('AuthResource');
+  fAuthResource := aResource;
+end;
+
+procedure TMcpServer.SetScopesSupported(const aScopes: TRawUtf8DynArray);
+var
+  i: PtrInt;
+begin
+  CheckNotStarted('ScopesSupported');
+  for i := 0 to high(aScopes) do
+    if aScopes[i] = 'offline_access' then
+      // "MCP Servers (Protected Resources) SHOULD NOT include offline_access in
+      // WWW-Authenticate scope or Protected Resource Metadata scopes_supported,
+      // as refresh tokens are not a resource requirement." Refusing it here
+      // beats documenting it: this list is copied into config files.
+      raise EMcpException.CreateU('offline_access is a client concern and must ' +
+        'not be advertised in scopes_supported');
+  fScopesSupported := aScopes;
+end;
+
+function TMcpServer.IsProtected: boolean;
+begin
+  result := fTokenVerifier <> nil;
+end;
+
+function TMcpServer.ProtectedResourceMetadata: RawUtf8;
+var
+  doc, arr: TDocVariantData;
+begin
+  doc.InitObject([], JSON_FAST);
+  // `resource` is the only REQUIRED member: it is the canonical URI clients put
+  // in the RFC 8707 `resource` parameter, so it MUST equal what we validate
+  // audiences against — publishing anything else would have clients obtain
+  // tokens this server then rejects.
+  doc.AddValue('resource', fAuthResource);
+  if fAuthorizationServers <> nil then
+  begin
+    arr.InitArrayFrom(fAuthorizationServers, JSON_FAST);
+    doc.AddValue('authorization_servers', variant(arr));
+  end;
+  if fScopesSupported <> nil then
+  begin
+    arr.InitArrayFrom(fScopesSupported, JSON_FAST);
+    doc.AddValue('scopes_supported', variant(arr));
+  end;
+  // we read the token from the Authorization header and nowhere else: "Access
+  // tokens MUST NOT be included in the URI query string"
+  arr.InitArray(['header'], JSON_FAST);
+  doc.AddValue('bearer_methods_supported', variant(arr));
+  result := doc.ToJson;
+end;
+
+function TMcpServer.AuthChallenge(aResult: TMcpTokenResult;
+  const aScope: RawUtf8): RawUtf8;
+begin
+  result := 'Bearer';
+  if aResult = mtrInsufficientScope then
+    result := result + ' error="insufficient_scope",';
+  // resource_metadata points at the document that names the authorization
+  // server — without it a client that has never seen this server has no way to
+  // find out where to authenticate, which is the whole point of the challenge
+  if fAuthResource <> '' then
+    result := result + ' resource_metadata="' +
+      McpResourceMetadataUrl(fAuthResource) + '",';
+  if aScope <> '' then
+    result := result + ' scope="' + aScope + '",'
+  else if fScopesSupported <> nil then
+    result := result + ' scope="' + RawUtf8ArrayToCsv(fScopesSupported, ' ') + '",';
+  if result[length(result)] = ',' then
+    SetLength(result, length(result) - 1);
+end;
+
+function TMcpServer.AuthHttpStatus(aResult: TMcpTokenResult): integer;
+begin
+  case aResult of
+    mtrValid:
+      result := HTTP_MCP_SUCCESS;
+    mtrInsufficientScope:
+      // "403 Forbidden — Invalid scopes or insufficient permissions"
+      result := HTTP_MCP_FORBIDDEN;
+  else
+    // everything else is "Authorization required or token invalid" — including
+    // a wrong audience: such a token is not weak here, it is not ours at all
+    result := HTTP_MCP_UNAUTHORIZED;
+  end;
+end;
+
+function TMcpServer.Authorize(const aAuthorizationHeader: RawUtf8;
+  out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+begin
+  result := AuthorizeToken(McpBearerToken(aAuthorizationHeader), aAuthCtx);
+end;
+
+function TMcpServer.AuthorizeToken(const aToken: RawUtf8;
+  out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+var
+  verifier: IMcpTokenVerifier;
+begin
+  Finalize(aAuthCtx);
+  FillCharFast(aAuthCtx, SizeOf(aAuthCtx), 0);
+  // read the interface into a local: an embedder may swap the verifier at any
+  // moment, and half of this function running against each one is worse than
+  // either. The local also keeps the instance alive for the call.
+  verifier := fTokenVerifier;
+  if verifier = nil then
+    exit(mtrValid); // authorization is OPTIONAL and not switched on here
+  if fAuthResource = '' then
+    // Fail CLOSED. Without a canonical URI the audience check is undefined, and
+    // "MUST only accept tokens specifically intended for themselves" cannot be
+    // satisfied — accepting everything would be the one unacceptable reading.
+    raise EMcpException.CreateU('AuthResource must be set before a ' +
+      'TokenVerifier: there is no audience to validate against otherwise');
+  if aToken = '' then
+    exit(mtrMissing);
+  result := verifier.VerifyToken(aToken, fAuthResource, aAuthCtx);
+  if result <> mtrValid then
+  begin
+    // Never hand a partially filled context to a caller that only checks the
+    // context: a verifier may have written a principal before rejecting.
+    // Finalize first — the record holds managed fields, and zeroing them
+    // without releasing would leak every rejected request.
+    Finalize(aAuthCtx);
+    FillCharFast(aAuthCtx, SizeOf(aAuthCtx), 0);
   end;
 end;
 
@@ -2199,9 +2684,30 @@ end;
 
 function TMcpServer.ExecuteRequest(const aRequestJson: RawUtf8): RawUtf8;
 var
+  anonymous: TMcpAuthContext;
+begin
+  // No caller identity: stays fail-closed, which is what stdio and in-process
+  // dispatch get. An HTTP transport MUST use the overload below instead — its
+  // token check would otherwise be decorative.
+  FillCharFast(anonymous, SizeOf(anonymous), 0);
+  result := ExecuteRequest(aRequestJson, anonymous);
+end;
+
+function TMcpServer.ExecuteRequest(const aRequestJson: RawUtf8;
+  const aAuthCtx: TMcpAuthContext): RawUtf8;
+var
+  ignored: RawUtf8;
+begin
+  // stdio and in-process callers have no HTTP status to set, so a scope refusal
+  // can only reach them as the JSON-RPC error the third overload also produces
+  result := ExecuteRequest(aRequestJson, aAuthCtx, ignored);
+end;
+
+function TMcpServer.ExecuteRequest(const aRequestJson: RawUtf8;
+  const aAuthCtx: TMcpAuthContext; out aScopeChallenge: RawUtf8): RawUtf8;
+var
   method: RawUtf8;
   params, requestId, resultData: variant;
-  authCtx: TMcpAuthContext;
   callCtx: TMcpCallContext;
   isNotification, personalized: boolean;
   status: integer;
@@ -2210,24 +2716,19 @@ begin
   // Single validation gate, shared with the transports: whatever Preflight
   // rejects never reaches a handler, here or anywhere else. It hands the parsed
   // request back, so the body is parsed exactly once per dispatch.
+  aScopeChallenge := '';
   if not Preflight(aRequestJson, method, params, requestId, result, status) then
     exit;
   isNotification := VarIsVoid(requestId);
   m := McpMethodFromName(method);
 
-  // Auth context. Identity must be injected by a backend auth resolver before
-  // any tool may trust IsAuthenticated/Roles; until then we stay fail-closed.
-  // (Previously the transport session id was carried here for correlation —
-  // protocol sessions no longer exist, so there is nothing to carry.)
-  FillCharFast(authCtx, SizeOf(authCtx), 0);
-  authCtx.IsAuthenticated := false;
   personalized := false;
 
   try
     // INSIDE the try: CallContext type-checks the MRTR retry fields and raises
     // EMcpInvalidParams on a malformed one. Building it before the try would
     // let that escape into the HTTP worker, which has no handler for it.
-    callCtx := CallContext(params, method, authCtx);
+    callCtx := CallContext(params, method, aAuthCtx);
     // A request carrying MRTR retry fields produced a caller-specific answer.
     // Presence decides, not content — VarIsVoid() considers an EMPTY object
     // void, so testing the value would let `inputResponses: {}` be cached as
@@ -2302,6 +2803,18 @@ begin
     // Catch EVERY exception (not just ESynException): tools may raise plain
     // Exception, EConvertError, DB/OS errors. Translate to a JSON-RPC error so
     // the transport stays alive and the client gets a well-formed response.
+    // A per-operation scope refusal. The JSON-RPC error is built either way, so
+    // stdio still gets a usable answer; an HTTP transport reads the challenge
+    // and answers 403 with it instead, which is what lets a client step up.
+    on E: EMcpInsufficientScope do
+      if isNotification then
+        result := ''
+      else
+      begin
+        aScopeChallenge := E.Scope;
+        result := fProcessor.CreateError(requestId, JSONRPC_INVALID_REQUEST,
+          StringToUtf8(E.Message));
+      end;
     on E: EMcpInputCapabilityMissing do
       if isNotification then
         result := ''
