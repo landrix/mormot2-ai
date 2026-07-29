@@ -63,7 +63,13 @@ var
   i: PtrInt;
 begin
   result := nil;
-  resp := fServer.ExecuteRequest('{"jsonrpc":"2.0","id":1,"method":"tools/list"}', '');
+  // even in-process the request must carry the per-request protocol metadata:
+  // the server validates it uniformly, there is no privileged internal path
+  resp := fServer.ExecuteRequest(_Safe(_ObjFast([
+    'jsonrpc', '2.0',
+    'id', 1,
+    'method', 'tools/list',
+    'params', McpRequestParams(Null, 'mormot.ai.agent', '1.0.0')]))^.ToJson);
   v := _JsonFast(resp);
   // result.tools[] -> name / description / inputSchema (a JSON-Schema object)
   toolsArr := _Safe(v)^.O['result']^.A['tools'];
@@ -100,9 +106,10 @@ begin
     'jsonrpc', '2.0',
     'id', 1,
     'method', 'tools/call',
-    'params', _ObjFast(['name', aName, 'arguments', args])]);
+    'params', McpRequestParams(_ObjFast(['name', aName, 'arguments', args]),
+      'mormot.ai.agent', '1.0.0')]);
   reqJson := _Safe(req)^.ToJson;
-  resp := fServer.ExecuteRequest(reqJson, '');
+  resp := fServer.ExecuteRequest(reqJson);
   v := _JsonFast(resp);
   doc := _Safe(v);
   // surface a JSON-RPC error as text so the model can recover instead of failing

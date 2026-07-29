@@ -28,11 +28,11 @@ begin
   ConsoleWrite('Status: starting...', ccLightGray);
   server := CreateDemoServer('DemoServer', '1.0');
   try
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}';
+    request := '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}';
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 1/6 - Initialize:'#13#10+'%', [response], ccLightMagenta);
 
-    request := '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}';
+    request := '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}';
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 2/6 - Tools list:'#13#10+'%', [response], ccLightCyan);
 
@@ -46,7 +46,7 @@ begin
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 4/6 - Tool call public_ip:'#13#10+'%', [response], ccLightBlue);
 
-    request := '{"jsonrpc":"2.0","id":5,"method":"resources/list","params":{}}';
+    request := '{"jsonrpc":"2.0","id":5,"method":"resources/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}';
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 5/6 - Resources list:'#13#10+'%', [response], ccLightGreen);
 

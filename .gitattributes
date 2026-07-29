@@ -1,0 +1,10 @@
+# Dieses Repo wird unter Linux/FPC gebaut (WSL, Docker, CI).
+#
+# Shell-Skripte MUESSEN mit LF ausgecheckt werden: Wird das Repo unter Windows
+# mit core.autocrlf=true geklont, bekommen sie sonst CRLF und bash bricht sofort
+# ab ("set: pipefail: invalid option name" - das \r landet im Optionsnamen).
+# Genau das ist beim ersten Klon als Submodul passiert.
+*.sh text eol=lf
+
+# PowerShell-Wrapper laufen unter Windows und behalten CRLF.
+*.ps1 text eol=crlf

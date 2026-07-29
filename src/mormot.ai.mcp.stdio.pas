@@ -161,7 +161,7 @@ begin
     
   try
     // Execute MCP request
-    response := fServer.ExecuteRequest(aRequest, 'stdio');
+    response := fServer.ExecuteRequest(aRequest);
     
     // Send response if not a notification
     if response <> '' then

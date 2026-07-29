@@ -54,6 +54,14 @@ type
       aExpectedCode: integer; const aMessageContains: RawUtf8);
     function DocPropType(const props: PDocVariantData;
       const propName: RawUtf8): RawUtf8;
+    /// run a request, adding the _meta fields every request must carry
+    // - since 2026-07-28 each request declares its protocol version and client
+    //   capabilities; adding that here keeps the test literals about the RPC
+    //   under test instead of repeating protocol boilerplate everywhere
+    // - a payload that is not a JSON object, or a notification (no id), is
+    //   passed through untouched so the negative tests still exercise the
+    //   parser and the notification path
+    function Exec(aServer: TMcpServer; const aJson: RawUtf8): RawUtf8;
   published
     procedure SchemaFromRecord;
     procedure JsonRpcProcessor;
@@ -64,7 +72,9 @@ type
     procedure ToolExceptionBecomesError;
     procedure InvalidJsonRpcEnvelope;
     procedure NotificationsNoResponse;
-    procedure InitializeVersionNegotiation;
+    procedure DiscoverReportsVersionAndIdentity;
+    procedure RequestMetaIsMandatory;
+    procedure ResultsCarryResultTypeAndServerInfo;
   end;
 
 implementation
@@ -267,7 +277,7 @@ begin
     server.RegisterResource(res);
     server.Start;
 
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}');
     responseVar := _JsonFast(response);
     doc := _Safe(responseVar);
@@ -282,7 +292,7 @@ begin
     Check(itemDoc^.GetAsRawUtf8('name', toolName));
     CheckEqual(toolName, 'calc');
 
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"calc",' +
       '"arguments":{"a":5,"b":3,"enabled":true,"name":"x"}}}');
     responseVar := _JsonFast(response);
@@ -300,7 +310,7 @@ begin
     Check(itemDoc^.GetAsRawUtf8('text', tmp));
     CheckEqual(tmp, '5 + 3 = 8');
 
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}');
     responseVar := _JsonFast(response);
     doc := _Safe(responseVar);
@@ -315,7 +325,7 @@ begin
     Check(itemDoc^.GetAsRawUtf8('uri', tmp));
     CheckEqual(tmp, 'version://info');
 
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"version://info"}}');
     responseVar := _JsonFast(response);
     doc := _Safe(responseVar);
@@ -402,7 +412,7 @@ var
 begin
   server := TMcpServer.Create('TestServer', '1.0');
   try
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}');
     docVar := _JsonFast(response);
     doc := _Safe(docVar);
@@ -434,29 +444,29 @@ begin
     server.Start;
 
     // invalid JSON / malformed envelope -> Invalid Request (-32600)
-    response := server.ExecuteRequest('{');
+    response := Exec(server, '{');
     CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
 
-    response := server.ExecuteRequest('{"jsonrpc":"2.0","id":1}');
+    response := Exec(server, '{"jsonrpc":"2.0","id":1}');
     CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
 
     // unknown method -> Method not found (-32601)
-    response := server.ExecuteRequest('{"jsonrpc":"2.0","id":2,"method":"nope"}');
+    response := Exec(server, '{"jsonrpc":"2.0","id":2,"method":"nope"}');
     CheckErrorResponse(response, JSONRPC_METHOD_NOT_FOUND, 'Method not found');
 
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}');
     CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Missing tool name');
 
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"missing","arguments":{}}}');
     CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Tool not found');
 
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{}}');
     CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Missing uri');
 
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"missing://info"}}');
     CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'Resource not found');
   finally
@@ -476,7 +486,7 @@ begin
     server.Start;
     // a plain Exception from the tool must be turned into a JSON-RPC internal
     // error (not crash the worker, not escape ExecuteRequest)
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"boom",' +
       '"arguments":{"a":1,"b":2,"enabled":true,"name":"x"}}}');
     CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'tool blew up');
@@ -494,14 +504,14 @@ begin
   try
     server.Start;
     // wrong jsonrpc version -> Invalid Request
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"1.0","id":1,"method":"ping","params":{}}');
     CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
     // missing jsonrpc field -> Invalid Request
-    response := server.ExecuteRequest('{"id":2,"method":"ping"}');
+    response := Exec(server, '{"id":2,"method":"ping"}');
     CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
     // scalar params (must be object or array) -> Invalid Request
-    response := server.ExecuteRequest(
+    response := Exec(server, 
       '{"jsonrpc":"2.0","id":3,"method":"ping","params":5}');
     CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
   finally
@@ -517,47 +527,135 @@ begin
   server := TMcpServer.Create('TestServer', '1.0');
   try
     server.Start;
-    response := server.ExecuteRequest('{"jsonrpc":"2.0","method":"ping","params":{}}');
+    response := Exec(server, '{"jsonrpc":"2.0","method":"ping","params":{}}');
     Check(TrimU(response) = '');
   finally
     server.Free;
   end;
 end;
 
-procedure TTestMcpCore.InitializeVersionNegotiation;
+function TTestMcpCore.Exec(aServer: TMcpServer; const aJson: RawUtf8): RawUtf8;
+var
+  doc: TDocVariantData;
+  params: PDocVariantData;
+begin
+  doc.InitJson(aJson, JSON_FAST);
+  // malformed payloads and notifications go through untouched
+  if not doc.IsObject or
+     VarIsVoid(doc.GetValueOrNull('id')) then
+    exit(aServer.ExecuteRequest(aJson));
+  // params present but not an object = a deliberately malformed envelope:
+  // hand it over untouched, that is exactly what such a test asserts
+  if doc.GetValueIndex('params') >= 0 then
+  begin
+    if not doc.GetAsDocVariant('params', params) or
+       not params^.IsObject then
+      exit(aServer.ExecuteRequest(aJson));
+  end
+  else
+  begin
+    doc.AddValue('params', _ObjFast([]));
+    if not doc.GetAsDocVariant('params', params) then
+      exit(aServer.ExecuteRequest(aJson));
+  end;
+  params^.AddValue('_meta', McpRequestMeta('mcp.tests', '1.0'));
+  result := aServer.ExecuteRequest(doc.ToJson);
+end;
+
+procedure TTestMcpCore.DiscoverReportsVersionAndIdentity;
 var
   server: TMcpServer;
   response: RawUtf8;
-
-  // sends initialize with the given client protocolVersion and returns the
-  // protocolVersion the server negotiated back
-  function Negotiated(const aClientVersion: RawUtf8): RawUtf8;
-  var
-    rv, resv: variant;
-    rd: PDocVariantData;
-  begin
-    response := server.ExecuteRequest(
-      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"' + aClientVersion + '","capabilities":{},' +
-      '"clientInfo":{"name":"t","version":"1"}}}');
-    rv := _JsonFast(response);
-    resv := _Safe(rv)^.GetValueOrNull('result');
-    rd := _Safe(resv);
-    Check(rd^.GetAsRawUtf8('protocolVersion', result), 'protocolVersion present');
-  end;
-
+  rv, resv: variant;
+  rd, versions: PDocVariantData;
+  tmp: RawUtf8;
 begin
   server := TMcpServer.Create('TestServer', '1.0');
   try
     server.Start;
-    // a supported version is echoed back to the client
-    CheckEqual(Negotiated('2025-03-26'), MCP_PROTOCOL_VERSION_20250326,
-      'echo supported 2025-03-26');
-    CheckEqual(Negotiated(MCP_PROTOCOL_VERSION_LATEST), MCP_PROTOCOL_VERSION_LATEST,
-      'echo latest');
-    // an unknown version falls back to the server's latest supported version
-    CheckEqual(Negotiated('1999-01-01'), MCP_PROTOCOL_VERSION_LATEST,
-      'fallback to latest');
+    // server/discover replaces `initialize`: it is the one RPC a client may
+    // call to learn versions, capabilities and identity up front
+    response := Exec(server, '{"jsonrpc":"2.0","id":1,"method":"server/discover"}');
+    rv := _JsonFast(response);
+    resv := _Safe(rv)^.GetValueOrNull('result');
+    rd := _Safe(resv);
+    Check(rd^.GetAsDocVariant('supportedVersions', versions), 'supportedVersions');
+    Check(versions^.IsArray, 'supportedVersions is an array');
+    CheckEqual(versions^.Count, 1, 'exactly one supported version');
+    CheckEqual(VariantToUtf8(versions^.Values[0]), MCP_PROTOCOL_VERSION,
+      'reports 2026-07-28');
+    Check(rd^.GetValueIndex('capabilities') >= 0, 'capabilities present');
+    Check(rd^.GetAsRawUtf8('resultType', tmp), 'resultType present');
+    CheckEqual(tmp, MCP_RESULT_COMPLETE, 'resultType complete');
+    // the handshake methods of earlier revisions are gone, not merely ignored
+    CheckErrorResponse(Exec(server,
+      '{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}'),
+      JSONRPC_METHOD_NOT_FOUND, 'initialize');
+    CheckErrorResponse(Exec(server, '{"jsonrpc":"2.0","id":3,"method":"ping"}'),
+      JSONRPC_METHOD_NOT_FOUND, 'ping');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.RequestMetaIsMandatory;
+var
+  server: TMcpServer;
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    // NOTE: deliberately NOT via Exec — these requests must stay unadorned.
+    // Without a handshake the per-request fields are the only place the server
+    // can learn the version, so their absence is a malformed request (-32602).
+    CheckErrorResponse(server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'),
+      JSONRPC_INVALID_PARAMS, MCP_META_PROTOCOL_VERSION);
+    // protocolVersion present, but clientCapabilities missing
+    CheckErrorResponse(server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":' +
+      '{"' + MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '"}}}'),
+      JSONRPC_INVALID_PARAMS, MCP_META_CLIENT_CAPABILITIES);
+    // a version we do not speak is rejected with the MCP-specific code
+    CheckErrorResponse(server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":' +
+      '{"' + MCP_META_PROTOCOL_VERSION + '":"2025-11-25",' +
+      '"' + MCP_META_CLIENT_CAPABILITIES + '":{}}}}'),
+      MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION, 'Unsupported protocol version');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.ResultsCarryResultTypeAndServerInfo;
+var
+  server: TMcpServer;
+  rv, resv, errv: variant;
+  rd, meta, si: PDocVariantData;
+  tmp: RawUtf8;
+begin
+  server := TMcpServer.Create('TestServer', '9.9');
+  try
+    server.Start;
+    rv := _JsonFast(Exec(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'));
+    resv := _Safe(rv)^.GetValueOrNull('result');
+    rd := _Safe(resv);
+    // resultType is REQUIRED on every result, not just on discover
+    Check(rd^.GetAsRawUtf8('resultType', tmp), 'resultType present');
+    CheckEqual(tmp, MCP_RESULT_COMPLETE);
+    // identity now travels per result instead of once in the handshake
+    Check(rd^.GetAsDocVariant('_meta', meta), '_meta present');
+    Check(meta^.GetAsDocVariant(MCP_META_SERVER_INFO, si), 'serverInfo present');
+    Check(si^.GetAsRawUtf8('name', tmp));
+    CheckEqual(tmp, 'TestServer');
+    Check(si^.GetAsRawUtf8('version', tmp));
+    CheckEqual(tmp, '9.9');
+    // an error response carries no result, so it must not be stamped
+    rv := _JsonFast(Exec(server, '{"jsonrpc":"2.0","id":2,"method":"nope"}'));
+    errv := _Safe(rv)^.GetValueOrNull('error');
+    Check(_Safe(errv)^.IsObject, 'error object');
+    Check(VarIsVoid(_Safe(rv)^.GetValueOrNull('result')), 'no result on error');
   finally
     server.Free;
   end;

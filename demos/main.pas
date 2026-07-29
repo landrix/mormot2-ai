@@ -241,14 +241,14 @@ begin
 
     server.Start;
 
-    // Test initialize
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}';
+    // Test server/discover
+    request := '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}';
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 1/5 - Initialize:'#13#10+'%', [response], ccLightMagenta);
     ConsoleWriteLn;
 
     // Test tools/list
-    request := '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}';
+    request := '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}';
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 2/5 - Tools list:'#13#10+'%', [response], ccLightCyan);
     ConsoleWriteLn;
@@ -261,7 +261,7 @@ begin
     ConsoleWriteLn;
 
     // Test resources/list
-    request := '{"jsonrpc":"2.0","id":4,"method":"resources/list","params":{}}';
+    request := '{"jsonrpc":"2.0","id":4,"method":"resources/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}';
     response := server.ExecuteRequest(request);
     ConsoleWrite('Step 4/5 - Resources list:'#13#10+'%', [response], ccLightGreen);
     ConsoleWriteLn;
@@ -306,7 +306,7 @@ begin
       
       ConsoleWrite('SUCCESS - listening on http://localhost:%/mcp', [transport.Port], ccLightGreen);
       ConsoleWrite('Quick test:', ccLightGray);
-      ConsoleWrite('  curl -X POST http://localhost:%/mcp -H "Content-Type: application/json" -d ''{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}''', [transport.Port], ccYellow);
+      ConsoleWrite('  curl -X POST http://localhost:%/mcp -H "Content-Type: application/json" -d ''{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}''', [transport.Port], ccYellow);
       ConsoleWrite('Stop: press Enter to stop the server.', ccLightGray);
       ConsoleWaitForEnterKey;
       ConsoleWrite('Status: stopped.', ccLightGray);
@@ -330,7 +330,7 @@ begin
   ConsoleWrite('STDIO transport demo', ccLightCyan);
   ConsoleWrite('About: JSON-RPC over stdin/stdout for piping.', ccLightGray);
   ConsoleWrite('Status: ready - stdin in, stdout out', ccLightGray);
-  ConsoleWrite('Example request: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}', ccYellow);
+  ConsoleWrite('Example request: {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}', ccYellow);
   
   server := TMcpServer.Create('StdioTestServer', '1.0');
   try

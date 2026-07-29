@@ -53,8 +53,6 @@ type
     function VariantToInt64Loose(const V: variant; out aValue: Int64): boolean;
     function StartHttpTransport(const aServer: TMcpServer;
       out aTransport: TMcpHttpTransport): integer;
-    function StartSseTransport(const aServer: TMcpServer;
-      out aTransport: TMcpSseTransport): integer;
     procedure BackupStdIo(out aInput, aOutput: TMcpTextRec);
     procedure RestoreStdIo(const aInput, aOutput: TMcpTextRec);
     function WaitForFileNotEmpty(const aFileName: TFileName;
@@ -69,12 +67,9 @@ type
     procedure HttpTransportNotification;
     procedure HttpTransportBadJson;
     procedure HttpTransportInvalidMethod;
-    procedure SseTransportHandshake;
-    procedure SseTransportMessages;
-    procedure SseTransportOptions;
-    procedure SseTransportMissingSession;
-    procedure SseTransportUnknownSession;
-    procedure SseTransportConcurrentPosts;
+    // the legacy HTTP+SSE transport (TMcpSseTransport) and its session suite
+    // were removed with protocol version 2026-07-28 — the spec classifies that
+    // transport as Deprecated and this project serves only the modern revision
     procedure StdioTransportProcess;
     procedure StdioTransportMultiple;
     procedure StdioTransportBadJson;
@@ -86,14 +81,11 @@ type
     function StartStreamableTransport(const aServer: TMcpServer;
       out aTransport: TMcpStreamableHttpTransport): integer;
   published
-    procedure PostInitialize;
-    procedure PostWithSession;
+    /// a plain POST is answered without any session handshake
+    procedure PostDiscover;
     procedure PostNotification;
-    procedure PostBatch;
-    procedure DeleteSession;
-    procedure MissingSessionId;
-    procedure InvalidSessionId;
-    procedure GetReturns405;
+    /// GET and DELETE were the session-era verbs and must now yield 405
+    procedure GetAndDeleteReturn405;
     procedure OriginValidation;
     procedure MissingAcceptHeader;
     procedure WrongContentType;
@@ -101,6 +93,71 @@ type
   end;
 
 implementation
+
+const
+  /// the per-request protocol metadata every request must carry since 2026-07-28
+  MCP_TEST_META = '"_meta":{"io.modelcontextprotocol/protocolVersion":"' +
+    MCP_PROTOCOL_VERSION + '","io.modelcontextprotocol/clientCapabilities":{}}';
+
+/// POST an MCP request the way a conforming 2026-07-28 client would
+// - injects the mandatory _meta into params and mirrors method (and name/uri,
+//   where the spec requires it) into the standard headers, so the tests state
+//   what they are testing instead of repeating protocol boilerplate
+function McpPost(aClient: THttpClientSocket; const aEndpoint, aJson: RawUtf8): integer;
+var
+  doc: TDocVariantData;
+  params: PDocVariantData;
+  meta: PDocVariantData;
+  method, name, headers, body: RawUtf8;
+begin
+  doc.InitJson(aJson, JSON_FAST);
+  body := aJson;
+  headers := 'Accept: text/event-stream, application/json'#13#10 +
+    'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION;
+  if doc.IsObject and doc.GetAsRawUtf8('method', method) then
+  begin
+    headers := headers + #13#10 + 'Mcp-Method: ' + method;
+    // notifications carry no id and need no _meta
+    if not VarIsVoid(doc.GetValueOrNull('id')) then
+    begin
+      // a non-object params is a deliberately malformed envelope: post it as is
+      if doc.GetValueIndex('params') >= 0 then
+      begin
+        if not doc.GetAsDocVariant('params', params) or
+           not params^.IsObject then
+          exit(aClient.Post(aEndpoint, aJson, JSON_CONTENT_TYPE,
+            HTTP_KEEPALIVE_MS, headers));
+      end
+      else
+      begin
+        doc.AddValue('params', _ObjFast([]));
+        if not doc.GetAsDocVariant('params', params) then
+          exit(aClient.Post(aEndpoint, aJson, JSON_CONTENT_TYPE,
+            HTTP_KEEPALIVE_MS, headers));
+      end;
+      // merge into an existing _meta (e.g. a progressToken) instead of adding
+      // a second key of the same name, which would shadow the protocol fields
+      if params^.GetAsDocVariant('_meta', meta) and meta^.IsObject then
+      begin
+        meta^.AddValue(MCP_META_PROTOCOL_VERSION,
+          RawUtf8ToVariant(MCP_PROTOCOL_VERSION));
+        meta^.AddValue(MCP_META_CLIENT_CAPABILITIES, _ObjFast([]));
+      end
+      else
+        params^.AddValue('_meta', McpRequestMeta('mcp.tests', '1.0'));
+      name := '';
+      if method = 'resources/read' then
+        name := params^.U['uri']
+      else if (method = 'tools/call') or (method = 'prompts/get') then
+        name := params^.U['name'];
+      if name <> '' then
+        headers := headers + #13#10 + 'Mcp-Name: ' + name;
+      body := doc.ToJson;
+    end;
+  end;
+  result := aClient.Post(aEndpoint, body, JSON_CONTENT_TYPE,
+    HTTP_KEEPALIVE_MS, headers);
+end;
 
 { TCalcTool }
 
@@ -189,38 +246,6 @@ begin
   Check(false, 'Unable to start HTTP transport on an available port');
 end;
 
-function TTestMcpTransports.StartSseTransport(const aServer: TMcpServer;
-  out aTransport: TMcpSseTransport): integer;
-var
-  i: integer;
-  port: integer;
-  base: integer;
-  transport: TMcpSseTransport;
-begin
-  aTransport := nil;
-  base := 19000 + integer(GetTickCount64 mod 1000);
-  for i := 0 to 19 do
-  begin
-    port := base + i;
-    try
-      transport := TMcpSseTransport.Create(aServer);
-      transport.Port := port;
-      transport.Start;
-      aTransport := transport;
-      result := port;
-      exit;
-    except
-      on Exception do
-      begin
-        transport.Free;
-        continue;
-      end;
-    end;
-  end;
-  result := 0;
-  Check(false, 'Unable to start SSE transport on an available port');
-end;
-
 procedure TTestMcpTransports.BackupStdIo(out aInput, aOutput: TMcpTextRec);
 begin
   aInput := TMcpTextRec(Input);
@@ -295,7 +320,7 @@ begin
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
     request := '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
       '"arguments":{"a":5,"b":3,"enabled":true,"name":"x"}}}';
-    status := client.Post('/mcp', request, JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS);
+    status := McpPost(client, '/mcp', request);
     CheckEqual(status, HTTP_SUCCESS);
     docVar := _JsonFast(client.Content);
     doc := _Safe(docVar);
@@ -342,20 +367,24 @@ begin
     server.Start;
     port := StartHttpTransport(server, transport);
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    request := '{"jsonrpc":"2.0","id":0,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"dev.warp.Warp","version":"v0.2026.01.28.08.14.stable_04"}}}';
-    status := client.Post('/mcp', request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json');
+    // a real-world client now opens with server/discover instead of a handshake
+    request := '{"jsonrpc":"2.0","id":0,"method":"server/discover","params":' +
+      '{"_meta":{"io.modelcontextprotocol/protocolVersion":"' +
+      MCP_PROTOCOL_VERSION + '","io.modelcontextprotocol/clientCapabilities":{},' +
+      '"io.modelcontextprotocol/clientInfo":{"name":"dev.warp.Warp",' +
+      '"version":"v0.2026.01.28.08.14.stable_04"}}}}';
+    status := McpPost(client, '/mcp', request);
     CheckEqual(status, HTTP_SUCCESS);
     docVar := _JsonFast(client.Content);
     doc := _Safe(docVar);
     resultVar := doc^.GetValueOrNull('result');
     resultDoc := _Safe(resultVar);
     Check(resultDoc^.IsObject);
-    Check(resultDoc^.GetAsRawUtf8('protocolVersion', tmp));
-    // negotiated: the server echoes the client's requested version (2025-03-26)
-    CheckEqual(tmp, MCP_PROTOCOL_VERSION_20250326);
+    // nothing is negotiated anymore: discover states what the server supports
+    CheckEqual(VariantToUtf8(resultDoc^.A['supportedVersions']^.Values[0]),
+      MCP_PROTOCOL_VERSION);
+    Check(resultDoc^.GetAsRawUtf8('resultType', tmp));
+    CheckEqual(tmp, MCP_RESULT_COMPLETE);
     capsDoc := _Safe(resultDoc^.GetValueOrNull('capabilities'));
     Check(capsDoc^.IsObject);
   finally
@@ -417,11 +446,13 @@ begin
     port := StartHttpTransport(server, transport);
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
 
-    request := '{"jsonrpc":"2.0","id":0,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"dev.warp.Warp","version":"v0.2026.01.28.08.14.stable_04"}}}';
-    status := client.Post('/mcp', request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json');
+    // a real-world client now opens with server/discover instead of a handshake
+    request := '{"jsonrpc":"2.0","id":0,"method":"server/discover","params":' +
+      '{"_meta":{"io.modelcontextprotocol/protocolVersion":"' +
+      MCP_PROTOCOL_VERSION + '","io.modelcontextprotocol/clientCapabilities":{},' +
+      '"io.modelcontextprotocol/clientInfo":{"name":"dev.warp.Warp",' +
+      '"version":"v0.2026.01.28.08.14.stable_04"}}}}';
+    status := McpPost(client, '/mcp', request);
     CheckEqual(status, HTTP_SUCCESS);
     docVar := _JsonFast(client.Content);
     doc := _Safe(docVar);
@@ -429,15 +460,13 @@ begin
     resultDoc := _Safe(resultVar);
     Check(resultDoc^.IsObject);
 
-    request := '{"jsonrpc":"2.0","method":"notifications/initialized"}';
-    status := client.Post('/mcp', request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json');
+    request := '{"jsonrpc":"2.0","method":"notifications/cancelled"}';
+    status := McpPost(client, '/mcp', request);
     CheckEqual(status, HTTP_NOCONTENT);
 
     request := '{"jsonrpc":"2.0","id":1,"method":"resources/list","params":' +
       '{"_meta":{"progressToken":0}}}';
-    status := client.Post('/mcp', request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json');
+    status := McpPost(client, '/mcp', request);
     CheckEqual(status, HTTP_SUCCESS);
     docVar := _JsonFast(client.Content);
     doc := _Safe(docVar);
@@ -449,8 +478,7 @@ begin
 
     request := '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":' +
       '{"_meta":{"progressToken":1}}}';
-    status := client.Post('/mcp', request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json');
+    status := McpPost(client, '/mcp', request);
     CheckEqual(status, HTTP_SUCCESS);
     docVar := _JsonFast(client.Content);
     doc := _Safe(docVar);
@@ -492,8 +520,8 @@ begin
     server.Start;
     port := StartHttpTransport(server, transport);
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    request := '{"jsonrpc":"2.0","method":"notifications/initialized"}';
-    status := client.Post('/mcp', request, JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS);
+    request := '{"jsonrpc":"2.0","method":"notifications/cancelled"}';
+    status := McpPost(client, '/mcp', request);
     CheckEqual(status, HTTP_NOCONTENT);
     Check(TrimU(client.Content) = '');
   finally
@@ -526,7 +554,7 @@ begin
     server.Start;
     port := StartHttpTransport(server, transport);
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    status := client.Post('/mcp', '{', JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS);
+    status := McpPost(client, '/mcp', '{');
     CheckEqual(status, HTTP_SUCCESS);
     docVar := _JsonFast(client.Content);
     doc := _Safe(docVar);
@@ -576,288 +604,6 @@ begin
   end;
 end;
 
-procedure TTestMcpTransports.SseTransportHandshake;
-var
-  server: TMcpServer;
-  transport: TMcpSseTransport;
-  port: integer;
-  client: THttpClientSocket;
-  status: integer;
-  content: RawUtf8;
-begin
-  server := TMcpServer.Create('SseTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    server.Start;
-    port := StartSseTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    status := client.Get('/sse', HTTP_KEEPALIVE_MS);
-    CheckEqual(status, HTTP_SUCCESS);
-    CheckEqual(client.ContentType, 'text/event-stream');
-    content := client.Content;
-    Check(PosEx('event: endpoint', content) > 0);
-    Check(PosEx('session_id=', content) > 0);
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpTransports.SseTransportMessages;
-var
-  server: TMcpServer;
-  transport: TMcpSseTransport;
-  port: integer;
-  tool: IMcpTool;
-  clientGet, clientPost: THttpClientSocket;
-  status: integer;
-  content, sessionId, url: RawUtf8;
-  encodedSessionId: RawUtf8;
-  p, eol: integer;
-  request: RawUtf8;
-begin
-  EnsureCalcParamsRtti;
-  server := TMcpServer.Create('SseTestServer', '1.0');
-  transport := nil;
-  clientGet := nil;
-  clientPost := nil;
-  try
-    tool := TCalcTool.Create('calc', 'Add two numbers');
-    server.RegisterTool(tool);
-    server.Start;
-    port := StartSseTransport(server, transport);
-
-    clientGet := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    status := clientGet.Get('/sse', HTTP_KEEPALIVE_MS);
-    CheckEqual(status, HTTP_SUCCESS);
-    content := clientGet.Content;
-    p := PosEx('session_id=', content);
-    Check(p > 0);
-    if p <= 0 then
-      exit;
-    inc(p, length('session_id='));
-    eol := PosEx(#10, content, p);
-    if eol = 0 then
-      eol := length(content) + 1;
-    sessionId := copy(content, p, eol - p);
-    sessionId := TrimU(sessionId);
-    Check(sessionId <> '');
-    Check(sessionId[1] <> '=');
-
-    clientPost := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    request := '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
-      '"arguments":{"a":2,"b":4,"enabled":true,"name":"x"}}}';
-    url := '/messages?session_id=' + sessionId;
-    status := clientPost.Post(url, request, JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS);
-    CheckEqual(status, HTTP_ACCEPTED);
-    Check(PosEx('accepted', clientPost.Content) > 0);
-
-    encodedSessionId := UrlEncode(sessionId);
-    url := '/messages?session_id=' + encodedSessionId + '&foo=bar';
-    status := clientPost.Post(url, request, JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS);
-    CheckEqual(status, HTTP_ACCEPTED);
-  finally
-    clientPost.Free;
-    clientGet.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpTransports.SseTransportOptions;
-var
-  server: TMcpServer;
-  transport: TMcpSseTransport;
-  port: integer;
-  client: THttpClientSocket;
-  status: integer;
-begin
-  server := TMcpServer.Create('SseTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    server.Start;
-    port := StartSseTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    status := client.Request('/sse', 'OPTIONS', HTTP_KEEPALIVE_MS, JSON_CONTENT_TYPE_HEADER);
-    CheckEqual(status, HTTP_NOCONTENT);
-    Check(PosEx('Access-Control-Allow-Origin', client.Headers) > 0);
-    status := client.Request('/messages', 'OPTIONS', HTTP_KEEPALIVE_MS, JSON_CONTENT_TYPE_HEADER);
-    CheckEqual(status, HTTP_NOCONTENT);
-    Check(PosEx('Access-Control-Allow-Origin', client.Headers) > 0);
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpTransports.SseTransportMissingSession;
-var
-  server: TMcpServer;
-  transport: TMcpSseTransport;
-  port: integer;
-  client: THttpClientSocket;
-  status: integer;
-  request: RawUtf8;
-begin
-  server := TMcpServer.Create('SseTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    server.Start;
-    port := StartSseTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    request := '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}';
-    status := client.Post('/messages', request, JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS);
-    CheckEqual(status, HTTP_BADREQUEST);
-    Check(PosEx('Missing session_id', client.Content) > 0);
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpTransports.SseTransportUnknownSession;
-var
-  server: TMcpServer;
-  transport: TMcpSseTransport;
-  port: integer;
-  client: THttpClientSocket;
-  status: integer;
-  request: RawUtf8;
-begin
-  server := TMcpServer.Create('SseTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    server.Start;
-    port := StartSseTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    request := '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}';
-    status := client.Post('/messages?session_id=unknown', request,
-      JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS);
-    CheckEqual(status, HTTP_NOTFOUND);
-    Check(PosEx('Session not found', client.Content) > 0);
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-type
-  TSsePostThread = class(TThread)
-  private
-    fPort: integer;
-    fUrl: RawUtf8;
-    fRequest: RawUtf8;
-    fStatus: integer;
-  protected
-    procedure Execute; override;
-  public
-    constructor Create(aPort: integer; const aUrl, aRequest: RawUtf8);
-    property Status: integer read fStatus;
-  end;
-
-constructor TSsePostThread.Create(aPort: integer; const aUrl, aRequest: RawUtf8);
-begin
-  inherited Create(true);
-  FreeOnTerminate := false;
-  fPort := aPort;
-  fUrl := aUrl;
-  fRequest := aRequest;
-  fStatus := 0;
-  Resume;
-end;
-
-procedure TSsePostThread.Execute;
-var
-  client: THttpClientSocket;
-begin
-  client := nil;
-  try
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(fPort));
-    fStatus := client.Post(fUrl, fRequest, JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS);
-  finally
-    client.Free;
-  end;
-end;
-
-procedure TTestMcpTransports.SseTransportConcurrentPosts;
-var
-  server: TMcpServer;
-  transport: TMcpSseTransport;
-  port: integer;
-  tool: IMcpTool;
-  clientGet: THttpClientSocket;
-  status: integer;
-  content, sessionId, url: RawUtf8;
-  p, eol: integer;
-  request: RawUtf8;
-  th1, th2: TSsePostThread;
-begin
-  EnsureCalcParamsRtti;
-  server := TMcpServer.Create('SseTestServer', '1.0');
-  transport := nil;
-  clientGet := nil;
-  th1 := nil;
-  th2 := nil;
-  try
-    tool := TCalcTool.Create('calc', 'Add two numbers');
-    server.RegisterTool(tool);
-    server.Start;
-    port := StartSseTransport(server, transport);
-
-    clientGet := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    status := clientGet.Get('/sse', HTTP_KEEPALIVE_MS);
-    CheckEqual(status, HTTP_SUCCESS);
-    content := clientGet.Content;
-    p := PosEx('session_id=', content);
-    Check(p > 0);
-    if p <= 0 then
-      exit;
-    inc(p, length('session_id='));
-    eol := PosEx(#10, content, p);
-    if eol = 0 then
-      eol := length(content) + 1;
-    sessionId := copy(content, p, eol - p);
-    sessionId := TrimU(sessionId);
-    Check(sessionId <> '');
-
-    request := '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
-      '"arguments":{"a":2,"b":4,"enabled":true,"name":"x"}}}';
-    url := '/messages?session_id=' + sessionId;
-    th1 := TSsePostThread.Create(port, url, request);
-    th2 := TSsePostThread.Create(port, url, request);
-    th1.WaitFor;
-    th2.WaitFor;
-    CheckEqual(th1.Status, HTTP_ACCEPTED);
-    CheckEqual(th2.Status, HTTP_ACCEPTED);
-  finally
-    th2.Free;
-    th1.Free;
-    clientGet.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
 procedure TTestMcpTransports.StdioTransportProcess;
 var
   server: TMcpServer;
@@ -880,7 +626,7 @@ begin
     server.Start;
 
     request := '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
-      '"arguments":{"a":2,"b":4,"enabled":true,"name":"x"}}}'#13#10;
+      '"arguments":{"a":2,"b":4,"enabled":true,"name":"x"},' + MCP_TEST_META + '}}'#13#10;
     requestLine := TrimU(request);
     Check(FileFromString(request, inputFile));
     Check(FileFromString('', outputFile));
@@ -940,9 +686,9 @@ begin
     server.Start;
 
     request1 := '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
-      '"arguments":{"a":2,"b":4,"enabled":true,"name":"x"}}}'#13#10;
+      '"arguments":{"a":2,"b":4,"enabled":true,"name":"x"},' + MCP_TEST_META + '}}'#13#10;
     request2 := '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"calc",' +
-      '"arguments":{"a":10,"b":5,"enabled":true,"name":"x"}}}'#13#10;
+      '"arguments":{"a":10,"b":5,"enabled":true,"name":"x"},' + MCP_TEST_META + '}}'#13#10;
     Check(FileFromString(request1 + request2, inputFile));
     Check(FileFromString('', outputFile));
 
@@ -1079,7 +825,7 @@ begin
   Check(false, 'Unable to start Streamable transport on an available port');
 end;
 
-procedure TTestMcpStreamableTransport.PostInitialize;
+procedure TTestMcpStreamableTransport.PostDiscover;
 var
   server: TMcpServer;
   transport: TMcpStreamableHttpTransport;
@@ -1101,29 +847,28 @@ begin
     port := StartStreamableTransport(server, transport);
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
 
-    // Send initialize request
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"test","version":"1.0"}}}';
+    // A modern client opens with server/discover — there is no handshake, so
+    // this is an ordinary request carrying its own protocol metadata.
+    request := '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":' +
+      '{"_meta":{"' + MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION +
+      '","' + MCP_META_CLIENT_CAPABILITIES + '":{}}}}';
     status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
       HTTP_KEEPALIVE_MS,
-      'Accept: text/event-stream, application/json');
-    CheckEqual(status, HTTP_SUCCESS, 'initialize status');
+      'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: server/discover');
+    CheckEqual(status, HTTP_SUCCESS, 'discover status');
 
-    // Verify Mcp-Session-Id header in response
+    // No session is minted anymore: the header must be absent entirely
+    sessionId := '';
     FindNameValue(client.Headers, 'MCP-SESSION-ID:', sessionId);
-    sessionId := TrimU(sessionId);
-    Check(sessionId <> '', 'Mcp-Session-Id header must be present');
+    CheckEqual(TrimU(sessionId), '', 'no Mcp-Session-Id may be issued');
 
     // Verify Content-Type is text/event-stream
     Check(PosEx('text/event-stream', client.ContentType) > 0,
       'response should be SSE');
 
-    // Verify CORS Expose-Headers
-    Check(PosEx('Access-Control-Expose-Headers', client.Headers) > 0,
-      'CORS Expose-Headers must be present');
-
-    // Parse SSE: verify event structure (event, id, data fields)
+    // Parse SSE: verify event structure (event + data; ids are gone)
     lines := CsvToRawUtf8DynArray(client.Content, #10);
     Check(length(lines) > 0, 'SSE response must have lines');
 
@@ -1134,9 +879,9 @@ begin
       if IdemPChar(pointer(lines[status]), 'EVENT: ') then
         Check(TrimU(copy(lines[status], 8, MaxInt)) = 'message',
           'SSE event type should be message');
-      if IdemPChar(pointer(lines[status]), 'ID: ') then
-        Check(TrimU(copy(lines[status], 5, MaxInt)) <> '',
-          'SSE id should be non-empty');
+      // stream resumability was removed: an 'id:' line must NOT be emitted
+      Check(not IdemPChar(pointer(lines[status]), 'ID: '),
+        'SSE events must carry no id (no resumability)');
       if IdemPChar(pointer(lines[status]), 'DATA: ') then
       begin
         dataJson := TrimU(copy(lines[status], 7, MaxInt));
@@ -1151,9 +896,14 @@ begin
     resultDoc := _Safe(resultVar);
     Check(resultDoc^.IsObject, 'result must be object');
 
-    // Verify protocol version is 2025-03-26
-    Check(resultDoc^.GetAsRawUtf8('protocolVersion', tmp));
-    CheckEqual(tmp, MCP_PROTOCOL_VERSION_20250326, 'protocol version');
+    // discover reports exactly the one revision we serve, and every result
+    // carries the mandatory resultType
+    Check(resultDoc^.GetAsRawUtf8('resultType', tmp));
+    CheckEqual(tmp, MCP_RESULT_COMPLETE, 'resultType');
+    Check(resultDoc^.GetValueIndex('supportedVersions') >= 0,
+      'supportedVersions present');
+    CheckEqual(VariantToUtf8(resultDoc^.A['supportedVersions']^.Values[0]),
+      MCP_PROTOCOL_VERSION, 'reports 2026-07-28');
   finally
     client.Free;
     if transport <> nil then
@@ -1186,137 +936,29 @@ begin
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
 
     // initialize
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"test","version":"1.0"}}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json');
+    request := '{"jsonrpc":"2.0","id":1,"method":"server/discover"}';
+    status := McpPost(client, transport.Endpoint, request);
     CheckEqual(status, HTTP_SUCCESS, 'initialize status');
     Check(hfTransferChunked in client.Http.HeaderFlags,
-      'initialize response must be a chunked SSE stream, not a buffered body');
-    FindNameValue(client.Headers, 'MCP-SESSION-ID:', sessionId);
-    sessionId := TrimU(sessionId);
-    Check(sessionId <> '', 'session id present');
+      'response must be a chunked SSE stream, not a buffered body');
 
-    // batch of two requests on the SAME socket: proves multiple discrete SSE
-    // events are streamed AND that the connection survives for keep-alive reuse
-    request := '[' +
-      '{"jsonrpc":"2.0","id":2,"method":"ping","params":{}},' +
-      '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}]';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      FormatUtf8('Accept: text/event-stream, application/json'#13#10 +
-        'Mcp-Session-Id: %', [sessionId]));
-    CheckEqual(status, HTTP_SUCCESS, 'batch status (keep-alive reuse after stream)');
+    // a second request on the SAME socket: JSON-RPC batching is not part of
+    // this revision (one request per POST), so what must be proven here is that
+    // the connection survives the first stream and is reusable for keep-alive
+    request := '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}';
+    status := McpPost(client, transport.Endpoint, request);
+    CheckEqual(status, HTTP_SUCCESS, 'second request (keep-alive reuse after stream)');
     Check(hfTransferChunked in client.Http.HeaderFlags,
-      'batch response must be chunked');
+      'second response must be chunked');
     Check(PosEx('text/event-stream', client.ContentType) > 0, 'SSE content-type');
 
-    // exactly one SSE event per request in the batch
+    // exactly one SSE event carrying the response
     lines := CsvToRawUtf8DynArray(client.Content, #10);
     evtCount := 0;
     for i := 0 to high(lines) do
       if IdemPChar(pointer(lines[i]), 'EVENT: MESSAGE') then
         inc(evtCount);
-    CheckEqual(evtCount, 2, 'two discrete SSE events streamed for the batch');
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpStreamableTransport.PostWithSession;
-var
-  server: TMcpServer;
-  transport: TMcpStreamableHttpTransport;
-  port: integer;
-  tool: IMcpTool;
-  client: THttpClientSocket;
-  status: integer;
-  request, sessionId: RawUtf8;
-  lines: TRawUtf8DynArray;
-  dataJson, tmp: RawUtf8;
-  doc, resultDoc, listDoc, itemDoc: PDocVariantData;
-  docVar, resultVar, listVar, itemVar: variant;
-  j: integer;
-begin
-  EnsureCalcParamsRtti;
-  server := TMcpServer.Create('StreamableTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    tool := TCalcTool.Create('calc', 'Add two numbers');
-    server.RegisterTool(tool);
-    server.Start;
-    port := StartStreamableTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-
-    // Step 1: Initialize to get session ID
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"test","version":"1.0"}}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      'Accept: text/event-stream, application/json');
-    CheckEqual(status, HTTP_SUCCESS, 'init status');
-    FindNameValue(client.Headers, 'MCP-SESSION-ID:', sessionId);
-    sessionId := TrimU(sessionId);
-    Check(sessionId <> '', 'session id');
-
-    // Step 2: tools/list with session
-    request := '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      FormatUtf8('Accept: text/event-stream, application/json'#13#10 +
-        'Mcp-Session-Id: %', [sessionId]));
-    CheckEqual(status, HTTP_SUCCESS, 'tools/list status');
-
-    // Parse SSE data
-    lines := CsvToRawUtf8DynArray(client.Content, #10);
-    dataJson := '';
-    for j := 0 to high(lines) do
-      if IdemPChar(pointer(lines[j]), 'DATA: ') then
-      begin
-        dataJson := TrimU(copy(lines[j], 7, MaxInt));
-        break;
-      end;
-    Check(dataJson <> '', 'tools/list SSE data');
-
-    docVar := _JsonFast(dataJson);
-    doc := _Safe(docVar);
-    resultVar := doc^.GetValueOrNull('result');
-    resultDoc := _Safe(resultVar);
-    listVar := resultDoc^.GetValueOrNull('tools');
-    listDoc := _Safe(listVar);
-    Check(listDoc^.IsArray, 'tools is array');
-    Check(listDoc^.Count > 0, 'tools not empty');
-    itemVar := listDoc^.Values[0];
-    Check(_Safe(itemVar, itemDoc), 'tools[0] is object');
-    Check(itemDoc^.GetAsRawUtf8('name', tmp));
-    CheckEqual(tmp, 'calc', 'tool name');
-
-    // Step 3: tools/call with session
-    request := '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":' +
-      '{"name":"calc","arguments":{"a":10,"b":20,"enabled":true,"name":"x"}}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      FormatUtf8('Accept: text/event-stream, application/json'#13#10 +
-        'Mcp-Session-Id: %', [sessionId]));
-    CheckEqual(status, HTTP_SUCCESS, 'tools/call status');
-
-    lines := CsvToRawUtf8DynArray(client.Content, #10);
-    dataJson := '';
-    for j := 0 to high(lines) do
-      if IdemPChar(pointer(lines[j]), 'DATA: ') then
-      begin
-        dataJson := TrimU(copy(lines[j], 7, MaxInt));
-        break;
-      end;
-    Check(dataJson <> '', 'tools/call SSE data');
-    Check(PosEx('10 + 20 = 30', dataJson) > 0, 'calc result');
+    CheckEqual(evtCount, 1, 'one discrete SSE event streamed');
   finally
     client.Free;
     if transport <> nil then
@@ -1344,22 +986,13 @@ begin
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
 
     // Initialize first
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"test","version":"1.0"}}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      'Accept: text/event-stream, application/json');
+    request := '{"jsonrpc":"2.0","id":1,"method":"server/discover"}';
+    status := McpPost(client, transport.Endpoint, request);
     CheckEqual(status, HTTP_SUCCESS);
-    FindNameValue(client.Headers, 'MCP-SESSION-ID:', sessionId);
-    sessionId := TrimU(sessionId);
 
     // Send notification — should get 202 Accepted
-    request := '{"jsonrpc":"2.0","method":"notifications/initialized"}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      FormatUtf8('Accept: text/event-stream, application/json'#13#10 +
-        'Mcp-Session-Id: %', [sessionId]));
+    request := '{"jsonrpc":"2.0","method":"notifications/cancelled"}';
+    status := McpPost(client, transport.Endpoint, request);
     CheckEqual(status, HTTP_ACCEPTED, 'notification should return 202');
     Check(TrimU(client.Content) = '', 'notification body should be empty');
   finally
@@ -1371,186 +1004,7 @@ begin
   end;
 end;
 
-procedure TTestMcpStreamableTransport.PostBatch;
-var
-  server: TMcpServer;
-  transport: TMcpStreamableHttpTransport;
-  port: integer;
-  tool: IMcpTool;
-  client: THttpClientSocket;
-  status: integer;
-  request, sessionId: RawUtf8;
-  lines: TRawUtf8DynArray;
-  dataCount, j: integer;
-begin
-  EnsureCalcParamsRtti;
-  server := TMcpServer.Create('StreamableTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    tool := TCalcTool.Create('calc', 'Add two numbers');
-    server.RegisterTool(tool);
-    server.Start;
-    port := StartStreamableTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-
-    // Initialize
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"test","version":"1.0"}}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      'Accept: text/event-stream, application/json');
-    FindNameValue(client.Headers, 'MCP-SESSION-ID:', sessionId);
-    sessionId := TrimU(sessionId);
-
-    // Send batch of 2 requests + 1 notification
-    request := '[' +
-      '{"jsonrpc":"2.0","id":10,"method":"tools/list","params":{}},' +
-      '{"jsonrpc":"2.0","method":"notifications/initialized"},' +
-      '{"jsonrpc":"2.0","id":11,"method":"ping"}' +
-      ']';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      FormatUtf8('Accept: text/event-stream, application/json'#13#10 +
-        'Mcp-Session-Id: %', [sessionId]));
-    CheckEqual(status, HTTP_SUCCESS, 'batch status');
-
-    // Count SSE data lines — should be 2 (one per request, notification has none)
-    lines := CsvToRawUtf8DynArray(client.Content, #10);
-    dataCount := 0;
-    for j := 0 to high(lines) do
-      if IdemPChar(pointer(lines[j]), 'DATA: ') then
-        inc(dataCount);
-    CheckEqual(dataCount, 2, 'batch should produce 2 SSE data events');
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpStreamableTransport.DeleteSession;
-var
-  server: TMcpServer;
-  transport: TMcpStreamableHttpTransport;
-  port: integer;
-  client: THttpClientSocket;
-  status: integer;
-  request, sessionId: RawUtf8;
-begin
-  server := TMcpServer.Create('StreamableTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    server.Start;
-    port := StartStreamableTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-
-    // Initialize
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"test","version":"1.0"}}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      'Accept: text/event-stream, application/json');
-    FindNameValue(client.Headers, 'MCP-SESSION-ID:', sessionId);
-    sessionId := TrimU(sessionId);
-    Check(sessionId <> '', 'session id present');
-
-    // DELETE the session using a fresh connection (keep-alive DELETE may timeout)
-    client.Free;
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    status := client.Request(transport.Endpoint, 'DELETE', 0,
-      'Mcp-Session-Id: ' + sessionId, '', '');
-    CheckEqual(status, HTTP_SUCCESS, 'DELETE should return 200');
-
-    // Subsequent request with same session should get 404 (fresh connection)
-    client.Free;
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-    request := '{"jsonrpc":"2.0","id":2,"method":"ping"}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      FormatUtf8('Accept: text/event-stream, application/json'#13#10 +
-        'Mcp-Session-Id: %', [sessionId]));
-    CheckEqual(status, HTTP_NOTFOUND, 'after DELETE should get 404');
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpStreamableTransport.MissingSessionId;
-var
-  server: TMcpServer;
-  transport: TMcpStreamableHttpTransport;
-  port: integer;
-  client: THttpClientSocket;
-  status: integer;
-  request: RawUtf8;
-begin
-  server := TMcpServer.Create('StreamableTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    server.Start;
-    port := StartStreamableTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-
-    // Non-initialize request without Mcp-Session-Id should get 400
-    request := '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      'Accept: text/event-stream, application/json');
-    CheckEqual(status, HTTP_BADREQUEST, 'missing session id should return 400');
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpStreamableTransport.InvalidSessionId;
-var
-  server: TMcpServer;
-  transport: TMcpStreamableHttpTransport;
-  port: integer;
-  client: THttpClientSocket;
-  status: integer;
-  request: RawUtf8;
-begin
-  server := TMcpServer.Create('StreamableTestServer', '1.0');
-  transport := nil;
-  client := nil;
-  try
-    server.Start;
-    port := StartStreamableTransport(server, transport);
-    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
-
-    // Request with non-existent session ID should get 404
-    request := '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      'Accept: text/event-stream, application/json'#13#10 +
-      'Mcp-Session-Id: non-existent-session-id');
-    CheckEqual(status, HTTP_NOTFOUND, 'invalid session id should return 404');
-  finally
-    client.Free;
-    if transport <> nil then
-      transport.Stop;
-    transport.Free;
-    server.Free;
-  end;
-end;
-
-procedure TTestMcpStreamableTransport.GetReturns405;
+procedure TTestMcpStreamableTransport.GetAndDeleteReturn405;
 var
   server: TMcpServer;
   transport: TMcpStreamableHttpTransport;
@@ -1597,12 +1051,12 @@ begin
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
 
     // Request with wrong Origin should get 403
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"test","version":"1.0"}}}';
+    request := '{"jsonrpc":"2.0","id":1,"method":"server/discover"}';
     status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
       HTTP_KEEPALIVE_MS,
       'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: server/discover'#13#10 +
       'Origin: https://evil.example.com');
     CheckEqual(status, HTTP_FORBIDDEN, 'wrong origin should return 403');
   finally
@@ -1634,12 +1088,8 @@ begin
     // Accept header is filtered by mORMot's THttpAsyncServer (HeadersUnFiltered=false)
     // so the server cannot validate it. The transport is lenient: if Accept is not
     // found in InHeaders, the request is accepted (same as SSE transport behavior).
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize","params":' +
-      '{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":' +
-      '{"name":"test","version":"1.0"}}}';
-    status := client.Post(transport.Endpoint, request, JSON_CONTENT_TYPE,
-      HTTP_KEEPALIVE_MS,
-      'Accept: application/json');
+    request := '{"jsonrpc":"2.0","id":1,"method":"server/discover"}';
+    status := McpPost(client, transport.Endpoint, request);
     CheckEqual(status, HTTP_SUCCESS, 'should succeed when Accept is filtered');
   finally
     client.Free;
@@ -1667,7 +1117,7 @@ begin
     port := StartStreamableTransport(server, transport);
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
 
-    request := '{"jsonrpc":"2.0","id":1,"method":"initialize"}';
+    request := '{"jsonrpc":"2.0","id":1,"method":"server/discover"}';
     status := client.Post(transport.Endpoint, request, TEXT_CONTENT_TYPE,
       HTTP_KEEPALIVE_MS,
       'Accept: text/event-stream, application/json');

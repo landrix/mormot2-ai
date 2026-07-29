@@ -40,7 +40,7 @@ else
   # WICHTIG: hier ALLE Demos auflisten, sonst meldet der "all"-Build faelschlich
   # "ALL DEMOS OK", obwohl LLM-/RAG-Demos nie gebaut (und evtl. kaputt) sind.
   DEMOS=(mcp.examples.dpr stdio/demo.mcp.stdio.dpr http/demo.mcp.http.dpr \
-         sse/demo.mcp.sse.dpr streamable/demo.mcp.streamable.dpr \
+         streamable/demo.mcp.streamable.dpr \
          llm/llm-chat.dpr llm/llm-agent.dpr llm/llm-structured.dpr \
          llm/llm-embed.dpr llm/llm-vision.dpr llm/llm-anthropic.dpr \
          rag/rag-spike.dpr rag/rag-chat.dpr rag/rag-agent.dpr)

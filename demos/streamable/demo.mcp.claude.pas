@@ -54,7 +54,7 @@ type
   public
     constructor Create;
     /// TMcpStreamCall handler — set as TMcpStreamableHttpTransport.OnStreamCall
-    function HandleStreamCall(const aRequestJson, aSessionId: RawUtf8;
+    function HandleStreamCall(const aRequestJson: RawUtf8;
       const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
   end;
 
@@ -279,7 +279,7 @@ begin
   until false;
 end;
 
-function TClaudeStreamer.HandleStreamCall(const aRequestJson, aSessionId: RawUtf8;
+function TClaudeStreamer.HandleStreamCall(const aRequestJson: RawUtf8;
   const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
 var
   doc: TDocVariantData;
