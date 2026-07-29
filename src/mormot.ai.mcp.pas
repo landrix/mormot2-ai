@@ -341,6 +341,7 @@ type
     fPending: TRawUtf8DynArray;
     fPendingCount: integer;
     fCancelled: boolean;
+    fCancelReason: RawUtf8;
     fSafe: TLightLock;
     function GetCancelled: boolean;
   public
@@ -362,7 +363,12 @@ type
     /// whether this filter asked for notifications about that resource URI
     function WatchesResource(const aUri: RawUtf8): boolean;
     /// mark as cancelled so the owning stream stops at its next turn
-    procedure Cancel;
+    // - aReason is echoed in the notifications/cancelled the stream sends on
+    //   its way out; it is optional on the wire but the only thing that tells
+    //   a client apart "the server is shutting down" from "you were too slow"
+    procedure Cancel(const aReason: RawUtf8 = '');
+    /// why this subscription was cancelled, for notifications/cancelled
+    function CancelReason: RawUtf8;
     /// the JSON-RPC id of the originating request — also the subscription id
     property Id: variant read fId;
     /// the notification types this stream opted into
@@ -721,6 +727,11 @@ type
     /// the first message on a stream: what the server agreed to deliver
     // - MUST precede every notification of that subscription
     function SubscriptionAcknowledgement(
+      aSubscription: TMcpSubscription): RawUtf8;
+    /// the notifications/cancelled a server-side teardown MUST send
+    // - sent before SubscriptionEndResponse: this says why the stream ends,
+    //   the empty result then closes the long-lived request itself
+    function SubscriptionCancelledNotification(
       aSubscription: TMcpSubscription): RawUtf8;
     /// the empty result that ends a subscription gracefully
     // - lets a client tell an orderly shutdown from a dropped connection
@@ -1504,7 +1515,7 @@ begin
   fSubscriptionSafe.Lock;
   try
     for i := 0 to high(fSubscriptions) do
-      fSubscriptions[i].Cancel;
+      fSubscriptions[i].Cancel('the server is shutting down');
   finally
     fSubscriptionSafe.UnLock;
   end;
@@ -1601,6 +1612,31 @@ begin
     'params', _ObjFast([
       '_meta', _ObjFast([MCP_META_SUBSCRIPTION_ID, aSubscription.Id]),
       'notifications', variant(agreed)])]))^.ToJson;
+end;
+
+function TMcpServer.SubscriptionCancelledNotification(
+  aSubscription: TMcpSubscription): RawUtf8;
+var
+  params: TDocVariantData;
+  reason: RawUtf8;
+begin
+  // "A server MUST send notifications/cancelled referencing a
+  // subscriptions/listen request ID when it tears down that subscription
+  // stream." That is the only purpose a server may send it for — it is NOT a
+  // general-purpose "I gave up on your request" message.
+  // The empty subscriptions/listen response (SubscriptionEndResponse) is a
+  // separate SHOULD and follows this one: this says why the stream ends, that
+  // one closes the long-lived request it belongs to.
+  params.InitObject([
+    'requestId', aSubscription.Id,
+    '_meta', _ObjFast([MCP_META_SUBSCRIPTION_ID, aSubscription.Id])], JSON_FAST);
+  reason := aSubscription.CancelReason;
+  if reason <> '' then
+    params.AddValue('reason', RawUtf8ToVariant(reason));
+  result := _Safe(_ObjFast([
+    'jsonrpc', '2.0',
+    'method', 'notifications/cancelled',
+    'params', variant(params)]))^.ToJson;
 end;
 
 function TMcpServer.SubscriptionEndResponse(
@@ -2383,6 +2419,8 @@ begin
       // until the process dies, and MaxSubscriptions only caps how MANY
       // queues exist, not how large one gets. Drop the stream instead.
       fCancelled := true;
+      if fCancelReason = '' then
+        fCancelReason := 'the client was not draining this subscription';
       fPending := nil;
       fPendingCount := 0;
       exit;
@@ -2418,11 +2456,26 @@ begin
   result := FindRawUtf8(fFilter.ResourceSubscriptions, aUri) >= 0;
 end;
 
-procedure TMcpSubscription.Cancel;
+procedure TMcpSubscription.Cancel(const aReason: RawUtf8);
 begin
   fSafe.Lock;
   try
+    // keep the FIRST reason: it is the one that actually ended the stream, and
+    // a later blanket Cancel (shutdown sweeping up everything) would otherwise
+    // overwrite the specific cause with a generic one
+    if not fCancelled then
+      fCancelReason := aReason;
     fCancelled := true;
+  finally
+    fSafe.UnLock;
+  end;
+end;
+
+function TMcpSubscription.CancelReason: RawUtf8;
+begin
+  fSafe.Lock;
+  try
+    result := fCancelReason;
   finally
     fSafe.UnLock;
   end;

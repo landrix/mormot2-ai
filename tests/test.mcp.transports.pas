@@ -1576,9 +1576,19 @@ begin
     Check(PosEx('notifications/resources/list_changed', body) = 0,
       'the server must not send an unrequested notification type');
 
-    // 4. server-side teardown ends with the empty response to the listen
-    // request, so the client can tell this from a dropped connection
+    // 4. server-side teardown: "A server MUST send notifications/cancelled
+    // referencing a subscriptions/listen request ID when it tears down that
+    // subscription stream" — followed by the empty response to the listen
+    // request, so the client can tell this from a dropped connection.
+    Check(PosEx('notifications/cancelled', body) > 0,
+      'a server-side teardown announces itself as a cancellation');
+    Check(PosEx('"requestId":7', body) > 0,
+      'and references the subscriptions/listen request it tears down');
+    Check(PosEx('shutting down', body) > 0,
+      'the reason tells the client whether reconnecting makes sense');
     Check(PosEx('"id":7', body) > 0, 'graceful closure response, correlated');
+    Check(PosEx('notifications/cancelled', body) < PosEx('"id":7', body),
+      'the cancellation precedes the response that closes the request');
   finally
     if driver <> nil then
     begin

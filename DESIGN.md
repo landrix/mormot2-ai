@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**483 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
+**487 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -67,8 +67,13 @@ Konsequenzen, die die ganze Implementierung prägen:
   langlebiger POST-Response-Stream, der nur die Notification-Typen liefert, die der
   Client im Filter angefordert hat (Whitelist — der Server darf nichts anderes
   senden). Erste Nachricht ist die Acknowledgement, jede Nachricht trägt
-  `_meta.subscriptionId` (= id des listen-Requests), Abschluss ist das leere Result
-  auf denselben Request. `RegisterTool`/`RegisterResource` lösen die
+  `_meta.subscriptionId` (= id des listen-Requests). Beim **server-seitigen** Abbruch
+  gehen zwei Nachrichten raus: erst `notifications/cancelled` mit `requestId` + Grund
+  (die Cancellation-Seite macht das zum **MUSS**, und sie ist der einzige erlaubte
+  Anlass für diese Notification), dann das leere Result auf den listen-Request, das
+  ihn abschließt (**SOLL** laut Subscriptions-Seite). Schließt der **Client** den
+  Stream, ist das selbst die Abbruchmeldung und bekommt keine Antwort.
+  `RegisterTool`/`RegisterResource` lösen die
   list_changed-Notifications selbst aus, deshalb meldet `server/discover`
   `listChanged`/`subscribe` — die Ankündigung deckt sich mit dem Verhalten.
   **Nur der Streamable-HTTP-Transport** kann das; stdio und der einfache
@@ -162,7 +167,7 @@ Verdrahtung wie das Backend: mORMot-Unit-/Static-Pfade aus
 Die Tests nutzen mORMots **`TSynTests`** (nicht FPCUnit) — passend zum
 Contribution-Ziel. Zwei Runner:
 - `tests/mcp.tests.lpr` — MCP-Suite (Core + Transporte + Streamable),
-  **483 Assertions** grün; `scripts/run-fpc-tests.sh`.
+  **487 Assertions** grün; `scripts/run-fpc-tests.sh`.
 - `tests/llm.tests.lpr` — LLM-Suite (SSE, Client, Agent, Agent-MCP, **Anthropic**,
   Structured, RAG, RAG-Tool, Vision), **273 Assertions** grün;
   `scripts/run-fpc-llm-tests.sh`.

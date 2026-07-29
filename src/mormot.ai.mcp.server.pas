@@ -940,14 +940,25 @@ begin
       // vanished without a FIN (the write then fails)
       alive := aWrite(SseChunk(':'#13#10));
     end;
-    // Graceful end: the empty response to the long-lived request tells the
-    // client this closed on purpose rather than the connection dropping. It is
-    // sent for a server-side cancellation too — that is exactly the shutdown
-    // case the spec asks for it in. Only a client that already vanished
-    // (alive=false) gets nothing, because there is nobody left to tell.
+    // Server-side teardown, in the order the spec asks for:
+    // 1. "A server MUST send notifications/cancelled referencing a
+    //    subscriptions/listen request ID when it tears down that subscription
+    //    stream" — it names the reason, which is all the client has to decide
+    //    whether reconnecting makes sense.
+    // 2. The empty response to the long-lived request (a SHOULD) then closes
+    //    the request itself: this ended on purpose rather than the connection
+    //    dropping.
+    // Reaching here with alive=true means WE ended it (cancelled, or the
+    // transport went inactive) — a client that closed its own stream is gone
+    // and gets neither, which is also what the spec expects: closing the
+    // stream IS the client's cancellation, and needs no answer.
     if alive then
+    begin
+      aWrite(SseChunk(FormatSseEvent('message',
+        fServer.SubscriptionCancelledNotification(sub))));
       aWrite(SseChunk(FormatSseEvent('message',
         fServer.SubscriptionEndResponse(sub))));
+    end;
   finally
     fServer.CloseSubscription(sub);
   end;
