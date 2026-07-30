@@ -1760,7 +1760,25 @@ begin
       'and a bare trailing slash is not a path');
     CheckEqual(McpResourceMetadataPath('https://mcp.example.com/mcp'),
       MCP_WELL_KNOWN_RESOURCE + '/mcp', 'the transport routes that same path');
+    // "If the request lacks any authentication information … the resource server
+    // SHOULD NOT include an error code" (RFC 6750 §3.1): nothing was presented,
+    // so nothing was rejected.
     Check(PosEx('error=', tmp) = 0, 'a plain 401 carries no error code');
+
+    // A token that WAS presented and refused must say why, in the challenge —
+    // the client acts on WWW-Authenticate, not on the response body. Without a
+    // code it cannot tell "get a fresh token" from "ask for more scope".
+    Check(PosEx('error="invalid_token"',
+      server.AuthChallenge(mtrInvalid)) > 0,
+      'a refused token is named invalid_token');
+    Check(PosEx('error="invalid_token"',
+      server.AuthChallenge(mtrExpired)) > 0,
+      'an expired one too — a fresh token is what fixes it');
+    // A wrong audience is not a weaker permission, it is a token for someone
+    // else — also invalid_token, never insufficient_scope.
+    Check(PosEx('error="invalid_token"',
+      server.AuthChallenge(mtrWrongAudience)) > 0,
+      'and a token minted for another resource');
 
     tmp := server.AuthChallenge(mtrInsufficientScope, 'files:write tools:call');
     Check(PosEx('error="insufficient_scope"', tmp) > 0,

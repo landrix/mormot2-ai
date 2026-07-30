@@ -2385,8 +2385,18 @@ function TMcpServer.AuthChallenge(aResult: TMcpTokenResult;
   const aScope: RawUtf8): RawUtf8;
 begin
   result := 'Bearer';
-  if aResult = mtrInsufficientScope then
-    result := result + ' error="insufficient_scope",';
+  // RFC 6750 §3: the `error` parameter belongs in the challenge itself, not only
+  // in a response body. A client acts on WWW-Authenticate — told nothing, it
+  // cannot tell "fetch a fresh token" (invalid_token) from "ask for more scope"
+  // (insufficient_scope) and has no reason to retry at all.
+  // - mtrMissing is the ONE case that stays silent: "If the request lacks any
+  //   authentication information … the resource server SHOULD NOT include an
+  //   error code" (§3.1). Nothing was presented, so nothing was rejected — the
+  //   bare challenge IS the message. MCP_TOKEN_ERROR still names invalid_request
+  //   for the JSON body, which is our own diagnostic, not the RFC's challenge.
+  if (aResult <> mtrMissing) and
+     (MCP_TOKEN_ERROR[aResult] <> '') then
+    result := result + ' error="' + MCP_TOKEN_ERROR[aResult] + '",';
   // resource_metadata points at the document that names the authorization
   // server — without it a client that has never seen this server has no way to
   // find out where to authenticate, which is the whole point of the challenge
