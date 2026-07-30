@@ -47,8 +47,22 @@ Konsequenzen, die die ganze Implementierung prägen:
   `-32022` samt Liste der unterstützten Versionen.
 - `server/discover` ersetzt `initialize` als Einstiegs-RPC (MUSS implementiert sein).
 - Jedes Result trägt `resultType` und `_meta.serverInfo` (`FinalizeResult`).
-- **Caching-Hints sind Pflicht** auf `server/discover`, `tools/list`, `resources/list`
-  und `resources/read`: `ttlMs` (≥ 0) und `cacheScope`. Konfigurierbar am
+- **Pagination** auf allen Listen (`tools/list`, `resources/list`, `prompts/list`):
+  `cursor` rein, `nextCursor` raus, Seitengröße über `ListPageSize` (0 = aus).
+  Der Cursor ist **keyset-basiert** (er nennt den zuletzt gelieferten *Namen*,
+  nicht einen Index) und base64uri-verpackt — ein Index-Cursor würde Einträge
+  überspringen, sobald sich die Registry zwischen zwei Seiten ändert. Deshalb
+  werden die Listen **sortiert**: eine Dictionary-Enumeration ist keine
+  definierte Reihenfolge, und ein Cursor darüber liefert Dubletten und Lücken.
+  Ein **leerer** Cursor-String ist laut Spec **gültig** (Präsenz entscheidet,
+  nicht der Wert); ein gefälschter ergibt `-32602`.
+- **Prompts**: `prompts/list` (paginiert + cacheable) und `prompts/get`, das als
+  dritte Methode einen `InputRequiredResult` liefern darf. `IMcpPrompt` rendert
+  entweder ein volles Ergebnis-Objekt oder ein blankes `messages`-Array (der
+  Server verpackt es). Optionale Felder (`title`, `arguments`) werden
+  **weggelassen** statt leer gesendet.
+- **Caching-Hints sind Pflicht** auf `server/discover`, `tools/list`, `prompts/list`,
+  `resources/list` und `resources/read`: `ttlMs` (≥ 0) und `cacheScope`. Konfigurierbar am
   `TMcpServer` — **getrennt für Listen und Read** (`ListCacheTtlMs`/`ListCacheScope`
   vs. `ReadCacheTtlMs`/`ReadCacheScope`), damit eine cachebare Tool-Liste nicht
   zwingt, auch Ressourcen-**Inhalte** für geteilte Proxies freizugeben. Der Scope
@@ -359,11 +373,14 @@ Neue Tests im passenden Runner ergänzen.
        Offen bleiben TVec0Store/lembed-Realtests + RAG-Atomar-Rollback (brauchen die
        sqlite-vec-Runtime).
     7. **MCP-Features nach Phase 1+2**: `CacheableResult` (`ttlMs`/`cacheScope`),
-       `subscriptions/listen` und **MRTR** sind **gebaut** (siehe Protokoll-Abschnitt
-       oben); `-32021` wird jetzt vom MRTR-Capability-Gate ausgelöst. Offen bleiben
-       `x-mcp-header`, Extensions-Framework, JSON Schema 2020-12 im `inputSchema`,
-       OTel-`_meta`-Keys, deterministische `tools/list`-Reihenfolge (SHOULD) sowie
-       Prompts/Completion/Pagination/Auth.
+       `subscriptions/listen`, **MRTR**, **Auth** (OAuth-Resource-Server),
+       **Pagination** und **Prompts** sind **gebaut** (siehe Protokoll-Abschnitt
+       oben); `-32021` wird vom MRTR-Capability-Gate ausgelöst, die
+       `tools/list`-Reihenfolge ist jetzt deterministisch (sortiert — Voraussetzung
+       der Pagination, nicht Kosmetik). Offen bleiben `x-mcp-header`,
+       Extensions-Framework, JSON Schema 2020-12 im `inputSchema`, OTel-`_meta`-Keys,
+       `resources/templates/list` + `completion/complete` sowie Progress-/
+       Logging-Notifications.
 
 ### Review-Härtung (kritischer Review, behoben — Build + Tests grün)
 

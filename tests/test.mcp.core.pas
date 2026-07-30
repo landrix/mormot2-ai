@@ -38,6 +38,33 @@ type
     function GetContent: RawUtf8; override;
   end;
 
+  /// a prompt with one required argument, returning a bare messages ARRAY to
+  /// prove the server wraps it into the result envelope
+  TReviewPrompt = class(TInterfacedObject, IMcpPrompt)
+  protected
+    fName: RawUtf8;
+  public
+    constructor Create(const aName: RawUtf8); reintroduce;
+    function GetName: RawUtf8;
+    function GetTitle: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetArguments: variant;
+    function Render(const Args: variant;
+      const AuthCtx: TMcpAuthContext): variant;
+  end;
+
+  /// a prompt with no arguments and no title, returning a FULL result object —
+  /// the other of the two shapes a prompt may produce
+  TGreetPrompt = class(TInterfacedObject, IMcpPrompt)
+  public
+    function GetName: RawUtf8;
+    function GetTitle: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetArguments: variant;
+    function Render(const Args: variant;
+      const AuthCtx: TMcpAuthContext): variant;
+  end;
+
   /// a tool that raises a PLAIN Exception (not ESynException) — used to prove a
   /// tool error is translated into a JSON-RPC error, never escapes the handler
   TThrowingTool = class(TMcpToolBase<TCalcParams>)
@@ -142,6 +169,9 @@ type
     procedure RequestStateCodecBindsAndExpires;
     procedure ScopeHierarchyAndBearerParsing;
     procedure ProtectedResourceMetadataAndChallenges;
+    procedure CursorCodecRejectsForgeries;
+    procedure ListsAreSortedAndPaginated;
+    procedure PromptsListAndGet;
   end;
 
 implementation
@@ -167,6 +197,87 @@ end;
 function TVersionResource.GetContent: RawUtf8;
 begin
   result := '{"version":"1.0.0","protocol":"MCP"}';
+end;
+
+{ TReviewPrompt }
+
+constructor TReviewPrompt.Create(const aName: RawUtf8);
+begin
+  inherited Create;
+  fName := aName;
+end;
+
+function TReviewPrompt.GetName: RawUtf8;
+begin
+  result := fName;
+end;
+
+function TReviewPrompt.GetTitle: RawUtf8;
+begin
+  result := 'Request Code Review';
+end;
+
+function TReviewPrompt.GetDescription: RawUtf8;
+begin
+  result := 'Asks the LLM to analyze code quality';
+end;
+
+function TReviewPrompt.GetArguments: variant;
+begin
+  result := _ArrFast([
+    _ObjFast(['name', 'code',
+              'description', 'The code to review',
+              'required', true])]);
+end;
+
+function TReviewPrompt.Render(const Args: variant;
+  const AuthCtx: TMcpAuthContext): variant;
+var
+  code: RawUtf8;
+begin
+  // "Missing required arguments: -32602" — the prompt itself knows which of its
+  // arguments are required, so it is the one that must refuse
+  if not _Safe(Args)^.GetAsRawUtf8('code', code) or
+     (code = '') then
+    raise EMcpInvalidParams.CreateU('prompt argument "code" is required');
+  // a BARE messages array: the server wraps it
+  result := _ArrFast([
+    _ObjFast(['role', 'user',
+              'content', _ObjFast(['type', 'text',
+                                   'text', 'Please review:'#10 + code])])]);
+end;
+
+{ TGreetPrompt }
+
+function TGreetPrompt.GetName: RawUtf8;
+begin
+  result := 'greet';
+end;
+
+function TGreetPrompt.GetTitle: RawUtf8;
+begin
+  result := ''; // optional and omitted — must not appear in prompts/list
+end;
+
+function TGreetPrompt.GetDescription: RawUtf8;
+begin
+  result := 'Say hello';
+end;
+
+function TGreetPrompt.GetArguments: variant;
+begin
+  SetVariantNull(result); // no arguments at all
+end;
+
+function TGreetPrompt.Render(const Args: variant;
+  const AuthCtx: TMcpAuthContext): variant;
+begin
+  // the FULL envelope shape, passed through untouched
+  result := _ObjFast([
+    'description', 'A greeting',
+    'messages', _ArrFast([
+      _ObjFast(['role', 'user',
+                'content', _ObjFast(['type', 'text', 'text', 'Hello'])])])]);
 end;
 
 { TThrowingTool }
@@ -1801,6 +1912,213 @@ begin
       '{"jsonrpc":"2.0","id":9,"method":"tools/list"}')) > 0,
       'in-process dispatch stays open on a protected server: authorization is ' +
       'a transport concern, and stdio SHOULD NOT use it at all');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.CursorCodecRejectsForgeries;
+var
+  after: RawUtf8;
+begin
+  CheckEqual(McpEncodeCursor('calc'), McpEncodeCursor('calc'),
+    'the same position always encodes to the same token');
+  Check(McpEncodeCursor('calc') <> 'calc',
+    'and not to the bare name, which would invite clients to build their own');
+
+  Check(McpDecodeCursor(McpEncodeCursor('calc'), after), 'our own token decodes');
+  CheckEqual(after, 'calc', 'back to the position it named');
+
+  // "an empty string is a valid cursor and thus MUST NOT be treated as the end
+  // of results" — it names no position, so the page starts at the beginning
+  Check(McpDecodeCursor('', after), 'an empty cursor is VALID, not an error');
+  CheckEqual(after, '', 'and starts from the beginning');
+
+  // Anything we did not mint must fail rather than land on a plausible
+  // position: silently restarting at the top would loop a client over page one
+  // forever instead of telling it the token is bad.
+  Check(not McpDecodeCursor('not-base64-$$$', after), 'garbage is refused');
+  Check(not McpDecodeCursor(BinToBase64uri('x:calc'), after),
+    'a well-formed token without our marker is refused too');
+  Check(not McpDecodeCursor('Y2FsYw', after),
+    'and so is a bare base64 name someone built by hand');
+end;
+
+procedure TTestMcpCore.ListsAreSortedAndPaginated;
+var
+  server: TMcpServer;
+  resp, cursor, seen: RawUtf8;
+  req: RawUtf8;
+  doc: TDocVariantData;
+  res, arr: PDocVariantData;
+  pages, i: integer;
+  hasNext: boolean;
+begin
+  server := TMcpServer.Create('paging', '1.0');
+  try
+    // Registered in deliberately NON-alphabetical order: a dictionary
+    // enumerates in hash order, so without sorting the sequence would depend on
+    // insertion and on the hash function — and a cursor over an unordered set
+    // repeats some entries while skipping others.
+    server.RegisterTool(TCalcTool.Create('delta', 'd'));
+    server.RegisterTool(TCalcTool.Create('alpha', 'a'));
+    server.RegisterTool(TCalcTool.Create('echo', 'e'));
+    server.RegisterTool(TCalcTool.Create('bravo', 'b'));
+    server.RegisterTool(TCalcTool.Create('charlie', 'c'));
+    server.ListPageSize := 2;
+    server.Start;
+
+    // Walk every page, collecting the names in the order they arrive.
+    seen := '';
+    cursor := '';
+    pages := 0;
+    repeat
+      if pages = 0 then
+        req := '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+      else
+        req := FormatUtf8('{"jsonrpc":"2.0","id":1,"method":"tools/list",' +
+          '"params":{"cursor":"%"}}', [cursor]);
+      resp := Exec(server, req);
+      doc.Clear;
+      doc.InitJson(resp, JSON_FAST);
+      Check(doc.GetAsDocVariant('result', res), 'a page comes back as a result');
+      Check(res^.GetAsDocVariant('tools', arr), 'carrying a tools array');
+      for i := 0 to arr^.Count - 1 do
+        seen := seen + _Safe(arr^.Values[i])^.U['name'] + ' ';
+      cursor := res^.U[MCP_RESULT_NEXT_CURSOR];
+      hasNext := res^.GetValueIndex(MCP_RESULT_NEXT_CURSOR) >= 0;
+      if hasNext then
+        Check(arr^.Count = 2, 'a non-final page is full')
+      else
+        Check(arr^.Count <= 2, 'the final page holds the remainder');
+      inc(pages);
+      Check(pages <= 5, 'pagination terminates instead of looping');
+    until not hasNext;
+
+    CheckEqual(pages, 3, '5 tools at 2 per page take three pages');
+    // The whole point: every tool exactly once, in a defined order, across
+    // pages — not the hash order the dictionary would have produced.
+    CheckEqual(seen, 'alpha bravo charlie delta echo ',
+      'every tool appears exactly once, sorted, across all pages');
+    // "Clients SHOULD treat a missing nextCursor as the end of results" — so
+    // the last page must OMIT it, not send an empty one.
+    Check(not hasNext, 'the last page omits nextCursor entirely');
+
+    // An empty cursor is valid and starts from the beginning (spec: it MUST NOT
+    // be read as the end of results).
+    resp := Exec(server, '{"jsonrpc":"2.0","id":2,"method":"tools/list",' +
+      '"params":{"cursor":""}}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'an empty cursor is served');
+    Check(res^.GetAsDocVariant('tools', arr), 'with a page of tools');
+    CheckEqual(_Safe(arr^.Values[0])^.U['name'], 'alpha',
+      'and starts at the first entry, not at the end');
+
+    // "Invalid cursors SHOULD result in an error with code -32602"
+    CheckErrorResponse(Exec(server,
+      '{"jsonrpc":"2.0","id":3,"method":"tools/list",' +
+      '"params":{"cursor":"forged"}}'), -32602, 'cursor');
+
+    // Paging off: one page, no cursor, still sorted.
+    server.ListPageSize := 0;
+    resp := Exec(server, '{"jsonrpc":"2.0","id":4,"method":"tools/list"}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'unpaginated list is served');
+    Check(res^.GetValueIndex(MCP_RESULT_NEXT_CURSOR) < 0,
+      'with no nextCursor at all');
+    Check(res^.GetAsDocVariant('tools', arr), 'and every tool at once');
+    CheckEqual(arr^.Count, 5, 'all five in one page');
+    CheckEqual(_Safe(arr^.Values[0])^.U['name'], 'alpha', 'still sorted');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.PromptsListAndGet;
+var
+  server: TMcpServer;
+  resp: RawUtf8;
+  doc: TDocVariantData;
+  res, arr, entry, msgs: PDocVariantData;
+begin
+  server := TMcpServer.Create('prompts', '1.0');
+  try
+    server.RegisterPrompt(TReviewPrompt.Create('code_review'));
+    server.RegisterPrompt(TGreetPrompt.Create);
+    server.Start;
+
+    // --- the capability must be announced, or a client never asks -----------
+    resp := Exec(server, '{"jsonrpc":"2.0","id":1,"method":"server/discover"}');
+    Check(PosEx('"prompts":{"listChanged":true}', resp) > 0,
+      'server/discover declares the prompts capability with listChanged');
+
+    // --- prompts/list ------------------------------------------------------
+    resp := Exec(server, '{"jsonrpc":"2.0","id":2,"method":"prompts/list"}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'prompts/list answers');
+    Check(res^.GetAsDocVariant('prompts', arr), 'with a prompts array');
+    CheckEqual(arr^.Count, 2, 'both prompts are listed');
+    // sorted, like every other list
+    CheckEqual(_Safe(arr^.Values[0])^.U['name'], 'code_review', 'sorted first');
+    CheckEqual(_Safe(arr^.Values[1])^.U['name'], 'greet', 'sorted second');
+
+    entry := _Safe(arr^.Values[0]);
+    CheckEqual(entry^.U['title'], 'Request Code Review', 'title is published');
+    Check(entry^.GetAsDocVariant('arguments', msgs), 'arguments are published');
+    CheckEqual(msgs^.Count, 1, 'one declared argument');
+    CheckEqual(_Safe(msgs^.Values[0])^.U['name'], 'code', 'named code');
+    Check(_Safe(msgs^.Values[0])^.B['required'], 'and marked required');
+
+    // Optional fields are OMITTED, not emitted empty: a client must be able to
+    // tell "no title" from "a title that happens to be blank".
+    entry := _Safe(arr^.Values[1]);
+    Check(entry^.GetValueIndex('title') < 0, 'an absent title is left out');
+    Check(entry^.GetValueIndex('arguments') < 0,
+      'and a prompt without arguments publishes no arguments key');
+
+    // prompts/list is one of the methods that MUST carry caching hints
+    Check(res^.GetValueIndex('ttlMs') >= 0, 'prompts/list carries ttlMs');
+    Check(res^.GetValueIndex('cacheScope') >= 0, 'and cacheScope');
+
+    // --- prompts/get, bare-array shape ------------------------------------
+    resp := Exec(server, '{"jsonrpc":"2.0","id":3,"method":"prompts/get",' +
+      '"params":{"name":"code_review","arguments":{"code":"x := 1;"}}}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'prompts/get answers');
+    Check(res^.GetAsDocVariant('messages', msgs),
+      'a prompt returning a bare array gets it wrapped into messages');
+    CheckEqual(msgs^.Count, 1, 'one message');
+    CheckEqual(_Safe(msgs^.Values[0])^.U['role'], 'user', 'from the user');
+    Check(PosEx('x := 1;', resp) > 0, 'with the argument interpolated');
+    CheckEqual(res^.U['resultType'], 'complete', 'and it is a complete result');
+
+    // --- prompts/get, full-envelope shape ---------------------------------
+    resp := Exec(server,
+      '{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"greet"}}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'the envelope shape answers too');
+    CheckEqual(res^.U['description'], 'A greeting',
+      'and is passed through untouched');
+    Check(res^.GetAsDocVariant('messages', msgs), 'with its own messages');
+
+    // --- errors ------------------------------------------------------------
+    // "Invalid prompt name: -32602"
+    CheckErrorResponse(Exec(server,
+      '{"jsonrpc":"2.0","id":5,"method":"prompts/get","params":{"name":"nope"}}'),
+      -32602, 'Prompt not found');
+    // "Missing required arguments: -32602"
+    CheckErrorResponse(Exec(server,
+      '{"jsonrpc":"2.0","id":6,"method":"prompts/get",' +
+      '"params":{"name":"code_review"}}'), -32602, 'required');
+    // a request without a name at all
+    CheckErrorResponse(Exec(server,
+      '{"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{}}'),
+      -32602, 'Missing prompt name');
   finally
     server.Free;
   end;

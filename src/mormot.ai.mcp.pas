@@ -105,6 +105,19 @@ const
   /// the opaque blob the server handed out, echoed back verbatim
   MCP_PARAM_REQUEST_STATE = 'requestState';
 
+  /// where a client asks to continue a paginated list
+  // - "The cursor is an opaque string token, representing a position in the
+  //   result set"; an ABSENT cursor starts at the beginning
+  MCP_PARAM_CURSOR = 'cursor';
+  /// where the server says a further page exists
+  // - omitted entirely when the list is exhausted: "Clients SHOULD treat a
+  //   missing nextCursor as the end of results"
+  MCP_RESULT_NEXT_CURSOR = 'nextCursor';
+  /// how many entries one page of a list carries by default
+  // - "Page size is determined by the server, and clients MUST NOT assume a
+  //   fixed page size", so this is ours to pick and ours to change
+  MCP_DEFAULT_PAGE_SIZE = 100;
+
   /// the ONLY three server-to-client request methods an InputRequiredResult may
   // ask for — "inputRequests values are request objects that MUST be one of
   // ElicitRequest, CreateMessageRequest, or ListRootsRequest"
@@ -493,6 +506,8 @@ type
     mcpToolsCall,
     mcpResourcesList,
     mcpResourcesRead,
+    mcpPromptsList,
+    mcpPromptsGet,
     mcpSubscriptionsListen);
 
 
@@ -548,6 +563,44 @@ type
     ['{5B8E1A3C-4D62-4F79-B1E5-8C2A7D0F3B94}']
     /// read with the full request context, including any input responses
     function ReadInteractive(const Context: TMcpCallContext): RawUtf8;
+  end;
+
+  /// MCP Prompt interface — a server-defined message template a USER picks
+  // - "Prompts are designed to be user-controlled … This refers to who decides
+  //   when the prompt is used, not who authors its content". Unlike a tool, a
+  //   prompt is not called by the model on its own initiative: it is offered to
+  //   the person, typically as a slash command.
+  IMcpPrompt = interface(IInvokable)
+    ['{3E7B9D14-5C82-4A6F-B0D3-7A1E4F8C2B95}']
+    /// the unique identifier clients call it by
+    function GetName: RawUtf8;
+    /// optional human-readable name for display ('' to omit)
+    function GetTitle: RawUtf8;
+    /// optional human-readable description ('' to omit)
+    function GetDescription: RawUtf8;
+    /// the `arguments` array published in prompts/list, or void for none
+    // - each entry is {name, description?, required?}; the completion API can
+    //   auto-complete these, so the names are part of the public contract
+    function GetArguments: variant;
+    /// render the prompt into `messages`
+    // - aArgs is the client's `arguments` object (void when it sent none)
+    // - return either a full result ({description?, messages:[…]}) or just the
+    //   messages array — the server wraps a bare array for convenience
+    // - raise EMcpInvalidParams for a missing required argument: "Missing
+    //   required arguments: -32602"
+    function Render(const Args: variant;
+      const AuthCtx: TMcpAuthContext): variant;
+  end;
+
+  /// a prompt that takes part in Multi Round-Trip Requests
+  // - prompts/get is the third method allowed to answer with an
+  //   InputRequiredResult ("Servers MAY also respond to prompts/get with an
+  //   InputRequiredResult"), e.g. to elicit an argument it cannot guess
+  IMcpInteractivePrompt = interface(IMcpPrompt)
+    ['{9A2D6E38-7F41-4B5C-8E0A-2D6B9F3C7A18}']
+    /// render with the full request context, including any input responses
+    function RenderInteractive(const Args: variant;
+      const Context: TMcpCallContext): variant;
   end;
 
 
@@ -643,6 +696,41 @@ function McpHttpStatus(const aResponseJson: RawUtf8): integer;
 // - rejects any method other than the three the spec allows, so a typo becomes
 //   a loud server-side failure instead of a response no client understands
 function McpInputRequest(const aMethod: RawUtf8; const aParams: variant): variant;
+
+/// wrap a list position into the opaque cursor a client gets handed
+// - the position is the NAME of the last entry delivered, not its index: a
+//   keyset cursor still points at the right place after entries are registered
+//   or removed, which is what "Servers SHOULD provide stable cursors" asks for.
+//   An index would silently skip or repeat entries across such a change.
+// - base64uri is not obfuscation, it is a fence: a cursor that looks like a
+//   plain name invites clients to build one themselves, and the spec forbids
+//   exactly that ("Don't attempt to parse or modify cursors")
+function McpEncodeCursor(const aAfterName: RawUtf8): RawUtf8;
+
+/// unwrap a cursor back into the list position it names
+// - returns false when the token is not one we minted, which the caller turns
+//   into -32602 ("Invalid cursors SHOULD result in an error with code -32602")
+// - an EMPTY cursor string decodes to an empty position and is VALID: the spec
+//   is explicit that "an empty string is a valid cursor and thus MUST NOT be
+//   treated as the end of results". It simply starts from the beginning.
+function McpDecodeCursor(const aCursor: RawUtf8; out aAfterName: RawUtf8): boolean;
+
+/// read the pagination cursor out of a request's params
+// - returns whether a cursor was SUPPLIED, which is not the same as whether it
+//   is non-empty: `cursor: ""` is a valid cursor per the spec, so presence has
+//   to be tested on the key, never on the value
+function McpRequestCursor(const aParams: variant; out aCursor: RawUtf8): boolean;
+
+/// cut one page out of a SORTED name list, starting after the cursor position
+// - aNames MUST be sorted: a cursor over an unordered set (a dictionary
+//   enumeration, say) would repeat some entries and skip others as soon as the
+//   registry changes between two pages
+// - returns the index range [aFirst, aLast] to emit, and aNextCursor as the
+//   token for the following page ('' when this page is the last one)
+// - raises EMcpInvalidParams on a malformed cursor
+procedure McpPageRange(const aNames: TRawUtf8DynArray; const aCursor: RawUtf8;
+  aHasCursor: boolean; aPageSize: integer;
+  out aFirst, aLast: PtrInt; out aNextCursor: RawUtf8);
 
 
 { ************ RTTI-based Schema Generation }
@@ -778,6 +866,7 @@ type
   private
     fTools: IKeyValue<RawUtf8, IMcpTool>; // name -> IMcpTool
     fResources: IKeyValue<RawUtf8, IMcpResource>; // uri -> IMcpResource
+    fPrompts: IKeyValue<RawUtf8, IMcpPrompt>; // name -> IMcpPrompt
     fProcessor: TMcpJsonRpcProcessor;
     fActive: boolean;
     fSafe: TLightLock;
@@ -788,6 +877,7 @@ type
     fSubscriptions: array of TMcpSubscription;
     fSubscriptionSafe: TLightLock;
     fMaxSubscriptions: integer;
+    fListPageSize: integer;
     fTokenVerifier: IMcpTokenVerifier;
     fAuthResource: RawUtf8;
     fAuthorizationServers: TRawUtf8DynArray;
@@ -825,8 +915,15 @@ type
       const aContext: TMcpCallContext): variant;
     function ExecuteResourceRead(const aParams: variant;
       const aContext: TMcpCallContext): variant;
-    function ListTools: variant;
-    function ListResources: variant;
+    function ListTools(const aParams: variant): variant;
+    function ListResources(const aParams: variant): variant;
+    function ListPrompts(const aParams: variant): variant;
+    function GetPrompt(const aParams: variant;
+      const aContext: TMcpCallContext): variant;
+    /// sorted key snapshot of a registry, taken under the lock
+    function SortedToolNames: TRawUtf8DynArray;
+    function SortedResourceUris: TRawUtf8DynArray;
+    function SortedPromptNames: TRawUtf8DynArray;
   public
     /// initialize the MCP server
     constructor Create(const aServerName: RawUtf8 = 'M-MCP-Server';
@@ -843,6 +940,11 @@ type
     function UnregisterTool(const aName: RawUtf8): boolean;
     /// unregister a resource by URI
     function UnregisterResource(const aUri: RawUtf8): boolean;
+    /// register a prompt template
+    // - thread-safe
+    procedure RegisterPrompt(const aPrompt: IMcpPrompt);
+    /// unregister a prompt by name
+    function UnregisterPrompt(const aName: RawUtf8): boolean;
     /// start the server (activates tool/resource access)
     procedure Start;
     /// stop the server
@@ -902,6 +1004,9 @@ type
     procedure NotifyToolsListChanged;
     /// tell subscribers the resource list changed
     procedure NotifyResourcesListChanged;
+    /// tell subscribers the prompt list changed
+    // - only streams that opted into promptsListChanged receive it
+    procedure NotifyPromptsListChanged;
     /// tell subscribers watching that URI that the resource changed
     procedure NotifyResourceUpdated(const aUri: RawUtf8);
     /// finalize a response produced OUTSIDE the dispatch (a streaming hook)
@@ -994,6 +1099,14 @@ type
     //   answer. It is a caching hint either way, never an access control.
     property ListCacheScope: TMcpCacheScope
       read fListCacheScope write fListCacheScope;
+    /// how many entries one page of tools/list, resources/list or prompts/list
+    /// carries (default MCP_DEFAULT_PAGE_SIZE; 0 disables paging entirely)
+    // - the spec leaves page size to the server and forbids clients to assume
+    //   one, so this can be tuned per deployment without breaking anyone
+    // - 0 means "one page, however long": honest for a small static registry,
+    //   and it keeps `nextCursor` out of the response altogether
+    property ListPageSize: integer
+      read fListPageSize write fListPageSize;
     /// how many subscriptions/listen streams may be open at once (default 8)
     // - each open stream occupies one HTTP worker thread for its whole life
     //   (the transport drains its queue there), so an unbounded number would
@@ -1263,6 +1376,96 @@ begin
   raise EMcpException.CreateUtf8(
     '% is not a valid inputRequests method: MCP allows only %, % and %',
     [aMethod, MCP_INPUT_ELICITATION, MCP_INPUT_SAMPLING, MCP_INPUT_ROOTS]);
+end;
+
+function McpRequestCursor(const aParams: variant; out aCursor: RawUtf8): boolean;
+var
+  doc: PDocVariantData;
+  i: PtrInt;
+begin
+  aCursor := '';
+  result := false;
+  doc := _Safe(aParams);
+  if not doc^.IsObject then
+    exit;
+  // GetValueIndex, not a value test: `cursor: ""` IS a cursor ("an empty string
+  // is a valid cursor and thus MUST NOT be treated as the end of results"), and
+  // asking VarIsVoid or comparing to '' would collapse it into "absent".
+  i := doc^.GetValueIndex(MCP_PARAM_CURSOR);
+  if i < 0 then
+    exit;
+  result := true;
+  VariantToUtf8(doc^.Values[i], aCursor);
+end;
+
+const
+  /// prefix inside the encoded cursor, so a token from somewhere else (or a
+  /// hand-built one) fails to decode instead of landing on a plausible position
+  MCP_CURSOR_MARK = 'n:';
+
+function McpEncodeCursor(const aAfterName: RawUtf8): RawUtf8;
+begin
+  result := BinToBase64uri(MCP_CURSOR_MARK + aAfterName);
+end;
+
+function McpDecodeCursor(const aCursor: RawUtf8; out aAfterName: RawUtf8): boolean;
+var
+  plain: RawByteString;
+begin
+  aAfterName := '';
+  // "an empty string is a valid cursor": it names no position, so the page
+  // starts at the beginning — the same place an absent cursor starts.
+  if aCursor = '' then
+    exit(true);
+  plain := Base64uriToBin(aCursor);
+  // Base64uriToBin returns '' on anything it cannot decode; combined with the
+  // marker check below, a forged or truncated token is rejected rather than
+  // quietly restarting the list from the top (which would loop a client
+  // forever over page one).
+  // Exact comparison, NOT IdemPChar: that one is case-insensitive and needs its
+  // pattern in uppercase, so a lowercase marker would never match — and a
+  // marker that tolerates case is a weaker fence than one that does not.
+  result := (length(plain) >= length(MCP_CURSOR_MARK)) and
+            CompareMemFixed(pointer(plain), PAnsiChar(MCP_CURSOR_MARK),
+              length(MCP_CURSOR_MARK));
+  if result then
+    aAfterName := copy(plain, length(MCP_CURSOR_MARK) + 1, maxInt);
+end;
+
+procedure McpPageRange(const aNames: TRawUtf8DynArray; const aCursor: RawUtf8;
+  aHasCursor: boolean; aPageSize: integer;
+  out aFirst, aLast: PtrInt; out aNextCursor: RawUtf8);
+var
+  after: RawUtf8;
+  n: PtrInt;
+begin
+  aNextCursor := '';
+  n := length(aNames);
+  aFirst := 0;
+  aLast := n - 1;
+  if aHasCursor then
+  begin
+    if not McpDecodeCursor(aCursor, after) then
+      raise EMcpInvalidParams.CreateU('invalid cursor');
+    // Keyset: skip everything up to and including the named entry. Comparing
+    // by NAME (not by a remembered index) is what survives a registry change
+    // between two pages — an entry inserted before the cursor cannot shift the
+    // window and make us skip an unseen one.
+    while (aFirst < n) and
+          (StrComp(pointer(aNames[aFirst]), pointer(after)) <= 0) do
+      inc(aFirst);
+  end;
+  if aPageSize > 0 then
+    if aLast - aFirst + 1 > aPageSize then
+    begin
+      aLast := aFirst + aPageSize - 1;
+      // Only NOW is there a further page — emitting a cursor on the last page
+      // would keep a client asking for an empty one forever.
+      aNextCursor := McpEncodeCursor(aNames[aLast]);
+    end;
+  // an exhausted list yields an empty range (aFirst > aLast), which the callers
+  // render as an empty array — not as an error: a cursor pointing past the end
+  // is a race with a shrinking registry, not a client mistake
 end;
 
 
@@ -1645,6 +1848,7 @@ begin
     'supportedVersions', _ArrFast([MCP_PROTOCOL_VERSION]),
     'capabilities', _ObjFast([
       'tools', _ObjFast(['listChanged', true]),
+      'prompts', _ObjFast(['listChanged', true]),
       'resources', _ObjFast([
         'listChanged', true,
         'subscribe', true])])]);
@@ -1765,6 +1969,7 @@ begin
   fProcessor := TMcpJsonRpcProcessor.Create(aServerName, aServerVersion);
   fTools := Collections.NewPlainKeyValue<RawUtf8, IMcpTool>;
   fResources := Collections.NewPlainKeyValue<RawUtf8, IMcpResource>;
+  fPrompts := Collections.NewPlainKeyValue<RawUtf8, IMcpPrompt>;
   fActive := false;
   fListCacheTtlMs := MCP_CACHE_TTL_DEFAULT;
   fReadCacheTtlMs := MCP_CACHE_TTL_DEFAULT;
@@ -1773,6 +1978,7 @@ begin
   fReadCacheScope := mcsPrivate;
   fSubscriptionSafe.Init;
   fMaxSubscriptions := 8; // see the property: each one holds a worker thread
+  fListPageSize := MCP_DEFAULT_PAGE_SIZE;
 end;
 
 function TMcpServer.OpenSubscription(const aRequestId,
@@ -1901,6 +2107,11 @@ begin
   Broadcast('notifications/resources/list_changed', '');
 end;
 
+procedure TMcpServer.NotifyPromptsListChanged;
+begin
+  Broadcast('notifications/prompts/list_changed', '');
+end;
+
 procedure TMcpServer.NotifyResourceUpdated(const aUri: RawUtf8);
 begin
   if aUri <> '' then
@@ -1992,7 +2203,8 @@ begin
   case aMethod of
     mcpDiscover,
     mcpToolsList,
-    mcpResourcesList:
+    mcpResourcesList,
+    mcpPromptsList:
       begin
         ttl := fListCacheTtlMs;
         scope := fListCacheScope;
@@ -2110,6 +2322,34 @@ begin
     NotifyResourcesListChanged;
 end;
 
+procedure TMcpServer.RegisterPrompt(const aPrompt: IMcpPrompt);
+var
+  name: RawUtf8;
+begin
+  if aPrompt = nil then
+    exit;
+  name := aPrompt.GetName;
+  fSafe.Lock;
+  try
+    fPrompts.Add(name, aPrompt);
+  finally
+    fSafe.UnLock;
+  end;
+  NotifyPromptsListChanged;
+end;
+
+function TMcpServer.UnregisterPrompt(const aName: RawUtf8): boolean;
+begin
+  fSafe.Lock;
+  try
+    result := fPrompts.Remove(aName);
+  finally
+    fSafe.UnLock;
+  end;
+  if result then
+    NotifyPromptsListChanged;
+end;
+
 procedure TMcpServer.Start;
 begin
   // Validate the authorization configuration HERE, where it is still a startup
@@ -2153,60 +2393,258 @@ begin
   result := fActive;
 end;
 
-function TMcpServer.ListTools: variant;
+function TMcpServer.SortedToolNames: TRawUtf8DynArray;
 var
-  doc, toolsList: TDocVariantData;
-  toolObj: TDocVariantData;
   pair: TPair<RawUtf8, IMcpTool>;
+  n: PtrInt;
 begin
-  doc.InitObject([], JSON_FAST);
-  toolsList.InitArray([], JSON_FAST);
-
+  result := nil;
   fSafe.Lock;
   try
+    SetLength(result, fTools.Count);
+    n := 0;
     for pair in fTools do
     begin
-      toolObj.InitObject([
-        'name', pair.Key,
-        'description', pair.Value.GetDescription,
-        'inputSchema', pair.Value.GetInputSchema
-      ], JSON_FAST);
-      toolsList.AddItem(variant(toolObj));
+      result[n] := pair.Key;
+      inc(n);
     end;
   finally
     fSafe.UnLock;
   end;
+  // A dictionary enumerates in hash order, which is neither stable across
+  // insertions nor the same on two machines. Pagination over that would repeat
+  // some tools and skip others; even unpaginated it would make tools/list a
+  // moving target for caches and diffs. Sorting is the cheapest way to make the
+  // list a well-defined sequence.
+  QuickSortRawUtf8(result, length(result));
+end;
 
-  doc.AddValue('tools', variant(toolsList));
+function TMcpServer.SortedResourceUris: TRawUtf8DynArray;
+var
+  pair: TPair<RawUtf8, IMcpResource>;
+  n: PtrInt;
+begin
+  result := nil;
+  fSafe.Lock;
+  try
+    SetLength(result, fResources.Count);
+    n := 0;
+    for pair in fResources do
+    begin
+      result[n] := pair.Key;
+      inc(n);
+    end;
+  finally
+    fSafe.UnLock;
+  end;
+  QuickSortRawUtf8(result, length(result));
+end;
+
+function TMcpServer.SortedPromptNames: TRawUtf8DynArray;
+var
+  pair: TPair<RawUtf8, IMcpPrompt>;
+  n: PtrInt;
+begin
+  result := nil;
+  fSafe.Lock;
+  try
+    SetLength(result, fPrompts.Count);
+    n := 0;
+    for pair in fPrompts do
+    begin
+      result[n] := pair.Key;
+      inc(n);
+    end;
+  finally
+    fSafe.UnLock;
+  end;
+  QuickSortRawUtf8(result, length(result));
+end;
+
+function TMcpServer.ListPrompts(const aParams: variant): variant;
+var
+  doc, promptsList: TDocVariantData;
+  promptObj: TDocVariantData;
+  names: TRawUtf8DynArray;
+  prompt: IMcpPrompt;
+  cursor, nextCursor, txt: RawUtf8;
+  args: variant;
+  first, last, i: PtrInt;
+  hasCursor: boolean;
+begin
+  names := SortedPromptNames;
+  hasCursor := McpRequestCursor(aParams, cursor);
+  McpPageRange(names, cursor, hasCursor, fListPageSize, first, last, nextCursor);
+
+  doc.InitObject([], JSON_FAST);
+  promptsList.InitArray([], JSON_FAST);
+  for i := first to last do
+  begin
+    fSafe.Lock;
+    try
+      if not fPrompts.TryGetValue(names[i], prompt) then
+        prompt := nil;
+    finally
+      fSafe.UnLock;
+    end;
+    if prompt = nil then
+      continue;
+    promptObj.InitObject(['name', names[i]], JSON_FAST);
+    // title/description/arguments are all OPTIONAL: emit them only when the
+    // prompt actually supplies one, rather than shipping empty strings a client
+    // would then have to treat as "present but blank"
+    txt := prompt.GetTitle;
+    if txt <> '' then
+      promptObj.AddValue('title', RawUtf8ToVariant(txt));
+    txt := prompt.GetDescription;
+    if txt <> '' then
+      promptObj.AddValue('description', RawUtf8ToVariant(txt));
+    args := prompt.GetArguments;
+    if _Safe(args)^.IsArray and
+       (_Safe(args)^.Count > 0) then
+      promptObj.AddValue('arguments', args);
+    promptsList.AddItem(variant(promptObj));
+  end;
+
+  doc.AddValue('prompts', variant(promptsList));
+  if nextCursor <> '' then
+    doc.AddValue(MCP_RESULT_NEXT_CURSOR, RawUtf8ToVariant(nextCursor));
   result := variant(doc);
 end;
 
-function TMcpServer.ListResources: variant;
+function TMcpServer.GetPrompt(const aParams: variant;
+  const aContext: TMcpCallContext): variant;
 var
-  doc, resourcesList: TDocVariantData;
-  resourceObj: TDocVariantData;
-  pair: TPair<RawUtf8, IMcpResource>;
+  doc, res: PDocVariantData;
+  promptName: RawUtf8;
+  args, rendered: variant;
+  prompt: IMcpPrompt;
+  interactive: IMcpInteractivePrompt;
+  wrap: TDocVariantData;
 begin
-  doc.InitObject([], JSON_FAST);
-  resourcesList.InitArray([], JSON_FAST);
+  if _Safe(aParams, doc) then
+    if not doc.GetAsRawUtf8('name', promptName) then
+      raise EMcpInvalidParams.CreateU('Missing prompt name in prompts/get');
+  args := doc.GetValueOrDefault('arguments', Null);
 
   fSafe.Lock;
   try
-    for pair in fResources do
-    begin
-      resourceObj.InitObject([
-        'uri', pair.Value.GetUri,
-        'name', pair.Value.GetName,
-        'description', pair.Value.GetDescription,
-        'mimeType', pair.Value.GetMimeType
-      ], JSON_FAST);
-      resourcesList.AddItem(variant(resourceObj));
-    end;
+    if not fPrompts.TryGetValue(promptName, prompt) then
+      // "Invalid prompt name: -32602" — naming something that does not exist is
+      // bad input, not a server failure
+      raise EMcpInvalidParams.CreateUtf8('Prompt not found: %', [promptName]);
   finally
     fSafe.UnLock;
   end;
 
+  // A prompt that opted into Multi Round-Trip Requests gets the full context;
+  // every other prompt keeps the two-argument call it was written against.
+  if Supports(prompt, IMcpInteractivePrompt, interactive) then
+    rendered := interactive.RenderInteractive(args, aContext)
+  else
+    rendered := prompt.Render(args, aContext.Auth);
+
+  // Convenience: a prompt may return just the messages array. Wrapping it here
+  // means every prompt does not have to build the envelope, and the result
+  // still leaves this method as the object the spec requires.
+  res := _Safe(rendered);
+  if res^.IsArray then
+  begin
+    wrap.InitObject(['messages', rendered], JSON_FAST);
+    result := variant(wrap);
+  end
+  else if res^.IsObject then
+    result := rendered
+  else
+    // neither shape: the prompt is broken, and shipping it would produce a
+    // result no client can read
+    raise EMcpException.CreateUtf8(
+      'prompt % returned neither a messages array nor a result object',
+      [promptName]);
+end;
+
+function TMcpServer.ListTools(const aParams: variant): variant;
+var
+  doc, toolsList: TDocVariantData;
+  toolObj: TDocVariantData;
+  names: TRawUtf8DynArray;
+  tool: IMcpTool;
+  cursor, nextCursor: RawUtf8;
+  first, last, i: PtrInt;
+  hasCursor: boolean;
+begin
+  names := SortedToolNames;
+  hasCursor := McpRequestCursor(aParams, cursor);
+  McpPageRange(names, cursor, hasCursor, fListPageSize, first, last, nextCursor);
+
+  doc.InitObject([], JSON_FAST);
+  toolsList.InitArray([], JSON_FAST);
+  for i := first to last do
+  begin
+    // Re-resolve under the lock per entry: a tool unregistered between the
+    // snapshot and here simply drops out of this page rather than raising.
+    fSafe.Lock;
+    try
+      if not fTools.TryGetValue(names[i], tool) then
+        tool := nil;
+    finally
+      fSafe.UnLock;
+    end;
+    if tool = nil then
+      continue;
+    toolObj.InitObject([
+      'name', names[i],
+      'description', tool.GetDescription,
+      'inputSchema', tool.GetInputSchema
+    ], JSON_FAST);
+    toolsList.AddItem(variant(toolObj));
+  end;
+
+  doc.AddValue('tools', variant(toolsList));
+  if nextCursor <> '' then
+    doc.AddValue(MCP_RESULT_NEXT_CURSOR, RawUtf8ToVariant(nextCursor));
+  result := variant(doc);
+end;
+
+function TMcpServer.ListResources(const aParams: variant): variant;
+var
+  doc, resourcesList: TDocVariantData;
+  resourceObj: TDocVariantData;
+  uris: TRawUtf8DynArray;
+  res: IMcpResource;
+  cursor, nextCursor: RawUtf8;
+  first, last, i: PtrInt;
+  hasCursor: boolean;
+begin
+  uris := SortedResourceUris;
+  hasCursor := McpRequestCursor(aParams, cursor);
+  McpPageRange(uris, cursor, hasCursor, fListPageSize, first, last, nextCursor);
+
+  doc.InitObject([], JSON_FAST);
+  resourcesList.InitArray([], JSON_FAST);
+  for i := first to last do
+  begin
+    fSafe.Lock;
+    try
+      if not fResources.TryGetValue(uris[i], res) then
+        res := nil;
+    finally
+      fSafe.UnLock;
+    end;
+    if res = nil then
+      continue;
+    resourceObj.InitObject([
+      'uri', res.GetUri,
+      'name', res.GetName,
+      'description', res.GetDescription,
+      'mimeType', res.GetMimeType
+    ], JSON_FAST);
+    resourcesList.AddItem(variant(resourceObj));
+  end;
+
   doc.AddValue('resources', variant(resourcesList));
+  if nextCursor <> '' then
+    doc.AddValue(MCP_RESULT_NEXT_CURSOR, RawUtf8ToVariant(nextCursor));
   result := variant(doc);
 end;
 
@@ -2260,12 +2698,11 @@ var
   m: RawUtf8;
 begin
   // "Servers MUST NOT send InputRequiredResult responses on any other client
-  // requests" than prompts/get, resources/read and tools/call. Only two of
-  // those exist here; asking for input from tools/list would produce a result
-  // no conforming client would act on.
-  if not (aMethod in [mcpToolsCall, mcpResourcesRead]) then
+  // requests" than prompts/get, resources/read and tools/call. Asking for input
+  // from tools/list would produce a result no conforming client acts on.
+  if not (aMethod in [mcpToolsCall, mcpResourcesRead, mcpPromptsGet]) then
     raise EMcpException.CreateU('An InputRequiredResult is only allowed on ' +
-      'tools/call and resources/read');
+      'tools/call, resources/read and prompts/get');
 
   requests := _Safe(aInputRequests);
   // "Servers MUST include at least one of inputRequests or requestState in
@@ -2595,7 +3032,7 @@ begin
   // the same rules — including the MRTR ones. Deriving both from the request
   // body (rather than being handed a method name) is what keeps a hook from
   // quietly bypassing them; that has now happened twice in this transport.
-  personalized := (m in [mcpToolsCall, mcpResourcesRead]) and
+  personalized := (m in [mcpToolsCall, mcpResourcesRead, mcpPromptsGet]) and
                   req.GetAsDocVariant('params', params) and
                   ((params^.GetValueIndex(MCP_PARAM_INPUT_RESPONSES) >= 0) or
                    (params^.GetValueIndex(MCP_PARAM_REQUEST_STATE) >= 0));
@@ -2745,7 +3182,7 @@ begin
     // shareable. Only the two methods that may take part in a round trip
     // count: retry fields elsewhere are meaningless and must not degrade
     // their cacheability.
-    personalized := (m in [mcpToolsCall, mcpResourcesRead]) and
+    personalized := (m in [mcpToolsCall, mcpResourcesRead, mcpPromptsGet]) and
                     (callCtx.HasRequestState or callCtx.HasInputResponses);
 
     // Dispatch to handler — any handler/tool exception is mapped to a JSON-RPC
@@ -2754,13 +3191,17 @@ begin
       mcpDiscover:
         resultData := fProcessor.HandleDiscover;
       mcpToolsList:
-        resultData := ListTools;
+        resultData := ListTools(params);
       mcpToolsCall:
         resultData := ExecuteToolCall(params, callCtx);
       mcpResourcesList:
-        resultData := ListResources;
+        resultData := ListResources(params);
       mcpResourcesRead:
         resultData := ExecuteResourceRead(params, callCtx);
+      mcpPromptsList:
+        resultData := ListPrompts(params);
+      mcpPromptsGet:
+        resultData := GetPrompt(params, callCtx);
       mcpSubscriptionsListen:
         // Only a streaming transport can serve this: it is a long-lived
         // response stream, not a request/response. The Streamable HTTP
@@ -2868,6 +3309,10 @@ begin
     result := mcpResourcesList
   else if aMethod = 'resources/read' then
     result := mcpResourcesRead
+  else if aMethod = 'prompts/list' then
+    result := mcpPromptsList
+  else if aMethod = 'prompts/get' then
+    result := mcpPromptsGet
   else if aMethod = 'subscriptions/listen' then
     result := mcpSubscriptionsListen
   else
