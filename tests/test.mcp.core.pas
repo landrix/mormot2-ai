@@ -62,7 +62,7 @@ type
     function GetDescription: RawUtf8;
     function GetMimeType: RawUtf8;
     function Complete(const ArgumentName, ArgumentValue: RawUtf8;
-      const Context: variant): TRawUtf8DynArray;
+      const Context: variant; const AuthCtx: TMcpAuthContext): TRawUtf8DynArray;
   end;
 
   /// a prompt whose completion returns MORE than the 100 the spec allows, to
@@ -76,7 +76,21 @@ type
     function Render(const Args: variant;
       const AuthCtx: TMcpAuthContext): variant;
     function Complete(const ArgumentName, ArgumentValue: RawUtf8;
-      const Context: variant): TRawUtf8DynArray;
+      const Context: variant; const AuthCtx: TMcpAuthContext): TRawUtf8DynArray;
+  end;
+
+  /// a prompt that ELICITS its missing argument instead of failing — prompts/get
+  /// is the third method allowed to answer with an InputRequiredResult
+  TElicitingPrompt = class(TInterfacedObject, IMcpPrompt, IMcpInteractivePrompt)
+  public
+    function GetName: RawUtf8;
+    function GetTitle: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetArguments: variant;
+    function Render(const Args: variant;
+      const AuthCtx: TMcpAuthContext): variant;
+    function RenderInteractive(const Args: variant;
+      const Context: TMcpCallContext): variant;
   end;
 
   /// a prompt with no arguments and no title, returning a FULL result object —
@@ -288,7 +302,9 @@ end;
 
 function TFilesTemplate.GetTitle: RawUtf8;
 begin
-  result := 'Project Files';
+  // deliberately DIFFERENT from GetName: identical strings would hide a bug
+  // that serializes the name under the title key (or vice versa)
+  result := 'Browse project files';
 end;
 
 function TFilesTemplate.GetDescription: RawUtf8;
@@ -302,7 +318,7 @@ begin
 end;
 
 function TFilesTemplate.Complete(const ArgumentName, ArgumentValue: RawUtf8;
-  const Context: variant): TRawUtf8DynArray;
+  const Context: variant; const AuthCtx: TMcpAuthContext): TRawUtf8DynArray;
 begin
   result := nil;
   // an unknown argument has no suggestions — proves the name reaches us
@@ -341,7 +357,7 @@ begin
 end;
 
 function TFloodPrompt.Complete(const ArgumentName, ArgumentValue: RawUtf8;
-  const Context: variant): TRawUtf8DynArray;
+  const Context: variant; const AuthCtx: TMcpAuthContext): TRawUtf8DynArray;
 var
   i: integer;
 begin
@@ -349,6 +365,57 @@ begin
   SetLength(result, 150); // deliberately over the 100 ceiling
   for i := 0 to 149 do
     result[i] := FormatUtf8('v%', [i]);
+end;
+
+{ TElicitingPrompt }
+
+function TElicitingPrompt.GetName: RawUtf8;
+begin
+  result := 'eliciting';
+end;
+
+function TElicitingPrompt.GetTitle: RawUtf8;
+begin
+  result := '';
+end;
+
+function TElicitingPrompt.GetDescription: RawUtf8;
+begin
+  result := 'asks for its argument when it was not supplied';
+end;
+
+function TElicitingPrompt.GetArguments: variant;
+begin
+  result := _ArrFast([_ObjFast(['name', 'topic', 'required', true])]);
+end;
+
+function TElicitingPrompt.Render(const Args: variant;
+  const AuthCtx: TMcpAuthContext): variant;
+begin
+  // never reached: the server prefers RenderInteractive when it is available
+  result := _ArrFast([]);
+end;
+
+function TElicitingPrompt.RenderInteractive(const Args: variant;
+  const Context: TMcpCallContext): variant;
+var
+  topic: RawUtf8;
+begin
+  // Round two: the client answered, so build the real prompt from its answer.
+  if Context.HasInputResponses then
+  begin
+    topic := _Safe(_Safe(Context.InputResponses)^.GetValueOrNull('topic'))^.
+      U['content'];
+    result := _ArrFast([
+      _ObjFast(['role', 'user',
+                'content', _ObjFast(['type', 'text', 'text', 'About ' + topic])])]);
+    exit;
+  end;
+  // Round one: the argument is missing and only the user can supply it.
+  raise EMcpInputRequired.Create(
+    _ObjFast(['topic', McpInputRequest(MCP_INPUT_ELICITATION,
+      _ObjFast(['message', 'Which topic?',
+                'requestedSchema', _ObjFast(['type', 'object'])]))]), '');
 end;
 
 { TGreetPrompt }
@@ -1032,7 +1099,7 @@ end;
 procedure TTestMcpCore.SubscriptionFilterAndFanout;
 var
   server: TMcpServer;
-  tools, res, none, extra: TMcpSubscription;
+  tools, res, none, extra, prompts: TMcpSubscription;
   queued: TRawUtf8DynArray;
   ack: RawUtf8;
   doc, params, meta, agreed: PDocVariantData;
@@ -1084,7 +1151,29 @@ begin
     Check(agreed^.GetValueIndex('toolsListChanged') < 0,
       'does not echo a type this stream did not request');
     Check(agreed^.GetValueIndex('promptsListChanged') < 0,
-      'never echoes a type the server cannot raise at all');
+      'nor one this stream did not ask for, even though the server can raise it');
+
+    // A stream that DOES ask for prompt changes gets them echoed and delivered.
+    // Both halves matter: the capability is announced in server/discover, and
+    // for a while Broadcast had no route for this notification at all — it was
+    // silently dropped, so the announcement was a promise the server did not
+    // keep. The fan-out assertion below is what makes that impossible again.
+    prompts := server.OpenSubscription(10,
+      _ObjFast(['notifications', _ObjFast(['promptsListChanged', true])]));
+    Check(prompts <> nil, 'a prompts stream opens');
+    dv := _JsonFast(server.SubscriptionAcknowledgement(prompts));
+    Check(_Safe(dv)^.GetAsDocVariant('params', params), 'ack params');
+    Check(params^.GetAsDocVariant('notifications', agreed), 'agreed filter');
+    Check(agreed^.GetValueIndex('promptsListChanged') >= 0,
+      'the server honors promptsListChanged and says so');
+
+    server.RegisterPrompt(TGreetPrompt.Create);
+    CheckEqual(DrainedMethod(prompts), 'notifications/prompts/list_changed',
+      'registering a prompt really reaches the subscriber');
+    Check(not tools.Drain(queued), 'and only that stream');
+    // release the slot again, so the cap assertions below still measure the cap
+    // and not this test's own bookkeeping
+    server.CloseSubscription(prompts);
 
     // fan-out follows the filters, not the connection
     server.NotifyToolsListChanged;
@@ -2046,6 +2135,14 @@ begin
     'a well-formed token without our marker is refused too');
   Check(not McpDecodeCursor('Y2FsYw', after),
     'and so is a bare base64 name someone built by hand');
+
+  // The keyset comparison is StrComp, which stops at the first #0. A cursor
+  // carrying an embedded null would be compared only up to that byte — a token
+  // that looks valid but silently selects the wrong window. Names never contain
+  // #0, so it cannot be one of ours.
+  Check(not McpDecodeCursor(BinToBase64uri('n:foo'#0'bar'), after),
+    'a cursor with an embedded null is refused, not silently truncated');
+  CheckEqual(after, '', 'and yields no position');
 end;
 
 procedure TTestMcpCore.ListsAreSortedAndPaginated;
@@ -2135,6 +2232,38 @@ begin
     Check(res^.GetAsDocVariant('tools', arr), 'and every tool at once');
     CheckEqual(arr^.Count, 5, 'all five in one page');
     CheckEqual(_Safe(arr^.Values[0])^.U['name'], 'alpha', 'still sorted');
+
+    // A negative page size cannot mean anything; it must not be read as "one
+    // entry per page" or wrap into a huge window. Same harmless reading as 0.
+    server.ListPageSize := -3;
+    resp := Exec(server, '{"jsonrpc":"2.0","id":5,"method":"tools/list"}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'a negative page size still answers');
+    Check(res^.GetAsDocVariant('tools', arr), 'with tools');
+    CheckEqual(arr^.Count, 5, 'and behaves like paging off');
+
+    // THE off-by-one: an item count that is an exact multiple of the page size.
+    // The last full page must NOT carry a nextCursor, or the client fetches an
+    // empty page and cannot tell that from a truncated list.
+    server.UnregisterTool('echo');
+    server.ListPageSize := 2;
+    resp := Exec(server, '{"jsonrpc":"2.0","id":6,"method":"tools/list"}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'page one of four items');
+    cursor := res^.U[MCP_RESULT_NEXT_CURSOR];
+    Check(res^.GetValueIndex(MCP_RESULT_NEXT_CURSOR) >= 0,
+      'four items at two per page: page one has a successor');
+    resp := Exec(server, FormatUtf8('{"jsonrpc":"2.0","id":7,' +
+      '"method":"tools/list","params":{"cursor":"%"}}', [cursor]));
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'page two answers');
+    Check(res^.GetAsDocVariant('tools', arr), 'with the remaining tools');
+    CheckEqual(arr^.Count, 2, 'exactly the rest');
+    Check(res^.GetValueIndex(MCP_RESULT_NEXT_CURSOR) < 0,
+      'and NO nextCursor: the list ended exactly on a page boundary');
   finally
     server.Free;
   end;
@@ -2223,6 +2352,58 @@ begin
     CheckErrorResponse(Exec(server,
       '{"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{}}'),
       -32602, 'Missing prompt name');
+
+    // --- prompts/get as a Multi Round-Trip Request -------------------------
+    // "Servers MAY also respond to prompts/get with an InputRequiredResult":
+    // the third method allowed to do so, alongside tools/call and
+    // resources/read. Round one asks, round two answers.
+    server.RegisterPrompt(TElicitingPrompt.Create);
+    resp := ExecCaps(server,
+      '{"jsonrpc":"2.0","id":8,"method":"prompts/get","params":{"name":"eliciting"}}',
+      _ObjFast(['elicitation', _ObjFast([])]));
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'round one answers');
+    CheckEqual(res^.U['resultType'], 'input_required',
+      'an interim result, not a complete one');
+    Check(res^.GetAsDocVariant('inputRequests', msgs),
+      'naming what the server needs');
+    Check(msgs^.GetValueIndex('topic') >= 0, 'under the key it assigned');
+    // An interim result carries no caching hints — there is nothing stable yet.
+    Check(res^.GetValueIndex('ttlMs') < 0, 'and no caching hints');
+
+    resp := ExecCaps(server,
+      '{"jsonrpc":"2.0","id":9,"method":"prompts/get","params":{"name":"eliciting",' +
+      '"inputResponses":{"topic":{"content":"pascal"}}}}',
+      _ObjFast(['elicitation', _ObjFast([])]));
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'round two answers');
+    CheckEqual(res^.U['resultType'], 'complete', 'and completes this time');
+    Check(res^.GetAsDocVariant('messages', msgs), 'with the rendered messages');
+    Check(PosEx('About pascal', resp) > 0,
+      'built from the answer the client sent back');
+
+    // --- prompts/list paginates too ----------------------------------------
+    // The page arithmetic is shared (McpPageRange), but each list wires its own
+    // array key and nextCursor — so each needs proof it was wired at all.
+    server.ListPageSize := 1;
+    resp := Exec(server, '{"jsonrpc":"2.0","id":10,"method":"prompts/list"}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'prompts/list page one');
+    Check(res^.GetAsDocVariant('prompts', arr), 'under the prompts key');
+    CheckEqual(arr^.Count, 1, 'one per page');
+    resp := Exec(server, FormatUtf8('{"jsonrpc":"2.0","id":11,' +
+      '"method":"prompts/list","params":{"cursor":"%"}}',
+      [res^.U[MCP_RESULT_NEXT_CURSOR]]));
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'prompts/list page two');
+    Check(res^.GetAsDocVariant('prompts', arr), 'again under prompts');
+    CheckEqual(arr^.Count, 1, 'the next one');
+    CheckEqual(_Safe(arr^.Values[0])^.U['name'], 'eliciting',
+      'sorted: code_review, then eliciting');
   finally
     server.Free;
   end;
@@ -2260,6 +2441,8 @@ begin
     CheckEqual(entry^.U['uriTemplate'], 'file:///{path}',
       'the RFC 6570 template is what identifies it');
     CheckEqual(entry^.U['name'], 'Project Files', 'with its name');
+    CheckEqual(entry^.U['title'], 'Browse project files',
+      'and its title under the title key, not the name');
     CheckEqual(entry^.U['mimeType'], 'application/octet-stream', 'and mimeType');
     // it is a list, so it is cacheable and paginated like the others
     Check(res^.GetValueIndex('ttlMs') >= 0, 'templates/list carries ttlMs');

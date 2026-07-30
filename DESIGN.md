@@ -64,7 +64,11 @@ Konsequenzen, die die ganze Implementierung prägen:
 - **Resource-Templates**: `resources/templates/list` (paginiert + cacheable)
   veröffentlicht RFC-6570-Templates (`file:///{path}`). Ein Template wird nie
   gelesen — es sagt dem Client, welche URIs er bauen darf; die konkrete URI geht
-  dann an `resources/read`.
+  dann an `resources/read`. **Grenze:** `resources/read` löst ausschließlich per
+  **exaktem** Registry-Treffer auf; ein expandiertes `file:///src/main.pas`
+  ergibt `-32602`, wenn genau diese URI nicht ebenfalls registriert ist. Ein
+  Matcher/Resolver-Hook fehlt noch — Templates also nur veröffentlichen, wenn
+  die beschriebenen URIs wirklich als Resources existieren.
 - **Completion**: `completion/complete` für Prompt- und Template-Argumente.
   Wer Vorschläge liefern will, implementiert zusätzlich `IMcpCompletable` —
   wer nicht, bekommt eine leere `values`-Liste statt eines Fehlers (nichts
@@ -73,7 +77,8 @@ Konsequenzen, die die ganze Implementierung prägen:
   gekappt und `hasMore` gesetzt, statt eine überlange Antwort auf die Leitung
   zu legen.
 - **Caching-Hints sind Pflicht** auf `server/discover`, `tools/list`, `prompts/list`,
-  `resources/list` und `resources/read`: `ttlMs` (≥ 0) und `cacheScope`. Konfigurierbar am
+  `resources/list`, `resources/templates/list` und `resources/read`: `ttlMs` (≥ 0)
+  und `cacheScope`. Konfigurierbar am
   `TMcpServer` — **getrennt für Listen und Read** (`ListCacheTtlMs`/`ListCacheScope`
   vs. `ReadCacheTtlMs`/`ReadCacheScope`), damit eine cachebare Tool-Liste nicht
   zwingt, auch Ressourcen-**Inhalte** für geteilte Proxies freizugeben. Der Scope

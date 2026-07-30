@@ -602,6 +602,13 @@ type
   /// a parameterized resource, published as an RFC 6570 URI template
   // - the template itself is never read: it tells a client which URIs it may
   //   construct, and the resulting concrete URI goes to resources/read
+  // - LIMITATION, know this before publishing one: resources/read resolves a
+  //   URI by EXACT lookup in the resource registry. Nothing expands a template
+  //   or matches a concrete URI back against it, so a client that dutifully
+  //   builds `file:///src/main.pas` from `file:///{path}` gets -32602 unless
+  //   that exact URI is also registered. Publish a template only when the URIs
+  //   it describes really exist as registered resources; a matcher/resolver
+  //   hook is the missing piece and is not built yet.
   IMcpResourceTemplate = interface(IInvokable)
     ['{6D3F8A21-4E95-4C7B-9F16-8B2D5A0E3C74}']
     /// the RFC 6570 template, e.g. 'file:///{path}' — also the registry key
@@ -628,8 +635,12 @@ type
     // - aValue is what the user typed so far (possibly empty)
     // - return at most 100 entries; the server truncates beyond that and sets
     //   `hasMore`, so an over-eager implementation cannot break the response
+    // - AuthCtx identifies the caller: suggestions ARE data, and a shared
+    //   server must be able to offer a user only what that user may see. A
+    //   completion that ignores it leaks the shape of everything it knows —
+    //   file names, record ids — to anyone who can type a prefix.
     function Complete(const ArgumentName, ArgumentValue: RawUtf8;
-      const Context: variant): TRawUtf8DynArray;
+      const Context: variant; const AuthCtx: TMcpAuthContext): TRawUtf8DynArray;
   end;
 
   /// a prompt that takes part in Multi Round-Trip Requests
@@ -962,7 +973,8 @@ type
     function ListResourceTemplates(const aParams: variant): variant;
     function GetPrompt(const aParams: variant;
       const aContext: TMcpCallContext): variant;
-    function CompleteArgument(const aParams: variant): variant;
+    function CompleteArgument(const aParams: variant;
+      const aAuthCtx: TMcpAuthContext): variant;
     /// sorted key snapshot of a registry, taken under the lock
     function SortedToolNames: TRawUtf8DynArray;
     function SortedResourceUris: TRawUtf8DynArray;
@@ -1478,8 +1490,18 @@ begin
   result := (length(plain) >= length(MCP_CURSOR_MARK)) and
             CompareMemFixed(pointer(plain), PAnsiChar(MCP_CURSOR_MARK),
               length(MCP_CURSOR_MARK));
-  if result then
-    aAfterName := copy(plain, length(MCP_CURSOR_MARK) + 1, maxInt);
+  if not result then
+    exit;
+  aAfterName := copy(plain, length(MCP_CURSOR_MARK) + 1, maxInt);
+  // The keyset comparison is StrComp, which stops at the first #0. A cursor
+  // carrying an embedded null would therefore be accepted here but compared
+  // only up to that byte — a "valid" token silently producing the wrong window.
+  // Names never contain #0, so such a cursor is not one of ours.
+  if PosExChar(#0, aAfterName) <> 0 then
+  begin
+    aAfterName := '';
+    result := false;
+  end;
 end;
 
 procedure McpPageRange(const aNames: TRawUtf8DynArray; const aCursor: RawUtf8;
@@ -1497,14 +1519,21 @@ begin
   begin
     if not McpDecodeCursor(aCursor, after) then
       raise EMcpInvalidParams.CreateU('invalid cursor');
-    // Keyset: skip everything up to and including the named entry. Comparing
-    // by NAME (not by a remembered index) is what survives a registry change
-    // between two pages — an entry inserted before the cursor cannot shift the
-    // window and make us skip an unseen one.
-    while (aFirst < n) and
-          (StrComp(pointer(aNames[aFirst]), pointer(after)) <= 0) do
-      inc(aFirst);
+    // An empty position names nothing, so it skips nothing — this is what makes
+    // `cursor: ""` genuinely equivalent to sending no cursor at all. Without the
+    // guard, StrComp(nil, nil) returns 0 and the `<= 0` test would swallow an
+    // entry whose own name is empty.
+    if after <> '' then
+      // Keyset: skip everything up to and including the named entry. Comparing
+      // by NAME (not by a remembered index) is what survives a registry change
+      // between two pages — an entry inserted before the cursor cannot shift the
+      // window and make us skip an unseen one.
+      while (aFirst < n) and
+            (StrComp(pointer(aNames[aFirst]), pointer(after)) <= 0) do
+        inc(aFirst);
   end;
+  // <= 0 covers both "paging off" (0) and a nonsensical negative: neither can
+  // mean a page size, and refusing to page is the harmless reading of both.
   if aPageSize > 0 then
     if aLast - aFirst + 1 > aPageSize then
     begin
@@ -2122,12 +2151,18 @@ begin
       sub := fSubscriptions[i];
       if aNotification = 'notifications/tools/list_changed' then
         wants := sub.Filter.ToolsListChanged
+      else if aNotification = 'notifications/prompts/list_changed' then
+        wants := sub.Filter.PromptsListChanged
       else if aNotification = 'notifications/resources/list_changed' then
         wants := sub.Filter.ResourcesListChanged
       else if aNotification = 'notifications/resources/updated' then
         wants := sub.WatchesResource(aUri)
       else
-        wants := false;
+        // an unrouted notification is a WIRING bug, not a filter decision: the
+        // capability was announced, the notify method exists, and the message
+        // would vanish here without a trace. Fail loudly instead.
+        raise EMcpException.CreateUtf8(
+          'Broadcast: no subscription filter routes %', [aNotification]);
       if not wants then
         continue;
       // every message on the stream carries the subscription id, which is the
@@ -2181,11 +2216,12 @@ var
 begin
   // "The notifications field in the acknowledgment reflects the subset the
   // server agreed to honor. Notification types the server does not support are
-  // omitted." promptsListChanged is therefore never echoed: there are no
-  // prompts in this server, so it could never fire.
+  // omitted." All three fire here, so all three are echoed back when asked for.
   agreed.InitObject([], JSON_FAST);
   if aSubscription.Filter.ToolsListChanged then
     agreed.AddValue('toolsListChanged', true);
+  if aSubscription.Filter.PromptsListChanged then
+    agreed.AddValue('promptsListChanged', true);
   if aSubscription.Filter.ResourcesListChanged then
     agreed.AddValue('resourcesListChanged', true);
   if aSubscription.Filter.ResourceSubscriptions <> nil then
@@ -2495,6 +2531,14 @@ begin
   QuickSortRawUtf8(result, length(result));
 end;
 
+// The four Sorted*() below are deliberately four near-identical functions rather
+// than one generic helper: IKeyValue<RawUtf8,T> would need a generic method, and
+// the FPC/Delphi generic surface is exactly where this codebase has to stay
+// boring. What matters is that NONE of them may drop the QuickSortRawUtf8 call —
+// a registry enumerated in hash order breaks pagination (repeats and gaps), and
+// the compiler cannot tell you about it. A fifth registry copied from here must
+// keep both the lock and the sort.
+
 function TMcpServer.SortedPromptNames: TRawUtf8DynArray;
 var
   pair: TPair<RawUtf8, IMcpPrompt>;
@@ -2519,11 +2563,10 @@ end;
 function TMcpServer.ListPrompts(const aParams: variant): variant;
 var
   doc, promptsList: TDocVariantData;
-  promptObj: TDocVariantData;
   names: TRawUtf8DynArray;
   prompt: IMcpPrompt;
   cursor, nextCursor, txt: RawUtf8;
-  args: variant;
+  promptObj, args: variant;
   first, last, i: PtrInt;
   hasCursor: boolean;
 begin
@@ -2544,21 +2587,25 @@ begin
     end;
     if prompt = nil then
       continue;
-    promptObj.InitObject(['name', names[i]], JSON_FAST);
+    // A FRESH variant per entry. Reusing one TDocVariantData and calling
+    // InitObject again would leak: Init() nils VName/VValue without releasing
+    // them (it is written for an uninitialized record), so every entry after
+    // the first orphans its predecessor's arrays.
+    promptObj := _ObjFast(['name', names[i]]);
     // title/description/arguments are all OPTIONAL: emit them only when the
     // prompt actually supplies one, rather than shipping empty strings a client
     // would then have to treat as "present but blank"
     txt := prompt.GetTitle;
     if txt <> '' then
-      promptObj.AddValue('title', RawUtf8ToVariant(txt));
+      _ObjAddProp('title', txt, promptObj);
     txt := prompt.GetDescription;
     if txt <> '' then
-      promptObj.AddValue('description', RawUtf8ToVariant(txt));
+      _ObjAddProp('description', txt, promptObj);
     args := prompt.GetArguments;
     if _Safe(args)^.IsArray and
        (_Safe(args)^.Count > 0) then
-      promptObj.AddValue('arguments', args);
-    promptsList.AddItem(variant(promptObj));
+      _ObjAddProp('arguments', args, promptObj);
+    promptsList.AddItem(promptObj);
   end;
 
   doc.AddValue('prompts', variant(promptsList));
@@ -2577,10 +2624,15 @@ var
   interactive: IMcpInteractivePrompt;
   wrap: TDocVariantData;
 begin
-  if _Safe(aParams, doc) then
-    if not doc.GetAsRawUtf8('name', promptName) then
-      raise EMcpInvalidParams.CreateU('Missing prompt name in prompts/get');
-  args := doc.GetValueOrDefault('arguments', Null);
+  // Single-argument _Safe: it always yields a usable (possibly empty) doc, so a
+  // non-object `params` produces a clean -32602 below instead of dereferencing
+  // an unset pointer. The two-argument overload leaves its out-param untouched
+  // when it returns false — safe only as long as the caller checks, and this
+  // code must not depend on a guard that lives in another function.
+  doc := _Safe(aParams);
+  if not doc^.GetAsRawUtf8('name', promptName) then
+    raise EMcpInvalidParams.CreateU('Missing prompt name in prompts/get');
+  args := doc^.GetValueOrDefault('arguments', Null);
 
   fSafe.Lock;
   try
@@ -2672,7 +2724,7 @@ end;
 function TMcpServer.ListResourceTemplates(const aParams: variant): variant;
 var
   doc, list: TDocVariantData;
-  obj: TDocVariantData;
+  obj: variant;
   uris: TRawUtf8DynArray;
   tpl: IMcpResourceTemplate;
   cursor, nextCursor, txt: RawUtf8;
@@ -2696,19 +2748,20 @@ begin
     end;
     if tpl = nil then
       continue;
-    obj.InitObject([
+    // fresh variant per entry — see ListPrompts for why reuse leaks
+    obj := _ObjFast([
       'uriTemplate', uris[i],
-      'name', tpl.GetName], JSON_FAST);
+      'name', tpl.GetName]);
     txt := tpl.GetTitle;
     if txt <> '' then
-      obj.AddValue('title', RawUtf8ToVariant(txt));
+      _ObjAddProp('title', txt, obj);
     txt := tpl.GetDescription;
     if txt <> '' then
-      obj.AddValue('description', RawUtf8ToVariant(txt));
+      _ObjAddProp('description', txt, obj);
     txt := tpl.GetMimeType;
     if txt <> '' then
-      obj.AddValue('mimeType', RawUtf8ToVariant(txt));
-    list.AddItem(variant(obj));
+      _ObjAddProp('mimeType', txt, obj);
+    list.AddItem(obj);
   end;
 
   doc.AddValue('resourceTemplates', variant(list));
@@ -2717,9 +2770,10 @@ begin
   result := variant(doc);
 end;
 
-function TMcpServer.CompleteArgument(const aParams: variant): variant;
+function TMcpServer.CompleteArgument(const aParams: variant;
+  const aAuthCtx: TMcpAuthContext): variant;
 var
-  doc, refDoc: PDocVariantData;
+  doc, refDoc, argDoc, ctxDoc: PDocVariantData;
   refType, refName, argName, argValue: RawUtf8;
   target: IMcpCompletable;
   prompt: IMcpPrompt;
@@ -2735,12 +2789,24 @@ begin
   if not doc^.GetAsDocVariant('ref', refDoc) or
      not refDoc^.GetAsRawUtf8('type', refType) then
     raise EMcpInvalidParams.CreateU('completion/complete needs a ref with a type');
-  argName := _Safe(doc^.GetValueOrNull('argument'))^.U['name'];
-  argValue := _Safe(doc^.GetValueOrNull('argument'))^.U['value'];
+  if not doc^.GetAsDocVariant('argument', argDoc) or
+     not argDoc^.IsObject then
+    raise EMcpInvalidParams.CreateU('completion/complete needs an argument object');
+  argName := argDoc^.U['name'];
+  argValue := argDoc^.U['value'];
   if argName = '' then
     raise EMcpInvalidParams.CreateU('completion/complete needs argument.name');
-  // already-resolved arguments, so a suggestion can depend on an earlier choice
-  ctx := _Safe(doc^.GetValueOrNull('context'))^.GetValueOrNull('arguments');
+  // Already-resolved arguments, so a suggestion can depend on an earlier choice.
+  // A `context` of the wrong shape is refused rather than silently read as "no
+  // context": the caller would otherwise get suggestions computed without the
+  // constraint it believed it had sent.
+  SetVariantNull(ctx);
+  if doc^.GetValueIndex('context') >= 0 then
+    if doc^.GetAsDocVariant('context', ctxDoc) and
+       ctxDoc^.IsObject then
+      ctx := ctxDoc^.GetValueOrNull('arguments')
+    else
+      raise EMcpInvalidParams.CreateU('completion/complete context must be an object');
 
   target := nil;
   if refType = 'ref/prompt' then
@@ -2782,7 +2848,7 @@ begin
   // A prompt or template that offers no completion is not an error: it simply
   // has nothing to suggest, and an empty values array says exactly that.
   if target <> nil then
-    values := target.Complete(argName, argValue, ctx);
+    values := target.Complete(argName, argValue, ctx, aAuthCtx);
 
   total := length(values);
   // "Maximum 100 items per response" — enforced HERE, not trusted to the
@@ -2807,7 +2873,6 @@ end;
 function TMcpServer.ListTools(const aParams: variant): variant;
 var
   doc, toolsList: TDocVariantData;
-  toolObj: TDocVariantData;
   names: TRawUtf8DynArray;
   tool: IMcpTool;
   cursor, nextCursor: RawUtf8;
@@ -2833,12 +2898,11 @@ begin
     end;
     if tool = nil then
       continue;
-    toolObj.InitObject([
+    // fresh variant per entry — see ListPrompts for why reuse leaks
+    toolsList.AddItem(_ObjFast([
       'name', names[i],
       'description', tool.GetDescription,
-      'inputSchema', tool.GetInputSchema
-    ], JSON_FAST);
-    toolsList.AddItem(variant(toolObj));
+      'inputSchema', tool.GetInputSchema]));
   end;
 
   doc.AddValue('tools', variant(toolsList));
@@ -2850,7 +2914,6 @@ end;
 function TMcpServer.ListResources(const aParams: variant): variant;
 var
   doc, resourcesList: TDocVariantData;
-  resourceObj: TDocVariantData;
   uris: TRawUtf8DynArray;
   res: IMcpResource;
   cursor, nextCursor: RawUtf8;
@@ -2874,13 +2937,12 @@ begin
     end;
     if res = nil then
       continue;
-    resourceObj.InitObject([
+    // fresh variant per entry — see ListPrompts for why reuse leaks
+    resourcesList.AddItem(_ObjFast([
       'uri', res.GetUri,
       'name', res.GetName,
       'description', res.GetDescription,
-      'mimeType', res.GetMimeType
-    ], JSON_FAST);
-    resourcesList.AddItem(variant(resourceObj));
+      'mimeType', res.GetMimeType]));
   end;
 
   doc.AddValue('resources', variant(resourcesList));
@@ -3446,7 +3508,7 @@ begin
       mcpPromptsGet:
         resultData := GetPrompt(params, callCtx);
       mcpCompletionComplete:
-        resultData := CompleteArgument(params);
+        resultData := CompleteArgument(params, callCtx.Auth);
       mcpSubscriptionsListen:
         // Only a streaming transport can serve this: it is a long-lived
         // response stream, not a request/response. The Streamable HTTP
