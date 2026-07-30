@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**560 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
+**699 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -395,8 +395,10 @@ Neue Tests im passenden Runner ergänzen.
        `tools/list`-Reihenfolge ist jetzt deterministisch (sortiert — Voraussetzung
        der Pagination, nicht Kosmetik); `resources/templates/list` und
        `completion/complete` sind ebenfalls gebaut. Offen bleiben `x-mcp-header`,
-       Extensions-Framework, JSON Schema 2020-12 im `inputSchema`, OTel-`_meta`-Keys
-       sowie Progress-/Logging-Notifications.
+       Extensions-Framework, JSON Schema 2020-12 im `inputSchema`, OTel-`_meta`-Keys,
+       Progress-/Logging-Notifications sowie der **Template-Resolver** (`resources/read`
+       löst nur exakt auf — ein expandiertes Template-URI ergibt `-32602`; Begründung
+       und Grenze am Interface `IMcpResourceTemplate` dokumentiert).
 
 ### Review-Härtung (kritischer Review, behoben — Build + Tests grün)
 
