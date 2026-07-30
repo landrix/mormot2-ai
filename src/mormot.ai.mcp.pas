@@ -113,6 +113,11 @@ const
   // - omitted entirely when the list is exhausted: "Clients SHOULD treat a
   //   missing nextCursor as the end of results"
   MCP_RESULT_NEXT_CURSOR = 'nextCursor';
+  /// hard ceiling on completion/complete suggestions
+  // - "Maximum 100 items per response"; the server truncates to this and sets
+  //   `hasMore`, so an over-eager implementation cannot break the contract
+  MCP_COMPLETION_MAX_VALUES = 100;
+
   /// how many entries one page of a list carries by default
   // - "Page size is determined by the server, and clients MUST NOT assume a
   //   fixed page size", so this is ours to pick and ours to change
@@ -506,8 +511,10 @@ type
     mcpToolsCall,
     mcpResourcesList,
     mcpResourcesRead,
+    mcpResourcesTemplatesList,
     mcpPromptsList,
     mcpPromptsGet,
+    mcpCompletionComplete,
     mcpSubscriptionsListen);
 
 
@@ -590,6 +597,39 @@ type
     //   required arguments: -32602"
     function Render(const Args: variant;
       const AuthCtx: TMcpAuthContext): variant;
+  end;
+
+  /// a parameterized resource, published as an RFC 6570 URI template
+  // - the template itself is never read: it tells a client which URIs it may
+  //   construct, and the resulting concrete URI goes to resources/read
+  IMcpResourceTemplate = interface(IInvokable)
+    ['{6D3F8A21-4E95-4C7B-9F16-8B2D5A0E3C74}']
+    /// the RFC 6570 template, e.g. 'file:///{path}' — also the registry key
+    function GetUriTemplate: RawUtf8;
+    /// the name clients show for the family of resources
+    function GetName: RawUtf8;
+    /// optional display name ('' to omit)
+    function GetTitle: RawUtf8;
+    /// optional description ('' to omit)
+    function GetDescription: RawUtf8;
+    /// optional MIME type shared by the resources it produces ('' to omit)
+    function GetMimeType: RawUtf8;
+  end;
+
+  /// something whose arguments completion/complete can suggest values for
+  // - optional add-on to IMcpPrompt or IMcpResourceTemplate: the server offers
+  //   completion for exactly those that implement it, so a prompt with free-text
+  //   arguments needs no extra code
+  // - aContext carries the arguments the user already filled in, so a suggestion
+  //   can depend on an earlier choice ("framework" after "language")
+  IMcpCompletable = interface(IInvokable)
+    ['{8C5A2E76-1B49-4D03-A7F8-3E6C9B14D5A2}']
+    /// suggest values for one argument, ranked by relevance
+    // - aValue is what the user typed so far (possibly empty)
+    // - return at most 100 entries; the server truncates beyond that and sets
+    //   `hasMore`, so an over-eager implementation cannot break the response
+    function Complete(const ArgumentName, ArgumentValue: RawUtf8;
+      const Context: variant): TRawUtf8DynArray;
   end;
 
   /// a prompt that takes part in Multi Round-Trip Requests
@@ -867,6 +907,7 @@ type
     fTools: IKeyValue<RawUtf8, IMcpTool>; // name -> IMcpTool
     fResources: IKeyValue<RawUtf8, IMcpResource>; // uri -> IMcpResource
     fPrompts: IKeyValue<RawUtf8, IMcpPrompt>; // name -> IMcpPrompt
+    fTemplates: IKeyValue<RawUtf8, IMcpResourceTemplate>; // uriTemplate -> impl
     fProcessor: TMcpJsonRpcProcessor;
     fActive: boolean;
     fSafe: TLightLock;
@@ -918,12 +959,15 @@ type
     function ListTools(const aParams: variant): variant;
     function ListResources(const aParams: variant): variant;
     function ListPrompts(const aParams: variant): variant;
+    function ListResourceTemplates(const aParams: variant): variant;
     function GetPrompt(const aParams: variant;
       const aContext: TMcpCallContext): variant;
+    function CompleteArgument(const aParams: variant): variant;
     /// sorted key snapshot of a registry, taken under the lock
     function SortedToolNames: TRawUtf8DynArray;
     function SortedResourceUris: TRawUtf8DynArray;
     function SortedPromptNames: TRawUtf8DynArray;
+    function SortedTemplateUris: TRawUtf8DynArray;
   public
     /// initialize the MCP server
     constructor Create(const aServerName: RawUtf8 = 'M-MCP-Server';
@@ -945,6 +989,12 @@ type
     procedure RegisterPrompt(const aPrompt: IMcpPrompt);
     /// unregister a prompt by name
     function UnregisterPrompt(const aName: RawUtf8): boolean;
+    /// register a parameterized resource (RFC 6570 URI template)
+    // - thread-safe; broadcasts resources/list_changed, since a template is
+    //   part of what the resource surface offers
+    procedure RegisterResourceTemplate(const aTemplate: IMcpResourceTemplate);
+    /// unregister a resource template by its URI template
+    function UnregisterResourceTemplate(const aUriTemplate: RawUtf8): boolean;
     /// start the server (activates tool/resource access)
     procedure Start;
     /// stop the server
@@ -1849,6 +1899,9 @@ begin
     'capabilities', _ObjFast([
       'tools', _ObjFast(['listChanged', true]),
       'prompts', _ObjFast(['listChanged', true]),
+      // "Servers that support completions MUST declare the completions
+      // capability" — an empty object, it has no sub-features
+      'completions', _ObjFast([]),
       'resources', _ObjFast([
         'listChanged', true,
         'subscribe', true])])]);
@@ -1970,6 +2023,7 @@ begin
   fTools := Collections.NewPlainKeyValue<RawUtf8, IMcpTool>;
   fResources := Collections.NewPlainKeyValue<RawUtf8, IMcpResource>;
   fPrompts := Collections.NewPlainKeyValue<RawUtf8, IMcpPrompt>;
+  fTemplates := Collections.NewPlainKeyValue<RawUtf8, IMcpResourceTemplate>;
   fActive := false;
   fListCacheTtlMs := MCP_CACHE_TTL_DEFAULT;
   fReadCacheTtlMs := MCP_CACHE_TTL_DEFAULT;
@@ -2204,6 +2258,7 @@ begin
     mcpDiscover,
     mcpToolsList,
     mcpResourcesList,
+    mcpResourcesTemplatesList,
     mcpPromptsList:
       begin
         ttl := fListCacheTtlMs;
@@ -2561,6 +2616,192 @@ begin
     raise EMcpException.CreateUtf8(
       'prompt % returned neither a messages array nor a result object',
       [promptName]);
+end;
+
+procedure TMcpServer.RegisterResourceTemplate(const aTemplate: IMcpResourceTemplate);
+var
+  uri: RawUtf8;
+begin
+  if aTemplate = nil then
+    exit;
+  uri := aTemplate.GetUriTemplate;
+  fSafe.Lock;
+  try
+    fTemplates.Add(uri, aTemplate);
+  finally
+    fSafe.UnLock;
+  end;
+  // A template widens the resource surface, so the resources list changed as
+  // far as a client is concerned — there is no separate templates notification.
+  NotifyResourcesListChanged;
+end;
+
+function TMcpServer.UnregisterResourceTemplate(const aUriTemplate: RawUtf8): boolean;
+begin
+  fSafe.Lock;
+  try
+    result := fTemplates.Remove(aUriTemplate);
+  finally
+    fSafe.UnLock;
+  end;
+  if result then
+    NotifyResourcesListChanged;
+end;
+
+function TMcpServer.SortedTemplateUris: TRawUtf8DynArray;
+var
+  pair: TPair<RawUtf8, IMcpResourceTemplate>;
+  n: PtrInt;
+begin
+  result := nil;
+  fSafe.Lock;
+  try
+    SetLength(result, fTemplates.Count);
+    n := 0;
+    for pair in fTemplates do
+    begin
+      result[n] := pair.Key;
+      inc(n);
+    end;
+  finally
+    fSafe.UnLock;
+  end;
+  QuickSortRawUtf8(result, length(result));
+end;
+
+function TMcpServer.ListResourceTemplates(const aParams: variant): variant;
+var
+  doc, list: TDocVariantData;
+  obj: TDocVariantData;
+  uris: TRawUtf8DynArray;
+  tpl: IMcpResourceTemplate;
+  cursor, nextCursor, txt: RawUtf8;
+  first, last, i: PtrInt;
+  hasCursor: boolean;
+begin
+  uris := SortedTemplateUris;
+  hasCursor := McpRequestCursor(aParams, cursor);
+  McpPageRange(uris, cursor, hasCursor, fListPageSize, first, last, nextCursor);
+
+  doc.InitObject([], JSON_FAST);
+  list.InitArray([], JSON_FAST);
+  for i := first to last do
+  begin
+    fSafe.Lock;
+    try
+      if not fTemplates.TryGetValue(uris[i], tpl) then
+        tpl := nil;
+    finally
+      fSafe.UnLock;
+    end;
+    if tpl = nil then
+      continue;
+    obj.InitObject([
+      'uriTemplate', uris[i],
+      'name', tpl.GetName], JSON_FAST);
+    txt := tpl.GetTitle;
+    if txt <> '' then
+      obj.AddValue('title', RawUtf8ToVariant(txt));
+    txt := tpl.GetDescription;
+    if txt <> '' then
+      obj.AddValue('description', RawUtf8ToVariant(txt));
+    txt := tpl.GetMimeType;
+    if txt <> '' then
+      obj.AddValue('mimeType', RawUtf8ToVariant(txt));
+    list.AddItem(variant(obj));
+  end;
+
+  doc.AddValue('resourceTemplates', variant(list));
+  if nextCursor <> '' then
+    doc.AddValue(MCP_RESULT_NEXT_CURSOR, RawUtf8ToVariant(nextCursor));
+  result := variant(doc);
+end;
+
+function TMcpServer.CompleteArgument(const aParams: variant): variant;
+var
+  doc, refDoc: PDocVariantData;
+  refType, refName, argName, argValue: RawUtf8;
+  target: IMcpCompletable;
+  prompt: IMcpPrompt;
+  tpl: IMcpResourceTemplate;
+  values: TRawUtf8DynArray;
+  arr: TDocVariantData;
+  completion: TDocVariantData;
+  ctx: variant;
+  total, i: PtrInt;
+  truncated: boolean;
+begin
+  doc := _Safe(aParams);
+  if not doc^.GetAsDocVariant('ref', refDoc) or
+     not refDoc^.GetAsRawUtf8('type', refType) then
+    raise EMcpInvalidParams.CreateU('completion/complete needs a ref with a type');
+  argName := _Safe(doc^.GetValueOrNull('argument'))^.U['name'];
+  argValue := _Safe(doc^.GetValueOrNull('argument'))^.U['value'];
+  if argName = '' then
+    raise EMcpInvalidParams.CreateU('completion/complete needs argument.name');
+  // already-resolved arguments, so a suggestion can depend on an earlier choice
+  ctx := _Safe(doc^.GetValueOrNull('context'))^.GetValueOrNull('arguments');
+
+  target := nil;
+  if refType = 'ref/prompt' then
+  begin
+    refName := refDoc^.U['name'];
+    fSafe.Lock;
+    try
+      if not fPrompts.TryGetValue(refName, prompt) then
+        prompt := nil;
+    finally
+      fSafe.UnLock;
+    end;
+    if prompt = nil then
+      // "Invalid prompt name: -32602"
+      raise EMcpInvalidParams.CreateUtf8('Prompt not found: %', [refName]);
+    Supports(prompt, IMcpCompletable, target);
+  end
+  else if refType = 'ref/resource' then
+  begin
+    refName := refDoc^.U['uri'];
+    fSafe.Lock;
+    try
+      if not fTemplates.TryGetValue(refName, tpl) then
+        tpl := nil;
+    finally
+      fSafe.UnLock;
+    end;
+    if tpl = nil then
+      raise EMcpInvalidParams.CreateUtf8('Resource template not found: %',
+        [refName]);
+    Supports(tpl, IMcpCompletable, target);
+  end
+  else
+    raise EMcpInvalidParams.CreateUtf8(
+      'unknown completion ref type %: MCP defines ref/prompt and ref/resource',
+      [refType]);
+
+  values := nil;
+  // A prompt or template that offers no completion is not an error: it simply
+  // has nothing to suggest, and an empty values array says exactly that.
+  if target <> nil then
+    values := target.Complete(argName, argValue, ctx);
+
+  total := length(values);
+  // "Maximum 100 items per response" — enforced HERE, not trusted to the
+  // implementation: a handler returning more would otherwise put an
+  // over-long response on the wire and violate the spec on its behalf.
+  truncated := total > MCP_COMPLETION_MAX_VALUES;
+  arr.InitArray([], JSON_FAST);
+  for i := 0 to total - 1 do
+  begin
+    if i >= MCP_COMPLETION_MAX_VALUES then
+      break;
+    arr.AddItem(RawUtf8ToVariant(values[i]));
+  end;
+
+  completion.InitObject(['values', variant(arr)], JSON_FAST);
+  // total/hasMore are optional; report them because we know both exactly
+  completion.AddValue('total', total);
+  completion.AddValue('hasMore', truncated);
+  result := _ObjFast(['completion', variant(completion)]);
 end;
 
 function TMcpServer.ListTools(const aParams: variant): variant;
@@ -3198,10 +3439,14 @@ begin
         resultData := ListResources(params);
       mcpResourcesRead:
         resultData := ExecuteResourceRead(params, callCtx);
+      mcpResourcesTemplatesList:
+        resultData := ListResourceTemplates(params);
       mcpPromptsList:
         resultData := ListPrompts(params);
       mcpPromptsGet:
         resultData := GetPrompt(params, callCtx);
+      mcpCompletionComplete:
+        resultData := CompleteArgument(params);
       mcpSubscriptionsListen:
         // Only a streaming transport can serve this: it is a long-lived
         // response stream, not a request/response. The Streamable HTTP
@@ -3309,6 +3554,10 @@ begin
     result := mcpResourcesList
   else if aMethod = 'resources/read' then
     result := mcpResourcesRead
+  else if aMethod = 'resources/templates/list' then
+    result := mcpResourcesTemplatesList
+  else if aMethod = 'completion/complete' then
+    result := mcpCompletionComplete
   else if aMethod = 'prompts/list' then
     result := mcpPromptsList
   else if aMethod = 'prompts/get' then

@@ -61,6 +61,17 @@ Konsequenzen, die die ganze Implementierung prägen:
   entweder ein volles Ergebnis-Objekt oder ein blankes `messages`-Array (der
   Server verpackt es). Optionale Felder (`title`, `arguments`) werden
   **weggelassen** statt leer gesendet.
+- **Resource-Templates**: `resources/templates/list` (paginiert + cacheable)
+  veröffentlicht RFC-6570-Templates (`file:///{path}`). Ein Template wird nie
+  gelesen — es sagt dem Client, welche URIs er bauen darf; die konkrete URI geht
+  dann an `resources/read`.
+- **Completion**: `completion/complete` für Prompt- und Template-Argumente.
+  Wer Vorschläge liefern will, implementiert zusätzlich `IMcpCompletable` —
+  wer nicht, bekommt eine leere `values`-Liste statt eines Fehlers (nichts
+  vorzuschlagen ist kein Fehlschlag). Die **100er-Obergrenze erzwingt der
+  Server**, nicht der Handler: eine Implementierung, die mehr liefert, wird
+  gekappt und `hasMore` gesetzt, statt eine überlange Antwort auf die Leitung
+  zu legen.
 - **Caching-Hints sind Pflicht** auf `server/discover`, `tools/list`, `prompts/list`,
   `resources/list` und `resources/read`: `ttlMs` (≥ 0) und `cacheScope`. Konfigurierbar am
   `TMcpServer` — **getrennt für Listen und Read** (`ListCacheTtlMs`/`ListCacheScope`
@@ -377,10 +388,10 @@ Neue Tests im passenden Runner ergänzen.
        **Pagination** und **Prompts** sind **gebaut** (siehe Protokoll-Abschnitt
        oben); `-32021` wird vom MRTR-Capability-Gate ausgelöst, die
        `tools/list`-Reihenfolge ist jetzt deterministisch (sortiert — Voraussetzung
-       der Pagination, nicht Kosmetik). Offen bleiben `x-mcp-header`,
-       Extensions-Framework, JSON Schema 2020-12 im `inputSchema`, OTel-`_meta`-Keys,
-       `resources/templates/list` + `completion/complete` sowie Progress-/
-       Logging-Notifications.
+       der Pagination, nicht Kosmetik); `resources/templates/list` und
+       `completion/complete` sind ebenfalls gebaut. Offen bleiben `x-mcp-header`,
+       Extensions-Framework, JSON Schema 2020-12 im `inputSchema`, OTel-`_meta`-Keys
+       sowie Progress-/Logging-Notifications.
 
 ### Review-Härtung (kritischer Review, behoben — Build + Tests grün)
 

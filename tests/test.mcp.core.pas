@@ -53,6 +53,32 @@ type
       const AuthCtx: TMcpAuthContext): variant;
   end;
 
+  /// a resource template that ALSO offers completion for its {path} argument
+  TFilesTemplate = class(TInterfacedObject, IMcpResourceTemplate, IMcpCompletable)
+  public
+    function GetUriTemplate: RawUtf8;
+    function GetName: RawUtf8;
+    function GetTitle: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetMimeType: RawUtf8;
+    function Complete(const ArgumentName, ArgumentValue: RawUtf8;
+      const Context: variant): TRawUtf8DynArray;
+  end;
+
+  /// a prompt whose completion returns MORE than the 100 the spec allows, to
+  /// prove the server truncates instead of trusting the implementation
+  TFloodPrompt = class(TInterfacedObject, IMcpPrompt, IMcpCompletable)
+  public
+    function GetName: RawUtf8;
+    function GetTitle: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetArguments: variant;
+    function Render(const Args: variant;
+      const AuthCtx: TMcpAuthContext): variant;
+    function Complete(const ArgumentName, ArgumentValue: RawUtf8;
+      const Context: variant): TRawUtf8DynArray;
+  end;
+
   /// a prompt with no arguments and no title, returning a FULL result object —
   /// the other of the two shapes a prompt may produce
   TGreetPrompt = class(TInterfacedObject, IMcpPrompt)
@@ -172,6 +198,7 @@ type
     procedure CursorCodecRejectsForgeries;
     procedure ListsAreSortedAndPaginated;
     procedure PromptsListAndGet;
+    procedure TemplatesAndCompletion;
   end;
 
 implementation
@@ -245,6 +272,83 @@ begin
     _ObjFast(['role', 'user',
               'content', _ObjFast(['type', 'text',
                                    'text', 'Please review:'#10 + code])])]);
+end;
+
+{ TFilesTemplate }
+
+function TFilesTemplate.GetUriTemplate: RawUtf8;
+begin
+  result := 'file:///{path}'; // RFC 6570
+end;
+
+function TFilesTemplate.GetName: RawUtf8;
+begin
+  result := 'Project Files';
+end;
+
+function TFilesTemplate.GetTitle: RawUtf8;
+begin
+  result := 'Project Files';
+end;
+
+function TFilesTemplate.GetDescription: RawUtf8;
+begin
+  result := 'Access files in the project directory';
+end;
+
+function TFilesTemplate.GetMimeType: RawUtf8;
+begin
+  result := 'application/octet-stream';
+end;
+
+function TFilesTemplate.Complete(const ArgumentName, ArgumentValue: RawUtf8;
+  const Context: variant): TRawUtf8DynArray;
+begin
+  result := nil;
+  // an unknown argument has no suggestions — proves the name reaches us
+  if ArgumentName <> 'path' then
+    exit;
+  AddRawUtf8(result, 'src/main.pas');
+  AddRawUtf8(result, 'README.md');
+end;
+
+{ TFloodPrompt }
+
+function TFloodPrompt.GetName: RawUtf8;
+begin
+  result := 'flood';
+end;
+
+function TFloodPrompt.GetTitle: RawUtf8;
+begin
+  result := '';
+end;
+
+function TFloodPrompt.GetDescription: RawUtf8;
+begin
+  result := 'returns too many completions on purpose';
+end;
+
+function TFloodPrompt.GetArguments: variant;
+begin
+  result := _ArrFast([_ObjFast(['name', 'many'])]);
+end;
+
+function TFloodPrompt.Render(const Args: variant;
+  const AuthCtx: TMcpAuthContext): variant;
+begin
+  result := _ArrFast([]);
+end;
+
+function TFloodPrompt.Complete(const ArgumentName, ArgumentValue: RawUtf8;
+  const Context: variant): TRawUtf8DynArray;
+var
+  i: integer;
+begin
+  result := nil;
+  SetLength(result, 150); // deliberately over the 100 ceiling
+  for i := 0 to 149 do
+    result[i] := FormatUtf8('v%', [i]);
 end;
 
 { TGreetPrompt }
@@ -2119,6 +2223,100 @@ begin
     CheckErrorResponse(Exec(server,
       '{"jsonrpc":"2.0","id":7,"method":"prompts/get","params":{}}'),
       -32602, 'Missing prompt name');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.TemplatesAndCompletion;
+var
+  server: TMcpServer;
+  resp: RawUtf8;
+  doc: TDocVariantData;
+  res, arr, entry, comp: PDocVariantData;
+begin
+  server := TMcpServer.Create('templates', '1.0');
+  try
+    server.RegisterResourceTemplate(TFilesTemplate.Create);
+    server.RegisterPrompt(TReviewPrompt.Create('code_review'));
+    server.RegisterPrompt(TFloodPrompt.Create);
+    server.Start;
+
+    // "Servers that support completions MUST declare the completions capability"
+    resp := Exec(server, '{"jsonrpc":"2.0","id":1,"method":"server/discover"}');
+    Check(PosEx('"completions":{}', resp) > 0,
+      'server/discover declares the completions capability');
+
+    // --- resources/templates/list -----------------------------------------
+    resp := Exec(server,
+      '{"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'templates/list answers');
+    Check(res^.GetAsDocVariant('resourceTemplates', arr),
+      'with a resourceTemplates array');
+    CheckEqual(arr^.Count, 1, 'holding the one template');
+    entry := _Safe(arr^.Values[0]);
+    CheckEqual(entry^.U['uriTemplate'], 'file:///{path}',
+      'the RFC 6570 template is what identifies it');
+    CheckEqual(entry^.U['name'], 'Project Files', 'with its name');
+    CheckEqual(entry^.U['mimeType'], 'application/octet-stream', 'and mimeType');
+    // it is a list, so it is cacheable and paginated like the others
+    Check(res^.GetValueIndex('ttlMs') >= 0, 'templates/list carries ttlMs');
+
+    // --- completion for a resource template -------------------------------
+    resp := Exec(server, '{"jsonrpc":"2.0","id":3,"method":"completion/complete",' +
+      '"params":{"ref":{"type":"ref/resource","uri":"file:///{path}"},' +
+      '"argument":{"name":"path","value":""}}}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'completion answers');
+    Check(res^.GetAsDocVariant('completion', comp), 'with a completion object');
+    Check(comp^.GetAsDocVariant('values', arr), 'holding values');
+    CheckEqual(arr^.Count, 2, 'both suggestions come back');
+    CheckEqual(comp^.I['total'], 2, 'total is reported');
+    Check(not comp^.B['hasMore'], 'and nothing was held back');
+
+    // --- completion for a prompt, truncated at the ceiling ----------------
+    resp := Exec(server, '{"jsonrpc":"2.0","id":4,"method":"completion/complete",' +
+      '"params":{"ref":{"type":"ref/prompt","name":"flood"},' +
+      '"argument":{"name":"many","value":"v"}}}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res), 'a flooding prompt still answers');
+    Check(res^.GetAsDocVariant('completion', comp), 'with a completion object');
+    Check(comp^.GetAsDocVariant('values', arr), 'holding values');
+    // "Maximum 100 items per response" — the SERVER enforces it, so a handler
+    // returning 150 cannot put an over-long response on the wire
+    CheckEqual(arr^.Count, 100, 'truncated to the 100 the spec allows');
+    CheckEqual(comp^.I['total'], 150, 'while total reports what really exists');
+    Check(comp^.B['hasMore'], 'and hasMore says more were held back');
+
+    // --- a prompt that offers no completion at all ------------------------
+    // Not an error: it simply has nothing to suggest.
+    resp := Exec(server, '{"jsonrpc":"2.0","id":5,"method":"completion/complete",' +
+      '"params":{"ref":{"type":"ref/prompt","name":"code_review"},' +
+      '"argument":{"name":"code","value":"x"}}}');
+    doc.Clear;
+    doc.InitJson(resp, JSON_FAST);
+    Check(doc.GetAsDocVariant('result', res),
+      'a prompt without IMcpCompletable answers normally');
+    Check(res^.GetAsDocVariant('completion', comp), 'with a completion object');
+    Check(comp^.GetAsDocVariant('values', arr), 'and an EMPTY values array');
+    CheckEqual(arr^.Count, 0, 'nothing to suggest is not an error');
+
+    // --- errors ------------------------------------------------------------
+    CheckErrorResponse(Exec(server,
+      '{"jsonrpc":"2.0","id":6,"method":"completion/complete",' +
+      '"params":{"ref":{"type":"ref/prompt","name":"nope"},' +
+      '"argument":{"name":"a","value":""}}}'), -32602, 'Prompt not found');
+    CheckErrorResponse(Exec(server,
+      '{"jsonrpc":"2.0","id":7,"method":"completion/complete",' +
+      '"params":{"ref":{"type":"ref/nonsense","name":"x"},' +
+      '"argument":{"name":"a","value":""}}}'), -32602, 'unknown completion ref');
+    CheckErrorResponse(Exec(server,
+      '{"jsonrpc":"2.0","id":8,"method":"completion/complete","params":{}}'),
+      -32602, 'ref');
   finally
     server.Free;
   end;
