@@ -191,7 +191,11 @@ Konsequenzen, die die ganze Implementierung prägen:
 - Streamable HTTP: **nur POST** (GET/DELETE → 405), kein Batching, keine
   Resumability (`Last-Event-ID`), keine `Mcp-Session-Id`; die Standard-Header
   `MCP-Protocol-Version`/`Mcp-Method`/`Mcp-Name` sind Pflicht und werden gegen den
-  Body geprüft (`-32020` + 400).
+  Body geprüft (`-32020` + 400). Die Prüfung selbst liegt als freie Funktion
+  `McpValidateRequestHeaders` in der **Core-Unit**, nicht im Transport: wer den
+  Server als Route auf einem fremden HTTP-Host mountet (so tut es Landrix), muss
+  denselben Vertrag erzwingen — sonst wäre die Route ein zweiter Eingang, über den
+  sich der strengere Transport umgehen ließe.
 
 Ältere, handshake-basierte Revisionen werden **nicht** bedient (Greenfield: was die
 Spec entfernt, ist hier gelöscht, nicht deaktiviert).
@@ -429,7 +433,8 @@ Die nach dem 2026-07-28-Umbau verbliebene Restliste, jede gegen den Spec-Text ge
   Report schreibt — ein Handler, der schweigt, behält damit die volle Statuswahl
   (das 400 von `-32021`, das 403+`WWW-Authenticate` einer Scope-Ablehnung).
 - **`x-mcp-header`** — Autorenseite `TMcpToolBase<T>.MirrorToHeader`, Prüfseite
-  `McpCollectHeaderParams` + Validierung im Transport gegen den Body (`-32020` + 400).
+  `McpCollectHeaderParams` + Validierung gegen den Body (`-32020` + 400, über
+  `McpValidateRequestHeaders` — Core-Unit, nicht Transport, s. o.).
   Erzwungen werden alle Constraints der Spec: Token-Syntax (RFC 9110 `1*tchar`), nur
   `string`/`integer`/`boolean` (**kein `number`**), case-insensitive eindeutig, und
   **statisch erreichbar** — eine Annotation unter `items`/`oneOf`/`$ref` macht die

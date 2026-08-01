@@ -1452,6 +1452,28 @@ function McpIsHeaderToken(const aName: RawUtf8): boolean;
 //   rewrite a literal value that a client is required to send encoded
 function McpDecodeHeaderValue(const aValue: RawUtf8): RawUtf8;
 
+/// read one request header out of a raw CRLF-separated header block
+// - aName is matched case-insensitively and MUST be passed in UPPERCASE, as
+//   mORMot's FindNameValue expects
+// - returns '' when the header is absent
+function McpHeaderValue(const aHeaders, aName: RawUtf8): RawUtf8;
+
+/// validate the standard MCP request headers against the request body
+// - checks MCP-Protocol-Version, Mcp-Method, Mcp-Name and the tool's own
+//   Mcp-Param-<Name> mirrors; on failure aErrorMsg names the offending header
+//   and the caller answers -32020 (MCP_ERROR_HEADER_MISMATCH) with HTTP 400
+// - the headers exist so an intermediary can route, rate-limit or authorize
+//   WITHOUT parsing the body. That only holds if the two cannot disagree: a
+//   proxy acting on Mcp-Param-Region while the server executes another region
+//   is precisely the split source of truth -32020 was introduced to prevent
+// - aServer supplies the tool registry the Mcp-Param-* mirrors are derived
+//   from; nil skips that part (a caller with no tools cannot mirror anything)
+// - lives here, not in the HTTP transport, because every MCP entry point owes
+//   the client the same check — a server mounted as a route on a foreign HTTP
+//   host would otherwise accept header/body pairs the transport rejects
+function McpValidateRequestHeaders(const aHeaders, aBody: RawUtf8;
+  aServer: TMcpServer; out aErrorMsg: RawUtf8): boolean;
+
 /// match a concrete URI against an RFC 6570 URI template
 // - on success aVars is an object mapping each `{name}` to the text it captured,
 //   percent-decoded; on failure it is void and the result is false
@@ -4359,6 +4381,218 @@ begin
      (copy(aValue, 1, 9) = '=?base64?') and
      (copy(aValue, length(aValue) - 1, 2) = '?=') then
     result := Base64ToBin(copy(aValue, 10, length(aValue) - 11));
+end;
+
+function McpHeaderValue(const aHeaders, aName: RawUtf8): RawUtf8;
+var
+  p: PUtf8Char;
+  len: PtrInt;
+begin
+  result := '';
+  if (aHeaders = '') or
+     (aName = '') then
+    exit;
+  // both spellings: a client may or may not put a space after the colon, and
+  // FindNameValuePointer matches the literal it is given
+  p := FindNameValuePointer(pointer(aHeaders), pointer(aName + ': '), len);
+  if p = nil then
+    p := FindNameValuePointer(pointer(aHeaders), pointer(aName + ':'), len);
+  if p <> nil then
+    FastSetString(result, p, len);
+end;
+
+// Mcp-Param-<Name>: the tool's own inputSchema decides which arguments are
+// mirrored, so this needs the registry — hence aServer rather than a pure
+// header/body comparison
+function McpValidateParamHeaders(const aHeaders: RawUtf8;
+  var aBody: TDocVariantData; aServer: TMcpServer;
+  out aErrorMsg: RawUtf8): boolean;
+var
+  mirrored: TMcpHeaderParamDynArray;
+  params, args, node: PDocVariantData;
+  i, k, idx: PtrInt;
+  headerValue, bodyValue: RawUtf8;
+  hasBodyValue: boolean;
+  value: variant;
+  headerNum, bodyNum: Int64;
+begin
+  result := true;
+  if (aServer = nil) or
+     not aBody.GetAsDocVariant('params', params) or
+     not params^.IsObject then
+    exit;
+  // an invalid annotation is a server-side definition error; it must not turn
+  // every call into a -32020, so a raising collector fails the call loudly
+  mirrored := aServer.ToolHeaderParams(params^.U['name']);
+  if mirrored = nil then
+    exit;
+  if not params^.GetAsDocVariant('arguments', args) or
+     not args^.IsObject then
+    args := nil;
+  for i := 0 to high(mirrored) do
+  begin
+    // walk the exact property path; a missing step means "no value present"
+    hasBodyValue := false;
+    SetVariantNull(value);
+    node := args;
+    for k := 0 to high(mirrored[i].Path) do
+    begin
+      if node = nil then
+        break;
+      idx := node^.GetValueIndex(mirrored[i].Path[k]);
+      if idx < 0 then
+      begin
+        node := nil;
+        break;
+      end;
+      if k = high(mirrored[i].Path) then
+      begin
+        value := node^.Values[idx];
+        // "Parameter value is null -> client MUST omit the header": a null is
+        // an absent value here, not an empty string
+        hasBodyValue := not VarIsEmptyOrNull(value);
+      end
+      else
+        node := _Safe(node^.Values[idx]);
+    end;
+    headerValue := McpHeaderValue(aHeaders,
+      UpperCase(MCP_PARAM_HEADER_PREFIX + mirrored[i].Name));
+    if not hasBodyValue then
+    begin
+      // no value in the body: a header claiming one is exactly the split
+      // source of truth -32020 exists to prevent
+      if headerValue <> '' then
+      begin
+        aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
+          mirrored[i].Name + ' was sent but the argument is absent';
+        exit(false);
+      end;
+      continue;
+    end;
+    if headerValue = '' then
+    begin
+      aErrorMsg := 'Header mismatch: missing required header ' +
+        MCP_PARAM_HEADER_PREFIX + mirrored[i].Name;
+      exit(false);
+    end;
+    headerValue := McpDecodeHeaderValue(headerValue);
+    if VarIsEmptyOrNull(value) then
+      bodyValue := ''
+    else
+      bodyValue := VariantToUtf8(value); // integer/boolean -> canonical text
+    // "When validating integer parameter values, servers SHOULD compare the
+    // header value and the body value NUMERICALLY rather than as strings"
+    if ToInt64(headerValue, headerNum) and
+       ToInt64(bodyValue, bodyNum) then
+    begin
+      if headerNum <> bodyNum then
+      begin
+        aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
+          mirrored[i].Name + ' is ''' + headerValue + ''' but the argument is ''' +
+          bodyValue + '''';
+        exit(false);
+      end;
+    end
+    else if headerValue <> bodyValue then
+    begin
+      aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
+        mirrored[i].Name + ' is ''' + headerValue + ''' but the argument is ''' +
+        bodyValue + '''';
+      exit(false);
+    end;
+  end;
+end;
+
+function McpValidateRequestHeaders(const aHeaders, aBody: RawUtf8;
+  aServer: TMcpServer; out aErrorMsg: RawUtf8): boolean;
+var
+  doc: TDocVariantData;
+  params: PDocVariantData;
+  method, name, bodyName: RawUtf8;
+begin
+  result := false;
+  aErrorMsg := '';
+  doc.InitJson(aBody, JSON_FAST);
+
+  // MCP-Protocol-Version: REQUIRED, and must equal the _meta value. We only
+  // check presence/equality here — whether we *speak* that version is decided
+  // centrally in ValidateRequestMeta (-32022), not per entry point.
+  name := McpHeaderValue(aHeaders, 'MCP-PROTOCOL-VERSION');
+  if name = '' then
+  begin
+    aErrorMsg := 'Missing required header MCP-Protocol-Version';
+    exit;
+  end;
+  // Compare against the body — but only for requests. The spec leaves header
+  // requirements for notification POSTs undefined, and a notification carries
+  // no _meta to compare against.
+  if not VarIsVoid(doc.GetValueOrNull('id')) then
+  begin
+    bodyName := '';
+    if doc.GetAsDocVariant('params', params) and params^.IsObject then
+      if params^.GetAsDocVariant('_meta', params) and params^.IsObject then
+        bodyName := params^.U[MCP_META_PROTOCOL_VERSION];
+    // An absent body value is a mismatch too, not a free pass: leaving the
+    // header unchecked is exactly the split-source-of-truth the -32020 rule
+    // exists to prevent (a proxy routes on the header, we execute the body).
+    if bodyName <> name then
+    begin
+      aErrorMsg := 'Header mismatch: MCP-Protocol-Version header value ''' +
+        name + ''' does not match request body value ''' + bodyName + '''';
+      exit;
+    end;
+  end;
+
+  // Mcp-Method: REQUIRED on all requests, mirrors "method"
+  method := McpHeaderValue(aHeaders, 'MCP-METHOD');
+  if method = '' then
+  begin
+    aErrorMsg := 'Missing required header Mcp-Method';
+    exit;
+  end;
+  if method <> doc.U['method'] then
+  begin
+    aErrorMsg := 'Header mismatch: Mcp-Method header value ''' + method +
+      ''' does not match body value ''' + doc.U['method'] + '''';
+    exit;
+  end;
+
+  // Mcp-Name: REQUIRED for the three name-carrying methods, mirroring
+  // params.name (tools/call, prompts/get) or params.uri (resources/read)
+  if (method = 'tools/call') or
+     (method = 'resources/read') or
+     (method = 'prompts/get') then
+  begin
+    bodyName := '';
+    if doc.GetAsDocVariant('params', params) and params^.IsObject then
+      if method = 'resources/read' then
+        bodyName := params^.U['uri']
+      else
+        bodyName := params^.U['name'];
+    // a value that is not header-safe travels as '=?base64?…?=' and MUST be
+    // decoded before comparing, or every non-ASCII name would look mismatched
+    name := McpDecodeHeaderValue(McpHeaderValue(aHeaders, 'MCP-NAME'));
+    if name = '' then
+    begin
+      aErrorMsg := 'Missing required header Mcp-Name for ' + method;
+      exit;
+    end;
+    if name <> bodyName then
+    begin
+      aErrorMsg := 'Header mismatch: Mcp-Name header value ''' + name +
+        ''' does not match body value ''' + bodyName + '''';
+      exit;
+    end;
+  end;
+
+  // Validating the per-tool mirrors is what makes the mirroring trustworthy —
+  // an intermediary routing on Mcp-Param-Region must not be able to disagree
+  // with the region we actually execute against.
+  if method = 'tools/call' then
+    if not McpValidateParamHeaders(aHeaders, doc, aServer, aErrorMsg) then
+      exit;
+
+  result := true;
 end;
 
 function McpCollectHeaderParams(const aInputSchema: variant): TMcpHeaderParamDynArray;
