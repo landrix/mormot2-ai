@@ -174,6 +174,12 @@ type
     // - returns false and fills aErrorMsg on mismatch -> -32020 + HTTP 400
     function ValidateStandardHeaders(var Ctxt: THttpServerRequest;
       const aBody: RawUtf8; out aErrorMsg: RawUtf8): boolean;
+    /// verify the Mcp-Param-<Name> headers of a tools/call against its arguments
+    // - which parameters are mirrored is decided by the tool's own inputSchema
+    //   (`x-mcp-header`), so a tool without annotations is never affected
+    // - returns false and fills aErrorMsg on any mismatch -> -32020 + HTTP 400
+    function ValidateParamHeaders(var Ctxt: THttpServerRequest;
+      var aBody: TDocVariantData; out aErrorMsg: RawUtf8): boolean;
     // -- SSE formatting --
     // no event id: streams are not resumable in this revision
     function FormatSseEvent(const aEvent, aData: RawUtf8): RawUtf8;
@@ -946,7 +952,128 @@ begin
     end;
   end;
 
+  // Mcp-Param-<Name>: the tool's own inputSchema decides which arguments are
+  // mirrored. Validating them is what makes the mirroring trustworthy — an
+  // intermediary routing or rate-limiting on Mcp-Param-Region must not be able
+  // to disagree with the region we actually execute against.
+  if method = 'tools/call' then
+    if not ValidateParamHeaders(Ctxt, doc, aErrorMsg) then
+      exit;
+
   result := true;
+end;
+
+function TMcpStreamableHttpTransport.ValidateParamHeaders(
+  var Ctxt: THttpServerRequest; var aBody: TDocVariantData;
+  out aErrorMsg: RawUtf8): boolean;
+var
+  mirrored: TMcpHeaderParamDynArray;
+  params, args, node: PDocVariantData;
+  i, k, idx: PtrInt;
+  headerValue, bodyValue: RawUtf8;
+  hasBodyValue: boolean;
+  value: variant;
+  headerNum, bodyNum: Int64;
+
+  function Header(const aName: RawUtf8): RawUtf8;
+  var
+    p: PUtf8Char;
+    len: PtrInt;
+  begin
+    result := '';
+    p := FindNameValuePointer(pointer(Ctxt.InHeaders), pointer(aName + ': '), len);
+    if p = nil then
+      p := FindNameValuePointer(pointer(Ctxt.InHeaders), pointer(aName + ':'), len);
+    if p <> nil then
+      FastSetString(result, p, len);
+  end;
+
+begin
+  result := true;
+  if not aBody.GetAsDocVariant('params', params) or
+     not params^.IsObject then
+    exit;
+  // an invalid annotation is a server-side definition error; it must not turn
+  // every call into a -32020, so a raising collector fails the call loudly
+  mirrored := fServer.ToolHeaderParams(params^.U['name']);
+  if mirrored = nil then
+    exit;
+  if not params^.GetAsDocVariant('arguments', args) or
+     not args^.IsObject then
+    args := nil;
+  for i := 0 to high(mirrored) do
+  begin
+    // walk the exact property path; a missing step means "no value present"
+    hasBodyValue := false;
+    SetVariantNull(value);
+    node := args;
+    for k := 0 to high(mirrored[i].Path) do
+    begin
+      if node = nil then
+        break;
+      idx := node^.GetValueIndex(mirrored[i].Path[k]);
+      if idx < 0 then
+      begin
+        node := nil;
+        break;
+      end;
+      if k = high(mirrored[i].Path) then
+      begin
+        value := node^.Values[idx];
+        // "Parameter value is null -> client MUST omit the header": a null is
+        // an absent value here, not an empty string
+        hasBodyValue := not VarIsEmptyOrNull(value);
+      end
+      else
+        node := _Safe(node^.Values[idx]);
+    end;
+    headerValue := Header(UpperCase(MCP_PARAM_HEADER_PREFIX + mirrored[i].Name));
+    if not hasBodyValue then
+    begin
+      // no value in the body: a header claiming one is exactly the split
+      // source of truth -32020 exists to prevent
+      if headerValue <> '' then
+      begin
+        aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
+          mirrored[i].Name + ' was sent but the argument is absent';
+        exit(false);
+      end;
+      continue;
+    end;
+    if headerValue = '' then
+    begin
+      aErrorMsg := 'Header mismatch: missing required header ' +
+        MCP_PARAM_HEADER_PREFIX + mirrored[i].Name;
+      exit(false);
+    end;
+    headerValue := McpDecodeHeaderValue(headerValue);
+    if VarIsString(value) then
+      bodyValue := VariantToUtf8(value)
+    else if VarIsEmptyOrNull(value) then
+      bodyValue := ''
+    else
+      bodyValue := VariantToUtf8(value); // integer/boolean -> canonical text
+    // "When validating integer parameter values, servers SHOULD compare the
+    // header value and the body value NUMERICALLY rather than as strings"
+    if ToInt64(headerValue, headerNum) and
+       ToInt64(bodyValue, bodyNum) then
+    begin
+      if headerNum <> bodyNum then
+      begin
+        aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
+          mirrored[i].Name + ' is ''' + headerValue + ''' but the argument is ''' +
+          bodyValue + '''';
+        exit(false);
+      end;
+    end
+    else if headerValue <> bodyValue then
+    begin
+      aErrorMsg := 'Header mismatch: ' + MCP_PARAM_HEADER_PREFIX +
+        mirrored[i].Name + ' is ''' + headerValue + ''' but the argument is ''' +
+        bodyValue + '''';
+      exit(false);
+    end;
+  end;
 end;
 
 function TMcpStreamableHttpTransport.FormatSseEvent(
@@ -986,7 +1113,11 @@ end;
 type
   // pushes intermediate SSE 'message' events for a streaming tool call, by
   // wrapping each JSON message as one chunked SSE frame and writing it now
-  TMcpStreamEmitter = class(TInterfacedObject, IMcpStreamEmitter)
+  // also an IMcpNotificationSink, which is the same act seen from the core:
+  // put one JSON-RPC message on the stream that carries this request's
+  // response. The two names exist because the core must not know about SSE.
+  TMcpStreamEmitter = class(TInterfacedObject, IMcpStreamEmitter,
+    IMcpNotificationSink)
   protected
     fTransport: TMcpStreamableHttpTransport;
     fWrite: TMcpRawWrite;
@@ -994,6 +1125,29 @@ type
     constructor Create(aTransport: TMcpStreamableHttpTransport;
       const aWrite: TMcpRawWrite);
     procedure Emit(const aJsonMessage: RawUtf8);
+    /// IMcpNotificationSink — same wire act as Emit
+    procedure Send(const aJsonMessage: RawUtf8);
+  end;
+
+  /// the progress sink of a plain (hookless) request, which writes the SSE head
+  /// itself on the first message it is asked to send
+  // - this is what lets a handler report progress WITHOUT the transport having
+  //   to commit to HTTP 200 before the handler ran; see Send for why that
+  //   matters and HeadWritten for how the caller finds out what happened
+  TMcpLazyHeadSink = class(TInterfacedObject, IMcpNotificationSink)
+  protected
+    fTransport: TMcpStreamableHttpTransport;
+    fWrite: TMcpRawWrite;
+    fOutHeaders: RawUtf8;
+    fHeadWritten: boolean;
+  public
+    constructor Create(aTransport: TMcpStreamableHttpTransport;
+      const aWrite: TMcpRawWrite; const aOutHeaders: RawUtf8);
+    procedure Send(const aJsonMessage: RawUtf8);
+    /// true once a notification went out — the response is then already a 200
+    ///  SSE stream and the caller must finish it as one
+    property HeadWritten: boolean
+      read fHeadWritten;
   end;
 
 constructor TMcpStreamEmitter.Create(aTransport: TMcpStreamableHttpTransport;
@@ -1006,6 +1160,45 @@ end;
 
 procedure TMcpStreamEmitter.Emit(const aJsonMessage: RawUtf8);
 begin
+  fWrite(fTransport.SseChunk(
+    fTransport.FormatSseEvent('message', aJsonMessage)));
+end;
+
+procedure TMcpStreamEmitter.Send(const aJsonMessage: RawUtf8);
+begin
+  Emit(aJsonMessage);
+end;
+
+{ TMcpLazyHeadSink }
+
+constructor TMcpLazyHeadSink.Create(aTransport: TMcpStreamableHttpTransport;
+  const aWrite: TMcpRawWrite; const aOutHeaders: RawUtf8);
+begin
+  inherited Create;
+  fTransport := aTransport;
+  fWrite := aWrite;
+  fOutHeaders := aOutHeaders;
+end;
+
+procedure TMcpLazyHeadSink.Send(const aJsonMessage: RawUtf8);
+begin
+  // The head is written HERE, on the first message, not up front. Writing it
+  // before the handler runs would fix the response at 200 and cost the caller
+  // the 400 that -32021 MUST carry and the 403+WWW-Authenticate a scope refusal
+  // MUST carry. A handler that never reports progress therefore keeps the full
+  // status choice; one that does has already put bytes on the wire, so 200 is
+  // then the only honest answer anyway.
+  if not fHeadWritten then
+  begin
+    fHeadWritten := true;
+    fWrite('HTTP/1.1 200 OK'#13#10 +
+      'Content-Type: text/event-stream'#13#10 +
+      'Cache-Control: no-cache'#13#10 +
+      'X-Accel-Buffering: no'#13#10 +
+      'Transfer-Encoding: chunked'#13#10 +
+      fOutHeaders +
+      #13#10);
+  end;
   fWrite(fTransport.SseChunk(
     fTransport.FormatSseEvent('message', aJsonMessage)));
 end;
@@ -1113,6 +1306,10 @@ procedure TMcpStreamableHttpTransport.StreamDeferredResponse(
 var
   responseJson, scopeChallenge: RawUtf8;
   emitter: IMcpStreamEmitter;
+  // kept as the concrete class, not the interface: the HeadWritten answer is
+  // what decides whether a status may still be chosen below
+  lazySink: TMcpLazyHeadSink;
+  lazySinkRef: IMcpNotificationSink;
   handled, headWritten: boolean;
   status: integer;
 
@@ -1177,12 +1374,30 @@ begin
     end
     else
     begin
-      // No hook: nothing can be emitted before the final response, so we run
-      // the request FIRST and only then commit to a status. That is what lets
-      // -32021 carry the 400 the spec requires — it depends on what the handler
-      // turned out to need and cannot be known at preflight time.
-      responseJson := fServer.ExecuteRequest(aBody, aAuthCtx, scopeChallenge);
-      status := McpHttpStatus(responseJson);
+      // No hook: we run the request FIRST and only then commit to a status.
+      // That is what lets -32021 carry the 400 the spec requires — it depends
+      // on what the handler turned out to need and cannot be known at
+      // preflight time.
+      // The handler still gets a progress sink: it writes the SSE head itself
+      // on the first notification, so a handler that stays silent leaves the
+      // status choice below untouched, while one that reports progress gets a
+      // live stream instead of notifications buffered until the very end.
+      lazySink := TMcpLazyHeadSink.Create(self, aWrite, aOutHeaders);
+      // hold an interface reference for as long as we read HeadWritten below:
+      // ExecuteRequest's own reference dies with the call, and on a refcounted
+      // TInterfacedObject that would free the object under our feet
+      lazySinkRef := lazySink;
+      responseJson := fServer.ExecuteRequest(aBody, aAuthCtx, scopeChallenge,
+        lazySinkRef);
+      if lazySink.HeadWritten then
+      begin
+        // progress already went out: the head is on the wire, this IS a 200 SSE
+        // stream now, and the rest of it is the response event
+        headWritten := true;
+        status := HTTP_MCP_SUCCESS;
+      end
+      else
+        status := McpHttpStatus(responseJson);
       if scopeChallenge <> '' then
         // a handler refused for lack of scope: 403 with the challenge naming
         // what to ask for, which is what a client steps up with

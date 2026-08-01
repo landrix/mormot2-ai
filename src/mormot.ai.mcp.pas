@@ -91,6 +91,32 @@ const
   /// correlates a notification with the subscriptions/listen request it came from
   MCP_META_SUBSCRIPTION_ID = 'io.modelcontextprotocol/subscriptionId';
 
+  /// the prefix a mirrored tool parameter travels under (see `x-mcp-header`)
+  MCP_PARAM_HEADER_PREFIX = 'Mcp-Param-';
+  /// the annotation key that marks a tool parameter for header mirroring
+  MCP_SCHEMA_HEADER_ANNOTATION = 'x-mcp-header';
+
+  /// opts a request into progress notifications (string or integer)
+  // - like the OTel keys below, this one is reserved WITHOUT a prefix
+  // - a server may only emit notifications/progress for a token that arrived on
+  //   an active request, which is why it is read per request and never stored
+  MCP_META_PROGRESS_TOKEN = 'progressToken';
+
+  /// OpenTelemetry trace context, propagated through _meta
+  // - these three are the ONLY reserved keys without a prefix: the spec grants
+  //   them an explicit exception from the `<labels>/` naming rule to stay
+  //   compatible with the OpenTelemetry semantic conventions for MCP
+  // - values MUST follow W3C Trace Context / W3C Baggage. We do not parse them
+  //   (that is the observability backend's job) but we do refuse control
+  //   characters when reading — a consumer that forwards the value into an
+  //   outgoing HTTP header would otherwise carry a CRLF injection along
+  /// W3C traceparent: version-traceid-spanid-flags of the calling span
+  MCP_META_TRACEPARENT = 'traceparent';
+  /// W3C tracestate: vendor-specific trace continuation data
+  MCP_META_TRACESTATE = 'tracestate';
+  /// W3C baggage: user-defined key/value context travelling with the trace
+  MCP_META_BAGGAGE = 'baggage';
+
   /// values of the mandatory `resultType` field on every result
   /// the request completed and the result carries the final content
   MCP_RESULT_COMPLETE = 'complete';
@@ -340,6 +366,57 @@ type
       read fCapabilities;
   end;
 
+  /// how a handler pushes a message onto the stream carrying its own response
+  // - implemented by the transport (the Streamable HTTP one wraps each message
+  //   as an SSE event); the core defines it so TMcpCallContext can carry it
+  //   without depending on any particular transport
+  IMcpNotificationSink = interface
+    ['{6C1F9A72-4D3B-4E15-9F8A-2B6D0C7E4A31}']
+    /// send one complete JSON-RPC message on this request's response stream
+    procedure Send(const aJsonMessage: RawUtf8);
+  end;
+
+  /// how a handler reports progress on the request it is serving
+  // - always present on TMcpCallContext, so a handler never needs a nil check;
+  //   when the client sent no progressToken, or the response is not streamed,
+  //   Report does nothing and says so
+  IMcpProgressReporter = interface
+    ['{9E4A2C58-7B16-4D3F-8A05-1C7E9B2D6F84}']
+    /// emit one notifications/progress for this request
+    // - aProgress MUST increase between calls; a value that does not is DROPPED
+    //   rather than sent, because the spec makes the increase mandatory and a
+    //   client is entitled to rely on it (progress bars go forwards)
+    // - aTotal < 0 omits the optional `total`, for an unknown end point
+    // - returns false when nothing went out (no token, no stream, or no increase)
+    function Report(aProgress: double; aTotal: double = -1;
+      const aMessage: RawUtf8 = ''): boolean;
+    /// whether the client actually asked for progress on this request
+    function Wanted: boolean;
+  end;
+
+  /// one tool parameter mirrored into an HTTP header via `x-mcp-header`
+  TMcpHeaderParam = record
+    /// the chain of `properties` keys leading to the annotated property
+    // - one element for a top-level parameter, more for a nested object
+    Path: TRawUtf8DynArray;
+    /// the name portion: the header sent is 'Mcp-Param-' + Name
+    Name: RawUtf8;
+  end;
+  TMcpHeaderParamDynArray = array of TMcpHeaderParam;
+
+  /// the W3C trace context a request carried in its _meta
+  // - kept verbatim: correlating spans is the observability backend's job, and
+  //   a server that "corrects" a traceparent breaks the correlation it is
+  //   supposed to preserve
+  TMcpTraceContext = record
+    /// _meta.traceparent — identifies the calling span
+    TraceParent: RawUtf8;
+    /// _meta.tracestate — vendor-specific continuation data
+    TraceState: RawUtf8;
+    /// _meta.baggage — user-defined context travelling with the trace
+    Baggage: RawUtf8;
+  end;
+
   /// what a handler knows about the request it is serving, beyond its arguments
   // - carries the two Multi Round-Trip Request (MRTR) retry fields, so a
   //   handler that asked for input on a previous round can pick the answers up
@@ -377,6 +454,17 @@ type
     /// whether the request carried a `requestState` field at all
     // - same reasoning: an empty string is a present-but-empty state
     HasRequestState: boolean;
+    /// W3C trace context of the caller, from _meta.traceparent/tracestate/baggage
+    // - empty when the client sent none, or when what it sent contained control
+    //   characters (see TraceContextValue): a trace id that cannot be forwarded
+    //   safely is worth less than no trace id at all
+    // - handlers that call out to other services SHOULD forward these verbatim,
+    //   so a tool call stays one trace across process boundaries
+    Trace: TMcpTraceContext;
+    /// report progress on this request — never nil, see IMcpProgressReporter
+    // - a long-running tool SHOULD check Progress.Wanted before doing the extra
+    //   bookkeeping a report needs; Report() itself is always safe to call
+    Progress: IMcpProgressReporter;
   end;
 
   /// raised by a handler to answer with an InputRequiredResult instead of a
@@ -602,13 +690,13 @@ type
   /// a parameterized resource, published as an RFC 6570 URI template
   // - the template itself is never read: it tells a client which URIs it may
   //   construct, and the resulting concrete URI goes to resources/read
-  // - LIMITATION, know this before publishing one: resources/read resolves a
-  //   URI by EXACT lookup in the resource registry. Nothing expands a template
-  //   or matches a concrete URI back against it, so a client that dutifully
-  //   builds `file:///src/main.pas` from `file:///{path}` gets -32602 unless
-  //   that exact URI is also registered. Publish a template only when the URIs
-  //   it describes really exist as registered resources; a matcher/resolver
-  //   hook is the missing piece and is not built yet.
+  // - a template that ALSO implements IMcpExpandableResourceTemplate serves the
+  //   concrete URIs itself: resources/read then falls back from the exact
+  //   registry lookup to template matching, so a client that builds
+  //   `file:///src/main.pas` out of `file:///{path}` is answered without that
+  //   exact URI having to be registered
+  // - a template WITHOUT that add-on stays a pure advertisement: the URIs it
+  //   describes must exist as registered resources, or a read of them is -32602
   IMcpResourceTemplate = interface(IInvokable)
     ['{6D3F8A21-4E95-4C7B-9F16-8B2D5A0E3C74}']
     /// the RFC 6570 template, e.g. 'file:///{path}' — also the registry key
@@ -621,6 +709,19 @@ type
     function GetDescription: RawUtf8;
     /// optional MIME type shared by the resources it produces ('' to omit)
     function GetMimeType: RawUtf8;
+  end;
+
+  /// optional add-on to IMcpResourceTemplate: serve the concrete URIs yourself
+  // - without it a template only advertises URIs; with it, resources/read
+  //   resolves a URI that matches the template and calls ReadExpanded
+  IMcpExpandableResourceTemplate = interface(IInvokable)
+    ['{4A8E1D63-9C27-4B5F-8E30-6D1A7F2B9C05}']
+    /// produce the content behind one concrete URI built from this template
+    // - aVars holds the template variables as found in aUri, percent-decoded
+    // - raise EMcpInvalidParams when the URI matches the shape but names
+    //   nothing that exists — matching a pattern is not the same as existing
+    function ReadExpanded(const aUri: RawUtf8; const aVars: variant;
+      const aContext: TMcpCallContext): RawUtf8;
   end;
 
   /// something whose arguments completion/complete can suggest values for
@@ -805,6 +906,8 @@ type
   private
     fServerName: RawUtf8;
     fServerVersion: RawUtf8;
+    // id -> settings object, advertised as ServerCapabilities.extensions
+    fExtensions: TDocVariantData;
     function ExtractRequestId(const aRequest: variant): variant;
     function CreateResponse(const aRequestId: variant): variant;
     function CreateErrorResponse(const aRequestId: variant;
@@ -831,6 +934,17 @@ type
     //   missing capabilities, -32022 the supported versions)
     function CreateError(const aRequestId: variant; aErrorCode: integer;
       const aErrorMsg: RawUtf8; const aData: variant): RawUtf8; overload;
+    /// advertise an optional extension in ServerCapabilities.extensions
+    // - aId MUST satisfy McpIsValidExtensionId (prefixed, reverse-DNS style);
+    //   an invalid id raises, because silently dropping it would leave the
+    //   server claiming core-only support while its handlers assume otherwise
+    // - aSettings is the extension's own settings object; pass a void variant
+    //   for "supported, no settings", which the spec spells as `{}`
+    // - registering the same id twice replaces the settings
+    procedure RegisterExtension(const aId: RawUtf8;
+      const aSettings: variant); overload;
+    /// advertise an extension that has no settings of its own
+    procedure RegisterExtension(const aId: RawUtf8); overload;
     /// `io.modelcontextprotocol/serverInfo` value (name + version)
     function ServerInfo: variant;
     /// stamp `resultType` and `_meta.serverInfo` onto a handler payload
@@ -870,11 +984,26 @@ type
   protected
     fName: RawUtf8;
     fDescription: RawUtf8;
+    // property path -> header name, applied on top of the generated schema
+    fMirrored: TMcpHeaderParamDynArray;
     /// override this to implement tool logic
     function ExecuteTyped(const aParams: T; const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
   public
     /// initialize with tool name and description
     constructor Create(const aName, aDescription: RawUtf8); virtual;
+    /// mirror one parameter into the `Mcp-Param-<aHeaderName>` HTTP request
+    /// header, so intermediaries can route on it without parsing the body
+    // - aPropertyPath is the dotted path from the schema root ('region', or
+    //   'target.region' for a nested object); every step MUST be a real
+    //   property of the parameter record, or the annotation lands nowhere
+    // - the parameter must be of type string, integer or boolean — `number` is
+    //   excluded by the spec, since a float has no single decimal form to
+    //   compare a header against
+    // - NEVER mark a secret this way: header values are visible to every
+    //   intermediary on the path, which is the entire point of the feature
+    // - raises when the resulting schema would violate a constraint, at wiring
+    //   time rather than on the first call
+    procedure MirrorToHeader(const aPropertyPath, aHeaderName: RawUtf8);
     /// IMcpTool implementation
     function GetName: RawUtf8;
     function GetDescription: RawUtf8;
@@ -924,6 +1053,8 @@ type
     fSafe: TLightLock;
     fListCacheTtlMs: integer;
     fReadCacheTtlMs: integer;
+    fSchemaMaxDepth: integer;
+    fSchemaMaxNodes: integer;
     fListCacheScope: TMcpCacheScope;
     fReadCacheScope: TMcpCacheScope;
     fSubscriptions: array of TMcpSubscription;
@@ -956,7 +1087,8 @@ type
       aPersonalized: boolean = false);
     /// gather everything a handler may need beyond its own arguments
     function CallContext(const aParams: variant; const aMethod: RawUtf8;
-      const aAuthCtx: TMcpAuthContext): TMcpCallContext;
+      const aAuthCtx: TMcpAuthContext;
+      const aSink: IMcpNotificationSink = nil): TMcpCallContext;
     /// turn a handler's EMcpInputRequired into the interim result document
     function InputRequiredResult(const aInputRequests: variant;
       const aRequestState: RawUtf8): variant;
@@ -967,6 +1099,11 @@ type
       const aContext: TMcpCallContext): variant;
     function ExecuteResourceRead(const aParams: variant;
       const aContext: TMcpCallContext): variant;
+    /// resolve a URI that no registered resource claims against the templates
+    // - false when no expandable template matches, which is the -32602 case
+    function ReadFromTemplate(const aUri: RawUtf8;
+      const aContext: TMcpCallContext;
+      out aContent, aMimeType: RawUtf8): boolean;
     function ListTools(const aParams: variant): variant;
     function ListResources(const aParams: variant): variant;
     function ListPrompts(const aParams: variant): variant;
@@ -1007,6 +1144,19 @@ type
     procedure RegisterResourceTemplate(const aTemplate: IMcpResourceTemplate);
     /// unregister a resource template by its URI template
     function UnregisterResourceTemplate(const aUriTemplate: RawUtf8): boolean;
+    /// the `x-mcp-header` annotations of one registered tool
+    // - empty for an unknown tool: that is a -32602 the dispatcher reports, not
+    //   a header problem, and answering -32020 here would hide the real cause
+    // - empty as well when the tool's schema carries no annotation
+    function ToolHeaderParams(const aToolName: RawUtf8): TMcpHeaderParamDynArray;
+    /// advertise an optional extension in the capabilities of server/discover
+    // - forwards to Processor.RegisterExtension; see there for the id rules
+    // - the core protocol stays untouched: an extension only becomes visible
+    //   here, and a client that ignores it keeps getting core behaviour
+    procedure RegisterExtension(const aId: RawUtf8;
+      const aSettings: variant); overload;
+    /// advertise an extension that has no settings of its own
+    procedure RegisterExtension(const aId: RawUtf8); overload;
     /// start the server (activates tool/resource access)
     procedure Start;
     /// stop the server
@@ -1030,8 +1180,13 @@ type
     //   the missing scopes, and only the transport can send those. Returning it
     //   explicitly beats letting the exception escape into the HTTP worker.
     // - aScopeChallenge is non-empty exactly when the caller must answer 403
+    // - aSink, when given, is where a handler's notifications/progress go: it
+    //   is the stream carrying THIS request's response. Passing nil (stdio, a
+    //   buffered JSON answer) makes progress reporting a no-op instead of an
+    //   error — the client only ever gets a hint it asked for, never a failure
     function ExecuteRequest(const aRequestJson: RawUtf8;
-      const aAuthCtx: TMcpAuthContext; out aScopeChallenge: RawUtf8): RawUtf8;
+      const aAuthCtx: TMcpAuthContext; out aScopeChallenge: RawUtf8;
+      const aSink: IMcpNotificationSink = nil): RawUtf8;
       overload;
     /// open a subscriptions/listen stream for an already-validated request
     // - the caller (a transport) owns the returned object and MUST pass it to
@@ -1153,6 +1308,16 @@ type
     //   a different timescale than the set of resources
     property ReadCacheTtlMs: integer
       read fReadCacheTtlMs write fReadCacheTtlMs;
+    /// how deep a published tool inputSchema may nest (default 32)
+    // - the spec asks implementations to bound composition keywords and $defs
+    //   so a schema cannot become a denial-of-service vector against the
+    //   validator on the other side; enforced once, at RegisterTool
+    property SchemaMaxDepth: integer
+      read fSchemaMaxDepth write fSchemaMaxDepth;
+    /// how many subschema nodes a published tool inputSchema may contain
+    /// (default 4096)
+    property SchemaMaxNodes: integer
+      read fSchemaMaxNodes write fSchemaMaxNodes;
     /// who may cache server/discover, tools/list and resources/list
     // - defaults to mcsPrivate because this server cannot know whether a host
     //   application filters tools or resources per caller. Announcing public
@@ -1232,6 +1397,88 @@ function McpMethodFromName(const aMethod: RawUtf8): TMcpMethod;
 // - an absent or malformed filter yields an all-false filter: the server MUST
 //   NOT send a type the client did not explicitly request
 function McpParseNotificationFilter(const aParams: variant): TMcpNotificationFilter;
+
+/// check an extension identifier against the _meta key naming rules
+// - extensions are advertised in the `extensions` map of Client/ServerCapabilities
+//   and their identifiers "MUST follow the _meta key naming rules, with a
+//   MANDATORY prefix" — so, unlike a _meta key, a bare name is NOT valid here
+// - prefix: dot-separated labels then '/', each label starting with a letter and
+//   ending with a letter or digit, hyphens allowed in between
+// - name: begins and ends alphanumeric, with '-', '_', '.' allowed in between
+// - the rule is worth enforcing rather than trusting: an unprefixed identifier
+//   collides with every other server's, and one inside the reserved
+//   `io.modelcontextprotocol/` space claims to be an official extension
+function McpIsValidExtensionId(const aId: RawUtf8): boolean;
+
+/// build a notifications/progress JSON-RPC message
+// - aTotal < 0 omits the optional `total` (an operation of unknown length)
+// - aMessage is omitted when empty rather than sent as an empty string
+function McpProgressNotification(const aProgressToken: variant;
+  aProgress, aTotal: double; const aMessage: RawUtf8): RawUtf8;
+
+/// collect the `x-mcp-header` annotations of a tool inputSchema
+// - walks ONLY chains of `properties` keys, which is exactly what the spec calls
+//   "statically reachable"; an annotation under `items`, a composition keyword
+//   (`oneOf`/`anyOf`/`allOf`/`not`), `if`/`then`/`else` or behind a `$ref` is not
+//   reachable and makes the tool definition INVALID
+// - raises EMcpException on any violated constraint, naming it: an invalid
+//   annotation must surface where the tool is defined, not as a client-side
+//   rejection that silently removes the tool from tools/list
+function McpCollectHeaderParams(const aInputSchema: variant): TMcpHeaderParamDynArray;
+
+/// check a published JSON Schema against the 2020-12 usage rules of the spec
+// - aReason names the first violation found; the result is false then
+// - enforces the two rules a SERVER is responsible for, on the schemas it
+//   publishes in tools/list (a client is entitled to consume them safely):
+//   1. no `$ref` to a network URI. "Implementations MUST NOT automatically
+//      dereference $ref values that resolve to a network URI" — publishing one
+//      hands every client a fetch it must refuse, and a schema that cannot be
+//      resolved "SHOULD be rejected rather than silently treated as permissive"
+//   2. bounded depth and subschema count. Composition keywords (anyOf/oneOf/
+//      allOf/if-then-else) and $defs "can be expensive to validate", so a schema
+//      is a denial-of-service vector against every client's validator
+// - deliberately does NOT restrict which KEYWORDS appear: 2026-07-28 loosened
+//   inputSchema/outputSchema to allow any 2020-12 keyword, so an unknown one is
+//   valid input, not an error
+function McpCheckSchema(const aSchema: variant; aMaxDepth, aMaxNodes: integer;
+  out aReason: RawUtf8): boolean;
+
+/// whether aName is a legal HTTP field-name token (RFC 9110 `1*tchar`)
+function McpIsHeaderToken(const aName: RawUtf8): boolean;
+
+/// decode the `=?base64?…?=` sentinel a header value may travel in
+// - returns the value unchanged when it does not carry the markers
+// - the markers are CASE-SENSITIVE per spec: accepting '=?BASE64?x?=' would
+//   rewrite a literal value that a client is required to send encoded
+function McpDecodeHeaderValue(const aValue: RawUtf8): RawUtf8;
+
+/// match a concrete URI against an RFC 6570 URI template
+// - on success aVars is an object mapping each `{name}` to the text it captured,
+//   percent-decoded; on failure it is void and the result is false
+// - SIMPLE STRING EXPANSION ONLY (RFC 6570 level 1, `{var}`). The operator
+//   forms — `{+var}` `{#var}` `{.var}` `{/var}` `{;var}` `{?var}` `{&var}` and
+//   the `{var*}`/`{var:3}` modifiers — are NOT matched and make the template
+//   unmatchable rather than half-understood: guessing at an operator would
+//   resolve a URI to the wrong resource, which is worse than not resolving it
+// - a variable must capture at least one character, so `file:///{path}` does
+//   NOT match the bare `file:///`
+// - a variable captures GREEDILY up to the literal that follows it, and the
+//   last one takes the rest of the URI — reserved characters included. Strict
+//   RFC 6570 would percent-encode a '/' on expansion and could reject it here,
+//   but that would stop the most common template of all, `file:///{path}`, from
+//   matching any real file URI. The cost is that `db://{t}/rows/{id}` also
+//   matches `db://users/rows/42/x` with id='42/x'; a handler must validate what
+//   it is handed, which it has to do with any client input anyway
+function McpMatchUriTemplate(const aTemplate, aUri: RawUtf8;
+  out aVars: variant): boolean;
+
+/// whether the client declared support for an extension on THIS request
+// - reads _meta.clientCapabilities.extensions, which is per-request: there is no
+//   handshake to remember, so a handler must re-check on every call
+// - "If one party supports an extension but the other does not, the supporting
+//   party MUST either revert to core protocol behavior or reject the request"
+function McpClientSupportsExtension(const aClientCapabilities: variant;
+  const aId: RawUtf8): boolean;
 
 
 { ************ Client-side Request Metadata Helper }
@@ -1915,7 +2162,32 @@ begin
     'requested', version]);
 end;
 
+procedure TMcpJsonRpcProcessor.RegisterExtension(const aId: RawUtf8;
+  const aSettings: variant);
+begin
+  // EMcpException, not one of the request-error descendants: this is a wiring
+  // mistake in the server itself, not something a client did
+  if not McpIsValidExtensionId(aId) then
+    raise EMcpException.CreateUtf8(
+      '%.RegisterExtension: invalid extension id "%" — an identifier needs a ' +
+      'prefix ("com.example/name"), see the _meta key naming rules', [self, aId]);
+  if fExtensions.VarType = varEmpty then
+    fExtensions.InitFast(dvObject);
+  // "an empty object indicates support with no additional settings"
+  if VarIsEmptyOrNull(aSettings) then
+    fExtensions.AddOrUpdateValue(aId, _ObjFast([]))
+  else
+    fExtensions.AddOrUpdateValue(aId, aSettings);
+end;
+
+procedure TMcpJsonRpcProcessor.RegisterExtension(const aId: RawUtf8);
+begin
+  RegisterExtension(aId, Null);
+end;
+
 function TMcpJsonRpcProcessor.HandleDiscover: variant;
+var
+  caps: TDocVariantData;
 begin
   // Servers MUST implement server/discover. It reports what a client would
   // otherwise have learned from `initialize`: versions, capabilities, identity.
@@ -1923,17 +2195,23 @@ begin
   // listChanged/subscribe are advertised because the registry raises those
   // notifications itself (see RegisterTool/RegisterResource) — a client that
   // opens subscriptions/listen for them will really be told about changes.
+  caps.InitObject([
+    'tools', _ObjFast(['listChanged', true]),
+    'prompts', _ObjFast(['listChanged', true]),
+    // "Servers that support completions MUST declare the completions
+    // capability" — an empty object, it has no sub-features
+    'completions', _ObjFast([]),
+    'resources', _ObjFast([
+      'listChanged', true,
+      'subscribe', true])], JSON_FAST);
+  // extensions is OMITTED when none are registered rather than sent empty: an
+  // empty map and an absent field mean the same thing, and the absent one does
+  // not invite a client to look for settings that are not there
+  if fExtensions.Count > 0 then
+    caps.AddValue('extensions', variant(fExtensions));
   result := _ObjFast([
     'supportedVersions', _ArrFast([MCP_PROTOCOL_VERSION]),
-    'capabilities', _ObjFast([
-      'tools', _ObjFast(['listChanged', true]),
-      'prompts', _ObjFast(['listChanged', true]),
-      // "Servers that support completions MUST declare the completions
-      // capability" — an empty object, it has no sub-features
-      'completions', _ObjFast([]),
-      'resources', _ObjFast([
-        'listChanged', true,
-        'subscribe', true])])]);
+    'capabilities', variant(caps)]);
 end;
 
 function TMcpJsonRpcProcessor.CreateSuccessResponse(const aRequestId, aResult: variant;
@@ -1978,12 +2256,56 @@ begin
   result := fDescription;
 end;
 
+procedure TMcpToolBase<T>.MirrorToHeader(const aPropertyPath, aHeaderName: RawUtf8);
+var
+  n: PtrInt;
+begin
+  if aPropertyPath = '' then
+    raise EMcpException.CreateUtf8(
+      '%.MirrorToHeader: empty property path', [self]);
+  n := length(fMirrored);
+  SetLength(fMirrored, n + 1);
+  CsvToRawUtf8DynArray(pointer(aPropertyPath), fMirrored[n].Path, '.');
+  fMirrored[n].Name := aHeaderName;
+  // build the schema once, now: an annotation that violates a constraint (bad
+  // token, wrong type, duplicate name, unreachable path) must fail where the
+  // tool is wired up, not on the first client call
+  GetInputSchema;
+end;
+
 function TMcpToolBase<T>.GetInputSchema: variant;
 var
   typeInfo: PRttiInfo;
+  schema, node: PDocVariantData;
+  i, k, idx: PtrInt;
 begin
   typeInfo := System.TypeInfo(T);
   result := TMcpSchemaGenerator.GenerateSchema(typeInfo);
+  if fMirrored = nil then
+    exit;
+  schema := _Safe(result);
+  for i := 0 to high(fMirrored) do
+  begin
+    node := schema;
+    for k := 0 to high(fMirrored[i].Path) do
+    begin
+      if not node^.GetAsDocVariant('properties', node) then
+        raise EMcpException.CreateUtf8(
+          '%.MirrorToHeader: "%" is not a property of the parameter record',
+          [self, RawUtf8ArrayToCsv(fMirrored[i].Path, '.')]);
+      idx := node^.GetValueIndex(fMirrored[i].Path[k]);
+      if idx < 0 then
+        raise EMcpException.CreateUtf8(
+          '%.MirrorToHeader: "%" is not a property of the parameter record',
+          [self, RawUtf8ArrayToCsv(fMirrored[i].Path, '.')]);
+      node := _Safe(node^.Values[idx]);
+    end;
+    node^.AddOrUpdateValue(MCP_SCHEMA_HEADER_ANNOTATION,
+      RawUtf8ToVariant(fMirrored[i].Name));
+  end;
+  // re-read what we just produced through the same collector the transport
+  // uses, so author-time and request-time agree on what is valid
+  McpCollectHeaderParams(result);
 end;
 
 function TMcpToolBase<T>.Execute(const aArgs: variant; 
@@ -2062,6 +2384,10 @@ begin
   fSubscriptionSafe.Init;
   fMaxSubscriptions := 8; // see the property: each one holds a worker thread
   fListPageSize := MCP_DEFAULT_PAGE_SIZE;
+  // generous enough that no honest schema hits them, small enough that a
+  // pathological one cannot exhaust a client's validator
+  fSchemaMaxDepth := 32;
+  fSchemaMaxNodes := 4096;
 end;
 
 function TMcpServer.OpenSubscription(const aRequestId,
@@ -2357,11 +2683,19 @@ end;
 
 procedure TMcpServer.RegisterTool(const aTool: IMcpTool);
 var
-  name: RawUtf8;
+  name, reason: RawUtf8;
 begin
   if aTool = nil then
     exit;
   name := aTool.GetName;
+  // Check the schema HERE, once, instead of on every tools/list: a tool whose
+  // schema carries a network $ref or an unbounded nesting would be handed to
+  // every client, and each of them would have to refuse it. Failing at
+  // registration puts the error where the tool is defined.
+  if not McpCheckSchema(aTool.GetInputSchema, fSchemaMaxDepth, fSchemaMaxNodes,
+       reason) then
+    raise EMcpException.CreateUtf8(
+      '%.RegisterTool("%"): unusable inputSchema — %', [self, name, reason]);
   fSafe.Lock;
   try
     fTools.Add(name, aTool);
@@ -2700,6 +3034,37 @@ begin
     NotifyResourcesListChanged;
 end;
 
+function TMcpServer.ToolHeaderParams(
+  const aToolName: RawUtf8): TMcpHeaderParamDynArray;
+var
+  tool: IMcpTool;
+begin
+  result := nil;
+  fSafe.Lock;
+  try
+    if not fTools.TryGetValue(aToolName, tool) then
+      tool := nil;
+  finally
+    fSafe.UnLock;
+  end;
+  if tool = nil then
+    exit;
+  result := McpCollectHeaderParams(tool.GetInputSchema);
+end;
+
+procedure TMcpServer.RegisterExtension(const aId: RawUtf8;
+  const aSettings: variant);
+begin
+  // no lock and no list_changed broadcast: extensions are declared at wiring
+  // time and only ever read by server/discover, which is not a cached list
+  fProcessor.RegisterExtension(aId, aSettings);
+end;
+
+procedure TMcpServer.RegisterExtension(const aId: RawUtf8);
+begin
+  fProcessor.RegisterExtension(aId);
+end;
+
 function TMcpServer.SortedTemplateUris: TRawUtf8DynArray;
 var
   pair: TPair<RawUtf8, IMcpResourceTemplate>;
@@ -2951,11 +3316,110 @@ begin
   result := variant(doc);
 end;
 
+type
+  /// the per-request progress reporter handed to every handler
+  // - implementation detail: handlers only ever see IMcpProgressReporter
+  // - holds the token from THIS request, so a handler cannot address a token
+  //   that belongs to another request ("Progress notifications MUST only
+  //   reference tokens that were provided in an active request")
+  TMcpProgressReporter = class(TInterfacedObject, IMcpProgressReporter)
+  private
+    fSink: IMcpNotificationSink;
+    fToken: variant;
+    fLast: double;
+    fHasLast: boolean;
+    fWanted: boolean;
+    // a tool may report from worker threads of its own; the monotonic check is
+    // read-modify-write and would otherwise let two reports interleave into a
+    // decreasing pair
+    fSafe: TLightLock;
+  public
+    constructor Create(const aSink: IMcpNotificationSink; const aToken: variant;
+      aWanted: boolean);
+    function Report(aProgress: double; aTotal: double = -1;
+      const aMessage: RawUtf8 = ''): boolean;
+    function Wanted: boolean;
+  end;
+
+constructor TMcpProgressReporter.Create(const aSink: IMcpNotificationSink;
+  const aToken: variant; aWanted: boolean);
+begin
+  inherited Create;
+  fSink := aSink;
+  fToken := aToken;
+  fWanted := aWanted;
+end;
+
+function TMcpProgressReporter.Wanted: boolean;
+begin
+  // no token means the client did not opt in; no sink means this response is a
+  // single buffered JSON object with nowhere to put a notification
+  result := fWanted and
+            (fSink <> nil);
+end;
+
+function TMcpProgressReporter.Report(aProgress, aTotal: double;
+  const aMessage: RawUtf8): boolean;
+begin
+  result := false;
+  if not Wanted then
+    exit;
+  fSafe.Lock;
+  try
+    // "The progress value MUST increase with each notification": a repeated or
+    // going-backwards value is dropped here rather than put on the wire. A
+    // client is allowed to trust the increase, and a server that breaks it
+    // makes every consumer defend against its own protocol.
+    if fHasLast and
+       (aProgress <= fLast) then
+      exit;
+    fLast := aProgress;
+    fHasLast := true;
+  finally
+    fSafe.UnLock;
+  end;
+  fSink.Send(McpProgressNotification(fToken, aProgress, aTotal, aMessage));
+  result := true;
+end;
+
+// read one W3C trace context value out of _meta, or '' if it is unusable
+// - the three OTel keys are the spec's only unprefixed reserved keys, so they
+//   are read by exact name; anything non-string is simply not a trace context
+// - a value carrying control characters is dropped rather than passed on: the
+//   whole point of these fields is to be forwarded, and a handler that puts a
+//   CRLF-bearing value into an outgoing header would splice in a header of the
+//   attacker's choosing. Dropping loses a trace id; forwarding loses the
+//   integrity of every request that trace touches.
+function TraceContextValue(aMeta: PDocVariantData; const aKey: RawUtf8): RawUtf8;
+var
+  i: PtrInt;
+begin
+  result := '';
+  if aMeta = nil then
+    exit;
+  i := aMeta^.GetValueIndex(aKey);
+  // a non-string is not a trace context: converting e.g. a number to '42' here
+  // would invent a traceparent the client never sent
+  if (i < 0) or
+     not VarIsString(aMeta^.Values[i]) then
+    exit;
+  VariantToUtf8(aMeta^.Values[i], result);
+  for i := 1 to length(result) do
+    if result[i] < ' ' then // covers CR, LF, TAB and every other C0 control
+    begin
+      result := '';
+      exit;
+    end;
+end;
+
 function TMcpServer.CallContext(const aParams: variant; const aMethod: RawUtf8;
-  const aAuthCtx: TMcpAuthContext): TMcpCallContext;
+  const aAuthCtx: TMcpAuthContext;
+  const aSink: IMcpNotificationSink): TMcpCallContext;
 var
   doc, meta: PDocVariantData;
   i: PtrInt;
+  progressToken: variant;
+  wantsProgress: boolean;
 begin
   Finalize(result);
   FillCharFast(result, SizeOf(result), 0);
@@ -2987,9 +3451,34 @@ begin
     VariantToUtf8(doc^.Values[i], result.RequestState);
     result.HasRequestState := true;
   end;
+  wantsProgress := false;
+  SetVariantNull(progressToken);
   if doc^.GetAsDocVariant('_meta', meta) then
+  begin
     result.ClientCapabilities :=
       meta^.GetValueOrDefault(MCP_META_CLIENT_CAPABILITIES, Null);
+    // W3C trace context: read verbatim, but only if forwardable (see below)
+    result.Trace.TraceParent := TraceContextValue(meta, MCP_META_TRACEPARENT);
+    result.Trace.TraceState := TraceContextValue(meta, MCP_META_TRACESTATE);
+    result.Trace.Baggage := TraceContextValue(meta, MCP_META_BAGGAGE);
+    // "Progress tokens MUST be a string or integer value" — anything else is
+    // not an opt-in, and echoing e.g. an object back in every notification
+    // would produce messages no client can correlate
+    i := meta^.GetValueIndex(MCP_META_PROGRESS_TOKEN);
+    if i >= 0 then
+    begin
+      progressToken := meta^.Values[i];
+      wantsProgress := VarIsString(progressToken) or
+                       (TVarData(progressToken).VType in
+                          [varInteger, varInt64, varLongWord, varSmallint,
+                           varShortInt, varByte, varWord]);
+      if not wantsProgress then
+        SetVariantNull(progressToken);
+    end;
+  end;
+  // always assigned: a handler should never need a nil check to report progress
+  result.Progress := TMcpProgressReporter.Create(aSink, progressToken,
+    wantsProgress);
 end;
 
 procedure TMcpServer.ValidateInputRequests(const aInputRequests: variant;
@@ -3270,11 +3759,50 @@ begin
     result := tool.Execute(args, aContext.Auth);
 end;
 
+function TMcpServer.ReadFromTemplate(const aUri: RawUtf8;
+  const aContext: TMcpCallContext; out aContent, aMimeType: RawUtf8): boolean;
+var
+  uris: TRawUtf8DynArray;
+  tpl: IMcpResourceTemplate;
+  expandable: IMcpExpandableResourceTemplate;
+  vars: variant;
+  i: PtrInt;
+begin
+  result := false;
+  // Deterministic order (SortedTemplateUris), so two templates that both match
+  // a URI always resolve to the SAME one. Registry iteration order would make
+  // that a coin toss and the resulting bug unreproducible.
+  uris := SortedTemplateUris;
+  for i := 0 to high(uris) do
+  begin
+    fSafe.Lock;
+    try
+      if not fTemplates.TryGetValue(uris[i], tpl) then
+        tpl := nil;
+    finally
+      fSafe.UnLock;
+    end;
+    if (tpl = nil) or
+       // only a template that can actually serve its URIs takes part: a plain
+       // advertisement must keep answering -32602, not an empty success
+       not Supports(tpl, IMcpExpandableResourceTemplate, expandable) then
+      continue;
+    if not McpMatchUriTemplate(uris[i], aUri, vars) then
+      continue;
+    // ReadExpanded may still raise EMcpInvalidParams: matching the shape of a
+    // URI is not proof that what it names exists
+    aContent := expandable.ReadExpanded(aUri, vars, aContext);
+    aMimeType := tpl.GetMimeType;
+    result := true;
+    exit;
+  end;
+end;
+
 function TMcpServer.ExecuteResourceRead(const aParams: variant;
   const aContext: TMcpCallContext): variant;
 var
   doc: PDocVariantData;
-  uri, content: RawUtf8;
+  uri, content, mimeType: RawUtf8;
   resource: IMcpResource;
   interactive: IMcpInteractiveResource;
   result_doc, contentsList, contentItem: TDocVariantData;
@@ -3286,28 +3814,34 @@ begin
   fSafe.Lock;
   try
     if not fResources.TryGetValue(uri, resource) then
-      // -32602: the dedicated "resource not found" code (-32002) was removed
-      // in 2026-07-28 — an unknown URI is Invalid params like any other
-      raise EMcpInvalidParams.CreateUtf8('Resource not found: %', [uri]);
+      resource := nil;
   finally
     fSafe.UnLock;
   end;
 
-  if Supports(resource, IMcpInteractiveResource, interactive) then
-    content := interactive.ReadInteractive(aContext)
-  else
-    content := resource.Read;
+  if resource <> nil then
+  begin
+    mimeType := resource.GetMimeType;
+    if Supports(resource, IMcpInteractiveResource, interactive) then
+      content := interactive.ReadInteractive(aContext)
+    else
+      content := resource.Read;
+  end
+  else if not ReadFromTemplate(uri, aContext, content, mimeType) then
+    // -32602: the dedicated "resource not found" code (-32002) was removed
+    // in 2026-07-28 — an unknown URI is Invalid params like any other
+    raise EMcpInvalidParams.CreateUtf8('Resource not found: %', [uri]);
 
   // Build response
   result_doc.InitObject([], JSON_FAST);
   contentsList.InitArray([], JSON_FAST);
-  
+
   contentItem.InitObject([
     'uri', uri,
-    'mimeType', resource.GetMimeType,
+    'mimeType', mimeType,
     'text', content
   ], JSON_FAST);
-  
+
   contentsList.AddItem(variant(contentItem));
   result_doc.AddValue('contents', variant(contentsList));
   
@@ -3454,7 +3988,8 @@ begin
 end;
 
 function TMcpServer.ExecuteRequest(const aRequestJson: RawUtf8;
-  const aAuthCtx: TMcpAuthContext; out aScopeChallenge: RawUtf8): RawUtf8;
+  const aAuthCtx: TMcpAuthContext; out aScopeChallenge: RawUtf8;
+  const aSink: IMcpNotificationSink): RawUtf8;
 var
   method: RawUtf8;
   params, requestId, resultData: variant;
@@ -3478,7 +4013,7 @@ begin
     // INSIDE the try: CallContext type-checks the MRTR retry fields and raises
     // EMcpInvalidParams on a malformed one. Building it before the try would
     // let that escape into the HTTP worker, which has no handler for it.
-    callCtx := CallContext(params, method, aAuthCtx);
+    callCtx := CallContext(params, method, aAuthCtx, aSink);
     // A request carrying MRTR retry fields produced a caller-specific answer.
     // Presence decides, not content — VarIsVoid() considers an EMPTY object
     // void, so testing the value would let `inputResponses: {}` be cached as
@@ -3652,6 +4187,359 @@ begin
       if uri <> '' then
         AddRawUtf8(result.ResourceSubscriptions, uri);
     end;
+end;
+
+function McpIsValidExtensionId(const aId: RawUtf8): boolean;
+var
+  slash, i, labelStart: PtrInt;
+
+  function IsAlpha(c: AnsiChar): boolean;
+  begin
+    result := ((c >= 'a') and (c <= 'z')) or
+              ((c >= 'A') and (c <= 'Z'));
+  end;
+
+  function IsAlnum(c: AnsiChar): boolean;
+  begin
+    result := IsAlpha(c) or
+              ((c >= '0') and (c <= '9'));
+  end;
+
+begin
+  result := false;
+  slash := PosExChar('/', aId);
+  // MANDATORY prefix: without the slash there is no prefix at all
+  if (slash < 2) or
+     (slash = length(aId)) then
+    exit;
+  // prefix: one or more dot-separated labels, each <alpha> [<alnum|->…] <alnum>
+  labelStart := 1;
+  for i := 1 to slash do
+    if (i = slash) or
+       (aId[i] = '.') then
+    begin
+      if i = labelStart then
+        exit; // empty label ('a..b/x' or a leading dot)
+      if not IsAlpha(aId[labelStart]) then
+        exit; // "Labels MUST start with a letter"
+      if not IsAlnum(aId[i - 1]) then
+        exit; // "…and end with a letter or digit"
+      labelStart := i + 1;
+    end
+    else if not (IsAlnum(aId[i]) or
+                 (aId[i] = '-')) then
+      exit;
+  // name: begins and ends alphanumeric, '-' '_' '.' allowed in between
+  if not IsAlnum(aId[slash + 1]) or
+     not IsAlnum(aId[length(aId)]) then
+    exit;
+  for i := slash + 2 to length(aId) - 1 do
+    if not (IsAlnum(aId[i]) or
+            (aId[i] = '-') or
+            (aId[i] = '_') or
+            (aId[i] = '.')) then
+      exit;
+  result := true;
+end;
+
+function McpProgressNotification(const aProgressToken: variant;
+  aProgress, aTotal: double; const aMessage: RawUtf8): RawUtf8;
+var
+  params: TDocVariantData;
+begin
+  params.InitObject([
+    MCP_META_PROGRESS_TOKEN, aProgressToken,
+    'progress', aProgress], JSON_FAST);
+  // total and message are optional: sending `total: -1` would claim an end
+  // point that does not exist, and `message: ''` adds a field with no content
+  if aTotal >= 0 then
+    params.AddValue('total', aTotal);
+  if aMessage <> '' then
+    params.AddValue('message', RawUtf8ToVariant(aMessage));
+  result := ToUtf8(_ObjFast([
+    'jsonrpc', '2.0',
+    'method', 'notifications/progress',
+    'params', variant(params)]));
+end;
+
+function McpCheckSchema(const aSchema: variant; aMaxDepth, aMaxNodes: integer;
+  out aReason: RawUtf8): boolean;
+var
+  nodes: integer;
+  failed: RawUtf8;
+
+  // a $ref is local when it stays inside this document: '#', '#/$defs/x' or a
+  // relative JSON pointer. Anything with a scheme ('http://…', 'file://…') or a
+  // leading '//' is an external lookup the consumer must refuse anyway.
+  function IsLocalRef(const aRef: RawUtf8): boolean;
+  var
+    i: PtrInt;
+  begin
+    result := false;
+    if aRef = '' then
+      exit;
+    if aRef[1] = '#' then
+      exit(true);
+    if (length(aRef) >= 2) and
+       (aRef[1] = '/') and
+       (aRef[2] = '/') then
+      exit; // protocol-relative: still the network
+    // a scheme is <alpha> *( alpha / digit / '+' / '-' / '.' ) ':'
+    for i := 1 to length(aRef) do
+      if aRef[i] = ':' then
+        exit // has a scheme -> not local
+      else if not (aRef[i] in ['A'..'Z', 'a'..'z', '0'..'9', '+', '-', '.']) then
+        break;
+    result := true; // a plain relative pointer, resolved inside the document
+  end;
+
+  procedure Walk(aNode: PDocVariantData; aDepth: integer);
+  var
+    i: PtrInt;
+    ref: RawUtf8;
+  begin
+    if (failed <> '') or
+       (aNode = nil) then
+      exit;
+    inc(nodes);
+    if nodes > aMaxNodes then
+    begin
+      failed := FormatUtf8('schema has more than % subschemas', [aMaxNodes]);
+      exit;
+    end;
+    if aDepth > aMaxDepth then
+    begin
+      failed := FormatUtf8('schema nests deeper than % levels', [aMaxDepth]);
+      exit;
+    end;
+    if aNode^.IsObject and
+       aNode^.GetAsRawUtf8('$ref', ref) and
+       not IsLocalRef(ref) then
+    begin
+      failed := FormatUtf8('$ref "%" points outside the document', [ref]);
+      exit;
+    end;
+    for i := 0 to aNode^.Count - 1 do
+      Walk(_Safe(aNode^.Values[i]), aDepth + 1);
+  end;
+
+begin
+  failed := '';
+  nodes := 0;
+  Walk(_Safe(aSchema), 1);
+  aReason := failed;
+  result := failed = '';
+end;
+
+function McpIsHeaderToken(const aName: RawUtf8): boolean;
+var
+  i: PtrInt;
+begin
+  // RFC 9110 tchar: "!#$%&'*+-.^_`|~" / DIGIT / ALPHA — deliberately spelled out
+  // rather than "no control chars", because a space or a colon would produce a
+  // header line that splits into something else entirely
+  result := false;
+  if aName = '' then
+    exit;
+  for i := 1 to length(aName) do
+    case aName[i] of
+      '0'..'9', 'A'..'Z', 'a'..'z',
+      '!', '#', '$', '%', '&', '''', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+        ; // legal
+    else
+      exit;
+    end;
+  result := true;
+end;
+
+function McpDecodeHeaderValue(const aValue: RawUtf8): RawUtf8;
+begin
+  result := aValue;
+  if (length(aValue) > 11) and
+     (copy(aValue, 1, 9) = '=?base64?') and
+     (copy(aValue, length(aValue) - 1, 2) = '?=') then
+    result := Base64ToBin(copy(aValue, 10, length(aValue) - 11));
+end;
+
+function McpCollectHeaderParams(const aInputSchema: variant): TMcpHeaderParamDynArray;
+var
+  n, found: integer;
+
+  // every x-mcp-header anywhere in the document, reachable or not
+  function CountAnnotations(aNode: PDocVariantData): integer;
+  var
+    i: PtrInt;
+    child: PDocVariantData;
+  begin
+    result := 0;
+    if aNode = nil then
+      exit;
+    for i := 0 to aNode^.Count - 1 do
+    begin
+      if aNode^.IsObject and
+         (aNode^.Names[i] = MCP_SCHEMA_HEADER_ANNOTATION) then
+        inc(result);
+      child := _Safe(aNode^.Values[i]);
+      if child^.Count > 0 then
+        inc(result, CountAnnotations(child));
+    end;
+  end;
+
+  procedure Walk(aSchema: PDocVariantData; const aPath: TRawUtf8DynArray);
+  var
+    props, prop: PDocVariantData;
+    i, k: PtrInt;
+    headerName, propType: RawUtf8;
+    path: TRawUtf8DynArray;
+  begin
+    if (aSchema = nil) or
+       not aSchema^.GetAsDocVariant('properties', props) or
+       not props^.IsObject then
+      exit;
+    for i := 0 to props^.Count - 1 do
+    begin
+      prop := _Safe(props^.Values[i]);
+      if not prop^.IsObject then
+        continue;
+      path := copy(aPath);
+      AddRawUtf8(path, props^.Names[i]);
+      if prop^.GetAsRawUtf8(MCP_SCHEMA_HEADER_ANNOTATION, headerName) then
+      begin
+        if not McpIsHeaderToken(headerName) then
+          raise EMcpException.CreateUtf8(
+            'x-mcp-header "%" on "%" is not a valid HTTP field-name token',
+            [headerName, RawUtf8ArrayToCsv(path, '.')]);
+        // "MUST only be applied to parameters with primitive types (integer,
+        // string, boolean). Parameters with type number are NOT permitted" —
+        // a float has no round-trippable decimal form, so header and body
+        // could not be compared reliably
+        propType := prop^.U['type'];
+        if (propType <> 'string') and
+           (propType <> 'integer') and
+           (propType <> 'boolean') then
+          raise EMcpException.CreateUtf8(
+            'x-mcp-header on "%" needs type string/integer/boolean, not "%"',
+            [RawUtf8ArrayToCsv(path, '.'), propType]);
+        for k := 0 to n - 1 do
+          // case-INSENSITIVE uniqueness: HTTP field names are case-insensitive,
+          // so 'Region' and 'region' would be one and the same header
+          if IdemPropNameU(result[k].Name, headerName) then
+            raise EMcpException.CreateUtf8(
+              'duplicate x-mcp-header "%" in the same inputSchema', [headerName]);
+        SetLength(result, n + 1);
+        result[n].Path := path;
+        result[n].Name := headerName;
+        inc(n);
+      end;
+      // nested objects stay statically reachable as long as every step is a
+      // `properties` key, so recursion follows exactly that one edge
+      Walk(prop, path);
+    end;
+  end;
+
+var
+  schema: PDocVariantData;
+begin
+  result := nil;
+  n := 0;
+  schema := _Safe(aInputSchema);
+  if not schema^.IsObject then
+    exit;
+  Walk(schema, nil);
+  // An annotation that our walk did NOT reach sits under items/oneOf/$ref/…,
+  // where the spec says it makes the tool definition invalid. Silently ignoring
+  // it would ship a tool whose author believes a header is being mirrored.
+  found := CountAnnotations(schema);
+  if found <> n then
+    raise EMcpException.CreateUtf8(
+      'x-mcp-header must be statically reachable through `properties` only: ' +
+      '% of % annotation(s) sit under items/composition/$ref', [found - n, found]);
+end;
+
+function McpMatchUriTemplate(const aTemplate, aUri: RawUtf8;
+  out aVars: variant): boolean;
+var
+  vars: TDocVariantData;
+  t, u, close, litStart, p: PtrInt;
+  name, lit, value: RawUtf8;
+begin
+  result := false;
+  SetVariantNull(aVars);
+  if (aTemplate = '') or
+     (aUri = '') then
+    exit;
+  vars.InitFast(dvObject);
+  t := 1;
+  u := 1;
+  while t <= length(aTemplate) do
+    if aTemplate[t] = '{' then
+    begin
+      close := PosEx('}', aTemplate, t);
+      if close = 0 then
+        exit; // malformed template: an unclosed expression matches nothing
+      name := copy(aTemplate, t + 1, close - t - 1);
+      // reject every RFC 6570 operator/modifier rather than mis-read it
+      if (name = '') or
+         (PosExChar(',', name) > 0) or
+         (PosExChar('*', name) > 0) or
+         (PosExChar(':', name) > 0) or
+         not (name[1] in ['A'..'Z', 'a'..'z', '0'..'9', '_']) then
+        exit;
+      t := close + 1;
+      // the literal run that follows delimits this variable's value
+      litStart := t;
+      while (t <= length(aTemplate)) and
+            (aTemplate[t] <> '{') do
+        inc(t);
+      lit := copy(aTemplate, litStart, t - litStart);
+      if lit = '' then
+      begin
+        // last expression in the template: it takes the rest of the URI
+        value := copy(aUri, u, length(aUri) - u + 1);
+        u := length(aUri) + 1;
+      end
+      else
+      begin
+        p := PosEx(lit, aUri, u);
+        if p = 0 then
+          exit;
+        value := copy(aUri, u, p - u);
+        u := p + length(lit);
+      end;
+      // an empty capture would let 'file:///{path}' answer for 'file:///'
+      if value = '' then
+        exit;
+      vars.AddValue(name, RawUtf8ToVariant(UrlDecode(value)));
+    end
+    else
+    begin
+      // a literal run before the first expression: must match position for position
+      litStart := t;
+      while (t <= length(aTemplate)) and
+            (aTemplate[t] <> '{') do
+        inc(t);
+      lit := copy(aTemplate, litStart, t - litStart);
+      if copy(aUri, u, length(lit)) <> lit then
+        exit;
+      inc(u, length(lit));
+    end;
+  // the URI must be fully consumed: a trailing remainder is a different URI
+  if u <> length(aUri) + 1 then
+    exit;
+  aVars := variant(vars);
+  result := true;
+end;
+
+function McpClientSupportsExtension(const aClientCapabilities: variant;
+  const aId: RawUtf8): boolean;
+var
+  ext: PDocVariantData;
+begin
+  // presence of the key is the declaration; the value is the extension's own
+  // settings object, which only that extension knows how to read
+  result := _Safe(aClientCapabilities)^.GetAsDocVariant('extensions', ext) and
+            ext^.IsObject and
+            (ext^.GetValueIndex(aId) >= 0);
 end;
 
 

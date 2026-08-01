@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**699 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
+**829 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -394,11 +394,63 @@ Neue Tests im passenden Runner ergänzen.
        oben); `-32021` wird vom MRTR-Capability-Gate ausgelöst, die
        `tools/list`-Reihenfolge ist jetzt deterministisch (sortiert — Voraussetzung
        der Pagination, nicht Kosmetik); `resources/templates/list` und
-       `completion/complete` sind ebenfalls gebaut. Offen bleiben `x-mcp-header`,
-       Extensions-Framework, JSON Schema 2020-12 im `inputSchema`, OTel-`_meta`-Keys,
-       Progress-/Logging-Notifications sowie der **Template-Resolver** (`resources/read`
-       löst nur exakt auf — ein expandiertes Template-URI ergibt `-32602`; Begründung
-       und Grenze am Interface `IMcpResourceTemplate` dokumentiert).
+       `completion/complete` sind ebenfalls gebaut. **Seit 2026-08-01 ebenfalls
+       gebaut** (die frühere Restliste): `x-mcp-header`, Extensions-Framework,
+       JSON-Schema-2020-12-Regeln, OTel-`_meta`-Keys, Progress-Notifications und
+       der **Template-Resolver** — Details unten unter „Protokoll-Restlücken".
+       **Logging-Notifications werden bewusst NICHT gebaut**: `notifications/message`
+       ist in 2026-07-28 *deprecated* („New implementations **SHOULD NOT** adopt
+       it"), und [CONCEPT.md §6](CONCEPT.md) hat das mit „Roots / Sampling /
+       Logging (deprecated) — gar nicht erst bauen" bereits entschieden. Die
+       frühere Nennung als offene Lücke war ein Doku-Fehler.
+
+### Protokoll-Restlücken geschlossen (2026-08-01, MCP **829** Assertions grün)
+
+Die nach dem 2026-07-28-Umbau verbliebene Restliste, jede gegen den Spec-Text gebaut:
+
+- **OTel-`_meta`-Keys** — `traceparent`/`tracestate`/`baggage` sind die einzigen
+  reservierten Keys **ohne** Prefix (ausdrückliche Ausnahme der Namensregel) und liegen
+  als `TMcpTraceContext` im `TMcpCallContext`, damit ein Handler sie an nachgelagerte
+  Dienste weiterreicht. **Ein Wert mit Steuerzeichen wird verworfen**, nicht
+  durchgereicht: ein Handler, der ihn in einen ausgehenden Header schreibt, trüge sonst
+  eine CRLF-Injection mit. Ein Nicht-String wird ignoriert statt stringifiziert.
+- **Extensions-Framework** — `TMcpServer.RegisterExtension`, ausgeliefert in
+  `server/discover` unter `capabilities.extensions`; **weggelassen**, wenn nichts
+  registriert ist. `McpIsValidExtensionId` erzwingt den bei Extension-Identifiern
+  **verpflichtenden** Prefix (anders als bei einem gewöhnlichen `_meta`-Key); eine
+  ungültige ID **wirft**, statt still ignoriert zu werden. Gegenrichtung:
+  `McpClientSupportsExtension` liest `_meta.clientCapabilities.extensions` — per
+  Request, denn es gibt keinen Handshake, den man sich merken könnte.
+- **Progress-Notifications** — `progressToken` (string|integer, sonst kein Opt-in) wird
+  gelesen, `TMcpCallContext.Progress` ist **immer** gesetzt, sodass kein Handler eine
+  nil-Prüfung braucht. Die Monotonie-Pflicht („MUST increase") wird **serverseitig
+  erzwungen**: ein wiederholter oder kleinerer Wert wird verworfen statt gesendet.
+  Der Transport reicht eine **lazy** Sink herein, die den SSE-Kopf erst beim ersten
+  Report schreibt — ein Handler, der schweigt, behält damit die volle Statuswahl
+  (das 400 von `-32021`, das 403+`WWW-Authenticate` einer Scope-Ablehnung).
+- **`x-mcp-header`** — Autorenseite `TMcpToolBase<T>.MirrorToHeader`, Prüfseite
+  `McpCollectHeaderParams` + Validierung im Transport gegen den Body (`-32020` + 400).
+  Erzwungen werden alle Constraints der Spec: Token-Syntax (RFC 9110 `1*tchar`), nur
+  `string`/`integer`/`boolean` (**kein `number`**), case-insensitive eindeutig, und
+  **statisch erreichbar** — eine Annotation unter `items`/`oneOf`/`$ref` macht die
+  Tool-Definition ungültig und wird nicht stillschweigend ignoriert. Integer werden
+  **numerisch** verglichen, der `=?base64?…?=`-Sentinel vorher dekodiert.
+- **JSON Schema 2020-12** — `McpCheckSchema`, angewandt **einmal bei `RegisterTool`**
+  statt bei jedem `tools/list`. Es werden **keine Keywords mehr eingeschränkt** (die
+  Revision hat `inputSchema`/`outputSchema` bewusst geöffnet); geprüft wird, was ein
+  *Server* schuldet: kein `$ref` ins Netz (der Konsument dürfte ihn ohnehin nicht
+  auflösen) und Grenzen für Tiefe/Subschema-Zahl (`SchemaMaxDepth` 32,
+  `SchemaMaxNodes` 4096) gegen DoS am Validator der Gegenseite.
+- **Template-Resolver** — neues Add-on `IMcpExpandableResourceTemplate`:
+  `resources/read` fällt vom exakten Registry-Treffer auf Template-Matching zurück.
+  `McpMatchUriTemplate` beherrscht RFC 6570 **Level 1**; Operator-Formen (`{+var}`,
+  `{#var}`, `{var*}`, …) machen ein Template **unmatchbar** statt halb verstanden — ein
+  geratener Operator löste sonst auf die *falsche* Ressource auf. Die letzte Variable
+  ist greedy (sonst könnte `file:///{path}` nie eine echte Datei-URI treffen). Ein
+  Template **ohne** das Add-on bleibt reine Werbung und antwortet weiter `-32602`.
+
+**Nicht gebaut, mit Absicht:** Logging-Notifications (`notifications/message`) — siehe
+den Hinweis oben; deprecated in dieser Revision und in CONCEPT.md §6 abgewählt.
 
 ### Review-Härtung (kritischer Review, behoben — Build + Tests grün)
 

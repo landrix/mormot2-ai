@@ -95,6 +95,7 @@ type
     procedure WrongContentType;
     procedure PostStreamsChunked;
     procedure HeaderValidationFailures;
+    procedure ParamHeadersMustMatchTheBody;
     procedure ProtocolErrorsUseHttpStatus;
     procedure ConcurrentPosts;
     procedure StreamHookIsValidatedAndContained;
@@ -1171,6 +1172,89 @@ begin
     client.Free;
     if transport <> nil then
       transport.Stop;
+    transport.Free;
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpStreamableTransport.ParamHeadersMustMatchTheBody;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  tool: TCalcTool;
+  port, status: integer;
+  client: THttpClientSocket;
+  stdHeaders: RawUtf8;
+
+  // a tools/call for 'calc' with the given arguments and the given extra headers
+  function CallWith(const aArguments, aExtraHeaders: RawUtf8): integer;
+  begin
+    result := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
+      '"arguments":' + aArguments + ',' + MCP_TEST_META + '}}',
+      JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS,
+      'Accept: text/event-stream, application/json'#13#10 +
+      stdHeaders + aExtraHeaders);
+  end;
+
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    tool := TCalcTool.Create('calc', 'Add two numbers');
+    // A is an integer, Name a string — both legal to mirror
+    tool.MirrorToHeader('A', 'A-Value');
+    tool.MirrorToHeader('Name', 'Who');
+    server.RegisterTool(tool);
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    stdHeaders := 'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/call'#13#10 + 'Mcp-Name: calc'#13#10;
+
+    // matching headers pass straight through
+    status := CallWith('{"A":42,"B":1,"Name":"bob"}',
+      'Mcp-Param-A-Value: 42'#13#10 + 'Mcp-Param-Who: bob'#13#10);
+    CheckEqual(status, HTTP_SUCCESS, 'matching Mcp-Param headers are accepted');
+
+    // a mirrored argument WITHOUT its header: a conforming client always sends
+    // it, and letting it through would leave the header unchecked
+    status := CallWith('{"A":42,"B":1,"Name":"bob"}',
+      'Mcp-Param-Who: bob'#13#10);
+    CheckEqual(status, HTTP_BADREQUEST, 'a missing Mcp-Param header -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // header and body disagree — the split source of truth the rule prevents
+    status := CallWith('{"A":42,"B":1,"Name":"bob"}',
+      'Mcp-Param-A-Value: 7'#13#10 + 'Mcp-Param-Who: bob'#13#10);
+    CheckEqual(status, HTTP_BADREQUEST, 'a disagreeing Mcp-Param header -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // a header for an argument that is not there at all
+    status := CallWith('{"A":42,"B":1}',
+      'Mcp-Param-A-Value: 42'#13#10 + 'Mcp-Param-Who: ghost'#13#10);
+    CheckEqual(status, HTTP_BADREQUEST, 'a header without its argument -> 400');
+    CheckErrorCode(client.Content, MCP_ERROR_HEADER_MISMATCH);
+
+    // an absent argument with no header is fine: nothing to disagree about
+    status := CallWith('{"A":42,"B":1}', 'Mcp-Param-A-Value: 42'#13#10);
+    CheckEqual(status, HTTP_SUCCESS, 'an absent argument needs no header');
+
+    // "servers SHOULD compare integer values NUMERICALLY": +42 is 42
+    status := CallWith('{"A":42,"B":1}', 'Mcp-Param-A-Value: +42'#13#10);
+    CheckEqual(status, HTTP_SUCCESS, 'integers compare numerically, not as text');
+
+    // a value that is not header-safe travels base64-encoded and MUST be
+    // decoded before the comparison, or every non-ASCII value would mismatch
+    status := CallWith('{"A":1,"B":1,"Name":"M' + #$C3#$BC + 'ller"}',
+      'Mcp-Param-A-Value: 1'#13#10 +
+      'Mcp-Param-Who: =?base64?' + BinToBase64('M' + #$C3#$BC + 'ller') +
+      '?='#13#10);
+    CheckEqual(status, HTTP_SUCCESS, 'a base64 sentinel value is decoded first');
+  finally
+    client.Free;
     transport.Free;
     server.Free;
   end;

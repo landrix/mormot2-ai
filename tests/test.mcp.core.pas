@@ -65,6 +65,20 @@ type
       const Context: variant; const AuthCtx: TMcpAuthContext): TRawUtf8DynArray;
   end;
 
+  /// a template that SERVES its concrete URIs — the add-on that turns a mere
+  /// advertisement into something resources/read can resolve
+  TDbTemplate = class(TInterfacedObject, IMcpResourceTemplate,
+    IMcpExpandableResourceTemplate)
+  public
+    function GetUriTemplate: RawUtf8;
+    function GetName: RawUtf8;
+    function GetTitle: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetMimeType: RawUtf8;
+    function ReadExpanded(const aUri: RawUtf8; const aVars: variant;
+      const aContext: TMcpCallContext): RawUtf8;
+  end;
+
   /// a prompt whose completion returns MORE than the 100 the spec allows, to
   /// prove the server truncates instead of trusting the implementation
   TFloodPrompt = class(TInterfacedObject, IMcpPrompt, IMcpCompletable)
@@ -120,6 +134,44 @@ type
   protected
     function ExecuteTyped(const aParams: TCalcParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
+  end;
+
+  /// collects what a handler pushed onto its response stream
+  TRecordingSink = class(TInterfacedObject, IMcpNotificationSink)
+  public
+    /// every JSON-RPC message the handler sent, in order
+    Sent: TRawUtf8DynArray;
+    procedure Send(const aJsonMessage: RawUtf8);
+  end;
+
+  /// a tool that reports progress, driven by what the test wants to prove
+  TProgressTool = class(TMcpToolBase<TCalcParams>, IMcpInteractiveTool)
+  protected
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  public
+    /// the progress values the tool will try to report, in order
+    Steps: TDoubleDynArray;
+    /// what Report() answered for each attempt
+    Accepted: array of boolean;
+    /// what Wanted() said on entry
+    SawWanted: boolean;
+    function ExecuteInteractive(const Args: variant;
+      const Context: TMcpCallContext): variant;
+  end;
+
+  /// a tool that records the W3C trace context it was handed
+  // - the only way to observe TMcpCallContext.Trace from a test: the trace
+  //   fields never appear in a result, they exist so a handler can forward them
+  TTraceRecordingTool = class(TMcpToolBase<TCalcParams>, IMcpInteractiveTool)
+  protected
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  public
+    /// what the last call saw in _meta.traceparent/tracestate/baggage
+    SawTrace: TMcpTraceContext;
+    function ExecuteInteractive(const Args: variant;
+      const Context: TMcpCallContext): variant;
   end;
 
   /// a tool doing a Multi Round-Trip Request: it asks for a name on the first
@@ -213,6 +265,12 @@ type
     procedure ListsAreSortedAndPaginated;
     procedure PromptsListAndGet;
     procedure TemplatesAndCompletion;
+    procedure TraceContextReachesTheHandler;
+    procedure ExtensionsAreAdvertisedAndNegotiated;
+    procedure ProgressIsOptInAndMonotonic;
+    procedure UriTemplatesResolveOnRead;
+    procedure HeaderMirroringIsConstrained;
+    procedure PublishedSchemasAreBounded;
   end;
 
 implementation
@@ -289,6 +347,44 @@ begin
 end;
 
 { TFilesTemplate }
+
+function TDbTemplate.GetUriTemplate: RawUtf8;
+begin
+  result := 'db://{table}/rows/{id}';
+end;
+
+function TDbTemplate.GetName: RawUtf8;
+begin
+  result := 'db-row';
+end;
+
+function TDbTemplate.GetTitle: RawUtf8;
+begin
+  result := 'Database row';
+end;
+
+function TDbTemplate.GetDescription: RawUtf8;
+begin
+  result := 'One row of a table';
+end;
+
+function TDbTemplate.GetMimeType: RawUtf8;
+begin
+  result := 'application/json';
+end;
+
+function TDbTemplate.ReadExpanded(const aUri: RawUtf8; const aVars: variant;
+  const aContext: TMcpCallContext): RawUtf8;
+var
+  vars: PDocVariantData;
+begin
+  vars := _Safe(aVars);
+  // matching the shape is not proof that the thing exists
+  if vars^.U['table'] = 'missing' then
+    raise EMcpInvalidParams.CreateUtf8('No such table: %', [vars^.U['table']]);
+  result := FormatUtf8('{"table":"%","id":"%"}',
+    [vars^.U['table'], vars^.U['id']]);
+end;
 
 function TFilesTemplate.GetUriTemplate: RawUtf8;
 begin
@@ -469,6 +565,58 @@ begin
 end;
 
 { TElicitingTool }
+
+procedure TRecordingSink.Send(const aJsonMessage: RawUtf8);
+begin
+  AddRawUtf8(Sent, aJsonMessage);
+end;
+
+function TProgressTool.ExecuteTyped(const aParams: TCalcParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  raise Exception.Create('ExecuteTyped must not be called on an interactive tool');
+end;
+
+function TProgressTool.ExecuteInteractive(const Args: variant;
+  const Context: TMcpCallContext): variant;
+var
+  builder: TMcpResponseBuilder;
+  i: PtrInt;
+begin
+  SawWanted := Context.Progress.Wanted;
+  SetLength(Accepted, length(Steps));
+  for i := 0 to high(Steps) do
+    Accepted[i] := Context.Progress.Report(Steps[i], 100, 'step');
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText('done');
+    result := builder.Build;
+  finally
+    builder.Free;
+  end;
+end;
+
+function TTraceRecordingTool.ExecuteTyped(const aParams: TCalcParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  // never reached: the server prefers ExecuteInteractive on this tool
+  raise Exception.Create('ExecuteTyped must not be called on an interactive tool');
+end;
+
+function TTraceRecordingTool.ExecuteInteractive(const Args: variant;
+  const Context: TMcpCallContext): variant;
+var
+  builder: TMcpResponseBuilder;
+begin
+  SawTrace := Context.Trace;
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText('ok');
+    result := builder.Build;
+  finally
+    builder.Free;
+  end;
+end;
 
 function TElicitingTool.ExecuteTyped(const aParams: TCalcParams;
   const aAuthCtx: TMcpAuthContext): variant;
@@ -2503,6 +2651,462 @@ begin
   finally
     server.Free;
   end;
+end;
+
+procedure TTestMcpCore.TraceContextReachesTheHandler;
+var
+  server: TMcpServer;
+  tool: TTraceRecordingTool;
+  id: integer;
+
+  // a tools/call carrying the given extra _meta entries verbatim
+  // - ExecCaps() cannot serve here: it drops the caller's _meta and rebuilds
+  //   it, which is exactly the field under test
+  procedure CallWith(const aExtraMeta: RawUtf8);
+  begin
+    inc(id);
+    tool.SawTrace := Default(TMcpTraceContext);
+    server.ExecuteRequest(FormatUtf8(
+      '{"jsonrpc":"2.0","id":%,"method":"tools/call","params":{' +
+      '"name":"trace","arguments":{"a":1,"b":2},"_meta":{' +
+      '"%":"%","%":{}%}}}',
+      [id, MCP_META_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION,
+       MCP_META_CLIENT_CAPABILITIES, aExtraMeta]));
+  end;
+
+const
+  PARENT = '00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01';
+begin
+  id := 0;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    tool := TTraceRecordingTool.Create('trace', 'Records its trace context');
+    server.RegisterTool(tool);
+    server.Start;
+
+    // the whole trio arrives verbatim — a server that "normalises" a
+    // traceparent breaks the very correlation it is meant to preserve
+    CallWith(',"' + MCP_META_TRACEPARENT + '":"' + PARENT + '"' +
+             ',"' + MCP_META_TRACESTATE + '":"vendor=abc"' +
+             ',"' + MCP_META_BAGGAGE + '":"tenant=acme"');
+    CheckEqual(tool.SawTrace.TraceParent, PARENT, 'traceparent is passed through');
+    CheckEqual(tool.SawTrace.TraceState, 'vendor=abc', 'tracestate too');
+    CheckEqual(tool.SawTrace.Baggage, 'tenant=acme', 'and baggage');
+
+    // absent stays absent: no invented trace id
+    CallWith('');
+    CheckEqual(tool.SawTrace.TraceParent, '', 'no traceparent, no value');
+
+    // A CRLF-bearing value is DROPPED, not forwarded. A handler propagating it
+    // into an outgoing header would otherwise splice in headers of the
+    // caller's choosing — the value is worthless anyway, since it cannot be a
+    // valid W3C traceparent.
+    CallWith(',"' + MCP_META_TRACEPARENT + '":"00-abc\r\nX-Injected: 1"');
+    CheckEqual(tool.SawTrace.TraceParent, '',
+      'a traceparent carrying CRLF is dropped, not forwarded');
+
+    // a non-string is not a trace context: stringifying 42 would hand the
+    // handler a traceparent the client never sent
+    CallWith(',"' + MCP_META_TRACEPARENT + '":42');
+    CheckEqual(tool.SawTrace.TraceParent, '', 'a non-string traceparent is ignored');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.ExtensionsAreAdvertisedAndNegotiated;
+var
+  server: TMcpServer;
+  rv: variant;
+  caps, ext, settings: PDocVariantData;
+  raised: boolean;
+begin
+  // --- identifier rules: the prefix is MANDATORY for an extension id ---
+  Check(McpIsValidExtensionId('io.modelcontextprotocol/tasks'), 'official id');
+  Check(McpIsValidExtensionId('com.example/my-ext_v2.1'), 'vendor id');
+  Check(not McpIsValidExtensionId('tasks'),
+    'a bare name is a valid _meta key but NOT a valid extension id');
+  Check(not McpIsValidExtensionId('/tasks'), 'empty prefix');
+  Check(not McpIsValidExtensionId('com.example/'), 'empty name');
+  Check(not McpIsValidExtensionId('com..example/x'), 'empty label');
+  Check(not McpIsValidExtensionId('1com.example/x'), 'label starts with a digit');
+  Check(not McpIsValidExtensionId('com.example-/x'), 'label ends with a hyphen');
+  Check(not McpIsValidExtensionId('com.example/-x'), 'name starts with a hyphen');
+  Check(not McpIsValidExtensionId('com.example/x/y'), 'slash inside the name');
+
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    // discover without extensions omits the field entirely
+    rv := _JsonFast(Exec(server,
+      '{"jsonrpc":"2.0","id":1,"method":"server/discover"}'));
+    Check(_Safe(_Safe(rv)^.GetValueOrNull('result'))^.GetAsDocVariant(
+      'capabilities', caps), 'discover reports capabilities');
+    Check(caps^.GetValueIndex('extensions') < 0,
+      'no extensions registered, no extensions field');
+
+    // an invalid id must RAISE, not be dropped: a silently ignored registration
+    // leaves handlers assuming an extension the server never advertised
+    raised := false;
+    try
+      server.RegisterExtension('tasks');
+    except
+      on EMcpException do
+        raised := true;
+    end;
+    Check(raised, 'an unprefixed extension id is refused');
+
+    server.RegisterExtension('io.modelcontextprotocol/tasks');
+    server.RegisterExtension('com.example/ui',
+      _ObjFast(['mimeTypes', _ArrFast(['text/html'])]));
+
+    rv := _JsonFast(Exec(server,
+      '{"jsonrpc":"2.0","id":2,"method":"server/discover"}'));
+    Check(_Safe(_Safe(rv)^.GetValueOrNull('result'))^.GetAsDocVariant(
+      'capabilities', caps), 'capabilities again');
+    Check(caps^.GetAsDocVariant('extensions', ext), 'extensions are advertised');
+    CheckEqual(ext^.Count, 2, 'both extensions listed');
+    Check(ext^.GetAsDocVariant('io.modelcontextprotocol/tasks', settings),
+      'settings-free extension present');
+    CheckEqual(settings^.Count, 0,
+      'support without settings is spelled as an empty object, not null');
+    Check(ext^.GetAsDocVariant('com.example/ui', settings), 'ui extension');
+    Check(settings^.GetValueIndex('mimeTypes') >= 0, 'its settings survive');
+
+    // --- the client side is per-request, since there is no handshake ---
+    Check(McpClientSupportsExtension(
+      _JsonFast('{"extensions":{"com.example/ui":{}}}'), 'com.example/ui'),
+      'a declared extension is detected');
+    Check(not McpClientSupportsExtension(
+      _JsonFast('{"extensions":{"com.example/ui":{}}}'), 'com.example/other'),
+      'an undeclared one is not');
+    Check(not McpClientSupportsExtension(_JsonFast('{}'), 'com.example/ui'),
+      'no extensions map at all means no support');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.ProgressIsOptInAndMonotonic;
+var
+  server: TMcpServer;
+  tool: TProgressTool;
+  sink: TRecordingSink;
+  sinkRef: IMcpNotificationSink;
+  auth: TMcpAuthContext;
+  challenge: RawUtf8;
+  note: PDocVariantData;
+  params: PDocVariantData;
+  id: integer;
+
+  // one tools/call with the given extra _meta, served with (or without) a sink
+  procedure CallWith(const aExtraMeta: RawUtf8; aWithSink: boolean);
+  begin
+    inc(id);
+    sink := TRecordingSink.Create;
+    sinkRef := sink; // refcount: keep it alive while the assertions read Sent
+    if not aWithSink then
+      sinkRef := nil;
+    server.ExecuteRequest(FormatUtf8(
+      '{"jsonrpc":"2.0","id":%,"method":"tools/call","params":{' +
+      '"name":"work","arguments":{"a":1,"b":2},"_meta":{' +
+      '"%":"%","%":{}%}}}',
+      [id, MCP_META_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION,
+       MCP_META_CLIENT_CAPABILITIES, aExtraMeta]), auth, challenge, sinkRef);
+  end;
+
+begin
+  id := 0;
+  FillCharFast(auth, SizeOf(auth), 0);
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    tool := TProgressTool.Create('work', 'Reports progress');
+    server.RegisterTool(tool);
+    server.Start;
+
+    // --- opted in, values increasing: everything goes out ---
+    tool.Steps := TDoubleDynArray.Create(10, 50, 100);
+    CallWith(',"' + MCP_META_PROGRESS_TOKEN + '":"abc123"', true);
+    Check(tool.SawWanted, 'a progressToken plus a stream means progress is wanted');
+    CheckEqual(length(sink.Sent), 3, 'all three reports went out');
+    note := _Safe(_JsonFast(sink.Sent[0]));
+    CheckEqual(note^.U['method'], 'notifications/progress', 'method name');
+    Check(note^.GetAsDocVariant('params', params), 'params');
+    CheckEqual(params^.U[MCP_META_PROGRESS_TOKEN], 'abc123',
+      'the token is echoed so the client can correlate');
+    CheckSame(params^.D['progress'], 10, 1E-9, 'progress value');
+    CheckSame(params^.D['total'], 100, 1E-9, 'total is carried when known');
+    CheckEqual(params^.U['message'], 'step', 'message is carried');
+
+    // --- "The progress value MUST increase with each notification" ---
+    // A repeat and a step backwards are DROPPED rather than put on the wire:
+    // a client is entitled to rely on the increase.
+    tool.Steps := TDoubleDynArray.Create(10, 10, 5, 20);
+    CallWith(',"' + MCP_META_PROGRESS_TOKEN + '":7', true);
+    CheckEqual(length(sink.Sent), 2, 'only the two increasing values are sent');
+    Check(tool.Accepted[0], 'first value accepted');
+    Check(not tool.Accepted[1], 'a repeated value is refused');
+    Check(not tool.Accepted[2], 'a decreasing value is refused');
+    Check(tool.Accepted[3], 'an increase after a refusal is accepted again');
+    note := _Safe(_JsonFast(sink.Sent[1]));
+    Check(note^.GetAsDocVariant('params', params), 'params of the second');
+    CheckSame(params^.D['progress'], 20, 1E-9, 'the second sent value is 20, not 5');
+
+    // --- no token: the client did not opt in, so nothing may be emitted ---
+    tool.Steps := TDoubleDynArray.Create(1, 2);
+    CallWith('', true);
+    Check(not tool.SawWanted, 'without a token progress is not wanted');
+    CheckEqual(length(sink.Sent), 0, 'and nothing is sent');
+
+    // --- token but nowhere to send: a no-op, never an error ---
+    tool.Steps := TDoubleDynArray.Create(1, 2);
+    CallWith(',"' + MCP_META_PROGRESS_TOKEN + '":"abc"', false);
+    Check(not tool.SawWanted, 'no stream means progress cannot be wanted');
+    Check(not tool.Accepted[0], 'Report says so instead of failing');
+
+    // --- a token that is neither string nor integer is not an opt-in ---
+    tool.Steps := TDoubleDynArray.Create(1);
+    CallWith(',"' + MCP_META_PROGRESS_TOKEN + '":{"nope":1}', true);
+    Check(not tool.SawWanted,
+      'an object token cannot be correlated, so it is no opt-in');
+    CheckEqual(length(sink.Sent), 0, 'nothing sent for a malformed token');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.UriTemplatesResolveOnRead;
+var
+  server: TMcpServer;
+  vars: variant;
+  rv: variant;
+  rd, contents, item: PDocVariantData;
+  caps: variant;
+begin
+  // --- the matcher itself ---
+  Check(McpMatchUriTemplate('file:///{path}', 'file:///src/main.pas', vars),
+    'a level-1 template matches');
+  CheckEqual(_Safe(vars)^.U['path'], 'src/main.pas', 'and captures the value');
+  Check(McpMatchUriTemplate('db://{table}/rows/{id}', 'db://users/rows/42', vars),
+    'two variables with a literal in between');
+  CheckEqual(_Safe(vars)^.U['table'], 'users', 'first variable');
+  CheckEqual(_Safe(vars)^.U['id'], '42', 'second variable');
+  Check(McpMatchUriTemplate('file:///{path}', 'file:///a%20b.txt', vars),
+    'a percent-encoded value matches');
+  CheckEqual(_Safe(vars)^.U['path'], 'a b.txt', 'and arrives decoded');
+
+  // an empty capture would make the bare prefix answer for the whole family
+  Check(not McpMatchUriTemplate('file:///{path}', 'file:///', vars),
+    'a variable must capture something');
+  Check(not McpMatchUriTemplate('file:///{path}', 'other:///x', vars),
+    'the literal prefix must match');
+  // the LAST variable takes the rest, reserved characters included — otherwise
+  // 'file:///{path}' could never match a real file URI (see the function's own
+  // comment for why strict RFC 6570 encoding is not enforced here)
+  Check(McpMatchUriTemplate('db://{table}/rows/{id}', 'db://users/rows/42/x',
+    vars), 'the trailing variable is greedy');
+  CheckEqual(_Safe(vars)^.U['id'], '42/x', 'and takes the slash with it');
+  // a template ending in a LITERAL still has to consume the whole URI
+  Check(not McpMatchUriTemplate('db://{table}/rows', 'db://users/rows/extra',
+    vars), 'a trailing remainder after the last literal is not a match');
+  // operator forms are refused rather than half-understood: guessing would
+  // resolve a URI to the WRONG resource
+  Check(not McpMatchUriTemplate('file:///{+path}', 'file:///a/b', vars),
+    'the reserved-expansion operator is not supported');
+  Check(not McpMatchUriTemplate('file:///{path*}', 'file:///a/b', vars),
+    'the explode modifier is not supported');
+  Check(not McpMatchUriTemplate('file:///{path', 'file:///a', vars),
+    'an unclosed expression matches nothing');
+
+  // --- end to end through resources/read ---
+  caps := _ObjFast([]);
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterResourceTemplate(TDbTemplate.Create);
+    // a template WITHOUT the add-on: still a pure advertisement
+    server.RegisterResourceTemplate(TFilesTemplate.Create);
+    server.Start;
+
+    rv := _JsonFast(ExecCaps(server, '{"jsonrpc":"2.0","id":1,' +
+      '"method":"resources/read","params":{"uri":"db://users/rows/42"}}', caps));
+    rd := _Safe(_Safe(rv)^.GetValueOrNull('result'));
+    Check(rd^.GetAsDocVariant('contents', contents) and (contents^.Count = 1),
+      'a URI built from an expandable template resolves');
+    item := _Safe(contents^.Values[0]);
+    CheckEqual(item^.U['uri'], 'db://users/rows/42', 'the concrete URI is echoed');
+    CheckEqual(item^.U['mimeType'], 'application/json',
+      'the mime type comes from the template');
+    CheckEqual(item^.U['text'], '{"table":"users","id":"42"}',
+      'the template produced the content');
+
+    // shape matched, thing does not exist -> the handler's own -32602 stands
+    CheckErrorResponse(ExecCaps(server, '{"jsonrpc":"2.0","id":2,' +
+      '"method":"resources/read","params":{"uri":"db://missing/rows/1"}}', caps),
+      JSONRPC_INVALID_PARAMS, 'No such table');
+
+    // a template that cannot serve its URIs must NOT swallow the read
+    CheckErrorResponse(ExecCaps(server, '{"jsonrpc":"2.0","id":3,' +
+      '"method":"resources/read","params":{"uri":"file:///src/main.pas"}}', caps),
+      JSONRPC_INVALID_PARAMS, 'Resource not found');
+
+    // and a URI matching nothing at all is unchanged: -32602
+    CheckErrorResponse(ExecCaps(server, '{"jsonrpc":"2.0","id":4,' +
+      '"method":"resources/read","params":{"uri":"nope://x"}}', caps),
+      JSONRPC_INVALID_PARAMS, 'Resource not found');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.HeaderMirroringIsConstrained;
+var
+  tool: TCalcTool;
+  mirrored: TMcpHeaderParamDynArray;
+
+  // does collecting the annotations of this schema raise?
+  function Rejects(const aSchemaJson: RawUtf8): boolean;
+  begin
+    result := false;
+    try
+      McpCollectHeaderParams(_JsonFast(aSchemaJson));
+    except
+      on EMcpException do
+        result := true;
+    end;
+  end;
+
+begin
+  EnsureCalcParamsRtti;
+
+  // --- the header token rules (RFC 9110 1*tchar) ---
+  Check(McpIsHeaderToken('Region'), 'a plain token');
+  Check(McpIsHeaderToken('X-Tenant_Id.2'), 'tchar punctuation is allowed');
+  Check(not McpIsHeaderToken(''), 'empty is not a token');
+  Check(not McpIsHeaderToken('Re gion'), 'a space would split the header line');
+  Check(not McpIsHeaderToken('Region:'), 'a colon would split the header line');
+  Check(not McpIsHeaderToken('Reg'#13#10'ion'), 'CRLF would inject a header');
+
+  // --- the base64 sentinel ---
+  CheckEqual(McpDecodeHeaderValue('us-west1'), 'us-west1', 'plain value untouched');
+  CheckEqual(McpDecodeHeaderValue('=?base64?SGVsbG8=?='), 'Hello', 'sentinel decoded');
+  CheckEqual(McpDecodeHeaderValue('=?BASE64?SGVsbG8=?='), '=?BASE64?SGVsbG8=?=',
+    'the markers are case-sensitive: an uppercase one is a literal value');
+
+  // --- collecting from a schema ---
+  mirrored := McpCollectHeaderParams(_JsonFast(
+    '{"type":"object","properties":{' +
+    '"region":{"type":"string","x-mcp-header":"Region"},' +
+    '"query":{"type":"string"}}}'));
+  CheckEqual(length(mirrored), 1, 'one annotated property');
+  CheckEqual(mirrored[0].Name, 'Region', 'the header name');
+  CheckEqual(RawUtf8ArrayToCsv(mirrored[0].Path, '.'), 'region', 'the path');
+
+  // nested objects stay reachable as long as every step is a `properties` key
+  mirrored := McpCollectHeaderParams(_JsonFast(
+    '{"type":"object","properties":{"target":{"type":"object","properties":{' +
+    '"region":{"type":"string","x-mcp-header":"Region"}}}}}'));
+  CheckEqual(length(mirrored), 1, 'a nested annotation is reachable');
+  CheckEqual(RawUtf8ArrayToCsv(mirrored[0].Path, '.'), 'target.region',
+    'and carries its full path');
+
+  Check(Rejects('{"type":"object","properties":{' +
+    '"r":{"type":"string","x-mcp-header":"Bad Name"}}}'),
+    'an invalid field-name token is refused');
+  // a float has no single decimal form, so header and body could not be
+  // compared reliably — the spec excludes `number` for exactly that reason
+  Check(Rejects('{"type":"object","properties":{' +
+    '"r":{"type":"number","x-mcp-header":"R"}}}'),
+    'type number may not be mirrored');
+  Check(Rejects('{"type":"object","properties":{' +
+    '"a":{"type":"string","x-mcp-header":"R"},' +
+    '"b":{"type":"string","x-mcp-header":"r"}}}'),
+    'header names collide case-insensitively');
+  // an annotation the client cannot statically reach makes the WHOLE tool
+  // definition invalid — ignoring it would ship a tool whose author believes
+  // a header is being mirrored
+  Check(Rejects('{"type":"object","properties":{"list":{"type":"array",' +
+    '"items":{"type":"object","properties":{' +
+    '"r":{"type":"string","x-mcp-header":"R"}}}}}}'),
+    'an annotation under `items` is not statically reachable');
+  Check(Rejects('{"type":"object","properties":{"x":{"oneOf":[' +
+    '{"type":"object","properties":{' +
+    '"r":{"type":"string","x-mcp-header":"R"}}}]}}}'),
+    'an annotation under a composition keyword is not reachable either');
+
+  // --- the authoring API puts the annotation into the generated schema ---
+  tool := TCalcTool.Create('calc', 'Add two numbers');
+  try
+    tool.MirrorToHeader('A', 'A-Value');
+    mirrored := McpCollectHeaderParams(tool.GetInputSchema);
+    CheckEqual(length(mirrored), 1, 'the generated schema carries it');
+    CheckEqual(mirrored[0].Name, 'A-Value', 'with the given header name');
+
+    // a path that is not a property of the record must fail at wiring time,
+    // not silently annotate nothing
+    try
+      tool.MirrorToHeader('nosuchfield', 'X');
+      Check(false, 'an unknown property path must raise');
+    except
+      on EMcpException do
+        Check(true, 'an unknown property path is refused');
+    end;
+  finally
+    tool.Free;
+  end;
+end;
+
+procedure TTestMcpCore.PublishedSchemasAreBounded;
+var
+  reason: RawUtf8;
+  deep: RawUtf8;
+  i: PtrInt;
+begin
+  // an ordinary schema passes untouched
+  Check(McpCheckSchema(_JsonFast('{"type":"object","properties":{' +
+    '"a":{"type":"string"}}}'), 32, 4096, reason), 'a plain schema is fine');
+  CheckEqual(reason, '', 'and reports no reason');
+
+  // 2026-07-28 LOOSENED inputSchema to any 2020-12 keyword, so an unfamiliar
+  // one must NOT be rejected — that is the opposite of the old behaviour
+  Check(McpCheckSchema(_JsonFast('{"type":"object","unevaluatedProperties":false,' +
+    '"dependentSchemas":{"a":{"required":["b"]}},' +
+    '"patternProperties":{"^x-":{"type":"string"}}}'), 32, 4096, reason),
+    'any 2020-12 keyword is allowed');
+
+  // local $refs are fine: they resolve inside the document
+  Check(McpCheckSchema(_JsonFast('{"$defs":{"x":{"type":"string"}},' +
+    '"properties":{"a":{"$ref":"#/$defs/x"}}}'), 32, 4096, reason),
+    'a local $ref stays inside the document');
+  Check(McpCheckSchema(_JsonFast('{"properties":{"a":{"$ref":"defs.json"}}}'),
+    32, 4096, reason), 'a relative pointer is resolved locally too');
+
+  // a network $ref must never be published: the consumer MUST NOT dereference
+  // it, and a schema it cannot resolve should be rejected rather than treated
+  // as permissive — so we do not hand it out in the first place
+  Check(not McpCheckSchema(_JsonFast(
+    '{"properties":{"a":{"$ref":"https://evil.example/s.json"}}}'),
+    32, 4096, reason), 'an https $ref is refused');
+  Check(PosEx('outside the document', reason) > 0, 'and says why: ' + reason);
+  Check(not McpCheckSchema(_JsonFast(
+    '{"properties":{"a":{"$ref":"//evil.example/s.json"}}}'),
+    32, 4096, reason), 'a protocol-relative $ref is the network as well');
+  Check(not McpCheckSchema(_JsonFast(
+    '{"properties":{"a":{"$ref":"file:///etc/passwd"}}}'),
+    32, 4096, reason), 'a file:// $ref is refused too');
+
+  // depth and node bounds: a schema is a DoS vector against every client that
+  // validates against it
+  deep := '{"type":"string"}';
+  for i := 1 to 40 do
+    deep := '{"properties":{"a":' + deep + '}}';
+  Check(not McpCheckSchema(_JsonFast(deep), 32, 4096, reason),
+    'a schema nested past the depth limit is refused');
+  Check(PosEx('deeper', reason) > 0, 'and says why: ' + reason);
+  Check(McpCheckSchema(_JsonFast(deep), 200, 4096, reason),
+    'the same schema passes when the limit allows it');
+  Check(not McpCheckSchema(_JsonFast(deep), 200, 5, reason),
+    'the node cap bites independently of depth');
+  Check(PosEx('subschemas', reason) > 0, 'and says why: ' + reason);
 end;
 
 end.
