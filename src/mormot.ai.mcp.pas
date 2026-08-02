@@ -1603,7 +1603,17 @@ begin
     exit;
   slash := PosEx('://', aResource);
   if slash = 0 then
-    exit(aResource + MCP_WELL_KNOWN_RESOURCE);
+    // Not an absolute URI — which the spec calls invalid ("mcp.example.com
+    // (missing scheme)"). A well-known URL is an ORIGIN plus a path, and there
+    // is no origin to be had here, so the honest answer is none at all.
+    //
+    // The previous behaviour appended the suffix to the bare string, which made
+    // this function disagree with McpResourceMetadataPath: a transport routed
+    // `/.well-known/oauth-protected-resource` while the challenge advertised
+    // `host/api/v1/mcp/.well-known/oauth-protected-resource`. Two functions that
+    // exist to name ONE location must never answer differently — a caller has no
+    // way to tell which of them is lying.
+    exit('');
   slash := PosEx('/', aResource, slash + 3);
   if slash = 0 then
     result := aResource // scheme://host, no path
@@ -3634,6 +3644,8 @@ end;
 
 function TMcpServer.AuthChallenge(aResult: TMcpTokenResult;
   const aScope: RawUtf8): RawUtf8;
+var
+  metadataUrl: RawUtf8;
 begin
   result := 'Bearer';
   // RFC 6750 §3: the `error` parameter belongs in the challenge itself, not only
@@ -3650,10 +3662,13 @@ begin
     result := result + ' error="' + MCP_TOKEN_ERROR[aResult] + '",';
   // resource_metadata points at the document that names the authorization
   // server — without it a client that has never seen this server has no way to
-  // find out where to authenticate, which is the whole point of the challenge
-  if fAuthResource <> '' then
-    result := result + ' resource_metadata="' +
-      McpResourceMetadataUrl(fAuthResource) + '",';
+  // find out where to authenticate, which is the whole point of the challenge.
+  // Advertised only when a URL can actually be built: pointing a client at a
+  // location that does not exist is worse than staying silent, because it
+  // spends a round trip to learn nothing.
+  metadataUrl := McpResourceMetadataUrl(fAuthResource);
+  if metadataUrl <> '' then
+    result := result + ' resource_metadata="' + metadataUrl + '",';
   if aScope <> '' then
     result := result + ' scope="' + aScope + '",'
   else if fScopesSupported <> nil then
