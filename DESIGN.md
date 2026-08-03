@@ -6,7 +6,7 @@ Eine mORMot-native AI-Erweiterung. Erster Use-Case: **landrix als MCP-Server** �
 es stellt Tools/Ressourcen bereit, die ein externer Agent (z. B. Claude Desktop)
 über das Model Context Protocol aufruft. Langfristig Synopse-Contribution.
 
-## Aktueller Stand (Phasen A·C·D abgeschlossen)
+## Aktueller Stand (Phasen A·B·C·D abgeschlossen)
 
 Der MCP-Server ist **adoptiert** (mORMot-lizenziert) statt selbst gebaut — Basis:
 flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
@@ -246,8 +246,18 @@ Neue Tests im passenden Runner ergänzen.
 ## Roadmap
 
 - **Phase A** ✓ — flydev-MCP-Server adoptiert, `mormot.ai.*`, Build/Tests/Demos grün.
-- **Phase B** — landrix-spezifische MCP-Tools über `TMcpServer.RegisterTool`
-  andocken; Auth über die vorhandene mORMot-Auth des Backends.
+- **Phase B** ✓ — die Registry trägt einen echten Konsumenten: landrix dockt seine
+  Tools über `TMcpServer.RegisterTool` an und stellt den Token-Verifier
+  (`IMcpTokenVerifier`) über den `mormot.ai.mcp`-Auth-Context bereit. Die Bindung
+  liegt außerhalb dieses Repos (`backend/src/landrix.server.ai.*`, Doku:
+  [Feature-MCP-Auth.md](../../../docs/Feature-MCP-Auth.md)) — genau die Trennung,
+  die CONCEPT §7 verlangt.
+  **Abweichung vom Plan:** „Auth über die vorhandene mORMot-Auth des Backends" hat
+  nicht getragen. Die Spec verlangt vom MCP-Server einen **OAuth-2.1-Resource-Server**
+  (RFC 9728 Metadata, Audience-Bindung, Validierung vor jeder Verarbeitung) — ein
+  hausgemachtes Bearer-Schema hätte kein Client gefunden. Der Konsument stellt darum
+  einen echten Resource Server, und der Core bleibt fail-closed, wenn kein Verifier
+  gesetzt ist.
 - **Phase C** ✓ — MCP-Spec auf **2026-07-28** (stateless): `initialize`, Sessions,
   Batching, SSE-Resumability und der HTTP+SSE-Transport sind **gelöscht**;
   `server/discover` + per-Request-`_meta` treten an ihre Stelle. Siehe „Protokoll"
@@ -385,9 +395,11 @@ Neue Tests im passenden Runner ergänzen.
        injiziert `additionalProperties:false`) und Anthropic-**Streaming** — beide
        **live** gegen `claude-opus-4-8` verifiziert; `llm-structured`/`llm-chat` jetzt
        provider-agnostisch (`LLM_PROVIDER`).
-    6. **MCP-Transport-Produktionsreife** (kritischer Review, CONCEPT §6): echter
-       Auth-Resolver (Phase B; Core ist jetzt fail-closed) — der einzige verbliebene
-       Punkt. Sessions/Legacy-SSE sind mit 2026-07-28 **gelöscht** (damit entfallen
+    6. **MCP-Transport-Produktionsreife** (kritischer Review, CONCEPT §6): der
+       echte Auth-Resolver war der letzte verbliebene Punkt und ist mit **Phase B**
+       eingelöst — der Konsument setzt einen `IMcpTokenVerifier` (OAuth-2.1-Resource-
+       Server), der Core bleibt ohne ihn fail-closed.
+       Sessions/Legacy-SSE sind mit 2026-07-28 **gelöscht** (damit entfallen
        Session-Ablauf, UAF-Fläche und Härtung des Legacy-Transports); Nebenläufigkeit
        deckt jetzt `ConcurrentPosts` ab (4 parallele Clients + Keep-Alive-Reuse).
        Offen bleiben TVec0Store/lembed-Realtests + RAG-Atomar-Rollback (brauchen die

@@ -159,8 +159,12 @@ Weiter zu beachten:
 
 ## Nächste Schritte
 
-1. landrix-spezifische MCP-Tools andocken (über die `TMcpServer`-Registry).
-2. Clean-Room LLM-Client (`mormot.ai.llm`) — gegen die offiziellen Provider-/MCP-
-   Specs implementiert (interne Clean-Room-Prozessdoku separat, nicht eingecheckt).
+Offen ist nur noch **Phase E** — Schichtung/Merge/Backend-Bindung, siehe
+[CONCEPT.md](CONCEPT.md) (Single Source of Truth für die offenen Punkte).
 
 ✓ Demos übernommen (stdio/http/jsonrpc/sse/streamable inkl. Claude) — alle bauen grün.
+✓ Konsumenten-Tools angedockt (Phase B): landrix registriert seine Tools über die
+  `TMcpServer`-Registry und stellt den Token-Verifier; die Bindung liegt außerhalb
+  dieses Repos (CONCEPT §7). Der Core ist ohne Verifier fail-closed.
+✓ Clean-Room LLM-Client `mormot.ai.llm.*` (Phase D) — OpenAI-Wire + Anthropic,
+  Agent-/Tool-Loop, Embeddings/RAG, Vision; 273 Assertions grün.

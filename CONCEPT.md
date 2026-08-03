@@ -407,10 +407,11 @@ Alles unten **gebaut + review-gehärtet + grün** (FPC 3.2.2 aarch64-linux): MCP
 
 ## 9. Offene Punkte / Roadmap
 
-Die Engine-Funktionsfläche (Phase D) steht, die **Repo-Auslösung** (§7) ist erledigt;
-offen sind der **flydev-Merge** (§4), der **MCP-Sprung auf 2026-07-28** (§6) und die
-**Evaluation von neural-api** (§5). Diese Liste ist die konsolidierte Roadmap —
-DESIGN.md verweist hierher.
+Die Engine-Funktionsfläche (Phase D) steht, die **Repo-Auslösung** (§7) ist erledigt,
+der **MCP-Sprung auf 2026-07-28** (§6) ist durchgezogen und mit der
+Konsumenten-Bindung (Phase B) auch praktisch belegt; offen sind der **flydev-Merge**
+(§4) und die **Evaluation von neural-api** (§5). Diese Liste ist die konsolidierte
+Roadmap — DESIGN.md verweist hierher.
 
 0. **Repo-Auslösung (§7)** ✓ **erledigt (2026-07-29)** — `landrix/mormot2-ai`, Historie
    erhalten, Landrix zieht per Submodul. Alle weiteren Punkte finden **hier** statt.
@@ -441,29 +442,40 @@ DESIGN.md verweist hierher.
    Record extrahiert). Anthropic-**Streaming** live verifiziert (SSE-Parser inkl.
    message_start/delta-usage end-to-end). Beide Demos (`llm-structured`, `llm-chat`) jetzt
    provider-agnostisch via `LLM_PROVIDER`.
-6. **MCP-Sprung auf 2026-07-28** (§6) — ersetzt den früheren Punkt
+6. **MCP-Sprung auf 2026-07-28** (§6) ✓ **erledigt** — ersetzt den früheren Punkt
    „Transport-Produktionsreife". Der Umbau ist überwiegend **Löschen**; mehrere
-   Alt-Befunde erledigen sich dadurch:
+   Alt-Befunde erledigen sich dadurch. Stand: Branch `feat/mcp-2026-07-28` in `main`
+   gemerged, Protokoll-Restlücken am 2026-08-01 geschlossen, **829 Assertions** grün
+   (Belege im Einzelnen in [DESIGN.md](DESIGN.md), Abschnitte „Protokoll" und
+   „Protokoll-Restlücken geschlossen"):
    - ~~Parallel-Stresstest der Streamable-Sessions~~ **entfällt** — Protokoll-Sessions
      (und damit Registry, Ablauf, FSafe-Re-Resolve, `NextSessionEventId`) existieren
      im Zielprotokoll nicht mehr.
    - ~~Legacy-SSE-Transport härten oder entfernen~~ → **entfernen** (offiziell
      *Deprecated*), Entscheidung getroffen.
-   - **Auth: die Mechanik steht, der Resolver fehlt.** Der Server ist jetzt
+   - **Auth** ✓ **erledigt** (Mechanik **und** Resolver). Der Server ist
      OAuth-2.1-**Resource-Server** (RFC-9728-Metadata, Token-Prüfung vor dem Dispatch,
      Audience-Bindung, 401/403-Challenges — Details in [DESIGN.md](DESIGN.md)). Die
-     Naht ist `IMcpTokenVerifier`; **offen** ist deren Landrix-Implementierung im
-     Backend (`backend/src/landrix.server.ai.*`): JWT-Prüfung gegen die bestehende
-     Auth, Rollen aus `GetRolesForUser`, Scope→Permission-Abbildung.
+     Naht ist `IMcpTokenVerifier`; ihre Implementierung steht seit 2026-08-01 im
+     Konsumenten (`backend/src/landrix.server.ai.McpAuth.pas`) samt
+     Scope→Permission-Abbildung, dazu erste Tools über die Registry — das ist
+     **Phase B** und damit der Beleg, dass Registry, Auth-Context und RTTI-Schema
+     an fremdem Code tragen. Der Konsument ist inzwischen **auch** Authorization
+     Server (Selbstregistrierung, PKCE, Refresh-Rotation, Widerruf) — das ist
+     ausdrücklich **nicht** Sache dieses Repos, siehe
+     [Feature-MCP-Auth.md](../../../docs/Feature-MCP-Auth.md).
      **Korrektur zur früheren Fassung**: `iss`/RFC 9207, Client ID Metadata Documents
      und Issuer-Bindung sind **Client-/Authorization-Server-Pflichten**, nicht die des
      MCP-Servers — sie stehen hier nicht mehr an.
    - **Gebaut** (Details in [DESIGN.md](DESIGN.md), Abschnitt „Protokoll"):
      `server/discover`, `_meta`-Transport der Protokollversion, `subscriptions/listen`,
      `resultType`, **MRTR**, `ttlMs`/`cacheScope`, neue Header + Error-Codes.
-   - **Neu zu bauen**: `x-mcp-header`, Extensions-Framework, JSON Schema 2020-12 im
+   - ~~**Neu zu bauen**: `x-mcp-header`, Extensions-Framework, JSON Schema 2020-12 im
      `inputSchema`, OTel-`_meta`-Keys, deterministische `tools/list`-Reihenfolge,
-     Prompts/Completion/Pagination (Details §6).
+     Prompts/Completion/Pagination~~ — **alles gebaut** (2026-08-01), dazu
+     Progress-Notifications und der Template-Resolver. **Bewusst nicht gebaut**:
+     `notifications/message` (Logging) ist in 2026-07-28 *deprecated* — hier unter §6
+     schon entschieden, die frühere Nennung als Lücke war ein Doku-Fehler.
    - **Demo-Härtung** ✓ (bleibt gültig): Streamable-Demo bindet **Loopback**,
      `ask_claude` standardmäßig **deaktiviert** (`MCP_ENABLE_ASK_CLAUDE=1` als Opt-in).
 7. **neural-api integrieren** (§5) — Units `mormot.ai.embed.neuralapi` /
