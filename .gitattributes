@@ -8,3 +8,10 @@
 
 # PowerShell-Wrapper laufen unter Windows und behalten CRLF.
 *.ps1 text eol=crlf
+
+# Vendorierte Spezifikationen: WORTGLEICH lassen. Git wuerde die Zeilenenden
+# unter Windows sonst auf CRLF umschreiben - damit waere die Kopie nicht mehr
+# byte-identisch mit dem Upstream-Dokument, ein Diff gegen die Quelle schluege
+# in jeder Zeile an, und die Zusage "verbatim copy" in NOTICE/README waere
+# schlicht falsch. -text = nicht anfassen (Diff bleibt normal lesbar).
+docs/specs/** -text

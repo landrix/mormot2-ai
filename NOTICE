@@ -18,8 +18,17 @@ flydev-fr/mormot2-extensions — mormot-mcp-server  (ADOPTED & ADAPTED)
   retained. https://github.com/flydev-fr/mormot2-extensions
 
 Model Context Protocol — specification
-  Server implements MCP revision 2025-11-25 with version negotiation.
-  Open specification. https://modelcontextprotocol.io
+  Server implements MCP revision 2026-07-28 (stateless) — and only that revision.
+  A verbatim copy of the specification is vendored under
+  docs/specs/mcp-2026-07-28/ so that reviews and audits can cite the normative
+  text instead of recalling it. It is NOT part of this work and NOT covered by
+  the MPL/GPL/LGPL three-license above: the MCP project is transitioning from
+  MIT to Apache-2.0 (new specification contributions are Apache-2.0, older
+  contributions without relicensing consent remain MIT). The upstream license
+  text is kept alongside the copy as docs/specs/mcp-2026-07-28/LICENSE.
+  Copied unmodified from commit db4bfcff3d60f5df01a21bdf6b78f7012cac4634
+  (2026-07-28). https://modelcontextprotocol.io
+  https://github.com/modelcontextprotocol/modelcontextprotocol
 
 JSON-RPC 2.0 — specification
   https://www.jsonrpc.org/specification
