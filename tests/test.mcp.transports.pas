@@ -106,6 +106,10 @@ type
     procedure HookAndNotificationSeeTheCaller;
     /// the deferred hand-off re-checks the token and must honour the answer
     procedure DeferredHandoffRefusesALapsedToken;
+    /// a verifier that throws must not answer the caller with its own message
+    procedure ThrowingVerifierRefusesWithoutLeaking;
+    /// a listen stream cannot hold its worker thread forever
+    procedure SubscriptionStreamHasAMaximumLifetime;
   end;
 
 implementation
@@ -2256,6 +2260,119 @@ begin
       'and the refusal says how to come back (RFC 6750)');
     Check(PosEx('tools', client.Content) = 0,
       'no data reaches a caller whose token lapsed');
+  finally
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    client.Free;
+    server.Free;
+  end;
+end;
+
+
+type
+  /// a verifier whose backend is down - the failure mode an embedder does not
+  /// write on purpose but eventually has (database gone, JWKS endpoint timing out)
+  TThrowingVerifier = class(TInterfacedObject, IMcpTokenVerifier)
+  public
+    function VerifyToken(const aToken, aResource: RawUtf8;
+      out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+  end;
+
+function TThrowingVerifier.VerifyToken(const aToken, aResource: RawUtf8;
+  out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+begin
+  result := mtrInvalid; // never reached - keeps the compiler quiet
+  // a principal written BEFORE the failure, the way a real verifier would
+  aAuthCtx.UserID := 'half-written';
+  raise EMcpException.CreateU('SQL logic error near "WHERE": secret-ish detail');
+end;
+
+procedure TTestMcpStreamableTransport.ThrowingVerifierRefusesWithoutLeaking;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  scopes, authServers: TRawUtf8DynArray;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.AuthResource := 'https://mcp.example.com/mcp';
+    AddRawUtf8(scopes, 'files');
+    server.ScopesSupported := scopes;
+    AddRawUtf8(authServers, 'https://as.example.com');
+    server.AuthorizationServers := authServers;
+    server.TokenVerifier := TThrowingVerifier.Create;
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    // The verifier is foreign code. Its exception used to travel all the way
+    // out: mORMot renders class name and message into the 500 body, so an
+    // unauthenticated caller received the backend's error text.
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":' +
+      VariantSaveJson(McpRequestParams(Null, 'mcp.tests', '1.0')) + '}',
+      JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS,
+      'Accept: application/json, text/event-stream'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list'#13#10 +
+      'Authorization: Bearer any-token');
+    CheckEqual(status, HTTP_UNAUTHORIZED,
+      'a verifier that cannot answer has authorized nobody');
+    Check(PosEx('SQL logic error', client.Content) = 0,
+      'the backend error text does not reach the caller');
+    Check(PosEx('EMcpException', client.Content) = 0,
+      'nor the exception class name');
+    Check(PosEx('half-written', client.Content) = 0,
+      'nor anything the verifier had already written into the context');
+    Check(PosEx('tools', client.Content) = 0, 'and no data either');
+  finally
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    client.Free;
+    server.Free;
+  end;
+end;
+
+
+procedure TTestMcpStreamableTransport.SubscriptionStreamHasAMaximumLifetime;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  body: RawUtf8;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.Start;
+    // The token-expiry check only bites when a verifier reports an expiry, and
+    // an open server has no token at all - so without this bound a listen
+    // stream holds one of the eight slots (and its HTTP worker) forever, and
+    // the caller need not even authenticate to do it. One second here; the
+    // default is an hour.
+    server.MaxSubscriptionSeconds := 1;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    // nothing ever fires on this stream: it has to end itself
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":7,"method":"subscriptions/listen",' +
+      '"params":{"notifications":{"toolsListChanged":true}}}');
+    CheckEqual(status, HTTP_SUCCESS, 'the stream completed on its own');
+    body := client.Content;
+    Check(PosEx('notifications/cancelled', body) > 0,
+      'the teardown is announced, as it is for every other end of a stream');
+    Check(PosEx('maximum lifetime', body) > 0,
+      'and says why, so a client knows to reconnect rather than give up');
+    CheckEqual(server.SubscriptionCount, 0, 'the slot came back');
   finally
     if transport <> nil then
       transport.Stop;

@@ -27,7 +27,18 @@ type
     Name: RawUtf8;
   end;
 
-  TCalcTool = class(TMcpToolBase<TCalcParams>)
+  /// every tool here shares TCalcParams, where A and B are the actual
+  /// arguments and Enabled/Name are decoration - exactly the situation
+  /// MarkOptional exists for. Without it the generated schema would publish
+  /// all four as required AND (since that is now enforced) refuse the calls
+  /// these tests make, which is the honest consequence of a contract that
+  /// used to be decorative.
+  TCalcToolBase = class(TMcpToolBase<TCalcParams>)
+  public
+    constructor Create(const aName, aDescription: RawUtf8); override;
+  end;
+
+  TCalcTool = class(TCalcToolBase)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
@@ -121,7 +132,15 @@ type
 
   /// a tool that raises a PLAIN Exception (not ESynException) — used to prove a
   /// tool error is translated into a JSON-RPC error, never escapes the handler
-  TThrowingTool = class(TMcpToolBase<TCalcParams>)
+  /// refuses for lack of a scope - the only way that path can be reached
+  /// without an HTTP transport in front of it
+  TScopeGatedTool = class(TCalcToolBase)
+  protected
+    function ExecuteTyped(const aParams: TCalcParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  end;
+
+  TThrowingTool = class(TCalcToolBase)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
@@ -130,7 +149,7 @@ type
   /// a tool returning a JSON ARRAY instead of the required result object
   // - the protocol has no non-object result; this must surface as an error
   //   rather than silently shipping an empty success (see ResultMustBeAnObject)
-  TArrayResultTool = class(TMcpToolBase<TCalcParams>)
+  TArrayResultTool = class(TCalcToolBase)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
@@ -145,7 +164,7 @@ type
   end;
 
   /// a tool that reports progress, driven by what the test wants to prove
-  TProgressTool = class(TMcpToolBase<TCalcParams>, IMcpInteractiveTool)
+  TProgressTool = class(TCalcToolBase, IMcpInteractiveTool)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
@@ -163,7 +182,7 @@ type
   /// a tool that records the W3C trace context it was handed
   // - the only way to observe TMcpCallContext.Trace from a test: the trace
   //   fields never appear in a result, they exist so a handler can forward them
-  TTraceRecordingTool = class(TMcpToolBase<TCalcParams>, IMcpInteractiveTool)
+  TTraceRecordingTool = class(TCalcToolBase, IMcpInteractiveTool)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
@@ -176,7 +195,7 @@ type
 
   /// a tool doing a Multi Round-Trip Request: it asks for a name on the first
   /// round and completes once the client hands one back
-  TElicitingTool = class(TMcpToolBase<TCalcParams>, IMcpInteractiveTool)
+  TElicitingTool = class(TCalcToolBase, IMcpInteractiveTool)
   protected
     function ExecuteTyped(const aParams: TCalcParams;
       const aAuthCtx: TMcpAuthContext): variant; override;
@@ -272,10 +291,21 @@ type
     procedure HeaderMirroringIsConstrained;
     procedure PublishedSchemasAreBounded;
     procedure NotificationWithAbsentParamsIsSafe;
+    procedure SubscriptionCapIsPerPrincipalToo;
+    procedure ScopeRefusalUsesAnApplicationCode;
+    procedure RequiredSchemaIsHonestAndEnforced;
     procedure TypedToolRefusesArgumentsThatDoNotParse;
   end;
 
 implementation
+
+{ TCalcToolBase }
+
+constructor TCalcToolBase.Create(const aName, aDescription: RawUtf8);
+begin
+  inherited Create(aName, aDescription);
+  MarkOptional(['Enabled', 'Name']);
+end;
 
 { TCalcTool }
 
@@ -291,6 +321,15 @@ begin
   finally
     builder.Free;
   end;
+end;
+
+{ TScopeGatedTool }
+
+function TScopeGatedTool.ExecuteTyped(const aParams: TCalcParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+begin
+  result := Null; // never reached
+  raise EMcpInsufficientScope.CreateScope('files:write files:admin');
 end;
 
 { TVersionResource }
@@ -933,7 +972,7 @@ procedure TTestMcpCore.ResponseBuilderTextAndFile;
 var
   builder: TMcpResponseBuilder;
   response: variant;
-  doc, contentDoc, itemDoc: PDocVariantData;
+  doc, contentDoc, itemDoc, resDoc: PDocVariantData;
   contentVar, itemVar: variant;
   tmpFile: TFileName;
   content: RawByteString;
@@ -974,13 +1013,25 @@ begin
       exit;
     Check(itemDoc^.GetAsRawUtf8('type', tmp));
     CheckEqual(tmp, 'resource');
+    // EmbeddedResource: the discriminator REQUIRES a nested resource object,
+    // and a binary one is BlobResourceContents { uri; mimeType?; blob }. This
+    // test used to assert the flat shape - which matched no ContentBlock
+    // variant in the schema - and so cemented the defect it should have caught.
+    if CheckFailed(itemDoc^.GetAsDocVariant('resource', resDoc),
+         'content[1].resource missing') then
+      exit;
     base64 := BinToBase64(content);
-    Check(itemDoc^.GetAsRawUtf8('data', tmp));
+    Check(resDoc^.GetAsRawUtf8('blob', tmp), 'blob, not data');
     CheckEqual(tmp, base64);
-    Check(itemDoc^.GetAsRawUtf8('mimeType', tmp));
+    Check(resDoc^.GetAsRawUtf8('mimeType', tmp));
     Check(tmp <> '');
-    Check(itemDoc^.GetAsRawUtf8('fileName', tmp));
-    Check(tmp <> '');
+    Check(resDoc^.GetAsRawUtf8('uri', tmp), 'uri is required');
+    Check(IdemPChar(pointer(tmp), 'FILE:///'), 'and is a file URI');
+    // the base name, never the directory we read from
+    Check(PosEx('/', copy(tmp, 9, maxInt)) = 0,
+      'the uri carries no server path');
+    Check(not itemDoc^.Exists('data'), 'no stray data property');
+    Check(not itemDoc^.Exists('fileName'), 'nor the schema-alien fileName');
   finally
     DeleteFile(tmpFile);
   end;
@@ -1360,6 +1411,10 @@ begin
 
     // the cap exists so one client cannot take every HTTP worker thread
     CheckEqual(server.MaxSubscriptions, 8, 'bounded by default');
+    CheckEqual(server.MaxSubscriptionsPerPrincipal, 4, 'and per caller');
+    // everything here opens as the same (anonymous) principal, so take the
+    // per-caller cap out of the way - it has its own test below
+    server.MaxSubscriptionsPerPrincipal := 0;
     for i := 4 to 8 do
       Check(server.OpenSubscription(i, _ObjFast([])) <> nil, 'below the cap');
     extra := server.OpenSubscription(99, _ObjFast([]));
@@ -1542,8 +1597,11 @@ begin
     server.Start;
     // Copying nothing (the old behaviour) turned a broken handler into an empty
     // success response; the caller then saw resultType:complete and no content.
+    // the arguments are beside the point here, but they have to be present:
+    // what the schema declares required is enforced before the tool runs
     response := Exec(server,
-      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"arr"}}');
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"arr",' +
+      '"arguments":{"A":1,"B":2}}}');
     CheckErrorResponse(response, JSONRPC_INTERNAL_ERROR, 'must be a JSON object');
   finally
     server.Free;
@@ -2711,6 +2769,14 @@ begin
     // handler a traceparent the client never sent
     CallWith(',"' + MCP_META_TRACEPARENT + '":42');
     CheckEqual(tool.SawTrace.TraceParent, '', 'a non-string traceparent is ignored');
+
+    // DEL sits ABOVE the C0 range JSON already bars, and RFC 9110 counts it
+    // as neither VCHAR (0x21-0x7E) nor obs-text (0x80-0xFF): forwarding it
+    // builds an invalid header field. It is the one character that used to
+    // pass the filter.
+    CallWith(',"' + MCP_META_TRACEPARENT + '":"00-abc' + #$7F + 'def"');
+    CheckEqual(tool.SawTrace.TraceParent, '',
+      'a traceparent carrying DEL is dropped too');
   finally
     server.Free;
   end;
@@ -3186,6 +3252,167 @@ begin
       '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"calc",' +
       '"arguments":{"A":2,"B":3,"Unknown":true}}}');
     Check(PosEx('2 + 3 = 5', response) > 0, 'a valid payload still executes');
+  finally
+    server.Free;
+  end;
+end;
+
+
+procedure TTestMcpCore.SubscriptionCapIsPerPrincipalToo;
+var
+  server: TMcpServer;
+  i: integer;
+  mine, theirs, extra: TMcpSubscription;
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    // The global cap alone lets ONE caller take every slot and refuse the
+    // method to everyone else - a denial of service that costs the attacker
+    // one authenticated session. Each stream holds an HTTP worker for its
+    // whole life, so the slots are the scarce thing.
+    server.MaxSubscriptionsPerPrincipal := 2;
+    mine := server.OpenSubscription(1, _ObjFast([]), 'user-1');
+    Check(mine <> nil, 'first stream for this caller');
+    mine := server.OpenSubscription(2, _ObjFast([]), 'user-1');
+    Check(mine <> nil, 'second, still within the per-caller cap');
+    extra := server.OpenSubscription(3, _ObjFast([]), 'user-1');
+    Check(extra = nil, 'the third is refused, well below the global cap');
+
+    // and the refusal is per caller, not a global freeze: everyone else still
+    // gets in, which is the whole point
+    theirs := server.OpenSubscription(4, _ObjFast([]), 'user-2');
+    Check(theirs <> nil, 'a different caller is unaffected');
+
+    // unauthenticated callers share one bucket: without a verifier they cannot
+    // be told apart, so treating them as one is the honest reading
+    Check(server.OpenSubscription(5, _ObjFast([])) <> nil, 'anonymous #1');
+    Check(server.OpenSubscription(6, _ObjFast([])) <> nil, 'anonymous #2');
+    Check(server.OpenSubscription(7, _ObjFast([])) = nil,
+      'anonymous callers do not get a slot each');
+
+    // 0 turns the per-caller cap off, back to the global one alone
+    server.MaxSubscriptionsPerPrincipal := 0;
+    for i := 8 to 9 do
+      Check(server.OpenSubscription(i, _ObjFast([]), 'user-1') <> nil,
+        'per-caller cap disabled');
+    Check(server.SubscriptionCount <= server.MaxSubscriptions,
+      'the global cap still holds');
+  finally
+    server.Free;
+  end;
+end;
+
+
+procedure TTestMcpCore.ScopeRefusalUsesAnApplicationCode;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+  doc, errDoc, dataDoc: PDocVariantData;
+  docVar, errVar, dataVar: variant;
+  code: Int64;
+  scopes: RawUtf8;
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TScopeGatedTool.Create('gated', 'Needs a scope'));
+    server.Start;
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"gated",' +
+      '"arguments":{"A":1,"B":2}}}');
+    docVar := _JsonFast(response);
+    doc := _Safe(docVar);
+    errVar := doc^.GetValueOrNull('error');
+    errDoc := _Safe(errVar);
+    if CheckFailed(errDoc^.IsObject, 'a scope refusal is an error response') then
+      exit;
+    Check(VariantToInt64Loose(errDoc^.GetValueOrDefault('code', 0), code));
+
+    // NOT -32600: that code says the request object itself was malformed, and
+    // it was not - the caller simply may not do this yet. And not a code from
+    // -32020..-32099 either: that sub-range belongs to the specification alone
+    // (basic/index.mdx:118-128) and it defines nothing for scope, because it
+    // settles insufficient scope on the HTTP layer. Application-defined codes
+    // go outside the reserved range (:153-155), which is where this one sits.
+    CheckEqual(code, MCP_ERROR_INSUFFICIENT_SCOPE, 'an application code');
+    Check((code > -32000) or (code < -32768), 'outside the JSON-RPC reserved range');
+
+    // and the scopes are machine-readable, not only in the prose: on stdio
+    // there is no WWW-Authenticate header to carry them
+    dataVar := errDoc^.GetValueOrNull('data');
+    dataDoc := _Safe(dataVar);
+    if CheckFailed(dataDoc^.IsObject, 'error.data carries the challenge') then
+      exit;
+    Check(dataDoc^.GetAsRawUtf8('requiredScopes', scopes));
+    CheckEqual(scopes, 'files:write files:admin',
+      'space-separated, the shape RFC 6750 uses in the header');
+  finally
+    server.Free;
+  end;
+end;
+
+
+procedure TTestMcpCore.RequiredSchemaIsHonestAndEnforced;
+var
+  server: TMcpServer;
+  tool: TCalcTool;
+  response: RawUtf8;
+  schema: variant;
+  doc, req: PDocVariantData;
+  i: PtrInt;
+  names: RawUtf8;
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    tool := TCalcTool.Create('calc', 'Add two numbers');
+    server.RegisterTool(tool);
+    server.Start;
+
+    // 1. The published schema no longer over-declares. It used to list every
+    // RTTI property as required - and clients SHOULD validate against it, so
+    // the over-declaration made them reject calls this server would have taken.
+    schema := tool.GetInputSchema;
+    doc := _Safe(schema);
+    if CheckFailed(doc^.GetAsDocVariant('required', req), 'required is present') then
+      exit;
+    names := '';
+    for i := 0 to req^.Count - 1 do
+      names := names + VariantToUtf8(req^.Values[i]) + ' ';
+    CheckEqual(TrimU(names), 'a b',
+      'only what the tool did not declare optional');
+
+    // 2. and what it does declare is enforced. A missing argument used to parse
+    // into its zero value, so the tool ran on a number nobody sent.
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
+      '"arguments":{"A":2}}}');
+    Check(PosEx('"isError":true', response) > 0, 'a missing argument is refused');
+    Check(PosEx('b', response) > 0, 'and the answer names it');
+    Check(PosEx('2 + 0 = 2', response) = 0, 'the tool did not run on a zero');
+
+    // 3. an optional one may still be left out, which is the whole point
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"calc",' +
+      '"arguments":{"A":2,"B":3}}}');
+    Check(PosEx('2 + 3 = 5', response) > 0, 'optional arguments stay optional');
+
+    // 4. present-but-empty is a value the caller chose, not an omission
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"calc",' +
+      '"arguments":{"A":0,"B":0}}}');
+    Check(PosEx('0 + 0 = 0', response) > 0, 'a zero the caller SENT is fine');
+
+    // 5. a typo in MarkOptional is caught at wiring time, not by silently
+    // leaving the field required and refusing valid calls forever
+    try
+      tool.MarkOptional(['NoSuchField']);
+      Check(false, 'MarkOptional must reject an unknown property');
+    except
+      on E: EMcpException do
+        Check(PosEx('NoSuchField', StringToUtf8(E.Message)) > 0, 'and names it');
+    end;
   finally
     server.Free;
   end;

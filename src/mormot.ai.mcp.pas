@@ -36,6 +36,7 @@ uses
   mormot.core.collections,
   mormot.core.threads,
   mormot.core.interfaces,
+  mormot.core.log, // sllWarning when a foreign token verifier throws
   mormot.crypt.core; // HmacSha256 for the MRTR requestState envelope
 
 
@@ -75,6 +76,20 @@ const
   MCP_ERROR_MISSING_CLIENT_CAPABILITY = -32021;
   /// the requested protocol version is not implemented by this server
   MCP_ERROR_UNSUPPORTED_PROTOCOL_VERSION = -32022;
+
+  /// a handler refused this operation for lack of an OAuth scope
+  // - NOT in -32020..-32099: that sub-range is 'defined exclusively by the MCP
+  //   specification' and an implementation 'MUST NOT emit any code from this
+  //   sub-range that is not defined by' it (basic/index.mdx:118-128) - and the
+  //   spec defines no scope code, because it settles insufficient scope on the
+  //   HTTP layer (403 + WWW-Authenticate, basic/authorization/index.mdx).
+  //   Which is exactly what both HTTP transports do; this code is what stdio
+  //   and any other non-HTTP transport are left with.
+  // - so it goes where the spec puts application-defined errors: 'outside the
+  //   JSON-RPC reserved range (-32768 to -32000)' (basic/index.mdx:153-155).
+  //   It used to be -32600, which claims the request object itself was
+  //   malformed - it was not, the caller simply may not do this yet
+  MCP_ERROR_INSUFFICIENT_SCOPE = -31001;
 
   /// reserved _meta keys of the MCP specification
   // - the `io.modelcontextprotocol/` prefix is reserved for MCP itself
@@ -544,6 +559,10 @@ type
   TMcpSubscription = class
   protected
     fId: variant;
+    // who opened it, and when - the per-principal cap counts on the first,
+    // the absolute lifetime on the second
+    fPrincipal: RawUtf8;
+    fOpenedUnix: Int64;
     fFilter: TMcpNotificationFilter;
     fPending: TRawUtf8DynArray;
     fPendingCount: integer;
@@ -554,7 +573,14 @@ type
   public
     /// initialize for the given subscriptions/listen request id and filter
     constructor Create(const aId: variant;
-      const aFilter: TMcpNotificationFilter); reintroduce;
+      const aFilter: TMcpNotificationFilter;
+      const aPrincipal: RawUtf8 = ''); reintroduce;
+    /// the caller this stream was opened for ('' = unauthenticated)
+    property Principal: RawUtf8
+      read fPrincipal;
+    /// when it was opened, as Unix seconds - see MaxSubscriptionSeconds
+    property OpenedUnix: Int64
+      read fOpenedUnix;
     /// release the queue and its lock
     destructor Destroy; override;
     /// queue one ready-made JSON-RPC notification for delivery
@@ -893,7 +919,11 @@ type
   TMcpSchemaGenerator = class
   public
     /// Returns a TDocVariantData with schema structure
-    class function GenerateSchema(aTypeInfo: PRttiInfo): variant;
+    // - aOptional names the properties (case-insensitive) that must NOT be
+    //   listed as required: RTTI carries no optional marker, so the tool has
+    //   to say which of its fields a caller may leave out
+    class function GenerateSchema(aTypeInfo: PRttiInfo;
+      const aOptional: TRawUtf8DynArray = nil): variant;
   end;
 
 
@@ -907,7 +937,13 @@ type
     fServerName: RawUtf8;
     fServerVersion: RawUtf8;
     // id -> settings object, advertised as ServerCapabilities.extensions
+    // - guarded: RegisterExtension is deliberately callable after Start (the
+    //   sister setters lock themselves down with CheckNotStarted, this one is
+    //   documented as open and the suite uses it that way), while HandleDiscover
+    //   reads and copies it per request on a 32-thread pool. Registering a
+    //   capability must not be able to tear a discover response.
     fExtensions: TDocVariantData;
+    fExtensionsSafe: TLightLock;
     function ExtractRequestId(const aRequest: variant): variant;
     function CreateResponse(const aRequestId: variant): variant;
     function CreateErrorResponse(const aRequestId: variant;
@@ -986,6 +1022,10 @@ type
     fDescription: RawUtf8;
     // property path -> header name, applied on top of the generated schema
     fMirrored: TMcpHeaderParamDynArray;
+    // lowercased names of the parameters a caller may omit (MarkOptional)
+    fOptional: TRawUtf8DynArray;
+    /// '' when every required parameter is present, else their names
+    function MissingRequired(aArgs: PDocVariantData): RawUtf8;
     /// override this to implement tool logic
     function ExecuteTyped(const aParams: T; const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
   public
@@ -1004,6 +1044,18 @@ type
     // - raises when the resulting schema would violate a constraint, at wiring
     //   time rather than on the first call
     procedure MirrorToHeader(const aPropertyPath, aHeaderName: RawUtf8);
+    /// declare parameters a caller may leave out
+    // - RTTI has no concept of an optional field, so without this every
+    //   parameter is published as `required` - a contract this class did not
+    //   keep, since a missing one simply parsed into its zero value. Clients
+    //   SHOULD validate against inputSchema, so the over-declaration was
+    //   externally visible and rejected calls the server would have taken.
+    // - what is NOT declared optional here is now also ENFORCED: a call
+    //   leaving out a required parameter is refused with isError instead of
+    //   running the tool on a zero the caller never sent
+    // - names are matched case-insensitively; every one MUST be a real
+    //   property of the parameter record, or this raises at wiring time
+    procedure MarkOptional(const aPropertyNames: array of RawUtf8);
     /// IMcpTool implementation
     function GetName: RawUtf8;
     function GetDescription: RawUtf8;
@@ -1060,6 +1112,8 @@ type
     fSubscriptions: array of TMcpSubscription;
     fSubscriptionSafe: TLightLock;
     fMaxSubscriptions: integer;
+    fMaxPerPrincipal: integer;
+    fMaxSubscriptionSeconds: integer;
     fListPageSize: integer;
     fTokenVerifier: IMcpTokenVerifier;
     fAuthResource: RawUtf8;
@@ -1194,7 +1248,11 @@ type
     // - returns nil when MaxSubscriptions is already reached: an unbounded
     //   number of long-lived streams would exhaust the HTTP worker pool, so
     //   refusing is a availability guard, not a protocol decision
-    function OpenSubscription(const aRequestId, aParams: variant): TMcpSubscription;
+    // - aPrincipal is the caller (TMcpAuthContext.UserID, '' when there is no
+    //   verifier): the per-principal cap counts against it, so one caller
+    //   cannot take every slot and lock everyone else out
+    function OpenSubscription(const aRequestId, aParams: variant;
+      const aPrincipal: RawUtf8 = ''): TMcpSubscription;
     /// end a subscription and release it
     procedure CloseSubscription(aSubscription: TMcpSubscription);
     /// how many subscriptions/listen streams are currently open
@@ -1341,6 +1399,21 @@ type
     //   only together with the transport's ServerThreadPoolCount.
     property MaxSubscriptions: integer
       read fMaxSubscriptions write fMaxSubscriptions;
+    /// how many of those one caller may hold (default 4, 0 = no per-caller cap)
+    // - the global cap alone does not stop ONE principal from taking every
+    //   slot and refusing everyone else the method. Counted against
+    //   TMcpAuthContext.UserID; unauthenticated callers share the '' bucket,
+    //   which is the honest reading - without a verifier they cannot be told
+    //   apart, so they are treated as one
+    property MaxSubscriptionsPerPrincipal: integer
+      read fMaxPerPrincipal write fMaxPerPrincipal;
+    /// how long one stream may stay open at most, in seconds (default 3600)
+    // - the token expiry check only bites when the verifier reports one, and
+    //   an open server has no token at all. Without an absolute bound a stream
+    //   holds its worker thread forever, and the attacker need not even
+    //   authenticate. 0 disables it - only sensible with a trusted client set
+    property MaxSubscriptionSeconds: integer
+      read fMaxSubscriptionSeconds write fMaxSubscriptionSeconds;
     /// who may cache resources/read
     // - deliberately SEPARATE from ListCacheScope: a static tool list is a
     //   reasonable candidate for public, while resource CONTENT is exactly what
@@ -1915,7 +1988,8 @@ end;
 
 { ************ TMcpSchemaGenerator Implementation }
 
-class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo): variant;
+class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo;
+  const aOptional: TRawUtf8DynArray): variant;
 var
   rc: TRttiCustom;
   prop: PRttiCustomProp;
@@ -1923,7 +1997,7 @@ var
   required: TDocVariantData;
   i: PtrInt;
   propSchema: TDocVariantData;
-  jsonType: RawUtf8;
+  jsonType, propName: RawUtf8;
 
   function JsonTypeFromRtti(const aRtti: TRttiCustom): RawUtf8;
   begin
@@ -1989,10 +2063,15 @@ begin
     propSchema.AddValue('type', jsonType);
 
     // Add to properties
-    props.AddValue(LowerCaseU(prop.Name), variant(propSchema));
+    propName := LowerCaseU(prop.Name);
+    props.AddValue(propName, variant(propSchema));
 
-    // All properties are required (no optional metadata available)
-    required.AddItem(LowerCaseU(prop.Name));
+    // Required unless the tool declared it optional. RTTI carries no such
+    // marker, and listing everything was a contract this code did not keep:
+    // a client validating against the schema (which the spec tells it to do)
+    // rejected calls the server would have accepted happily.
+    if FindPropName(aOptional, propName) < 0 then
+      required.AddItem(propName);
   end;
 
   schema.AddValue('properties', variant(props));
@@ -2203,13 +2282,18 @@ begin
     raise EMcpException.CreateUtf8(
       '%.RegisterExtension: invalid extension id "%" — an identifier needs a ' +
       'prefix ("com.example/name"), see the _meta key naming rules', [self, aId]);
-  if fExtensions.VarType = varEmpty then
-    fExtensions.InitFast(dvObject);
-  // "an empty object indicates support with no additional settings"
-  if VarIsEmptyOrNull(aSettings) then
-    fExtensions.AddOrUpdateValue(aId, _ObjFast([]))
-  else
-    fExtensions.AddOrUpdateValue(aId, aSettings);
+  fExtensionsSafe.Lock;
+  try
+    if fExtensions.VarType = varEmpty then
+      fExtensions.InitFast(dvObject);
+    // "an empty object indicates support with no additional settings"
+    if VarIsEmptyOrNull(aSettings) then
+      fExtensions.AddOrUpdateValue(aId, _ObjFast([]))
+    else
+      fExtensions.AddOrUpdateValue(aId, aSettings);
+  finally
+    fExtensionsSafe.UnLock;
+  end;
 end;
 
 procedure TMcpJsonRpcProcessor.RegisterExtension(const aId: RawUtf8);
@@ -2239,8 +2323,15 @@ begin
   // extensions is OMITTED when none are registered rather than sent empty: an
   // empty map and an absent field mean the same thing, and the absent one does
   // not invite a client to look for settings that are not there
-  if fExtensions.Count > 0 then
-    caps.AddValue('extensions', variant(fExtensions));
+  // copy under the lock: variant(fExtensions) walks the document, and a
+  // concurrent AddOrUpdateValue may be reallocating it mid-walk
+  fExtensionsSafe.Lock;
+  try
+    if fExtensions.Count > 0 then
+      caps.AddValue('extensions', variant(fExtensions));
+  finally
+    fExtensionsSafe.UnLock;
+  end;
   result := _ObjFast([
     'supportedVersions', _ArrFast([MCP_PROTOCOL_VERSION]),
     'capabilities', variant(caps)]);
@@ -2305,6 +2396,63 @@ begin
   GetInputSchema;
 end;
 
+procedure TMcpToolBase<T>.MarkOptional(const aPropertyNames: array of RawUtf8);
+var
+  rc: TRttiCustom;
+  i, k: PtrInt;
+  name: RawUtf8;
+  known: boolean;
+begin
+  rc := Rtti.RegisterType(System.TypeInfo(T));
+  for i := 0 to high(aPropertyNames) do
+  begin
+    name := LowerCaseU(aPropertyNames[i]);
+    // checked against the record NOW: a typo would otherwise silently leave
+    // the field required forever, and the tool would refuse valid calls
+    known := false;
+    if rc <> nil then
+      for k := 0 to rc.Props.Count - 1 do
+        if LowerCaseU(rc.Props.List[k].Name) = name then
+        begin
+          known := true;
+          break;
+        end;
+    if not known then
+      raise EMcpException.CreateUtf8(
+        '%.MarkOptional: "%" is not a property of the parameter record',
+        [self, aPropertyNames[i]]);
+    if FindPropName(fOptional, name) < 0 then
+      AddRawUtf8(fOptional, name);
+  end;
+end;
+
+function TMcpToolBase<T>.MissingRequired(aArgs: PDocVariantData): RawUtf8;
+var
+  rc: TRttiCustom;
+  i: PtrInt;
+  name: RawUtf8;
+begin
+  result := '';
+  rc := Rtti.RegisterType(System.TypeInfo(T));
+  if rc = nil then
+    exit;
+  for i := 0 to rc.Props.Count - 1 do
+  begin
+    if rc.Props.List[i].Name = '' then
+      continue;
+    name := LowerCaseU(rc.Props.List[i].Name);
+    if FindPropName(fOptional, name) >= 0 then
+      continue;
+    // absent, not empty: `"query": ""` is a value the caller chose and the
+    // tool may well accept it. Only a key that never arrived is missing.
+    if (aArgs = nil) or
+       (aArgs^.GetValueIndex(name) < 0) then
+      result := result + name + ', ';
+  end;
+  if result <> '' then
+    SetLength(result, length(result) - 2);
+end;
+
 function TMcpToolBase<T>.GetInputSchema: variant;
 var
   typeInfo: PRttiInfo;
@@ -2312,7 +2460,7 @@ var
   i, k, idx: PtrInt;
 begin
   typeInfo := System.TypeInfo(T);
-  result := TMcpSchemaGenerator.GenerateSchema(typeInfo);
+  result := TMcpSchemaGenerator.GenerateSchema(typeInfo, fOptional);
   if fMirrored = nil then
     exit;
   schema := _Safe(result);
@@ -2345,13 +2493,31 @@ function TMcpToolBase<T>.Execute(const aArgs: variant;
 var
   params: T;
   doc: PDocVariantData;
-  json: RawUtf8;
+  json, missing: RawUtf8;
 begin
   // Deserialize arguments into typed record
   if _Safe(aArgs, doc) then
     json := doc^.ToJson
   else
+  begin
+    doc := nil;
     json := '{}';
+  end;
+  // What the schema publishes as required is now enforced. It used to be
+  // decorative: a missing parameter parsed into its zero value and the tool
+  // ran on a number the caller never sent. Declaring a field optional
+  // (MarkOptional) is how a tool opts out - and then it does not appear in
+  // `required` either, so the published contract and this check agree.
+  missing := MissingRequired(doc);
+  if missing <> '' then
+  begin
+    result := _ObjFast([
+      'content', _Arr([_ObjFast([
+        'type', 'text',
+        'text', 'Missing required argument(s): ' + missing])]),
+      'isError', true]);
+    exit;
+  end;
   // The parser leaves the record untouched when it fails (jpoClearValues is
   // in neither default option set), and the compiler initializes managed
   // fields only - so a rejected payload used to hand ExecuteTyped
@@ -2440,6 +2606,11 @@ begin
   fReadCacheScope := mcsPrivate;
   fSubscriptionSafe.Init;
   fMaxSubscriptions := 8; // see the property: each one holds a worker thread
+  // half the global cap: a legitimate client keeps several thematic streams
+  // open (tools, prompts, resources, unfiltered), so a tight bound would break
+  // normal use - but nobody gets to hold more than half the pool either
+  fMaxPerPrincipal := 4;
+  fMaxSubscriptionSeconds := 3600;
   fListPageSize := MCP_DEFAULT_PAGE_SIZE;
   // generous enough that no honest schema hits them, small enough that a
   // pathological one cannot exhaust a client's validator
@@ -2448,9 +2619,9 @@ begin
 end;
 
 function TMcpServer.OpenSubscription(const aRequestId,
-  aParams: variant): TMcpSubscription;
+  aParams: variant; const aPrincipal: RawUtf8): TMcpSubscription;
 var
-  n: PtrInt;
+  i, n, mine: PtrInt;
 begin
   result := nil;
   fSubscriptionSafe.Lock;
@@ -2458,8 +2629,19 @@ begin
     n := length(fSubscriptions);
     if n >= fMaxSubscriptions then
       exit; // caller turns this into an error response
+    if fMaxPerPrincipal > 0 then
+    begin
+      // Counted under the same lock that appends below, or two requests from
+      // one caller could both pass the check and then both append.
+      mine := 0;
+      for i := 0 to n - 1 do
+        if fSubscriptions[i].Principal = aPrincipal then
+          inc(mine);
+      if mine >= fMaxPerPrincipal then
+        exit;
+    end;
     result := TMcpSubscription.Create(aRequestId,
-      McpParseNotificationFilter(aParams));
+      McpParseNotificationFilter(aParams), aPrincipal);
     SetLength(fSubscriptions, n + 1);
     fSubscriptions[n] := result;
   finally
@@ -3462,7 +3644,11 @@ begin
     exit;
   VariantToUtf8(aMeta^.Values[i], result);
   for i := 1 to length(result) do
-    if result[i] < ' ' then // covers CR, LF, TAB and every other C0 control
+    // C0 covers CR, LF, TAB and the rest; DEL is neither VCHAR (0x21-0x7E)
+    // nor obs-text (0x80-0xFF) per RFC 9110, so a handler forwarding it would
+    // build an invalid header field - and JSON only bars < 0x20, so it gets here
+    if (result[i] < ' ') or
+       (result[i] = #$7F) then
     begin
       result := '';
       exit;
@@ -3744,7 +3930,28 @@ begin
       'TokenVerifier: there is no audience to validate against otherwise');
   if aToken = '' then
     exit(mtrMissing);
-  result := verifier.VerifyToken(aToken, fAuthResource, aAuthCtx);
+  try
+    result := verifier.VerifyToken(aToken, fAuthResource, aAuthCtx);
+  except
+    on E: Exception do
+    begin
+      // FOREIGN code, and it can fail for reasons that have nothing to do
+      // with this token (a database down, a JWKS endpoint timing out). Two
+      // things must not happen then.
+      // It must not leave as an exception: mORMot renders class name and
+      // message into the 500 body (ProcessErrorMessage), so a DB-backed
+      // verifier would hand an UNAUTHENTICATED caller its error text - and on
+      // the deferred streamable path it escapes into the connection's OnRead,
+      // which has no handler of its own and skips the AfterWrite cleanup
+      // (the fCurrentProcess counter then never comes back down).
+      // And it must not read as permission: a verifier that could not answer
+      // has authorized nobody. Refuse, and keep the reason on THIS side of the
+      // wire - the caller learns nothing beyond the 401.
+      TSynLog.Add.Log(sllWarning, 'AuthorizeToken: verifier raised %: %',
+        [E.ClassType, E.Message], self);
+      result := mtrInvalid;
+    end;
+  end;
   if result <> mtrValid then
   begin
     // Never hand a partially filled context to a caller that only checks the
@@ -4174,8 +4381,14 @@ begin
       else
       begin
         aScopeChallenge := E.Scope;
-        result := fProcessor.CreateError(requestId, JSONRPC_INVALID_REQUEST,
-          StringToUtf8(E.Message));
+        // the scopes travel in `data` as well, not only in the prose: a client
+        // that has to step up needs them machine-readable, and on stdio there
+        // is no WWW-Authenticate header to carry them. Space-separated, the
+        // same shape RFC 6750 gives them in that header - one format for the
+        // caller to parse, not two
+        result := fProcessor.CreateError(requestId,
+          MCP_ERROR_INSUFFICIENT_SCOPE, StringToUtf8(E.Message),
+          _ObjFast(['requiredScopes', E.Scope]));
       end;
     on E: EMcpInputCapabilityMissing do
       if isNotification then
@@ -4827,12 +5040,14 @@ end;
 { ************ TMcpSubscription }
 
 constructor TMcpSubscription.Create(const aId: variant;
-  const aFilter: TMcpNotificationFilter);
+  const aFilter: TMcpNotificationFilter; const aPrincipal: RawUtf8);
 begin
   inherited Create;
   fSafe.Init;
   fId := aId;
   fFilter := aFilter;
+  fPrincipal := aPrincipal;
+  fOpenedUnix := UnixTimeUtc;
 end;
 
 destructor TMcpSubscription.Destroy;
@@ -5019,11 +5234,21 @@ begin
     
   mimeType := GetMimeContentType(content, Utf8ToString(aFilePath));
 
+  // EmbeddedResource, as the schema defines it: the discriminator 'resource'
+  // REQUIRES a nested resource object, and a binary one is BlobResourceContents
+  // { uri; mimeType?; blob } - `data` belongs to Image/Audio, and `fileName`
+  // exists in no ContentBlock variant at all. The flat shape this used to build
+  // fit none of the five variants (schema.mdx: ContentBlock, EmbeddedResource,
+  // BlobResourceContents), so a client validating the result rejected it.
+  // The uri carries the BASE NAME only, never the path we read from: the
+  // spec's own example is `file:///example.png`, and handing a caller the
+  // server's directory layout is not part of returning a file.
   fileItem := _ObjFast([
     'type', 'resource',
-    'mimeType', mimeType,
-    'data', base64,
-    'fileName', fileName
+    'resource', _ObjFast([
+      'uri', 'file:///' + UrlEncodeName(fileName),
+      'mimeType', mimeType,
+      'blob', base64])
   ]);
   
   fContent.AddItem(fileItem);

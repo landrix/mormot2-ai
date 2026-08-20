@@ -6,7 +6,7 @@ crypto are the foundation, not a dependency we tolerate.
 
 > **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
 > (stateless) and only that one. Build, tests and demos green on aarch64-linux/FPC 3.2.2:
-> **852 assertions** MCP suite, **273 assertions** LLM suite. Open: phase E
+> **892 assertions** MCP suite, **273 assertions** LLM suite. Open: phase E
 > (layering / merge / backend binding) — see [CONCEPT.md](CONCEPT.md).
 
 ## Why a standalone extension
@@ -155,7 +155,7 @@ provider or runtime, not only against tests.
 
 | Area | State | Notes |
 |---|---|---|
-| MCP core, JSON-RPC, tool/resource registry | **stable** | 852 assertions, hardened over five review rounds |
+| MCP core, JSON-RPC, tool/resource registry | **stable** | 892 assertions, hardened over five review rounds |
 | Transports: stdio, HTTP, Streamable HTTP, in-process | **stable** | concurrency covered (parallel clients, keep-alive reuse) |
 | MCP authorization (resource server) | **stable** | opt-in per spec (`OPTIONAL`), closed once a verifier is set; the verifier itself is supplied by the consumer |
 | LLM client, OpenAI wire | **stable, live** | also covers LiteLLM and Ollama-compatible endpoints |

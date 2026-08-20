@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**852 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
+**892 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -679,6 +679,65 @@ gefangen und die Antwort einer Notification ohnehin verworfen, FPC warnt bei
 `out`-Parametern nicht. Der Beleg dort ist statisch (mORMots eigenes `{%H-}`, der
 identische Fix an der Schwesterstelle); der Test sichert nur das Verhalten gegen
 Regression — wer diese Stelle anfasst, kann sich nicht auf ihn stützen.
+
+### Review-Härtung Runde 5b (die P2/Cleanups derselben Unit, MCP **892** Assertions grün)
+
+- **`fExtensions` ohne Lock** (`mcp.pas:2197`): `RegisterExtension` mutiert, `HandleDiscover`
+  liest und **kopiert** pro Request auf einem 32-Thread-Pool. Bewusst **nicht** über
+  `CheckNotStarted` gelöst wie die Schwestersetter — Registrieren nach `Start` ist
+  dokumentiert und wird von der Suite genutzt; eine Fähigkeit wegzunehmen, um ein Lock zu
+  sparen, wäre der falsche Tausch. Jetzt `TLightLock` um beide Zugriffe.
+- **`AddFile` baute einen Content-Block, den das Schema nicht kennt** (`mcp.pas:4970`): flach
+  `type:resource` + `data` + `fileName`, ohne das von `EmbeddedResource` **verlangte**
+  verschachtelte `resource`-Objekt und ohne `uri`. `data` gehört zu Image/Audio, `fileName`
+  zu gar nichts. Jetzt `EmbeddedResource` → `BlobResourceContents { uri; mimeType; blob }`.
+  Die `uri` trägt **nur den Basisnamen** (`file:///name.pdf`) — dem Aufrufer das
+  Verzeichnislayout des Servers zu geben gehört nicht zum Ausliefern einer Datei.
+  Der Test kodierte die flache Form und zementierte damit den Defekt; er ist mitgezogen.
+- **Ein werfender Verifier antwortete dem Anrufer mit seiner eigenen Fehlermeldung**
+  (`server.pas:704`): `AuthorizeToken` lag an keiner der drei Aufrufstellen in einem `try`.
+  mORMot rendert Klassenname + Message in den 500er-Body, ein DB-gestützter Verifier reichte
+  also seinen SQLite-Fehlertext an einen **unauthentifizierten** Anrufer durch; auf dem
+  deferred Pfad entkam die Exception zusätzlich in `OnRead`, das keinen eigenen Handler hat.
+  Gefangen wird jetzt **im Core**, um den `VerifyToken`-Aufruf herum — eine Stelle statt drei,
+  und nur die Grenze zu fremdem Code, damit der absichtliche Wiring-Fehler
+  („Verifier ohne AuthResource") weiterhin hart bleibt. Ergebnis: `mtrInvalid` (wer nicht
+  antworten konnte, hat niemanden autorisiert), Grund als `sllWarning` ins **lokale** Log.
+- **`subscriptions/listen` war nur global gedeckelt** (`server.pas:995`): acht Slots, jeder
+  hält einen HTTP-Worker — ein einzelner Prinzipal konnte alle acht belegen und allen anderen
+  die Methode verweigern. Neu: `MaxSubscriptionsPerPrincipal` (Default 4, gezählt gegen
+  `TMcpAuthContext.UserID`; unauthentifizierte teilen den `''`-Topf, weil sie ohne Verifier
+  nicht unterscheidbar **sind**) und `MaxSubscriptionSeconds` (Default 3600). Die zweite
+  Grenze fehlte ganz: der Ablauf-Check greift nur, wenn ein Verifier eine Expiry meldet — auf
+  einem offenen Server also nie, und der Angreifer musste sich nicht einmal authentifizieren.
+- **`EMcpInsufficientScope` fuhr als `-32600`** (`mcp.pas:4145`), dem Code für ein kaputtes
+  Request-Objekt. Nicht in `-32020..-32099` verschoben: diese Sub-Range ist „defined
+  exclusively by the MCP specification" und wir dürften daraus **nichts** emittieren, was sie
+  nicht definiert (`basic/index.mdx:118-128`) — und sie definiert für Scope nichts, weil sie
+  das auf der HTTP-Ebene regelt. Also dorthin, wo die Spec anwendungsdefinierte Codes hinhaben
+  will: außerhalb des reservierten Bereichs (`:153-155`), `-31001`. Dazu `error.data.
+  requiredScopes` — auf stdio gibt es keinen `WWW-Authenticate`-Header, der sie tragen könnte.
+- **DEL passierte den OTel-Filter** (`mcp.pas:3440`): verworfen wurde alles `< 0x20`, aber
+  0x7F ist laut RFC 9110 weder `VCHAR` noch `obs-text` — JSON verbietet nur `< 0x20`, also kam
+  es durch und ein forwardender Handler baute ein ungültiges Header-Feld.
+
+**Das `required`-Schema ist jetzt ehrlich — und wird erzwungen** (`mcp.pas:1994`). Der
+Generator listete **jede** RTTI-Property als `required`, durchgesetzt wurde nichts: ein
+fehlendes Argument parste in seine Null und das Werkzeug rechnete mit einer Zahl, die niemand
+geschickt hatte. Beide Richtungen falsch, und die strenge Hälfte war nach außen sichtbar —
+Clients SOLLEN gegen `inputSchema` validieren (`server/tools.mdx:799-801`) und wiesen damit
+Aufrufe ab, die dieser Server angenommen hätte. RTTI kennt keinen Optional-Marker, also nennt
+ihn das Werkzeug selbst: `MarkOptional([...])` zur Wiring-Zeit, gegen die echten Feldnamen
+geprüft (ein Tippfehler fliegt sofort, nicht erst als dauerhaft abgelehnter Aufruf). Was so
+nicht markiert ist, steht im Schema **und** wird geprüft; die Ablehnung ist ein `isError`, aus
+demselben Grund wie in Runde 5. Beide produktiven Werkzeuge im Konsumenten-Repo waren
+betroffen und sind mitgezogen — ihre eigenen Beschreibungen versprachen den argumentlosen
+Aufruf längst („Leave query empty…", „Without arguments…").
+
+Gegenproben gefahren für: Per-Prinzipal-Deckel, werfender Verifier, Argument-Refusal, den
+Scope-Code und die zweite Token-Prüfung. Für das Lock (`fExtensions`) **keine** — ein
+Race-Test wäre unzuverlässig und würde Grün melden, wo er nichts beweist; der Fix ist
+strukturell begründet.
 
 ## Lizenz / Veröffentlichung
 

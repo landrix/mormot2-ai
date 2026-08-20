@@ -1015,7 +1015,10 @@ var
 begin
   doc.InitJson(aBody, JSON_FAST);
   requestId := doc.GetValueOrNull('id');
-  sub := fServer.OpenSubscription(requestId, doc.GetValueOrNull('params'));
+  // the caller comes along: the per-principal cap counts against it, so one
+  // authenticated client cannot hold every slot
+  sub := fServer.OpenSubscription(requestId, doc.GetValueOrNull('params'),
+    aAuthCtx.UserID);
   if sub = nil then
   begin
     // At the cap: refuse rather than take the last worker thread. The stream
@@ -1062,6 +1065,16 @@ begin
          (UnixTimeUtc >= aAuthCtx.ExpiresUnix) then
       begin
         sub.Cancel('the access token presented for this stream has expired');
+        break;
+      end;
+      // And an absolute bound on top, because the check above bites only when
+      // a verifier reports an expiry - on an open server there is no token at
+      // all, and the stream would then hold its worker thread forever without
+      // the caller ever authenticating.
+      if (fServer.MaxSubscriptionSeconds > 0) and
+         (UnixTimeUtc - sub.OpenedUnix >= fServer.MaxSubscriptionSeconds) then
+      begin
+        sub.Cancel('this stream reached its maximum lifetime; reconnect to continue');
         break;
       end;
       SleepHiRes(MCP_SUBSCRIPTION_POLL_MS);
