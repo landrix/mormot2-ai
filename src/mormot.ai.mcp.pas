@@ -2352,8 +2352,33 @@ begin
     json := doc^.ToJson
   else
     json := '{}';
-  RecordLoadJson(params, json, TypeInfo(T));
-  
+  // The parser leaves the record untouched when it fails (jpoClearValues is
+  // in neither default option set), and the compiler initializes managed
+  // fields only - so a rejected payload used to hand ExecuteTyped
+  // uninitialized stack for every plain field. Zero first, then refuse what
+  // did not parse.
+  // Refused as a TOOL error (isError), not as a JSON-RPC error: the spec
+  // splits tools/call failures in two, and puts 'Input validation errors'
+  // squarely on the isError side, because that is the half a model can
+  // 'use to self-correct and retry with adjusted parameters'
+  // (docs/specs/mcp-2026-07-28/server/tools.mdx:760-783). A -32602 would be
+  // the protocol half - reserved there for an unknown tool or a malformed
+  // CallToolRequest envelope, and `arguments` is untyped in that envelope
+  // (schema.mdx CallToolRequestParams), so a mismatch against the TOOL's own
+  // inputSchema is not an envelope violation. Same shape as the rag tool's
+  // empty-query refusal.
+  RecordZero(@params, TypeInfo(T));
+  if not RecordLoadJson(params, json, TypeInfo(T)) then
+  begin
+    result := _ObjFast([
+      'content', _Arr([_ObjFast([
+        'type', 'text',
+        'text', 'Invalid arguments: they do not match the input schema ' +
+                'this tool declares. Check the types and send them again.'])]),
+      'isError', true]);
+    exit;
+  end;
+
   // Execute typed implementation
   result := ExecuteTyped(params, aAuthCtx);
 end;
@@ -3772,11 +3797,16 @@ var
   tool: IMcpTool;
   interactive: IMcpInteractiveTool;
 begin
-  if _Safe(aParams, doc) then
-    if not doc.GetAsRawUtf8('name', toolName) then
-      raise EMcpInvalidParams.CreateU('Missing tool name in tools/call');
+  // Single-argument _Safe, for the reason spelled out in GetPrompt above:
+  // the two-argument overload leaves `doc` unset when it returns false, and
+  // `params` is absent on exactly the path Preflight skips - a notification
+  // (no id) is dispatched without the scalar-params guard, so the
+  // dereference below ran against an unset pointer.
+  doc := _Safe(aParams);
+  if not doc^.GetAsRawUtf8('name', toolName) then
+    raise EMcpInvalidParams.CreateU('Missing tool name in tools/call');
 
-  args := doc.GetValueOrDefault('arguments',  Null);
+  args := doc^.GetValueOrDefault('arguments', Null);
 
   fSafe.Lock;
   try
@@ -3844,9 +3874,11 @@ var
   interactive: IMcpInteractiveResource;
   result_doc, contentsList, contentItem: TDocVariantData;
 begin
-  if _Safe(aParams, doc) then
-    if not doc.GetAsRawUtf8('uri', uri) then
-      raise EMcpInvalidParams.CreateU('Missing uri in resources/read');
+  // Same as ExecuteToolCall above: the two-argument overload also swallowed
+  // the missing-uri error whenever `params` was not an object.
+  doc := _Safe(aParams);
+  if not doc^.GetAsRawUtf8('uri', uri) then
+    raise EMcpInvalidParams.CreateU('Missing uri in resources/read');
 
   fSafe.Lock;
   try

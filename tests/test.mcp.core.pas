@@ -271,6 +271,8 @@ type
     procedure UriTemplatesResolveOnRead;
     procedure HeaderMirroringIsConstrained;
     procedure PublishedSchemasAreBounded;
+    procedure NotificationWithAbsentParamsIsSafe;
+    procedure TypedToolRefusesArgumentsThatDoNotParse;
   end;
 
 implementation
@@ -3107,6 +3109,86 @@ begin
   Check(not McpCheckSchema(_JsonFast(deep), 200, 5, reason),
     'the node cap bites independently of depth');
   Check(PosEx('subschemas', reason) > 0, 'and says why: ' + reason);
+end;
+
+
+procedure TTestMcpCore.NotificationWithAbsentParamsIsSafe;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
+    server.Start;
+    // A notification (no id) skips BOTH guards that keep a non-object `params`
+    // away from the dispatcher: ParseRequest's scalar check and
+    // ValidateRequestMeta. It is therefore the only shape that reaches
+    // ExecuteToolCall with nothing to read, and the two-argument _Safe leaves
+    // its out-pointer unset in exactly that case. Reading `arguments` off it
+    // interpreted whatever the stack held as a TDocVariantData.
+    response := server.ExecuteRequest('{"jsonrpc":"2.0","method":"tools/call"}');
+    CheckEqual(TrimU(response), '', 'a notification is answered with nothing');
+    // the resources/read sibling reached the same overload
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"2.0","method":"resources/read"}');
+    CheckEqual(TrimU(response), '', 'resources/read notification: nothing');
+    // a scalar params is NOT the gap: ParseRequest rejects that shape on the
+    // notification path too, and answers -32600 with a null id. Asserted so a
+    // future change to that guard cannot quietly widen the hole above.
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"2.0","method":"tools/call","params":42}');
+    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
+    // and the server still answers correctly afterwards - a corrupted heap
+    // would not necessarily raise at the point of the read
+    response := Exec(server, '{"jsonrpc":"2.0","id":1,"method":"tools/list"}');
+    Check(PosEx('"calc"', response) > 0, 'the server is healthy afterwards');
+    // the request path (with an id) keeps rejecting the same body at the
+    // envelope level, which is where that check belongs
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":42}');
+    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.TypedToolRefusesArgumentsThatDoNotParse;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+begin
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
+    server.Start;
+    // `A` is declared integer and gets an array: the record parser refuses the
+    // payload. Its result used to be discarded, and since the default options
+    // do not include jpoClearValues the record was not even zeroed - the tool
+    // ran on whatever the stack held.
+    // The refusal is a TOOL error (isError), NOT a JSON-RPC error: the spec
+    // files 'Input validation errors' under the half a model can self-correct
+    // from (docs/specs/mcp-2026-07-28/server/tools.mdx:760-783), and reserves
+    // -32602 for an unknown tool or a malformed CallToolRequest envelope.
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"calc",' +
+      '"arguments":{"A":[1,2],"B":2}}}');
+    Check(PosEx('"isError":true', response) > 0,
+      'arguments that do not parse are refused as a tool error');
+    Check(PosEx('input schema', response) > 0, 'and say why');
+    Check(PosEx('"error"', response) = 0, 'never as a JSON-RPC protocol error');
+    Check(PosEx('0 + 0 = 0', response) = 0, 'and the tool did not run');
+    // a payload that DOES parse still works, arguments the record does not
+    // declare are still tolerated (the parser runs tolerant on purpose)
+    response := Exec(server,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"calc",' +
+      '"arguments":{"A":2,"B":3,"Unknown":true}}}');
+    Check(PosEx('2 + 3 = 5', response) > 0, 'a valid payload still executes');
+  finally
+    server.Free;
+  end;
 end;
 
 end.

@@ -6,7 +6,7 @@ crypto are the foundation, not a dependency we tolerate.
 
 > **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
 > (stateless) and only that one. Build, tests and demos green on aarch64-linux/FPC 3.2.2:
-> **829 assertions** MCP suite, **273 assertions** LLM suite. Open: phase E
+> **852 assertions** MCP suite, **273 assertions** LLM suite. Open: phase E
 > (layering / merge / backend binding) — see [CONCEPT.md](CONCEPT.md).
 
 ## Why a standalone extension
@@ -155,9 +155,9 @@ provider or runtime, not only against tests.
 
 | Area | State | Notes |
 |---|---|---|
-| MCP core, JSON-RPC, tool/resource registry | **stable** | 829 assertions, hardened over two review rounds |
+| MCP core, JSON-RPC, tool/resource registry | **stable** | 852 assertions, hardened over five review rounds |
 | Transports: stdio, HTTP, Streamable HTTP, in-process | **stable** | concurrency covered (parallel clients, keep-alive reuse) |
-| MCP authorization (resource server) | **stable** | fail-closed; the verifier itself is supplied by the consumer |
+| MCP authorization (resource server) | **stable** | opt-in per spec (`OPTIONAL`), closed once a verifier is set; the verifier itself is supplied by the consumer |
 | LLM client, OpenAI wire | **stable, live** | also covers LiteLLM and Ollama-compatible endpoints |
 | Anthropic driver | **stable, live** | streaming and tool loop verified against a real model |
 | Agent / tool-calling loop, structured output, vision | **stable, live** | |
@@ -209,10 +209,16 @@ Transports: stdio, HTTP, Streamable HTTP, in-process. Tools register via
 `TMcpServer.RegisterTool(IMcpTool)`; the input schema is generated **from RTTI** out of a
 typed record (`TMcpToolBase<T: record>`), so there is no hand-written JSON Schema to drift.
 
-**Authorization is fail-closed.** The core is an OAuth 2.1 resource server (RFC 9728
-metadata, token validation before dispatch, audience binding, 401/403 challenges); the seam
-is `IMcpTokenVerifier`. With no verifier set, every request is refused — never "no verifier,
-therefore allow". Found a path around it? [SECURITY.md](SECURITY.md).
+**Authorization is opt-in, and closed once it is on.** The core is an OAuth 2.1 resource
+server (RFC 9728 metadata, token validation before dispatch, audience binding, 401/403
+challenges); the seam is `IMcpTokenVerifier`. Authorization is `OPTIONAL` in the
+specification and the core follows that: **with no verifier set the server is open**, so any
+HTTP deployment has to set one (stdio SHOULD NOT use it — credentials come from the
+environment there). What the core does guarantee is that authorization can never be half on:
+`Start` refuses a verifier without an `AuthResource` or without `AuthorizationServers`, and a
+request a configured verifier does not accept is refused before dispatch, with a zeroed
+context (`IsAuthenticated=false`, no scopes) so a tool that gates on identity fails closed.
+Found a path around a configured verifier? [SECURITY.md](SECURITY.md).
 
 ### The spec is vendored
 

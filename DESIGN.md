@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**829 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
+**852 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -256,8 +256,8 @@ Neue Tests im passenden Runner ergänzen.
   nicht getragen. Die Spec verlangt vom MCP-Server einen **OAuth-2.1-Resource-Server**
   (RFC 9728 Metadata, Audience-Bindung, Validierung vor jeder Verarbeitung) — ein
   hausgemachtes Bearer-Schema hätte kein Client gefunden. Der Konsument stellt darum
-  einen echten Resource Server, und der Core bleibt fail-closed, wenn kein Verifier
-  gesetzt ist.
+  einen echten Resource Server. Ohne Verifier bleibt der Core **offen** (Auth ist laut
+  Spec `OPTIONAL`, siehe „Auth" oben) — geschlossen ist er, sobald einer gesetzt ist.
 - **Phase C** ✓ — MCP-Spec auf **2026-07-28** (stateless): `initialize`, Sessions,
   Batching, SSE-Resumability und der HTTP+SSE-Transport sind **gelöscht**;
   `server/discover` + per-Request-`_meta` treten an ihre Stelle. Siehe „Protokoll"
@@ -398,7 +398,8 @@ Neue Tests im passenden Runner ergänzen.
     6. **MCP-Transport-Produktionsreife** (kritischer Review, CONCEPT §6): der
        echte Auth-Resolver war der letzte verbliebene Punkt und ist mit **Phase B**
        eingelöst — der Konsument setzt einen `IMcpTokenVerifier` (OAuth-2.1-Resource-
-       Server), der Core bleibt ohne ihn fail-closed.
+       Server). Ohne ihn bleibt der Core offen (Spec: `OPTIONAL`); mit ihm wird jeder
+       nicht akzeptierte Request vor dem Dispatch abgelehnt.
        Sessions/Legacy-SSE sind mit 2026-07-28 **gelöscht** (damit entfallen
        Session-Ablauf, UAF-Fläche und Härtung des Legacy-Transports); Nebenläufigkeit
        deckt jetzt `ConcurrentPosts` ab (4 parallele Clients + Keep-Alive-Reuse).
@@ -590,6 +591,94 @@ Zwei Claude-Angles + Codex. Der schwerste Befund kam von **allen dreien unabhän
 - **Die `:`-Scope-Hierarchie ist eine Konvention, keine OAuth-Regel** (Codex): wo `admin`
   und `admin:delete` unabhängig sind, würde die erste die zweite still gewähren. Exakte
   Prüfung ist jetzt anforderbar.
+
+### Review-Härtung Runde 5 (Whole-System-Review, MCP **852** Assertions grün)
+
+Vier P1 aus dem Landrix-Review 2026-08 (eigene Finder + Codex, adversarisch verifiziert).
+Die Unit `ai-mcp` war die einzige Fläche, die fremde Anfragen aus dem Netz annimmt und
+bis dahin von keinem Review erfasst worden war.
+
+- **Uninitialisierter Zeiger, vom Netz erreichbar.** `ExecuteToolCall` klammerte nur den
+  Namens-Check in `if _Safe(aParams, doc)`; die Zwei-Argument-Überladung belegt ihren
+  `out`-Zeiger **nur** auf dem Erfolgspfad (mORMot markiert das selbst mit `{%H-}`), das
+  `GetValueOrDefault(arguments)` eine Zeile darunter lag außerhalb. Erreichbar über eine
+  **Notification** (`tools/call` ohne `id` und ohne `params`): `Preflight` überspringt bei
+  fehlender `id` beide Guards, die eine Nicht-Objekt-`params` sonst abfangen. Damit wurde
+  fremder Stack-Inhalt als `TDocVariantData` gelesen und ein Wert daraus **kopiert** — bei
+  Garbage-`VType` ein Refcount-Zugriff auf eine wilde Adresse. Das Projekt kannte den
+  Fehler bereits und hatte ihn an der Schwesterstelle `GetPrompt` behoben, samt Kommentar;
+  `ExecuteToolCall` und `ExecuteResourceRead` waren beim Fix übersehen worden. Beide nutzen
+  jetzt die Ein-Argument-Form.
+- **`RecordLoadJson`-Ergebnis verworfen, Record nicht genullt.** `TMcpToolBase<T>.Execute`
+  ignorierte den Rückgabewert und führte `ExecuteTyped` auch dann aus, wenn die Argumente
+  nicht geparst werden konnten. `jpoClearValues` steckt in **keinem** der beiden
+  Default-Optionssätze, und der Compiler initialisiert nur die *managed* Felder — jedes
+  einfache Feld trug also Stack-Müll ins Tool. Jetzt: `RecordZero` vorab, Rückgabewert
+  ausgewertet, `-32602` bei Nicht-Parsen (Argumente, die das Tool nicht lesen kann, sind
+  Falscheingabe, keine stillen Defaults).
+- **`OnStreamCall` bekam keinen Auth-Kontext.** Ein Hook, der `true` liefert, ersetzt den
+  gesamten autorisierten Dispatch samt Scope-Prüfung und 403-Pfad — konnte aber gar nicht
+  autorisieren: der Typ trug keinen Kontext, der Emitter hält nur den Transport, und ein
+  „aktueller Aufrufer" am Transport wäre unter `THttpAsyncServer` racy. `TMcpStreamCall`
+  trägt jetzt `aAuthCtx` (**Breaking Change**, bewusst jetzt, solange die Extension jung
+  ist). Damit gilt für den Hook dieselbe Regel wie für jeden Transport: wer dispatcht,
+  autorisiert.
+- **Doku versprach fail-closed, der Code war (spec-konform) offen.** `README`/`SECURITY`
+  behaupteten „ohne Verifier wird jeder Request abgelehnt"; `AuthorizeToken` liefert ohne
+  Verifier `mtrValid`, weil Auth laut Spec `OPTIONAL` ist (stdio SOLL sie sogar nicht
+  verwenden). `DESIGN.md` widersprach sich dabei selbst — die „Auth"-Sektion sagte es
+  richtig, zwei Rückblick-Stellen falsch. Der Irrtumspfad ist real: wer der Doku glaubt,
+  verdrahtet keinen Verifier und betreibt einen Streamable-HTTP-Server, der `tools/call`
+  anonym ausführt. Korrigiert wurde die **Doku**, nicht das Verhalten.
+
+Der Review der Fixes (zwei Claude-Angles + Codex) hat zwei davon nochmal bewegt:
+
+- **Die Argument-Zurückweisung war zuerst ein `-32602` — das war spec-widrig.** Die Spec
+  teilt `tools/call`-Fehler in zwei Klassen und stellt „Input validation errors" ausdrücklich
+  auf die `isError`-Seite, weil das die Hälfte ist, aus der ein Modell sich selbst korrigieren
+  kann (`server/tools.mdx:760-783`); `-32602` ist dort für einen unbekannten Tool-Namen oder
+  eine kaputte `CallToolRequest`-Hülle reserviert — und `arguments` ist in dieser Hülle
+  untypisiert, ein Verstoß gegen das **Tool**-`inputSchema` also kein Hüllen-Verstoß. Jetzt
+  `isError:true` mit erklärendem Text, dieselbe Form wie die Leerabfrage-Zurückweisung des
+  RAG-Tools. (`schema.mdx` trägt ein älteres Beispiel mit `-32602` für genau diesen Fall —
+  die beiden Stellen widersprechen sich; wir folgen dem spezifischeren Prosa-Abschnitt.)
+- **Der deferred Hand-off verwarf die Antwort seiner eigenen zweiten Token-Prüfung**
+  (`server.pas:521`, von Codex gefunden). Der Streamable-Pfad fragt zweimal — Preflight, dann
+  beim Hand-off, weil der Kontext ihn nicht überlebt — und die zweite Antwort **kann anders
+  ausfallen**: abgelaufen, widerrufen, ein Verifier mit Backend-Anbindung. Ihr Ergebnis wurde
+  ignoriert, der Request lief mit dem genullten Kontext weiter, den `AuthorizeToken` bei jeder
+  Ablehnung hinterlässt — **anonym auf einem Server, der Auth eingeschaltet hat**, beantwortet
+  mit 200 statt 401. Jetzt wird die zweite Antwort ausgewertet und mit RFC-6750-Challenge
+  abgelehnt. Dieselbe Fehlerklasse wie die beiden Punkte oben: ein Auth-Ergebnis, das
+  weggeworfen wird.
+
+Offen geblieben (kein Fix, weil Feature statt Bugfix): das aus dem Record generierte
+`inputSchema` deklariert alle Felder als `required`, **erzwungen wird das nirgends** — ein
+`arguments` ohne Pflichtfeld parst sauber in Defaultwerte. Codex hat das erneut gemeldet, das
+ursprüngliche Finding nennt es als Querverweis (`:1994`). Eine echte Schema-Validierung
+gegen das publizierte Schema gehört als eigener Schritt gebaut.
+
+Mitgenommen, weil dieselbe Codestelle:
+
+- **Der Notification-Zweig warf den aufgelösten Kontext weg** (`server.pas`): Token
+  geprüft, dann über die Ein-Argument-Überladung dispatcht — als einziger Pfad, während
+  `:379`, der deferred SSE-Pfad und `StreamDeferredResponse` die Identität durchreichen.
+  Wirkrichtung war fail-closed (Identität fällt weg, Rechte entstehen nicht), deshalb P2.
+- **Das Test-Gate baute geänderte `src/`-Units nicht neu.** Beim Gegenprobieren fiel auf,
+  dass `run-fpc-tests.sh` einen Fix ausbauen konnte, ohne dass ein Test rot wurde — FPC
+  erkannte die geänderte `.pas` neben der bestehenden `.ppu` nicht, erst eine Änderung
+  unter `tests/` löste den Rebuild aus. Ein Gate, das Quelländerungen ignoriert, belegt
+  Fixes, die nicht drin sind. Beide Testskripte werfen die eigenen `.ppu` jetzt vorab weg
+  (der mORMot2-Cache bleibt stehen). Das ist der Grund, warum in diesem Abschnitt jede
+  Gegenprobe zählt: vorher hätte sie nichts bewiesen.
+
+Gegenproben (Fix einzeln ausgebaut, Test muss rot werden): für die Argument-Zurückweisung,
+den Notification-Kontext und die zweite Token-Prüfung **hält sie**. Für den
+uninitialisierten Zeiger **nicht**: die AV wird vom `try/except` in `ExecuteRequest`
+gefangen und die Antwort einer Notification ohnehin verworfen, FPC warnt bei
+`out`-Parametern nicht. Der Beleg dort ist statisch (mORMots eigenes `{%H-}`, der
+identische Fix an der Schwesterstelle); der Test sichert nur das Verhalten gegen
+Regression — wer diese Stelle anfasst, kann sich nicht auf ihn stützen.
 
 ## Lizenz / Veröffentlichung
 

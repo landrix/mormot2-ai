@@ -491,7 +491,9 @@ Roadmap — DESIGN.md verweist hierher.
 **In diesem Review-Pass bereits behoben** (Build + Tests grün: MCP 202, LLM 256
 Assertions): JSON-RPC-Envelope-Validierung (`jsonrpc:"2.0"`, Params-Typ) + breiter
 Exception→JSON-RPC-Error-Fang mit korrekten Codes (−32600/−32601/−32603);
-fail-closed-Auth; Streamable-UAF via FSafe; SSE-Map thread-safe + Leak-Fix;
+fail-closed `IsAuthenticated` (Identität nur aus einem echten Resolver, nie
+aus dem Transport — NICHT „ohne Verifier wird alles abgelehnt“, siehe DESIGN
+„Review-Härtung Runde 5“); Streamable-UAF via FSafe; SSE-Map thread-safe + Leak-Fix;
 RAG-Ingestion **strikt** (exakte Vektoranzahl) **+ atomar** (`IVectorStore.AddBatch`,
 eine Transaktion); `build-demo.sh` baut wieder **alle** Demos (vorher nur 5 MCP-Demos
 trotz „ALL DEMOS OK"); Demo-Loopback + `ask_claude`-Gate.

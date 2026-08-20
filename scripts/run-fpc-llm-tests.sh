@@ -39,6 +39,17 @@ TESTLOG="$OUT/$PROG.log"
 
 mkdir -p "$UNIT_OUT"
 
+# Die eigenen Units IMMER neu uebersetzen. FPC erkennt eine geaenderte .pas
+# neben einer bestehenden .ppu in $UNIT_OUT hier nicht zuverlaessig: eine
+# Aenderung an src/mormot.ai.mcp.pas lief nachweislich gegen den alten Binary
+# durch (der Test blieb gruen, obwohl der Fix ausgebaut war), erst eine
+# Aenderung unter tests/ loeste den Rebuild aus. Ein Gate, das Quellaenderungen
+# ignoriert, ist schlimmer als gar keins - es belegt Fixes, die nicht drin sind.
+# Nur die eigenen Units wegwerfen: der mORMot2-Cache bleibt stehen, sonst
+# kostet jeder Lauf Minuten statt Sekunden.
+rm -f "$UNIT_OUT"/mormot.ai.*.ppu "$UNIT_OUT"/mormot.ai.*.o
+rm -f "$UNIT_OUT"/test.*.ppu "$UNIT_OUT"/test.*.o
+
 echo ">>> $PROG ($ARCH-$TARGET)"
 set +e
 fpc -MDelphi -Sci -Ci -O2 -g -gl -gw2 \

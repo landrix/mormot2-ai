@@ -50,9 +50,12 @@ Out of scope, with reasons:
 
 ## Two things worth knowing before you test
 
-**Authorization is fail-closed by design.** With no `IMcpTokenVerifier` set, the core
-refuses every request. If you find a path that reaches a tool without passing the verifier,
-that is a serious finding — it inverts the intended default.
+**Authorization is `OPTIONAL` in the protocol, and the core follows that.** With no
+`IMcpTokenVerifier` set the server is open. That is spec-conformant and deliberate — stdio
+SHOULD NOT use authorization at all — and it makes setting a verifier the embedder's job on
+any HTTP deployment. What *is* a serious finding: a path that reaches a tool past a
+**configured** verifier, or one that dispatches a request with a context the verifier did not
+produce. Either inverts the intended default.
 
 **The protocol revision is 2026-07-28, and only that one.** There is no negotiation and no
 older code path. A report resting on `initialize`, protocol sessions, request batching or

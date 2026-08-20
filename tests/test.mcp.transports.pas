@@ -102,6 +102,10 @@ type
     procedure SubscriptionStreamDelivers;
     procedure CapabilityErrorUsesHttpStatus;
     procedure BearerAuthGuardsTheEndpoint;
+    /// the two paths that used to run without the caller they authenticated
+    procedure HookAndNotificationSeeTheCaller;
+    /// the deferred hand-off re-checks the token and must honour the answer
+    procedure DeferredHandoffRefusesALapsedToken;
   end;
 
 implementation
@@ -1444,27 +1448,36 @@ type
   TStreamHookProbe = class
   public
     Called: boolean;
+    /// what the hook saw of the caller - the point of the aAuthCtx parameter
+    SeenUserId: RawUtf8;
+    SeenAuthenticated: boolean;
     /// answers with a bare result — no resultType, no serverInfo
     function Bare(const aRequestJson: RawUtf8; const aEmitter: IMcpStreamEmitter;
-      out aResponseJson: RawUtf8): boolean;
+      const aAuthCtx: TMcpAuthContext; out aResponseJson: RawUtf8): boolean;
     /// raises, the way a buggy or hostile hook would
     function Throws(const aRequestJson: RawUtf8;
-      const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+      const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
+      out aResponseJson: RawUtf8): boolean;
     /// answers a Multi Round-Trip Request: a hook may do that too
     function NeedsInput(const aRequestJson: RawUtf8;
-      const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+      const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
+      out aResponseJson: RawUtf8): boolean;
   end;
 
 function TStreamHookProbe.Bare(const aRequestJson: RawUtf8;
-  const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+  const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
+  out aResponseJson: RawUtf8): boolean;
 begin
   Called := true;
+  SeenUserId := aAuthCtx.UserID;
+  SeenAuthenticated := aAuthCtx.IsAuthenticated;
   aResponseJson := '{"jsonrpc":"2.0","id":1,"result":{"content":"from-hook"}}';
   result := true;
 end;
 
 function TStreamHookProbe.Throws(const aRequestJson: RawUtf8;
-  const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+  const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
+  out aResponseJson: RawUtf8): boolean;
 begin
   aResponseJson := '';
   result := false; // never reached — keeps the compiler from warning
@@ -1472,7 +1485,8 @@ begin
 end;
 
 function TStreamHookProbe.NeedsInput(const aRequestJson: RawUtf8;
-  const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+  const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
+  out aResponseJson: RawUtf8): boolean;
 begin
   Called := true;
   aResponseJson := '{"jsonrpc":"2.0","id":1,"result":{' +
@@ -2041,6 +2055,212 @@ begin
     if transport <> nil then
       transport.Stop;
     transport.Free;
+    server.Free;
+  end;
+end;
+
+
+type
+  /// records what reached a handler - the only way to observe a notification,
+  /// which is answered with 202 and no body whatsoever
+  TAuthRecordingTool = class(TInterfacedObject, IMcpTool)
+  public
+    function GetName: RawUtf8;
+    function GetDescription: RawUtf8;
+    function GetInputSchema: variant;
+    function Execute(const Args: variant;
+      const AuthCtx: TMcpAuthContext): variant;
+  end;
+
+var
+  RecordedAuthenticated: boolean;
+  RecordedUserId: RawUtf8;
+
+function TAuthRecordingTool.GetName: RawUtf8;
+begin
+  result := 'record_identity';
+end;
+
+function TAuthRecordingTool.GetDescription: RawUtf8;
+begin
+  result := 'Records the caller it was handed';
+end;
+
+function TAuthRecordingTool.GetInputSchema: variant;
+begin
+  result := _ObjFast(['type', 'object', 'properties', _ObjFast([])]);
+end;
+
+function TAuthRecordingTool.Execute(const Args: variant;
+  const AuthCtx: TMcpAuthContext): variant;
+begin
+  RecordedAuthenticated := AuthCtx.IsAuthenticated;
+  RecordedUserId := AuthCtx.UserID;
+  result := _ObjFast(['content', _ArrFast([])]);
+end;
+
+procedure TTestMcpStreamableTransport.HookAndNotificationSeeTheCaller;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  probe: TStreamHookProbe;
+  port, status: integer;
+  client: THttpClientSocket;
+  scopes, authServers: TRawUtf8DynArray;
+
+  // POST as an authenticated caller; aId <= 0 sends a notification (no id)
+  function PostAs(const aMethod, aTool: RawUtf8; aId: integer): integer;
+  var
+    hdr, body: RawUtf8;
+    doc: TDocVariantData;
+    params: variant;
+  begin
+    if aTool = '' then
+      params := Null
+    else
+      params := _ObjFast(['name', aTool, 'arguments', _ObjFast([])]);
+    doc.InitJson('{"jsonrpc":"2.0"}', JSON_FAST);
+    if aId > 0 then
+      doc.AddOrUpdateValue('id', aId);
+    doc.AddOrUpdateValue('method', aMethod);
+    doc.AddOrUpdateValue('params', McpRequestParams(params, 'mcp.tests', '1.0'));
+    body := doc.ToJson;
+    hdr := 'Accept: application/json, text/event-stream'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: ' + aMethod + #13#10 +
+      'Authorization: Bearer good-token';
+    if aTool <> '' then
+      hdr := hdr + #13#10 + 'Mcp-Name: ' + aTool;
+    result := client.Post(transport.Endpoint, body, JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, hdr);
+  end;
+
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  probe := TStreamHookProbe.Create;
+  try
+    server.AuthResource := 'https://mcp.example.com/mcp';
+    AddRawUtf8(scopes, 'files');
+    server.ScopesSupported := scopes;
+    AddRawUtf8(authServers, 'https://as.example.com');
+    server.AuthorizationServers := authServers;
+    server.TokenVerifier := TTransportVerifier.Create;
+    server.RegisterTool(TAuthRecordingTool.Create);
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    // --- the hook replaces the authorized dispatch, so it MUST be handed the
+    // caller: without it a hook can only fail closed or wave everyone through,
+    // and there is no other route to the identity (a 'current caller' kept on
+    // the transport would be racy across the worker pool).
+    transport.OnStreamCall := probe.Bare;
+    probe.Called := false;
+    probe.SeenAuthenticated := false;
+    probe.SeenUserId := '';
+    status := PostAs('tools/list', '', 1);
+    CheckEqual(status, HTTP_SUCCESS, 'an authenticated request reaches the hook');
+    Check(probe.Called, 'the hook ran');
+    Check(probe.SeenAuthenticated, 'the hook sees an authenticated caller');
+    CheckEqual(probe.SeenUserId, 'user-1', 'and which caller it is');
+
+    // --- the notification branch: it resolved the token and then dispatched
+    // through the context-less overload, so a handler saw an anonymous caller
+    // on this one path while every sibling path passed the identity down.
+    transport.OnStreamCall := nil;
+    RecordedAuthenticated := false;
+    RecordedUserId := '';
+    status := PostAs('tools/call', 'record_identity', 0);
+    CheckEqual(status, HTTP_ACCEPTED, 'a notification is accepted with 202');
+    Check(RecordedAuthenticated,
+      'a notification handler sees the authenticated caller');
+    CheckEqual(RecordedUserId, 'user-1', 'and which caller it is');
+  finally
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    client.Free;
+    server.Free;
+    probe.Free;
+  end;
+end;
+
+
+type
+  /// valid on the first call, expired on every one after it: the streamable
+  /// transport asks twice per request (preflight, then the deferred hand-off)
+  TLapsingVerifier = class(TInterfacedObject, IMcpTokenVerifier)
+  public
+    Calls: integer;
+    function VerifyToken(const aToken, aResource: RawUtf8;
+      out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+  end;
+
+function TLapsingVerifier.VerifyToken(const aToken, aResource: RawUtf8;
+  out aAuthCtx: TMcpAuthContext): TMcpTokenResult;
+begin
+  inc(Calls);
+  if Calls > 1 then
+    // the token lapsed in between - expiry, revocation, or a verifier that
+    // reaches a backend and got a different answer this time
+    exit(mtrExpired);
+  aAuthCtx.IsAuthenticated := true;
+  aAuthCtx.UserID := 'user-1';
+  aAuthCtx.Issuer := 'https://as.example.com';
+  result := mtrValid;
+end;
+
+procedure TTestMcpStreamableTransport.DeferredHandoffRefusesALapsedToken;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  verifier: TLapsingVerifier;
+  port, status: integer;
+  client: THttpClientSocket;
+  scopes, authServers: TRawUtf8DynArray;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  verifier := TLapsingVerifier.Create;
+  try
+    server.AuthResource := 'https://mcp.example.com/mcp';
+    AddRawUtf8(scopes, 'files');
+    server.ScopesSupported := scopes;
+    AddRawUtf8(authServers, 'https://as.example.com');
+    server.AuthorizationServers := authServers;
+    server.TokenVerifier := verifier;
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+
+    // A request with an id defers and streams: mcp() checks the token, hands
+    // off, and the async connection re-resolves it because the context does not
+    // survive the hand-off. The SECOND answer is the one that counts, and its
+    // result used to be discarded - the request then ran with the zeroed
+    // context AuthorizeToken leaves behind, anonymous on a server that HAS
+    // authorization on, and was answered 200 instead of 401.
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":' +
+      VariantSaveJson(McpRequestParams(Null, 'mcp.tests', '1.0')) + '}',
+      JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS,
+      'Accept: application/json, text/event-stream'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list'#13#10 +
+      'Authorization: Bearer good-token');
+    CheckEqual(verifier.Calls, 2, 'the transport asked twice');
+    CheckEqual(status, HTTP_UNAUTHORIZED, 'the lapsed token is refused');
+    Check(PosEx('Bearer', client.Headers) > 0,
+      'and the refusal says how to come back (RFC 6750)');
+    Check(PosEx('tools', client.Content) = 0,
+      'no data reaches a caller whose token lapsed');
+  finally
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    client.Free;
     server.Free;
   end;
 end;

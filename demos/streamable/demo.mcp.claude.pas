@@ -54,8 +54,13 @@ type
   public
     constructor Create;
     /// TMcpStreamCall handler — set as TMcpStreamableHttpTransport.OnStreamCall
+    // - handling a request here replaces the server's authorized dispatch, so
+    //   a hook is responsible for its own authorization. This demo runs with
+    //   no token verifier at all (aAuthCtx is therefore blank); anything
+    //   reachable over an authenticated server would have to gate on it.
     function HandleStreamCall(const aRequestJson: RawUtf8;
-      const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+      const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
+      out aResponseJson: RawUtf8): boolean;
   end;
 
 /// register the RTTI for TAskClaudeParams (needed for arg deserialization/schema)
@@ -280,7 +285,8 @@ begin
 end;
 
 function TClaudeStreamer.HandleStreamCall(const aRequestJson: RawUtf8;
-  const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean;
+  const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
+  out aResponseJson: RawUtf8): boolean;
 var
   doc: TDocVariantData;
   params, args: PDocVariantData;

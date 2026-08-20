@@ -138,11 +138,17 @@ type
 
   /// optional per-request streaming handler (see OnStreamCall)
   // - aRequestJson is a single JSON-RPC request
+  // - aAuthCtx is the caller the transport authenticated for THIS request. A
+  //   hook that returns true replaces the whole authorized dispatch, scope
+  //   check included, so it MUST gate on this context itself - there is no
+  //   other way to reach it, and under THttpAsyncServer any 'current caller'
+  //   kept on the transport would be racy across the worker pool
   // - return true if handled: push intermediate events via aEmitter and set
   //   aResponseJson to the final JSON-RPC response (or '' to send none)
   // - return false to let the transport process the request normally
   TMcpStreamCall = function(const aRequestJson: RawUtf8;
-    const aEmitter: IMcpStreamEmitter; out aResponseJson: RawUtf8): boolean of object;
+    const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
+    out aResponseJson: RawUtf8): boolean of object;
 
   /// Streamable HTTP transport implementing MCP 2026-07-28
   // - the endpoint accepts POST and OPTIONS only: GET (the standalone
@@ -229,6 +235,8 @@ type
     // - when assigned and it returns true for a given request, the transport
     //   emits the intermediate events it pushed plus its final response;
     //   otherwise the request is processed normally via the MCP server
+    // - a hook that handles a request bypasses ExecuteRequest entirely, so it
+    //   receives the authenticated context and owns the authorization
     property OnStreamCall: TMcpStreamCall read fOnStreamCall write fOnStreamCall;
   published
     /// single endpoint handler — routes by HTTP method
@@ -485,6 +493,9 @@ function TMcpStreamableAsyncConnection.OnRead: TPollAsyncSocketOnReadWrite;
 var
   transport: TMcpStreamableHttpTransport;
   authCtx: TMcpAuthContext;
+  tokenResult: TMcpTokenResult;
+  refusal: RawUtf8;
+  status: integer;
 begin
   result := inherited OnRead;
   // The published mcp() handler defers request batches by returning
@@ -510,9 +521,35 @@ begin
     // handler reached through this path must see the same identity as one
     // reached through the buffered path, or authorization would depend on which
     // transport happened to answer.
-    transport.Server.AuthorizeToken(fRequest.AuthBearer, authCtx);
-    transport.StreamDeferredResponse(WriteRaw, fHttp.Content,
-      fRequest.OutCustomHeaders, authCtx);
+    // The SECOND answer counts, and it can differ from the first: a token that
+    // was good at preflight may have expired, been revoked, or hit a verifier
+    // that changed its mind in between. Dispatching anyway would run the
+    // request with the zeroed context AuthorizeToken leaves behind — anonymous
+    // on a server that HAS authorization switched on, and answered 200 where
+    // the caller must see 401. Nothing has gone out on the socket yet, so the
+    // refusal is still ours to send.
+    tokenResult := transport.Server.AuthorizeToken(fRequest.AuthBearer, authCtx);
+    if tokenResult <> mtrValid then
+    begin
+      // RFC 6750: carry the challenge that says how to come back. Written raw
+      // because THttpAsyncServer was told not to generate a response for this
+      // request (rfAsynchronous) - SendAuthChallenge needs a THttpServerRequest
+      // that is no longer the one answering here. Same body shape it uses: NOT
+      // a JSON-RPC error, because this refusal is an HTTP-layer one and there
+      // is no request id to correlate it with that we did not invent.
+      refusal := '{"error":"' + MCP_TOKEN_ERROR[tokenResult] + '"}';
+      status := transport.Server.AuthHttpStatus(tokenResult);
+      WriteRaw(FormatUtf8('HTTP/1.1 % %'#13#10 +
+        'Content-Type: application/json'#13#10 +
+        'WWW-Authenticate: %'#13#10 +
+        'Content-Length: %'#13#10#13#10 + '%',
+        [status, StatusCodeToText(status)^,
+         transport.Server.AuthChallenge(tokenResult, ''),
+         length(refusal), refusal]));
+    end
+    else
+      transport.StreamDeferredResponse(WriteRaw, fHttp.Content,
+        fRequest.OutCustomHeaders, authCtx);
     fStreaming := false;
     // finalize once: hrsResponseDone lets the inherited AfterWrite run the
     // standard cleanup (fCurrentProcess) and either keep-alive (parser reset,
@@ -763,7 +800,14 @@ begin
   // --- Notification (no id): process and return 202 with no body ---
   if VarIsVoid(doc.GetValueOrNull('id')) then
   begin
-    fServer.ExecuteRequest(body);
+    // WITH the context: this was the one path that dropped it, which made a
+    // notification run as an anonymous caller while every sibling path (:379,
+    // the deferred SSE resolve, StreamDeferredResponse) passes it down. The
+    // one-argument overload nulls the context by contract - see its comment
+    // in the core unit: a token check that a transport then discards is
+    // decorative. There is no scope challenge to report: a notification is
+    // answered with 202 and no body, whatever the handler decided.
+    fServer.ExecuteRequest(body, authCtx);
     exit(HTTP_ACCEPTED);
   end;
 
@@ -1118,7 +1162,7 @@ begin
       // of streaming, and only a hook pays it.
       WriteStreamHead;
       emitter := TMcpStreamEmitter.Create(self, aWrite);
-      handled := fOnStreamCall(aBody, emitter, responseJson);
+      handled := fOnStreamCall(aBody, emitter, aAuthCtx, responseJson);
       if handled then
         // a hook builds its response by hand and would otherwise ship a result
         // without the mandatory resultType, serverInfo and caching hints
