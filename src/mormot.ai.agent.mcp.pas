@@ -70,7 +70,10 @@ begin
     'id', 1,
     'method', 'tools/list',
     'params', McpRequestParams(Null, 'mormot.ai.agent', '1.0.0')]))^.ToJson);
-  v := _JsonFast(resp);
+  // _JsonFastFloat: the inputSchema is re-serialized below and handed to the
+  // model as its tool contract. The default parser turns a float constant it
+  // cannot hold into a string, which would publish an invalid schema.
+  v := _JsonFastFloat(resp);
   // result.tools[] -> name / description / inputSchema (a JSON-Schema object)
   toolsArr := _Safe(v)^.O['result']^.A['tools'];
   SetLength(result, toolsArr^.Count);
@@ -98,7 +101,9 @@ begin
   begin
     if not IsValidJson(aArgumentsJson) then
       exit(FormatUtf8('{"error":"invalid tool arguments JSON: %"}', [aArgumentsJson]));
-    args := _Json(aArgumentsJson);
+    // _JsonFastFloat: this goes on to a real MCP server, which validates
+    // against the tool's schema - a float arriving as a string fails that
+    args := _JsonFastFloat(aArgumentsJson);
   end
   else
     args := _Obj([]);
@@ -110,7 +115,7 @@ begin
       'mormot.ai.agent', '1.0.0')]);
   reqJson := _Safe(req)^.ToJson;
   resp := fServer.ExecuteRequest(reqJson);
-  v := _JsonFast(resp);
+  v := _JsonFastFloat(resp);
   doc := _Safe(v);
   // surface a JSON-RPC error as text so the model can recover instead of failing
   if doc^.O['error']^.Count > 0 then

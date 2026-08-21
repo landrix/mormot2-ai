@@ -23,6 +23,7 @@ interface
 
 uses
   mormot.core.base,
+  mormot.core.text, // VariantToUtf8 for the required-field check
   mormot.core.rtti,
   mormot.core.variants,
   mormot.ai.llm.types,
@@ -56,8 +57,12 @@ function OpenAIJsonSchemaFormat(const aName, aSchemaJson: RawUtf8;
 // - aResult/aTypeInfo follow the RecordLoadJson convention: pass TypeInfo(TMyRec)
 //   and a matching record variable; the record's RTTI must be registered (e.g.
 //   Rtti.RegisterFromText) or the schema is empty
-// - aResult is only defined when the function returns true; on a parse failure
-//   (empty/non-JSON answer) treat it as undefined
+// - aResult is always CLEARED first, and left cleared when this returns
+//   false: a caller that forgets to check the result gets zeros rather than
+//   a half-filled record or the previous extraction
+// - returns false unless the answer is a JSON object carrying every field
+//   the generated schema declares required: '{}' and a wrapper object both
+//   parse without error and would otherwise pass for a successful extraction
 // - aStrict defaults to false for cross-provider compatibility; pass true only
 //   for a flat simple-field record talking to an OpenAI strict endpoint
 function ChatStructured(const aClient: ILlmClient; var aRequest: TLlmChatRequest;
@@ -80,11 +85,16 @@ function OpenAIJsonSchemaFormat(const aName, aSchemaJson: RawUtf8;
 var
   schema: variant;
 begin
-  schema := _Json(aSchemaJson);
+  // re-serialized into the request below: with the default parser a float
+  // constant in the schema would turn into a string and invalidate it
+  schema := _JsonFastFloat(aSchemaJson);
   // OpenAI strict mode additionally requires additionalProperties:false; the
   // RTTI schema generator does not emit it, so inject it on the top-level object
+  // AddOrUpdateValue, not AddValue: a schema that already carries the key
+  // would otherwise end up with it TWICE - TDocVariantData stores duplicate
+  // names happily and every lookup then returns the first one
   if aStrict then
-    _Safe(schema)^.AddValue('additionalProperties', false);
+    _Safe(schema)^.AddOrUpdateValue('additionalProperties', false);
   result := _Safe(_ObjFast([
     'type', 'json_schema',
     'json_schema', _ObjFast([
@@ -98,11 +108,41 @@ function ChatStructured(const aClient: ILlmClient; var aRequest: TLlmChatRequest
   aStrict: boolean): boolean;
 var
   resp: TLlmChatResponse;
+  schemaJson, field: RawUtf8;
+  av, sv: variant;
+  answer, required: PDocVariantData;
+  i: PtrInt;
 begin
+  schemaJson := RecordJsonSchema(aTypeInfo);
   aRequest.ResponseFormat :=
-    OpenAIJsonSchemaFormat(aSchemaName, RecordJsonSchema(aTypeInfo), aStrict);
+    OpenAIJsonSchemaFormat(aSchemaName, schemaJson, aStrict);
   resp := aClient.ChatComplete(aRequest);
+  // Clear first. RecordLoadJson leaves fields it did not parse untouched
+  // (jpoClearValues is in neither default option set), so a partial answer
+  // used to blend into whatever the caller's variable happened to hold - and
+  // for a caller that ignores the result, into the PREVIOUS extraction.
+  RecordZero(@aResult, aTypeInfo);
+  result := false;
+  av := _JsonFastFloat(resp.Content);
+  answer := _Safe(av);
+  if not answer^.IsObject then
+    exit; // prose, an empty answer, or a JSON array: not an extraction
+  // Every field the schema declared required has to actually be there. '{}'
+  // parses happily and a wrapper object like {"result":{...}} loses its
+  // payload to jpoIgnoreUnknownProperty - both used to be reported as a
+  // successful extraction with a record full of zeros. We publish the
+  // contract in the request; enforcing it on the way back is the other half.
+  required := _Safe(_JsonFastFloat(schemaJson))^.A['required'];
+  for i := 0 to required^.Count - 1 do
+  begin
+    VariantToUtf8(required^.Values[i], field);
+    if answer^.GetValueIndex(field) < 0 then
+      exit;
+  end;
   result := RecordLoadJson(aResult, resp.Content, aTypeInfo);
+  if not result then
+    // a type mismatch the presence check cannot catch: leave nothing behind
+    RecordZero(@aResult, aTypeInfo);
 end;
 
 end.

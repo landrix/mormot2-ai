@@ -147,6 +147,18 @@ begin
   blob := VectorToBlob(aVector);
   // both inserts in one transaction: a failed vector insert must not leave an
   // orphan documents row (which Count would over-report and Search never returns)
+  // Serialize the WHOLE write, not just its statements. TSqlDataBase locks per
+  // Execute but holds nothing across a transaction, and the direct
+  // Prepare/Bind/Step calls below bypass even that. Two concurrent writers would
+  // interleave: TransactionBegin rolls back whatever foreign transaction it
+  // finds open, and `rowid` comes from LastInsertRowID, which is per CONNECTION
+  // - so one writer could pair its document with the other's vector.
+  // Reentrant by contract: TSqlDataBase descends from TObjectOSLock and
+  // TOSLock.Lock is explicitly reentrant, so the inner per-statement locking
+  // still works. Readers stay lock-free: SQLite serializes them itself, and the
+  // two hazards above are writer-only.
+  fDB.Lock;
+  try
   fDB.TransactionBegin;
   try
     r.Prepare(fDB.DB, 'INSERT INTO documents(content) VALUES (?);');
@@ -169,6 +181,9 @@ begin
   except
     fDB.RollBack;
     raise;
+  end;
+  finally
+    fDB.UnLock;
   end;
 end;
 
@@ -194,6 +209,18 @@ begin
   // a mid-batch failure rolls back so the document is never partially indexed.
   // Both INSERTs are prepared ONCE and reused per row via Reset() - preparing
   // inside the loop would re-compile the statements on every chunk.
+  // Serialize the WHOLE write, not just its statements. TSqlDataBase locks per
+  // Execute but holds nothing across a transaction, and the direct
+  // Prepare/Bind/Step calls below bypass even that. Two concurrent writers would
+  // interleave: TransactionBegin rolls back whatever foreign transaction it
+  // finds open, and `rowid` comes from LastInsertRowID, which is per CONNECTION
+  // - so one writer could pair its document with the other's vector.
+  // Reentrant by contract: TSqlDataBase descends from TObjectOSLock and
+  // TOSLock.Lock is explicitly reentrant, so the inner per-statement locking
+  // still works. Readers stay lock-free: SQLite serializes them itself, and the
+  // two hazards above are writer-only.
+  fDB.Lock;
+  try
   fDB.TransactionBegin;
   try
     rDoc.Prepare(fDB.DB, 'INSERT INTO documents(content) VALUES (?);');
@@ -224,6 +251,9 @@ begin
   except
     fDB.RollBack;
     raise;
+  end;
+  finally
+    fDB.UnLock;
   end;
 end;
 
@@ -300,6 +330,18 @@ begin
   blob := VectorToBlob(aVector);
   // one transaction: the documents row and its vec_documents row must stay in sync
   // (a half-applied replace would leave a stale or orphan vector)
+  // Serialize the WHOLE write, not just its statements. TSqlDataBase locks per
+  // Execute but holds nothing across a transaction, and the direct
+  // Prepare/Bind/Step calls below bypass even that. Two concurrent writers would
+  // interleave: TransactionBegin rolls back whatever foreign transaction it
+  // finds open, and `rowid` comes from LastInsertRowID, which is per CONNECTION
+  // - so one writer could pair its document with the other's vector.
+  // Reentrant by contract: TSqlDataBase descends from TObjectOSLock and
+  // TOSLock.Lock is explicitly reentrant, so the inner per-statement locking
+  // still works. Readers stay lock-free: SQLite serializes them itself, and the
+  // two hazards above are writer-only.
+  fDB.Lock;
+  try
   fDB.TransactionBegin;
   try
     rowid := RowIdOfKey(aId);
@@ -349,6 +391,9 @@ begin
     fDB.RollBack;
     raise;
   end;
+  finally
+    fDB.UnLock;
+  end;
 end;
 
 procedure TVec0Store.Delete(const aId: RawUtf8);
@@ -356,6 +401,18 @@ var
   r: TSqlRequest;
   rowid: Int64;
 begin
+  // Serialize the WHOLE write, not just its statements. TSqlDataBase locks per
+  // Execute but holds nothing across a transaction, and the direct
+  // Prepare/Bind/Step calls below bypass even that. Two concurrent writers would
+  // interleave: TransactionBegin rolls back whatever foreign transaction it
+  // finds open, and `rowid` comes from LastInsertRowID, which is per CONNECTION
+  // - so one writer could pair its document with the other's vector.
+  // Reentrant by contract: TSqlDataBase descends from TObjectOSLock and
+  // TOSLock.Lock is explicitly reentrant, so the inner per-statement locking
+  // still works. Readers stay lock-free: SQLite serializes them itself, and the
+  // two hazards above are writer-only.
+  fDB.Lock;
+  try
   fDB.TransactionBegin;
   try
     rowid := RowIdOfKey(aId);
@@ -380,6 +437,9 @@ begin
   except
     fDB.RollBack;
     raise;
+  end;
+  finally
+    fDB.UnLock;
   end;
 end;
 

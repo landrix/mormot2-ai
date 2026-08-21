@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**892 Assertions** MCP-Suite + **273 Assertions** LLM-Suite. Offen ist die
+**892 Assertions** MCP-Suite + **344 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -738,6 +738,100 @@ Gegenproben gefahren für: Per-Prinzipal-Deckel, werfender Verifier, Argument-Re
 Scope-Code und die zweite Token-Prüfung. Für das Lock (`fExtensions`) **keine** — ein
 Race-Test wäre unzuverlässig und würde Grün melden, wo er nichts beweist; der Fix ist
 strukturell begründet.
+
+### Review-Härtung Runde 6 (LLM-Client, Agent, SSE, RAG — MCP **892** + LLM **344** grün)
+
+Die zwölf Findings der Unit `ai-llm`. Der P1 stand für sich; die sechs P2 teilten sich ein
+Muster, das der Report selbst benannt hat: **der naive Fix ist fast immer eine Regression** —
+bei einem davon ist das jetzt auch belegt (s. u.).
+
+**P1: Embedding-Vektoren wurden auf deutschem Windows um Zehnerpotenzen verfälscht.**
+`_Json` parst Fließkomma in `currency` und legt alles, was dort nicht hineinpasst, als
+**Text** ab. Beim Lesen in ein `single` läuft das über die RTL, und `PrepareFloatStr`
+**löscht jedes Zeichen, das gleich `DefaultFormatSettings.ThousandSeparator` ist** — auf
+deutschem Windows der **Punkt**. Aus `-0.0069619063` wird `-69619064`. Still, ohne Exception,
+direkt in Vektorspeicher und RAG-Index. Der Test setzt das Trennzeichen selbst, beweist es
+also auch auf dem Linux-Gate; ohne den Fix liefert er exakt die drei Werte, die der Report
+vorhergesagt hatte.
+
+**Und dieselbe Falle lag an zwölf weiteren Stellen** — der Report hatte nur die eine gesehen.
+Überall dort, wo fremdes JSON geparst und **wieder serialisiert** wird, ging ein Float als
+**String** hinaus:
+
+- `anthropic.pas` Antwort-Parser → `ToJson` des `input`-Blocks: die Argumente, die das Modell
+  selbst gewählt hat, erreichten das Werkzeug als `"threshold":"0.12345678"`. Wir haben das
+  Modell seinem eigenen Werkzeug gegenüber falsch zitiert.
+- Tool-Schemas und `response_format` in beiden Request-Buildern und in `structured.pas`: eine
+  Konstante wie `"minimum":0.12345678` ging als String hinaus — ein ungültiges JSON-Schema,
+  das ein Provider zu Recht ablehnt.
+- `agent.mcp.pas`: das `inputSchema` eines MCP-Werkzeugs wird re-serialisiert und dem Modell
+  als sein Vertrag gereicht; die Argumente gehen umgekehrt an einen echten MCP-Server, der
+  gegen genau dieses Schema validiert.
+- `mcp.pas`/`mcp.server.pas` zur Konsistenz mit: dort **entsteht kein Datenfehler** (der
+  typisierte Pfad konvertiert über mORMots eigenen, locale-unabhängigen Parser zurück — mit
+  einer Probe geprüft), aber ein Werkzeug, das den rohen Variant liest oder ihn nach
+  `structuredContent` spiegelt, sieht einen String, wo sein Schema `number` sagt.
+
+Die Regel lautet jetzt ausnahmslos: **fremdes JSON → `_JsonFastFloat`**.
+
+Die sechs P2:
+
+- **2xx-Antwortparser waren fail-open.** Ungültiges JSON → `_Json` liefert `false`, `_Safe`
+  gibt `DocVariantDataFake` zurück, dessen `dvoReturnNullForUnknownProperty` jedes Feld als
+  null liest — heraus kam eine leere Antwort, ohne dass irgendwo etwas warf. Der Agent-Loop
+  hält das für „das Modell hat geantwortet" und endet in Iteration 1 mit leerem Inhalt; der
+  Iterationsdeckel greift nicht, weil der Loop **regulär** verlassen wird. Beide Parser
+  prüfen jetzt Root-Typ und Pflichtfelder und erkennen ein Provider-Fehlerobjekt auch bei
+  2xx. Der Embeddings-Konsument zog diese Linie längst („fail loudly instead of returning an
+  empty vector"); der Chat-Pfad war der letzte ungeschützte.
+- **Abgeschnittene Streams galten als vollständig.** Das `Done`-Flag existierte, wurde aber
+  in keinem der beiden Clients geprüft. `ChatStream` gibt nichts zurück — der Aufrufer konnte
+  es also auch selbst nicht. Beide werfen jetzt bei 2xx ohne Terminalereignis, und die
+  Inband-Fehlerbehandlung des Anthropic-Zweigs ist auf OpenAI gespiegelt (`fStreamError` sitzt
+  dafür jetzt in der Basisklasse). **Einschränkung:** der `raise` selbst ist nicht getestet —
+  dazu bräuchte diese Suite einen HTTP-Server, den sie nicht hat; getestet ist die
+  Erkennungsgrundlage (`Done` bleibt false, `StreamError` wird gefüllt).
+- **Schemawidrige Antworten galten als erfolgreiche Extraktion.** `{}` parst fehlerfrei, ein
+  Wrapper-Objekt verliert seinen Inhalt an `jpoIgnoreUnknownProperty` — und weil
+  `jpoClearValues` fehlt, blieb der Record dabei unberührt. `ChatStructured` nullt jetzt
+  vorab, verlangt ein JSON-Objekt mit **allen** als `required` deklarierten Feldern und lässt
+  bei `false` nichts stehen. Damit erzwingt es dieselbe Zusage, die es im Request
+  veröffentlicht — die andere Hälfte der Schema-Härtung aus Runde 5b.
+- **`Extra` überschrieb den Transportmodus.** `AddOrUpdateFrom` überschreibt gleichnamige
+  Schlüssel, und `Extra` wird **nach** `stream` gemerged. `ChatComplete` mit
+  `Extra.stream=true` parste einen SSE-Body als JSON (leere Antwort, HTTP 200, keine
+  Exception); `ChatStream` mit `Extra.stream=false` feuerte **keinen einzigen** Callback.
+  Nicht „Extra zuerst mergen" — das bräche, dass `Extra` `model` überschreiben darf, was
+  getestet ist. Der Modus wird **nach** dem Merge wieder gesetzt, bei Anthropic gelöscht
+  (diese Wire lässt `stream` sonst weg). Das tote `TLlmChatRequest.Stream`-Feld ist entfernt:
+  es war die dritte scheinbare Stellschraube, von der keine wirkte.
+- **Parallele Tool-Calls gingen im Streaming verloren.** Gelesen wurde nur Slot 0, obwohl das
+  eigene Delta-Modell die Slots führt und der Anthropic-Parser sie korrekt nutzt. Der naive
+  Loop wäre eine Regression gewesen — **und das ist jetzt bewiesen**: mit ihm als Gegenprobe
+  verdoppelt sich der Text und die Usage wird doppelt gezählt. Korrekt sind eigene Deltas für
+  Slot 2..n, die **nur** die Tool-Felder tragen.
+- **`TVec0Store` serialisierte seine Transaktionen nicht.** `TSqlDataBase` sperrt pro
+  Statement, hält aber nichts über eine Transaktion, und die direkten
+  `Prepare`/`Bind`/`Step`-Aufrufe umgehen selbst das. Zwei Schreiber würden sich verschränken:
+  `TransactionBegin` rollt jede fremde offene Transaktion zurück, und `rowid` kommt aus
+  `LastInsertRowID` — **pro Verbindung**, nicht pro Anweisung. Alle vier Schreibpfade laufen
+  jetzt unter `fDB.Lock` (reentrant, das innere Sperren bleibt gültig); Leser bleiben
+  ungesperrt, SQLite serialisiert die selbst.
+
+Cleanups: der `fRaw`-Puffer ist jetzt wirklich gedeckelt (der Kommentar behauptete „bounded in
+size", während nichts ihn begrenzte — `MaxResponseBytes` ist Opt-in und **keine** Factory setzt
+es); `additionalProperties` wird im Strict-Modus ersetzt statt dupliziert; die einzige
+deutschsprachige Nutzerausgabe der Bibliothek ist englisch und über `NoAnswerText`
+überschreibbar; und eine leere Frage geht in denselben deterministischen Miss-Zweig, den
+`Ingest` und das RAG-Werkzeug längst haben (kein `raise` — `Query` wirft bei einem Miss
+bewusst nicht).
+
+**Und wieder ein Gate-Befund:** der Vectorstore-Test übersprang sich stumm, weil
+`SQLITE_EXT_DIR` nicht gesetzt war — obwohl die vec0-Extension im Repo liegt. Er meldete dabei
+„1 assertion passed", sah also aus wie ein Lauf. Dieselbe Klasse wie der fehlende Rebuild aus
+Runde 5: ein Gate, das weniger prüft als es könnte, und das nicht sagt. Das Skript findet die
+Extension jetzt selbst — der Test läuft mit **10** Assertionen und deckt damit auch den
+Lock-Umbau oben ab.
 
 ## Lizenz / Veröffentlichung
 

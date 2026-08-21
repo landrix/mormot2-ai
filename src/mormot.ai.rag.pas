@@ -36,6 +36,7 @@ type
     fChunkChars: integer;
     fOverlap: integer;
     fTopK: integer;
+    fNoAnswerText: RawUtf8;
     fLastHits: TRagHitDynArray;
   public
     /// wire the pieces together; aChatModel names the generation model
@@ -54,6 +55,13 @@ type
     property Overlap: integer read fOverlap write fOverlap;
     /// the chunks retrieved by the last Query
     property LastHits: TRagHitDynArray read fLastHits;
+    /// what Query answers when nothing was retrieved (English by default)
+    // - this is the one user-facing sentence this unit produces, and the
+    //   extension is meant to be language-neutral: the system prompt right
+    //   below is English on purpose. It used to be hardcoded German with no
+    //   way to change it - a German sentence in a generic library, appearing
+    //   in an otherwise English conversation.
+    property NoAnswerText: RawUtf8 read fNoAnswerText write fNoAnswerText;
   end;
 
 
@@ -126,6 +134,7 @@ begin
   fChunkChars := 800;
   fOverlap := 100;
   fTopK := 4;
+  fNoAnswerText := 'No matching information was found.';
 end;
 
 function TLlmRag.Ingest(const aText: RawUtf8): integer;
@@ -169,7 +178,14 @@ var
   msgs: TLlmMessageDynArray;
   req: TLlmChatRequest;
 begin
-  fLastHits := fStore.Search(fEmbedder.Embed(aQuestion), fTopK);
+  // An empty question goes down the same deterministic path. Ingest handles
+  // empty input cleanly and the RAG tool rejects an empty query outright;
+  // only this one passed it on, where the embedder or the store raises
+  // instead. Raising would break the contract - Query deliberately does NOT
+  // raise on a miss, and 'nothing asked' cannot retrieve anything either.
+  fLastHits := nil;
+  if TrimU(aQuestion) <> '' then
+    fLastHits := fStore.Search(fEmbedder.Embed(aQuestion), fTopK);
   if length(fLastHits) = 0 then
   begin
     // nothing retrieved: answer deterministically rather than prompt the model
@@ -177,7 +193,7 @@ begin
     Finalize(result);
     FillCharFast(result, SizeOf(result), 0);
     result.FinishReason := lfrStop;
-    result.Content := 'Dazu liegen keine passenden Informationen vor.';
+    result.Content := fNoAnswerText;
     exit;
   end;
   ctx := '';

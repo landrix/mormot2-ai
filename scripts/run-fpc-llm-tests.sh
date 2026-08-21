@@ -30,6 +30,16 @@ UNIT_OUT="$OUT/lib"
 TARGET="${TARGET:-linux}"
 ARCH="${ARCH:-$(fpc -iTP)}"
 
+# vec0 selbst finden. Die Extension liegt (gitignored) im Repo, aber der
+# Vectorstore-Test ueberspringt sich stumm ohne SQLITE_EXT_DIR - und meldet
+# dabei "1 assertion passed", sieht also aus wie ein Lauf. Dieselbe Klasse wie
+# der fehlende Rebuild: ein Gate, das weniger prueft als es koennte, und das
+# nicht sagt. Ein explizit gesetztes SQLITE_EXT_DIR gewinnt weiterhin.
+if [ -z "${SQLITE_EXT_DIR:-}" ] && [ -d "$LAI/vendor/sqlite-ext/$ARCH-$TARGET" ]; then
+  export SQLITE_EXT_DIR="$LAI/vendor/sqlite-ext/$ARCH-$TARGET"
+  echo ">>> SQLITE_EXT_DIR=$SQLITE_EXT_DIR (vec0 gefunden)"
+fi
+
 UNITS="$SRC/app;$SRC/core;$SRC/crypt;$SRC/db;$SRC/lib;$SRC/net;$SRC/orm;$SRC/rest;$SRC/soa;$SRC/script;$SRC/misc;$SRC/tools/mget"
 INCLUDES="$SRC;$SRC/core;$SRC/net"
 

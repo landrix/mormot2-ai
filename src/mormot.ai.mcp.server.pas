@@ -1148,7 +1148,7 @@ begin
   headWritten := false;
   // subscriptions/listen is not a request/response: it keeps this stream open
   // and pushes notifications onto it until one side ends it.
-  if McpMethodFromName(_Safe(_JsonFast(aBody))^.U['method']) =
+  if McpMethodFromName(_Safe(_JsonFastFloat(aBody))^.U['method']) =
        mcpSubscriptionsListen then
   begin
     WriteStreamHead;
@@ -1247,7 +1247,9 @@ begin
       // is idempotent, and covers the no-hook path where nothing went out yet.
       WriteStreamHead;
       responseJson := fServer.Processor.CreateError(
-        _Safe(_JsonFast(aBody))^.GetValueOrNull('id'), JSONRPC_INTERNAL_ERROR,
+        // echoed back to the caller: with the default options a numeric id
+        // carrying decimals would return to it as a string
+        _Safe(_JsonFastFloat(aBody))^.GetValueOrNull('id'), JSONRPC_INTERNAL_ERROR,
         StringToUtf8(E.Message));
     end;
   end;

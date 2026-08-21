@@ -82,14 +82,10 @@ type
   //   (stop_reason / usage), message_stop (terminal) -> neutral TLlmStreamDelta
   TAnthropicSseStream = class(TLlmSseStreamBase)
   protected
-    fStreamError: RawUtf8;
+    // fStreamError now lives on the base class: both wires can carry an inband
+    // error, and the OpenAI side needed the same treatment
     fStreamPromptTokens: integer; // input_tokens from message_start, for TotalTokens
     procedure ProcessData(const aPayload: RawUtf8); override;
-  public
-    /// non-empty if the stream carried an Anthropic `error` event - an inband
-    // server error (HTTP 200, e.g. overloaded_error) that ChatStream raises as
-    // ELlmClient instead of returning a silently truncated answer
-    property StreamError: RawUtf8 read fStreamError;
   end;
 
   /// native Anthropic Messages API client (ILlmClient)
@@ -215,7 +211,10 @@ begin
           // the model's arguments are a raw JSON object; embed as a real object
           if (aMsg.ToolCalls[i].ArgumentsJson <> '') and
              IsValidJson(aMsg.ToolCalls[i].ArgumentsJson) then
-            input := _Json(aMsg.ToolCalls[i].ArgumentsJson)
+            // _JsonFastFloat: these are the model's OWN arguments going back
+            // into the conversation. Parsed with the default, a float it chose
+            // returns to it as a string - we would be misquoting the model.
+            input := _JsonFastFloat(aMsg.ToolCalls[i].ArgumentsJson)
           else
             input := _Obj([]);
           _Safe(content)^.AddItem(_ObjFast([
@@ -283,7 +282,7 @@ begin
   result := false;
   if aResponseFormat = '' then
     exit;
-  rfv := _Json(aResponseFormat);
+  rfv := _JsonFastFloat(aResponseFormat); // a schema is re-serialized: see below
   rf := _Safe(rfv);
   // only the OpenAI json_schema shape carries a schema Anthropic can enforce
   if rf^.U['type'] <> 'json_schema' then
@@ -354,7 +353,10 @@ begin
       // Anthropic names the parameter schema `input_schema`; default to an empty
       // object schema so a tool without parameters still validates
       if aRequest.Tools[i].ParametersJson <> '' then
-        _Safe(tool)^.AddValue('input_schema', _Json(aRequest.Tools[i].ParametersJson))
+        // float constants in a schema must stay numbers on the wire - the
+        // default parser turns the ones it cannot hold into strings
+        _Safe(tool)^.AddValue('input_schema',
+          _JsonFastFloat(aRequest.Tools[i].ParametersJson))
       else
         _Safe(tool)^.AddValue('input_schema',
           _ObjFast(['type', 'object', 'properties', _Obj([])]));
@@ -369,7 +371,17 @@ begin
   // merge any provider-specific passthrough (e.g. thinking, tool_choice);
   // AddOrUpdateFrom overwrites rather than duplicating a key
   if _Safe(aRequest.Extra)^.Count > 0 then
+  begin
     _Safe(body)^.AddOrUpdateFrom(aRequest.Extra);
+    // the transport mode is not a passthrough field - see the OpenAI builder.
+    // Here it has to be DELETED for a non-streaming call, not set to false:
+    // this wire omits `stream` entirely unless streaming, so writing false
+    // would be a second, gratuitous difference from what we send otherwise.
+    if aStream then
+      _Safe(body)^.AddOrUpdateValue('stream', true)
+    else
+      _Safe(body)^.Delete('stream');
+  end;
   result := _Safe(body)^.ToJson;
 end;
 
@@ -385,8 +397,24 @@ var
 begin
   Finalize(result);
   FillCharFast(result, SizeOf(result), 0);
-  v := _Json(aJson);
+  // _JsonFastFloat: tool_use blocks are re-serialized below (block^.O['input']
+  // -> ArgumentsJson), so a float the model passed would reach the tool as a
+  // string if this parsed with the default options
+  v := _JsonFastFloat(aJson);
   d := _Safe(v);
+  // see ParseOpenAIChatResponse: a 2xx body that is not a message parsed into
+  // an empty response and stopped the agent loop silently. Anthropic marks its
+  // own error envelope with type:"error", which can arrive with a 2xx from a
+  // proxy in front of it.
+  if not d^.IsObject then
+    ELlmClient.RaiseUtf8('ParseAnthropicChatResponse: not a JSON object: %',
+      [LlmEllipsize(aJson)]);
+  if d^.U['type'] = 'error' then
+    ELlmClient.RaiseUtf8('ParseAnthropicChatResponse: provider error: %',
+      [LlmEllipsize(d^.O['error']^.U['message'])]);
+  if d^.GetValueIndex('content') < 0 then
+    ELlmClient.RaiseUtf8('ParseAnthropicChatResponse: no content block: %',
+      [LlmEllipsize(aJson)]);
   result.Raw := v;
   result.Model := d^.U['model'];
   content := d^.A['content'];
@@ -441,7 +469,7 @@ var
 begin
   Finalize(delta);
   FillCharFast(delta, SizeOf(delta), 0);
-  v := _JsonFast(aPayload);
+  v := _JsonFastFloat(aPayload); // foreign JSON: see ParseAnthropicChatResponse
   d := _Safe(v);
   if d^.Count = 0 then
     exit;
@@ -628,10 +656,18 @@ begin
       if (status < 200) or (status >= 300) then
         // a non-2xx body is a JSON error (not SSE): RawBody keeps it readable
         ELlmClient.RaiseUtf8('ChatStream: HTTP % - %', [status, sse.RawBody]);
-      // an inband `error` event arrives with HTTP 200, so it is invisible to the
-      // status check above - surface it rather than return a truncated answer
+      // An inband error arrives with HTTP 200, so the status check above cannot
+      // see it.
       if sse.StreamError <> '' then
-        ELlmClient.RaiseUtf8('ChatStream: stream error - %', [sse.StreamError]);
+        ELlmClient.RaiseUtf8('ChatStream: stream error - %',
+          [LlmEllipsize(sse.StreamError)]);
+      // No terminal event on a 2xx means the body ended early - a proxy that
+      // terminated the chunked body cleanly, or `Connection: close` without a
+      // Content-Length. The usual abort is loud (mORMot raises ENetSock); these
+      // are the quiet ones, and they used to pass for a complete answer.
+      // ChatStream returns nothing, so the caller cannot check this itself.
+      if not sse.Done then
+        ELlmClient.RaiseUtf8('ChatStream: the stream ended without its terminal event - the answer is truncated (% characters received)', [length(sse.FullText)]);
     finally
       outStream.Free; // frees sse (directly, or via the owning wrapper)
     end;

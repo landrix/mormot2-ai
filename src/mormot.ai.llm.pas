@@ -89,6 +89,11 @@ function OpenAIEmbeddingsRequestJson(const aModel: RawUtf8;
 //   batch response is mapped back to input order rather than array position
 function ParseOpenAIEmbeddings(const aJson: RawUtf8): TLlmEmbeddingDynArray;
 
+/// a short excerpt of an unexpected response body, for an exception message
+// - the body can be a megabyte of proxy HTML, and it is untrusted input:
+//   quoting all of it into an exception helps nobody and fills the log
+function LlmEllipsize(const aText: RawUtf8): RawUtf8;
+
 
 type
   /// OpenAI-wire LLM client driving OpenAI, LiteLLM and Ollama via config
@@ -190,23 +195,47 @@ begin
         'name', aRequest.Tools[i].Name,
         'description', aRequest.Tools[i].Description]);
       if aRequest.Tools[i].ParametersJson <> '' then
-        _Safe(fn)^.AddValue('parameters', _Json(aRequest.Tools[i].ParametersJson));
+        // _JsonFastFloat, not _Json: the default parses floats into currency and
+        // stores what it cannot hold as TEXT, so a schema carrying e.g.
+        // "minimum":0.12345678 would go out as "minimum":"0.12345678" - a
+        // string where the provider expects a number, i.e. an invalid schema
+        _Safe(fn)^.AddValue('parameters',
+          _JsonFastFloat(aRequest.Tools[i].ParametersJson));
       tool := _ObjFast(['type', 'function', 'function', fn]);
       _Safe(tools)^.AddItem(tool);
     end;
     _Safe(body)^.AddValue('tools', tools);
   end;
   if aRequest.ResponseFormat <> '' then
-    _Safe(body)^.AddValue('response_format', _Json(aRequest.ResponseFormat));
+    // same reason as the tool schema above: this one is re-serialized too
+    _Safe(body)^.AddValue('response_format',
+      _JsonFastFloat(aRequest.ResponseFormat));
   // merge any provider-specific passthrough fields; AddOrUpdateFrom overwrites
   // rather than blindly appending, so Extra cannot create a duplicate JSON key
   if _Safe(aRequest.Extra)^.Count > 0 then
+  begin
     _Safe(body)^.AddOrUpdateFrom(aRequest.Extra);
+    // ...but NOT over the transport mode. Extra winning here meant a
+    // ChatComplete with Extra.stream=true parsing an SSE body as JSON (empty
+    // answer, HTTP 200, no exception), and a ChatStream with Extra.stream=false
+    // firing no callbacks at all. Which of the two calls the caller made is
+    // not a passthrough field - it decides how the answer is read.
+    // Re-set AFTER the merge rather than merging Extra first: merging first
+    // would stop Extra from overriding `model`, which is tested behaviour.
+    _Safe(body)^.AddOrUpdateValue('stream', aStream);
+  end;
   result := _Safe(body)^.ToJson;
 end;
 
 
 { ************ Response parsing }
+
+function LlmEllipsize(const aText: RawUtf8): RawUtf8;
+begin
+  result := aText;
+  if length(result) > 200 then
+    result := copy(result, 1, 200) + '...';
+end;
 
 function ParseOpenAIChatResponse(const aJson: RawUtf8): TLlmChatResponse;
 var
@@ -216,8 +245,30 @@ var
 begin
   Finalize(result);
   FillCharFast(result, SizeOf(result), 0);
-  v := _Json(aJson);
+  v := _JsonFastFloat(aJson); // see ParseOpenAIEmbeddings for why
   d := _Safe(v);
+  // A 2xx whose body is NOT a chat completion used to parse into an empty
+  // response instead of failing: _Json returns false on malformed input and
+  // _Safe then hands back DocVariantDataFake, which carries
+  // dvoReturnNullForUnknownProperty - so every field below reads as null and
+  // nothing raises. The agent loop then sees no tool calls, treats that as
+  // "the model answered" and stops in iteration 1 with empty content. The
+  // embeddings consumer already refuses exactly this shape (embed.provider:
+  // "fail loudly instead of returning an empty vector"); the chat path was the
+  // one consumer left unguarded. Realistic triggers: proxy/gateway HTML, a
+  // misconfigured BaseUrl, or an OpenAI-compatible shim - and shims are a
+  // documented target here (OllamaConfig/LiteLLMConfig).
+  if not d^.IsObject then
+    ELlmClient.RaiseUtf8('ParseOpenAIChatResponse: not a JSON object: %',
+      [LlmEllipsize(aJson)]);
+  // a provider error object served with a 2xx status: the status check upstream
+  // cannot see it, and it is the shape a shim most often gets wrong
+  if d^.GetValueIndex('error') >= 0 then
+    ELlmClient.RaiseUtf8('ParseOpenAIChatResponse: provider error: %',
+      [LlmEllipsize(d^.O['error']^.U['message'])]);
+  if d^.A['choices']^.Count = 0 then
+    ELlmClient.RaiseUtf8('ParseOpenAIChatResponse: no choices in response: %',
+      [LlmEllipsize(aJson)]);
   result.Raw := v;
   result.Model := d^.U['model'];
   choice := d^.A['choices']^._[0];
@@ -263,7 +314,17 @@ var
   i, j, idx: PtrInt;
 begin
   result := nil;
-  v := _Json(aJson);
+  // JSON_FAST_FLOAT, not the plain default: without dvoAllowDoubleValue mORMot
+  // parses floating point into currency and gives up on anything with more
+  // than four decimals or an exponent - JsonToAnyVariant then stores it as
+  // TEXT ('it may be a double value, but we didn''t allow them'). Reading that
+  // back into a single below goes through the RTL string->float path, and
+  // PrepareFloatStr DELETES every character equal to
+  // DefaultFormatSettings.ThousandSeparator - which FPC fills from the OS
+  // locale on Windows. On a German machine that is the DOT, so the decimal
+  // point of every component vanishes: -0.0069619063 arrives as -69619064.
+  // Silently, and straight into the vector store and the RAG index.
+  v := _JsonFastFloat(aJson);
   d := _Safe(v);
   data := d^.A['data'];
   SetLength(result, data^.Count);
@@ -398,6 +459,18 @@ begin
       if (status < 200) or (status >= 300) then
         // a non-2xx body is a JSON error (not SSE): RawBody keeps it readable
         ELlmClient.RaiseUtf8('ChatStream: HTTP % - %', [status, sse.RawBody]);
+      // An inband error arrives with HTTP 200, so the status check above cannot
+      // see it.
+      if sse.StreamError <> '' then
+        ELlmClient.RaiseUtf8('ChatStream: stream error - %',
+          [LlmEllipsize(sse.StreamError)]);
+      // No terminal event on a 2xx means the body ended early - a proxy that
+      // terminated the chunked body cleanly, or `Connection: close` without a
+      // Content-Length. The usual abort is loud (mORMot raises ENetSock); these
+      // are the quiet ones, and they used to pass for a complete answer.
+      // ChatStream returns nothing, so the caller cannot check this itself.
+      if not sse.Done then
+        ELlmClient.RaiseUtf8('ChatStream: the stream ended without its terminal event - the answer is truncated (% characters received)', [length(sse.FullText)]);
     finally
       outStream.Free; // frees sse (directly, or via the owning wrapper)
     end;

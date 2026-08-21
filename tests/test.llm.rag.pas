@@ -26,6 +26,7 @@ type
     procedure ChunkingUtf8LongToken;
     procedure VectorBlobRoundTrip;
     procedure VectorStoreKeyedOps;
+    procedure EmptyQuestionIsADeterministicMiss;
   end;
 
 
@@ -183,6 +184,33 @@ begin
     if hits[i].Key = 'addr-2' then
       hadAddr2 := true;
   Check(not hadAddr2, 'deleted entity no longer appears in search results');
+end;
+
+
+procedure TTestLlmRag.EmptyQuestionIsADeterministicMiss;
+var
+  rag: TLlmRag;
+  resp: TLlmChatResponse;
+begin
+  // Deliberately wired with NO client, embedder or store: an empty question
+  // must not reach any of them. It used to be passed straight to the embedder,
+  // which raises on an empty vector - while Ingest handles empty input cleanly
+  // and the RAG tool rejects an empty query outright. Only this path differed.
+  rag := TLlmRag.Create(nil, nil, nil, 'model');
+  try
+    resp := rag.Query('   ');
+    Check(resp.FinishReason = lfrStop, 'answered, not raised');
+    CheckEqual(resp.Content, 'No matching information was found.',
+      'the deterministic miss answer, in English');
+    CheckEqual(length(rag.LastHits), 0, 'and nothing was retrieved');
+    // ...and it is overridable: the sentence used to be hardcoded German in a
+    // library whose own system prompt is English
+    rag.NoAnswerText := 'Nichts gefunden.';
+    resp := rag.Query('');
+    CheckEqual(resp.Content, 'Nichts gefunden.', 'caller-defined miss answer');
+  finally
+    rag.Free;
+  end;
 end;
 
 end.

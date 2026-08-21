@@ -2138,7 +2138,14 @@ begin
   aRequestId := Null;
 
   // Parse JSON (invalid JSON yields a non-object -> rejected below)
-  request := _JsonFast(aJson);
+  // _JsonFastFloat, like every other entry point taking foreign JSON: the
+  // default options keep floats in currency and store what they cannot hold as
+  // TEXT, so a tool argument of 0.12345678 would be passed on as the STRING
+  // "0.12345678". A typed tool recovers (RecordLoadJson is tolerant and
+  // converts through mORMot's own, locale-independent parser), but one that
+  // reads the raw variant - or echoes it into structuredContent - sees a
+  // string where its own published schema says number.
+  request := _JsonFastFloat(aJson);
   doc := _Safe(request);
   if not doc.IsObject then
     exit;

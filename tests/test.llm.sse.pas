@@ -24,6 +24,9 @@ type
     ToolName: RawUtf8;
     ToolArgs: RawUtf8;
     UsageTotal: integer;
+    UsageCount: integer;     // how OFTEN usage arrived, not just the value
+    ToolCallDeltas: integer; // deltas carrying a tool call
+    ToolSlots: RawUtf8;      // 'index:name ' per call, in arrival order
     DoneCount: integer;
     procedure Handle(const aDelta: TLlmStreamDelta);
   end;
@@ -40,6 +43,10 @@ type
     procedure StreamToolCalls;
     procedure FlushTrailingEvent;
     procedure RawBodyOnNonSse;
+    procedure TruncatedStreamIsNotDone;
+    procedure InbandErrorIsCaptured;
+    procedure ParallelToolCallsAllArrive;
+    procedure RawBodyIsActuallyBounded;
   end;
 
 
@@ -61,9 +68,15 @@ begin
     if aDelta.ToolCallName <> '' then
       ToolName := aDelta.ToolCallName;
     ToolArgs := ToolArgs + aDelta.ToolCallArgsDelta;
+    inc(ToolCallDeltas);
+    ToolSlots := ToolSlots +
+      FormatUtf8('%:% ', [aDelta.ToolCallIndex, aDelta.ToolCallName]);
   end;
   if aDelta.HasUsage then
+  begin
     UsageTotal := aDelta.Usage.TotalTokens;
+    inc(UsageCount);
+  end;
   if aDelta.Done then
     inc(DoneCount);
 end;
@@ -230,6 +243,114 @@ begin
     CheckEqual(s.FullText, '', 'no SSE content parsed');
     // the raw body is retained so the client can surface the provider's message
     Check(Pos(RawUtf8('invalid api key'), s.RawBody) > 0, 'raw error body retained');
+  finally
+    s.Free;
+    coll.Free;
+  end;
+end;
+
+
+procedure TTestLlmSse.TruncatedStreamIsNotDone;
+const
+  // a body that simply stops: two content chunks, no [DONE]. A proxy that
+  // terminated the chunked body cleanly, or `Connection: close` with no
+  // Content-Length, looks exactly like this - no exception anywhere.
+  TRUNCATED =
+    'data: {"choices":[{"delta":{"content":"Hel"}}]}'#10#10 +
+    'data: {"choices":[{"delta":{"content":"lo"}}]}'#10#10;
+var
+  s: TLlmSseStream;
+  coll: TSseCollector;
+begin
+  coll := Parse(TRUNCATED, 0, s);
+  try
+    CheckEqual(s.FullText, 'Hello', 'the partial text did arrive');
+    // and THIS is what tells the client the answer is incomplete. Nothing else
+    // can: ChatStream returns void, so a caller cannot inspect the result.
+    Check(not s.Done, 'a stream without its terminal event is not done');
+    CheckEqual(coll.DoneCount, 0, 'and no terminal delta was emitted');
+  finally
+    s.Free;
+    coll.Free;
+  end;
+end;
+
+procedure TTestLlmSse.InbandErrorIsCaptured;
+const
+  // HTTP 200, and the failure rides inside the stream - invisible to any status
+  // check. The Anthropic wire has always handled this shape; this one swallowed
+  // it as an empty chunk and kept the partial text.
+  INBAND_ERROR =
+    'data: {"choices":[{"delta":{"content":"Hel"}}]}'#10#10 +
+    'data: {"error":{"message":"model overloaded","type":"server_error"}}'#10#10;
+var
+  s: TLlmSseStream;
+  coll: TSseCollector;
+begin
+  coll := Parse(INBAND_ERROR, 0, s);
+  try
+    CheckEqual(s.StreamError, 'model overloaded', 'the inband error is captured');
+    Check(not s.Done, 'and such a stream never reaches its terminal event');
+    CheckEqual(s.FullText, 'Hel', 'the partial text is kept for diagnosis');
+  finally
+    s.Free;
+    coll.Free;
+  end;
+end;
+
+
+procedure TTestLlmSse.ParallelToolCallsAllArrive;
+const
+  // one chunk, two calls - the wire interleaves parallel tool calls and our own
+  // delta type models the slots. Reading tool_calls[0] only dropped every
+  // further call without a trace.
+  PARALLEL =
+    'data: {"choices":[{"delta":{"content":"go","tool_calls":[' +
+    '{"index":0,"id":"a","function":{"name":"get_weather","arguments":"{}"}},' +
+    '{"index":1,"id":"b","function":{"name":"get_time","arguments":"{}"}}]}}],' +
+    '"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}'#10#10 +
+    'data: [DONE]'#10#10;
+var
+  s: TLlmSseStream;
+  coll: TSseCollector;
+begin
+  coll := Parse(PARALLEL, 0, s);
+  try
+    CheckEqual(coll.ToolCallDeltas, 2, 'both calls reach the consumer');
+    CheckEqual(coll.ToolSlots, '0:get_weather 1:get_time ',
+      'each in its own slot, in order');
+    // ...and this is why the obvious loop would have been a regression: the
+    // extra deltas must NOT repeat what belongs to the chunk itself
+    CheckEqual(coll.ContentPieces, 1, 'the text is emitted exactly once');
+    CheckEqual(coll.Text, 'go', 'and not duplicated');
+    CheckEqual(coll.UsageCount, 1, 'usage is counted exactly once');
+    CheckEqual(coll.UsageTotal, 7, 'with the right total');
+    CheckEqual(s.FullText, 'go', 'the accumulated text is not doubled either');
+    Check(s.Done, 'terminal sentinel still seen');
+  finally
+    s.Free;
+    coll.Free;
+  end;
+end;
+
+
+procedure TTestLlmSse.RawBodyIsActuallyBounded;
+var
+  s: TLlmSseStream;
+  coll: TSseCollector;
+  huge: RawUtf8;
+begin
+  // A body that never produces a data: line - an HTML error page from a proxy,
+  // or a streaming dump. The comment claimed it was 'bounded in size' while
+  // nothing bounded it: MaxResponseBytes is opt-in and NO factory sets one, so
+  // this grew for as long as the body did.
+  SetLength(huge, 200 shl 10); // 200 KB
+  FillCharFast(pointer(huge)^, length(huge), ord('x'));
+  coll := Parse(huge, 0, s);
+  try
+    Check(length(s.RawBody) > 0, 'a diagnostic excerpt is still kept');
+    Check(length(s.RawBody) <= 8 shl 10,
+      'but it is capped - it exists to make an error readable, nothing more');
   finally
     s.Free;
     coll.Free;

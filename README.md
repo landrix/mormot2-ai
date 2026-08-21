@@ -6,7 +6,7 @@ crypto are the foundation, not a dependency we tolerate.
 
 > **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
 > (stateless) and only that one. Build, tests and demos green on aarch64-linux/FPC 3.2.2:
-> **892 assertions** MCP suite, **273 assertions** LLM suite. Open: phase E
+> **892 assertions** MCP suite, **344 assertions** LLM suite. Open: phase E
 > (layering / merge / backend binding) — see [CONCEPT.md](CONCEPT.md).
 
 ## Why a standalone extension

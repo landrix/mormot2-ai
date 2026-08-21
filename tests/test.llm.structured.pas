@@ -10,6 +10,7 @@ uses
   mormot.core.base,
   mormot.core.text,
   mormot.core.rtti,
+  mormot.core.variants, // PDocVariantData for the schema assertions
   mormot.core.test,
   mormot.ai.llm.types,
   mormot.ai.llm,
@@ -30,6 +31,8 @@ type
     procedure RecordSchemaHasFields;
     procedure ChatStructuredFillsRecord;
     procedure StrictModeInjectsAdditionalProperties;
+    procedure IncompleteAnswerIsNotASuccess;
+    procedure StrictModeDoesNotDuplicateAdditionalProperties;
   end;
 
 
@@ -122,6 +125,77 @@ begin
   Check(Pos(RawUtf8('"strict":true'), strictFmt) > 0, 'strict flag set');
   Check(Pos(RawUtf8('"additionalProperties":false'), strictFmt) > 0,
     'additionalProperties:false injected for strict');
+end;
+
+
+procedure TTestLlmStructured.IncompleteAnswerIsNotASuccess;
+var
+  stub: TStubLlmClient;
+  client: ILlmClient;
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  person: TPerson;
+
+  function Extract(const aAnswer: RawUtf8): boolean;
+  begin
+    stub.Push(JsonResponse(aAnswer));
+    // pre-fill, so a fix that only checks the return value cannot hide behind
+    // an already-zeroed variable: this is what a caller reusing a record has
+    person.name := 'STALE';
+    person.age := 99;
+    result := ChatStructured(client, req, TypeInfo(TPerson), person);
+  end;
+
+begin
+  EnsureRtti;
+  stub := TStubLlmClient.Create;
+  client := stub;
+  SetLength(msgs, 1);
+  msgs[0] := LlmMessage(lrUser, 'Extract the person.');
+  req := LlmChatRequest('test-model', msgs);
+
+  // '{}' parses without error and left the record untouched - reported as a
+  // successful extraction of a person who is nobody
+  Check(not Extract('{}'), 'an empty object is not an extraction');
+  CheckEqual(person.name, '', 'and nothing of the previous one survives');
+  CheckEqual(person.age, 0, 'nor of its numbers');
+
+  // a wrapper object: jpoIgnoreUnknownProperty swallows the payload whole
+  Check(not Extract('{"result":{"name":"Alice","age":30}}'),
+    'a wrapped answer is not silently accepted as empty');
+  CheckEqual(person.name, '', 'still nothing left behind');
+
+  // a partial answer: the schema declares both fields required
+  Check(not Extract('{"name":"Alice"}'), 'a missing required field fails');
+
+  // prose instead of JSON
+  Check(not Extract('I could not find a person.'), 'prose is not an extraction');
+
+  // and the complete answer still works, exactly as before
+  Check(Extract('{"name":"Alice","age":30}'), 'a complete answer succeeds');
+  CheckEqual(person.name, 'Alice', 'name');
+  CheckEqual(person.age, 30, 'age');
+end;
+
+
+procedure TTestLlmStructured.StrictModeDoesNotDuplicateAdditionalProperties;
+var
+  fmt: RawUtf8;
+  d: PDocVariantData;
+  i, n: PtrInt;
+begin
+  // a schema that already carries the key: AddValue appended a SECOND one, and
+  // TDocVariantData stores duplicate names happily - every lookup then returns
+  // the first, so the injected false was invisible to anyone reading it back
+  fmt := OpenAIJsonSchemaFormat('r',
+    '{"type":"object","additionalProperties":true,"properties":{}}', {strict=}true);
+  d := _Safe(_Json(fmt))^.O['json_schema']^.O['schema'];
+  n := 0;
+  for i := 0 to d^.Count - 1 do
+    if d^.Names[i] = 'additionalProperties' then
+      inc(n);
+  CheckEqual(n, 1, 'exactly one additionalProperties key');
+  Check(not d^.B['additionalProperties'], 'and strict mode won');
 end;
 
 end.

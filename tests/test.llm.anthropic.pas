@@ -40,6 +40,9 @@ type
     procedure ResponseTextAndUsage;
     procedure ResponseToolUse;
     procedure ResponseToolUseNoInput;
+    procedure ResponseToolUseKeepsFloatsNumeric;
+    procedure NonMessageBodyIsRefused;
+    procedure ExtraCannotOverrideTheTransportMode;
     procedure StopReasonMapping;
     procedure SseTextStream;
     procedure SseToolStream;
@@ -529,6 +532,88 @@ begin
     s.Free;
     coll.Free;
   end;
+end;
+
+
+procedure TTestLlmAnthropic.ResponseToolUseKeepsFloatsNumeric;
+const
+  // the model chose a threshold with more decimals than currency can hold
+  RESP_JSON =
+    '{"id":"msg_3","type":"message","role":"assistant","model":"claude-opus-4-8",' +
+    '"content":[{"type":"tool_use","id":"toolu_1","name":"search",' +
+    '"input":{"threshold":0.12345678,"limit":10}}],' +
+    '"stop_reason":"tool_use","usage":{"input_tokens":5,"output_tokens":3}}';
+var
+  resp: TLlmChatResponse;
+begin
+  // The input block is RE-SERIALIZED into ArgumentsJson, and that is what the
+  // tool receives. Parsed with the default options mORMot keeps floats in
+  // currency and stores what it cannot hold as text, so this used to arrive as
+  // "threshold":"0.12345678" - a string where the tool's own schema says
+  // number. We would be misquoting the model to its own tool.
+  resp := ParseAnthropicChatResponse(RESP_JSON);
+  CheckEqual(length(resp.ToolCalls), 1, 'one tool call');
+  Check(Pos(RawUtf8('"threshold":0.12345678'), resp.ToolCalls[0].ArgumentsJson) > 0,
+    'the float stays a number, undamaged');
+  Check(Pos(RawUtf8('"0.12345678"'), resp.ToolCalls[0].ArgumentsJson) = 0,
+    'and is not quoted as a string');
+  Check(Pos(RawUtf8('"limit":10'), resp.ToolCalls[0].ArgumentsJson) > 0,
+    'integers are unaffected either way');
+end;
+
+
+procedure TTestLlmAnthropic.NonMessageBodyIsRefused;
+
+  procedure MustRaise(const aBody, aWhat: RawUtf8);
+  var
+    resp: TLlmChatResponse;
+    raised: boolean;
+  begin
+    raised := false;
+    try
+      resp := ParseAnthropicChatResponse(aBody);
+    except
+      on E: ELlmClient do
+        raised := true;
+    end;
+    Check(raised, aWhat);
+  end;
+
+begin
+  // see the OpenAI side: a 2xx body that is not a message used to yield a
+  // silently empty response and end the agent loop in its first iteration
+  MustRaise('<html>502</html>', 'proxy HTML is refused');
+  MustRaise('{', 'malformed JSON is refused');
+  // Anthropic marks its own error envelope, and a proxy can deliver it with 200
+  MustRaise('{"type":"error","error":{"type":"overloaded_error",' +
+    '"message":"Overloaded"}}', 'a provider error envelope is refused');
+end;
+
+
+procedure TTestLlmAnthropic.ExtraCannotOverrideTheTransportMode;
+var
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  json: RawUtf8;
+begin
+  SetLength(msgs, 1);
+  msgs[0] := LlmMessage(lrUser, 'hi');
+  req := LlmChatRequest('claude-opus-4-8', msgs);
+  req.Extra := _ObjFast(['stream', true, 'temperature', 0.9]);
+
+  // this wire OMITS stream entirely unless streaming, so a non-streaming call
+  // has to delete the key Extra smuggled in - writing false would be a second,
+  // gratuitous difference from what we normally send
+  json := AnthropicChatRequestJson(req, {stream=}false);
+  Check(Pos(RawUtf8('"stream"'), json) = 0,
+    'no stream key at all on a non-streaming call');
+  Check(Pos(RawUtf8('"temperature":0.9'), json) > 0,
+    'everything else from Extra still passes through');
+
+  req.Extra := _ObjFast(['stream', false]);
+  json := AnthropicChatRequestJson(req, {stream=}true);
+  Check(Pos(RawUtf8('"stream":true'), json) > 0, 'streaming stays streaming');
+  Check(Pos(RawUtf8('"stream":false'), json) = 0, 'and not the smuggled false');
 end;
 
 end.

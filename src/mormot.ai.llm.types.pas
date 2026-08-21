@@ -130,8 +130,10 @@ type
     Temperature: double;
     /// response token cap; <= 0 means "omit / provider default"
     MaxTokens: integer;
-    /// request a streamed (SSE) response
-    Stream: boolean;
+    // NO `Stream` field: the transport mode is decided by which method the
+    // caller invokes (ChatComplete vs. ChatStream), and a second, ignored
+    // switch on the request was a trap - it read like it worked. Extra.stream
+    // is not a way in either; both builders re-set the mode after merging.
     /// optional response_format value as raw JSON (e.g. '{"type":"json_object"}'
     // or a json_schema object); '' omits it - see mormot.ai.llm.structured
     ResponseFormat: RawUtf8;
@@ -273,7 +275,7 @@ begin
   result.Messages := aMessages;
   result.Temperature := -1; // omit
   result.MaxTokens := 0;    // omit
-  result.Stream := false;
+
 end;
 
 function LlmMessage(aRole: TLlmRole; const aContent: RawUtf8): TLlmMessage;

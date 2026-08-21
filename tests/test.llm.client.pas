@@ -31,6 +31,10 @@ type
     procedure EmbeddingsParsing;
     procedure EmbeddingsParsingReordered;
     procedure EmbeddingsParsingNoIndex;
+    procedure EmbeddingsSurviveAThousandSeparatorLocale;
+    procedure ToolSchemaFloatsStayNumeric;
+    procedure NonChatBodyIsRefusedNotSilentlyEmpty;
+    procedure ExtraCannotOverrideTheTransportMode;
   end;
 
 
@@ -326,6 +330,147 @@ begin
   CheckEqual(length(vecs), 2, 'one vector per input');
   CheckSame(vecs[0][0], 0.1, 1e-4, 'first item -> slot 0 (not collapsed)');
   CheckSame(vecs[1][0], 0.4, 1e-4, 'second item -> slot 1 by position');
+end;
+
+
+procedure TTestLlmClient.EmbeddingsSurviveAThousandSeparatorLocale;
+const
+  // real embedding values: ten significant digits and an exponent. The
+  // existing tests only use 0.1..0.6, which fit into varCurrency - the parser
+  // never even reaches the path this test is about.
+  EMB_RESP =
+    '{"object":"list","data":[' +
+    '{"object":"embedding","index":0,' +
+    '"embedding":[-0.0069619063,0.12345678,4.9e-5]}],' +
+    '"model":"text-embedding-3-small"}';
+var
+  vecs: TLlmEmbeddingDynArray;
+  saved: TFormatSettings;
+begin
+  // A value mORMot cannot hold in currency is stored as TEXT unless the parser
+  // was allowed doubles - and reading it back then goes through the RTL's
+  // string->float conversion. PrepareFloatStr DELETES every character equal to
+  // DefaultFormatSettings.ThousandSeparator, which FPC fills from the OS locale
+  // on Windows (LOCALE_STHOUSAND) - a DOT on a German machine. The decimal
+  // point of every vector component simply vanishes.
+  // Set here rather than trusting the host locale, so the test proves the same
+  // thing on the Linux CI as on the German Windows box where it was found.
+  saved := DefaultFormatSettings;
+  try
+    DefaultFormatSettings.ThousandSeparator := '.';
+    vecs := ParseOpenAIEmbeddings(EMB_RESP);
+    CheckEqual(length(vecs), 1, 'one vector');
+    CheckEqual(length(vecs[0]), 3, 'three components');
+    // without the fix these come back as -69619064, 12345678 and 49:
+    // off by ten orders of magnitude, silently, and straight into the index
+    CheckSame(vecs[0][0], -0.0069619063, 1e-6, 'ten significant digits');
+    CheckSame(vecs[0][1], 0.12345678, 1e-6, 'eight decimals');
+    CheckSame(vecs[0][2], 4.9e-5, 1e-9, 'exponent notation');
+  finally
+    DefaultFormatSettings := saved;
+  end;
+end;
+
+
+procedure TTestLlmClient.ToolSchemaFloatsStayNumeric;
+var
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  json: RawUtf8;
+begin
+  // A tool schema is parsed and RE-SERIALIZED into the request body. With the
+  // default parser mORMot keeps floats in currency and stores what it cannot
+  // hold as text, so a constraint like "minimum":0.12345678 went out as a
+  // STRING - an invalid JSON Schema, which the provider is entitled to reject.
+  SetLength(msgs, 1);
+  msgs[0] := LlmMessage(lrUser, 'hi');
+  req := LlmChatRequest('gpt-4o', msgs);
+  SetLength(req.Tools, 1);
+  req.Tools[0].Name := 'search';
+  req.Tools[0].Description := 'search';
+  req.Tools[0].ParametersJson :=
+    '{"type":"object","properties":{"threshold":{"type":"number",' +
+    '"minimum":0.12345678}}}';
+  json := OpenAIChatRequestJson(req, {stream=}false);
+  Check(Pos(RawUtf8('"minimum":0.12345678'), json) > 0,
+    'a float constraint stays a number');
+  Check(Pos(RawUtf8('"0.12345678"'), json) = 0, 'and is not quoted');
+end;
+
+
+procedure TTestLlmClient.NonChatBodyIsRefusedNotSilentlyEmpty;
+
+  procedure MustRaise(const aBody, aWhat: RawUtf8);
+  var
+    resp: TLlmChatResponse;
+    raised: boolean;
+  begin
+    raised := false;
+    try
+      resp := ParseOpenAIChatResponse(aBody);
+    except
+      on E: ELlmClient do
+        raised := true;
+    end;
+    Check(raised, aWhat);
+  end;
+
+var
+  resp: TLlmChatResponse;
+begin
+  // These bodies used to parse into a completely empty response WITHOUT
+  // raising: _Json returns false and _Safe then yields DocVariantDataFake,
+  // whose dvoReturnNullForUnknownProperty makes every field read as null. The
+  // agent loop sees no tool calls, takes that for an answer and stops in
+  // iteration 1 with empty content - the iteration cap never fires, because
+  // the loop is left the regular way.
+  MustRaise('<html><body>502 Bad Gateway</body></html>', 'proxy HTML is refused');
+  MustRaise('{', 'malformed JSON is refused');
+  MustRaise('[1,2,3]', 'a JSON array is not a chat completion');
+  MustRaise('{"object":"chat.completion","choices":[]}', 'no choices is refused');
+  // a provider error served with 2xx - the status check upstream cannot see it
+  MustRaise('{"error":{"message":"model overloaded","type":"server_error"}}',
+    'a provider error object is refused even on a 2xx');
+
+  // and a real response still parses, including one with empty content (a
+  // content filter stop is a legitimate empty answer, not a broken body)
+  resp := ParseOpenAIChatResponse(
+    '{"model":"gpt-4o","choices":[{"finish_reason":"content_filter",' +
+    '"message":{"role":"assistant","content":""}}]}');
+  CheckEqual(resp.Content, '', 'a legitimately empty answer still parses');
+  Check(resp.FinishReason = lfrContentFilter, 'and keeps its finish reason');
+end;
+
+
+procedure TTestLlmClient.ExtraCannotOverrideTheTransportMode;
+var
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  json: RawUtf8;
+begin
+  SetLength(msgs, 1);
+  msgs[0] := LlmMessage(lrUser, 'hi');
+  req := LlmChatRequest('gpt-4o', msgs);
+  req.Extra := _ObjFast(['stream', true, 'model', 'override-me']);
+
+  // Extra is merged AFTER the canonical fields and overwrites same-named keys -
+  // which is wanted for model, but for `stream` it decides how the ANSWER is
+  // read. A ChatComplete with Extra.stream=true parsed an SSE body as JSON: an
+  // empty answer on HTTP 200, no exception anywhere.
+  json := OpenAIChatRequestJson(req, {stream=}false);
+  Check(Pos(RawUtf8('"stream":false'), json) > 0,
+    'the call decides the transport, not Extra');
+  Check(Pos(RawUtf8('"stream":true'), json) = 0, 'and no second stream key');
+  // still overridable where that is the point - this is tested behaviour
+  Check(Pos(RawUtf8('"model":"override-me"'), json) > 0,
+    'Extra still overrides everything else');
+
+  // and the other direction: ChatStream with Extra.stream=false used to fire no
+  // callbacks at all, because every line lacked the data: prefix
+  req.Extra := _ObjFast(['stream', false]);
+  json := OpenAIChatRequestJson(req, {stream=}true);
+  Check(Pos(RawUtf8('"stream":true'), json) > 0, 'streaming stays streaming');
+  Check(Pos(RawUtf8('"stream":false'), json) = 0, 'no leftover false');
 end;
 
 end.
