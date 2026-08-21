@@ -39,7 +39,10 @@ const
 /// the JSON-Schema (as raw JSON) of a record type, via the shared RTTI generator
 // - the record's RTTI must be available (e.g. Rtti.RegisterFromText for a packed
 //   record of simple fields), exactly as for an MCP tool parameter record
-function RecordJsonSchema(aTypeInfo: PRttiInfo): RawUtf8;
+// - aOptional names the fields a caller may leave out; everything else is
+//   published as required, exactly as for an MCP tool parameter record
+function RecordJsonSchema(aTypeInfo: PRttiInfo;
+  const aOptional: TRawUtf8DynArray = nil): RawUtf8;
 
 /// build an OpenAI response_format value for a named json_schema
 // - aStrict=false (default) is the broadly-compatible mode: the schema guides the
@@ -60,14 +63,23 @@ function OpenAIJsonSchemaFormat(const aName, aSchemaJson: RawUtf8;
 // - aResult is always CLEARED first, and left cleared when this returns
 //   false: a caller that forgets to check the result gets zeros rather than
 //   a half-filled record or the previous extraction
-// - returns false unless the answer is a JSON object carrying every field
-//   the generated schema declares required: '{}' and a wrapper object both
-//   parse without error and would otherwise pass for a successful extraction
+// - returns false unless the answer is a JSON object carrying every field the
+//   generated schema declares required (see aOptional): '{}' and a wrapper
+//   object both parse without error and would otherwise pass for a successful
+//   extraction
 // - aStrict defaults to false for cross-provider compatibility; pass true only
 //   for a flat simple-field record talking to an OpenAI strict endpoint
+// - aOptional names the fields the model may omit. RTTI carries no notion of
+//   an optional field, so without it EVERY field is published as required AND
+//   demanded back - which would make a record with a genuinely optional field
+//   (a middle name, an address line 2) unusable: every otherwise-correct
+//   extraction would be discarded. Same escape hatch MCP tools get from
+//   TMcpToolBase.MarkOptional, and the published schema follows it, so the
+//   contract we advertise and the one we enforce stay the same
 function ChatStructured(const aClient: ILlmClient; var aRequest: TLlmChatRequest;
   aTypeInfo: PRttiInfo; var aResult; const aSchemaName: RawUtf8 = 'result';
-  aStrict: boolean = false): boolean;
+  aStrict: boolean = false;
+  const aOptional: TRawUtf8DynArray = nil): boolean;
 
 
 implementation
@@ -75,9 +87,11 @@ implementation
 uses
   mormot.core.json;
 
-function RecordJsonSchema(aTypeInfo: PRttiInfo): RawUtf8;
+function RecordJsonSchema(aTypeInfo: PRttiInfo;
+  const aOptional: TRawUtf8DynArray): RawUtf8;
 begin
-  result := _Safe(TMcpSchemaGenerator.GenerateSchema(aTypeInfo))^.ToJson;
+  result :=
+    _Safe(TMcpSchemaGenerator.GenerateSchema(aTypeInfo, aOptional))^.ToJson;
 end;
 
 function OpenAIJsonSchemaFormat(const aName, aSchemaJson: RawUtf8;
@@ -105,7 +119,7 @@ end;
 
 function ChatStructured(const aClient: ILlmClient; var aRequest: TLlmChatRequest;
   aTypeInfo: PRttiInfo; var aResult; const aSchemaName: RawUtf8;
-  aStrict: boolean): boolean;
+  aStrict: boolean; const aOptional: TRawUtf8DynArray): boolean;
 var
   resp: TLlmChatResponse;
   schemaJson, field: RawUtf8;
@@ -113,7 +127,7 @@ var
   answer, required: PDocVariantData;
   i: PtrInt;
 begin
-  schemaJson := RecordJsonSchema(aTypeInfo);
+  schemaJson := RecordJsonSchema(aTypeInfo, aOptional);
   aRequest.ResponseFormat :=
     OpenAIJsonSchemaFormat(aSchemaName, schemaJson, aStrict);
   resp := aClient.ChatComplete(aRequest);

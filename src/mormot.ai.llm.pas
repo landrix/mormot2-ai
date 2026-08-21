@@ -89,11 +89,6 @@ function OpenAIEmbeddingsRequestJson(const aModel: RawUtf8;
 //   batch response is mapped back to input order rather than array position
 function ParseOpenAIEmbeddings(const aJson: RawUtf8): TLlmEmbeddingDynArray;
 
-/// a short excerpt of an unexpected response body, for an exception message
-// - the body can be a megabyte of proxy HTML, and it is untrusted input:
-//   quoting all of it into an exception helps nobody and fills the log
-function LlmEllipsize(const aText: RawUtf8): RawUtf8;
-
 
 type
   /// OpenAI-wire LLM client driving OpenAI, LiteLLM and Ollama via config
@@ -230,17 +225,11 @@ end;
 
 { ************ Response parsing }
 
-function LlmEllipsize(const aText: RawUtf8): RawUtf8;
-begin
-  result := aText;
-  if length(result) > 200 then
-    result := copy(result, 1, 200) + '...';
-end;
-
 function ParseOpenAIChatResponse(const aJson: RawUtf8): TLlmChatResponse;
 var
   v: variant;
   d, choice, msg, calls, call, fn, usage: PDocVariantData;
+  err: RawUtf8;
   i: PtrInt;
 begin
   Finalize(result);
@@ -261,13 +250,22 @@ begin
   if not d^.IsObject then
     ELlmClient.RaiseUtf8('ParseOpenAIChatResponse: not a JSON object: %',
       [LlmEllipsize(aJson)]);
-  // a provider error object served with a 2xx status: the status check upstream
-  // cannot see it, and it is the shape a shim most often gets wrong
-  if d^.GetValueIndex('error') >= 0 then
+  // A provider error object served with a 2xx status: the status check
+  // upstream cannot see it, and it is the shape a shim most often gets wrong.
+  // Judged by the VALUE, never by the key alone: a server built around a fixed
+  // response struct (Go, Rust, anything statically typed) serializes
+  // "error":null on success, and rejecting on key presence would discard every
+  // perfectly good answer it ever sends.
+  err := LlmProviderError(d);
+  if err <> '' then
     ELlmClient.RaiseUtf8('ParseOpenAIChatResponse: provider error: %',
-      [LlmEllipsize(d^.O['error']^.U['message'])]);
-  if d^.A['choices']^.Count = 0 then
-    ELlmClient.RaiseUtf8('ParseOpenAIChatResponse: no choices in response: %',
+      [LlmEllipsize(err)]);
+  // not merely "there is a choices array": `{"choices":[{}]}` and
+  // `{"choices":[null]}` both survive a count check and yield an empty answer -
+  // exactly the silent shape this guard exists to stop
+  if (d^.A['choices']^.Count = 0) or
+     (d^.A['choices']^._[0]^.O['message']^.Count = 0) then
+    ELlmClient.RaiseUtf8('ParseOpenAIChatResponse: no usable choice: %',
       [LlmEllipsize(aJson)]);
   result.Raw := v;
   result.Model := d^.U['model'];

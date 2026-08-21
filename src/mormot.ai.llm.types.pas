@@ -218,10 +218,28 @@ function LlmImageDataUri(const aImage: TLlmImage): RawUtf8;
 function LlmImageMediaType(const aImage: TLlmImage): RawUtf8;
 
 
+/// a short excerpt of an unexpected response body, for an exception message
+// - the body can be a megabyte of proxy HTML, and it is untrusted input:
+//   quoting all of it into an exception helps nobody and fills the log
+// - truncates on a codepoint boundary, so the excerpt stays valid UTF-8
+function LlmEllipsize(const aText: RawUtf8): RawUtf8;
+
+/// the message of a provider error object, or '' when there is none
+// - a 2xx body, and every single stream chunk, can carry a provider error
+//   that the HTTP status check cannot see. But the KEY alone means nothing:
+//   a server built around a fixed response struct (Go, Rust, anything
+//   statically typed) serializes "error":null on success, so presence is no
+//   evidence - only a populated object or a non-empty string is
+// - lives here rather than in mormot.ai.llm because the SSE unit needs it
+//   too, and that one sits below the client
+function LlmProviderError(aDoc: PDocVariantData): RawUtf8;
+
+
 implementation
 
 uses
-  mormot.core.text;
+  mormot.core.text,
+  mormot.core.unicode; // Utf8TruncatedLength: cut excerpts on a codepoint
 
 const
   /// fallback MIME for a base64 image whose MediaType was left empty
@@ -328,6 +346,47 @@ begin
     result := FormatUtf8('data:%;base64,%', [LlmImageMediaType(aImage), aImage.Data])
   else
     result := aImage.Data;
+end;
+
+const
+  /// how much of an unexpected body is quoted into an exception message
+  LLM_EXCERPT_MAX = 200;
+
+function LlmEllipsize(const aText: RawUtf8): RawUtf8;
+begin
+  result := aText;
+  // Utf8TruncatedLength, not a plain copy(): cutting at a fixed BYTE offset
+  // splits a multi-byte codepoint whenever one straddles the limit, and this
+  // excerpt goes into an exception message and from there into logs and JSON
+  // error bodies - where half a character is at best noise and at worst
+  // breaks a strict UTF-8 encoder.
+  if length(result) > LLM_EXCERPT_MAX then
+    result := copy(result, 1, Utf8TruncatedLength(result, LLM_EXCERPT_MAX)) +
+      '...';
+end;
+
+function LlmProviderError(aDoc: PDocVariantData): RawUtf8;
+var
+  v: variant;
+  o: PDocVariantData;
+begin
+  result := '';
+  if aDoc = nil then
+    exit;
+  v := aDoc^.GetValueOrNull('error');
+  o := _Safe(v);
+  if o^.Count > 0 then
+  begin
+    // the usual shape: {"error":{"message":...}}. Fall back to the object
+    // itself when it carries no message, so the caller still learns something
+    result := o^.U['message'];
+    if result = '' then
+      result := o^.ToJson;
+  end
+  else if VarIsString(v) then
+    // some shims put a bare string there
+    VariantToUtf8(v, result);
+  // null, false, an empty object or an absent key: not an error
 end;
 
 end.

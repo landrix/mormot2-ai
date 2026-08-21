@@ -35,6 +35,7 @@ type
     procedure ToolSchemaFloatsStayNumeric;
     procedure NonChatBodyIsRefusedNotSilentlyEmpty;
     procedure ExtraCannotOverrideTheTransportMode;
+    procedure FalsyErrorKeyIsNotAProviderError;
   end;
 
 
@@ -471,6 +472,56 @@ begin
   json := OpenAIChatRequestJson(req, {stream=}true);
   Check(Pos(RawUtf8('"stream":true'), json) > 0, 'streaming stays streaming');
   Check(Pos(RawUtf8('"stream":false'), json) = 0, 'no leftover false');
+end;
+
+
+procedure TTestLlmClient.FalsyErrorKeyIsNotAProviderError;
+var
+  resp: TLlmChatResponse;
+  raised: boolean;
+begin
+  // A server built around a fixed response struct - Go, Rust, anything
+  // statically typed - serializes "error":null on SUCCESS. Rejecting on the
+  // presence of the key would throw away every good answer it ever sends, and
+  // this library lists OpenAI-compatible shims as supported targets.
+  resp := ParseOpenAIChatResponse(
+    '{"error":null,"model":"gpt-4o","choices":[{"finish_reason":"stop",' +
+    '"message":{"role":"assistant","content":"hello"}}]}');
+  CheckEqual(resp.Content, 'hello', 'a null error key is not an error');
+  resp := ParseOpenAIChatResponse(
+    '{"error":false,"model":"gpt-4o","choices":[{"finish_reason":"stop",' +
+    '"message":{"role":"assistant","content":"hi"}}]}');
+  CheckEqual(resp.Content, 'hi', 'nor a false one');
+
+  // ...while a populated one still is
+  raised := false;
+  try
+    resp := ParseOpenAIChatResponse(
+      '{"error":{"message":"overloaded"},"choices":[]}');
+  except
+    on E: ELlmClient do
+      raised := true;
+  end;
+  Check(raised, 'a populated error object is still refused');
+
+  // and a choice that carries no message is as empty as no choice at all -
+  // the count check alone let {"choices":[{}]} through
+  raised := false;
+  try
+    resp := ParseOpenAIChatResponse('{"choices":[{}]}');
+  except
+    on E: ELlmClient do
+      raised := true;
+  end;
+  Check(raised, 'a choice without a message is refused');
+  raised := false;
+  try
+    resp := ParseOpenAIChatResponse('{"choices":[null]}');
+  except
+    on E: ELlmClient do
+      raised := true;
+  end;
+  Check(raised, 'and so is a null choice');
 end;
 
 end.

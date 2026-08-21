@@ -14,7 +14,7 @@ flydev-fr/mormot2-extensions, auf `mormot.ai.*` umbenannt (Commit-Pin: siehe
 (Phase C, stateless — siehe unten) und der clean-room LLM-Client (Phase D:
 OpenAI-Wire + Anthropic-Treiber, Agent-/Tool-Loop, Embeddings/RAG, agentic RAG,
 Vision). Build **+ alle Tests + alle Demos grün** (aarch64-linux/FPC 3.2.2):
-**892 Assertions** MCP-Suite + **344 Assertions** LLM-Suite. Offen ist die
+**892 Assertions** MCP-Suite + **361 Assertions** LLM-Suite. Offen ist die
 Schichtung/der Merge/die Backend-Bindung (Phase E, siehe [CONCEPT.md](CONCEPT.md)).
 
 ## Architektur (adoptiert)
@@ -739,7 +739,7 @@ Scope-Code und die zweite Token-Prüfung. Für das Lock (`fExtensions`) **keine*
 Race-Test wäre unzuverlässig und würde Grün melden, wo er nichts beweist; der Fix ist
 strukturell begründet.
 
-### Review-Härtung Runde 6 (LLM-Client, Agent, SSE, RAG — MCP **892** + LLM **344** grün)
+### Review-Härtung Runde 6 (LLM-Client, Agent, SSE, RAG — MCP **892** + LLM **361** grün)
 
 Die zwölf Findings der Unit `ai-llm`. Der P1 stand für sich; die sechs P2 teilten sich ein
 Muster, das der Report selbst benannt hat: **der naive Fix ist fast immer eine Regression** —
@@ -832,6 +832,55 @@ bewusst nicht).
 Runde 5: ein Gate, das weniger prüft als es könnte, und das nicht sagt. Das Skript findet die
 Extension jetzt selbst — der Test läuft mit **10** Assertionen und deckt damit auch den
 Lock-Umbau oben ab.
+
+
+**Der Review der Fixes hat sechs eigene Findings ergeben** (zwei Claude-Angles + Codex) —
+fünf davon in dem, was diese Runde neu gebaut hat. Die Verschärfungen waren an drei Stellen
+zu grob:
+
+- **Ein Provider-Fehler wurde am SCHLÜSSEL erkannt, nicht am Wert.** `GetValueIndex('error')`
+  prüft nur, ob der Name vorkommt. Ein Server mit festem Response-Struct (Go, Rust, alles
+  statisch Typisierte) serialisiert `"error":null` im **Erfolgsfall** — und in **jedem**
+  Stream-Chunk. Jede gültige Antwort so eines Servers wäre verworfen worden, mit leerer
+  Fehlermeldung; jeder seiner Streams wäre am ersten Delta gescheitert. Die Gegenprobe zeigt
+  genau das. `LlmProviderError` entscheidet jetzt am Wert und liegt in `llm.types`, weil die
+  SSE-Unit unter dem Client sitzt und sie ebenfalls braucht.
+- **Die Envelope-Prüfungen waren zu flach.** `{"choices":[{}]}` und `{"choices":[null]}`
+  überleben eine reine Count-Prüfung und ergeben genau die leere Antwort, die der Guard
+  verhindern sollte; auf der Anthropic-Seite kam `"content":null` durch eine Existenzprüfung.
+  Beide schauen jetzt eine Ebene tiefer.
+- **`ChatStructured` hatte keinen Ausweg.** Das generierte Schema erklärt jedes Feld für
+  `required`, und die neue Prüfung verlangte sie damit auch alle — ein Record mit einem
+  wirklich optionalen Feld (zweiter Vorname, Adresszeile 2) wäre unbrauchbar geworden, jede
+  sonst korrekte Extraktion verworfen. `aOptional` ist jetzt derselbe Ausweg, den MCP-Tools
+  mit `MarkOptional` haben, und das veröffentlichte Schema folgt ihm: wir werben keinen
+  strengeren Vertrag an, als wir durchsetzen.
+
+Dazu drei, die älter sind als diese Runde:
+
+- **Der Lock war zu eng gezogen — und die Begründung dafür falsch.** Ich hatte notiert,
+  Leser bräuchten keinen, „SQLite serialisiert die selbst". Das gilt nur unter
+  `SQLITE_CONFIG_SERIALIZED`. mORMot initialisiert mit `SQLITE_CONFIG_MULTITHREAD`, und der
+  eigene Header sagt, was das heißt: „application is responsible for serializing access to
+  database connections and prepared statements — as is the case with our TSqlDatabase and
+  its explicit Lock/LockJson/UnLock". `Search`, `Count` und `RowIdOfKey` laufen jetzt unter
+  demselben Lock. (Codex)
+- **Der `fRaw`-Deckel deckelte die falsche Kopie.** `fBuf` sammelt jeden Chunk, bis ein LF
+  kommt — eine endlose Zeile ließ ihn unbegrenzt wachsen, und `MaxResponseBytes` ist Opt-in.
+  Eine Zeile über 4 MB gilt jetzt als kaputt. (Codex)
+- **Beide Kürzungen schnitten an der Byte-Grenze** und konnten damit ein UTF-8-Zeichen
+  zerteilen — der Text landet in Exception-Meldungen, Logs und JSON-Fehlerbodies.
+  `Utf8TruncatedLength` schneidet auf der Codepoint-Grenze.
+
+Was der Review **geprüft und für sauber befunden** hat, mit Belegen: die Balance des neuen
+`try/finally`-Gerüsts auf allen Pfaden, die Reentranz von `TOSLock`, dass keine Referenz auf
+das entfernte `Stream`-Feld übrig ist, dass `_JsonFastFloat` Integers unangetastet lässt
+(nur Werte mit Punkt/Exponent gehen in den double-Zweig), die Initialisierung von
+`moreCalls` auf allen Pfaden, und dass keiner der neuen Tests leer läuft.
+
+**Nicht abgedeckt bleibt der Leser-Lock:** der Vectorstore-Test ist rein sequenziell, ein
+Nebenläufigkeitstest wäre hier unzuverlässig. Der Beleg ist mORMots eigene Header-Zusage,
+nicht ein grüner Testlauf.
 
 ## Lizenz / Veröffentlichung
 

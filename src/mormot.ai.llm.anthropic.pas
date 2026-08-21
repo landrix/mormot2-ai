@@ -409,11 +409,16 @@ begin
   if not d^.IsObject then
     ELlmClient.RaiseUtf8('ParseAnthropicChatResponse: not a JSON object: %',
       [LlmEllipsize(aJson)]);
+  // this wire marks its error envelope with type:"error"; the payload is read
+  // through the shared helper, which judges by value rather than by the mere
+  // presence of the key
   if d^.U['type'] = 'error' then
     ELlmClient.RaiseUtf8('ParseAnthropicChatResponse: provider error: %',
-      [LlmEllipsize(d^.O['error']^.U['message'])]);
-  if d^.GetValueIndex('content') < 0 then
-    ELlmClient.RaiseUtf8('ParseAnthropicChatResponse: no content block: %',
+      [LlmEllipsize(LlmProviderError(d))]);
+  // an ARRAY, not merely a present key: `"content":null` passes a presence
+  // check and leaves an empty response behind
+  if not d^.A['content']^.IsArray then
+    ELlmClient.RaiseUtf8('ParseAnthropicChatResponse: no content array: %',
       [LlmEllipsize(aJson)]);
   result.Raw := v;
   result.Model := d^.U['model'];

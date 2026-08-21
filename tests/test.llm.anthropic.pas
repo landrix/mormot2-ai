@@ -43,6 +43,7 @@ type
     procedure ResponseToolUseKeepsFloatsNumeric;
     procedure NonMessageBodyIsRefused;
     procedure ExtraCannotOverrideTheTransportMode;
+    procedure NullContentIsRefused;
     procedure StopReasonMapping;
     procedure SseTextStream;
     procedure SseToolStream;
@@ -614,6 +615,32 @@ begin
   json := AnthropicChatRequestJson(req, {stream=}true);
   Check(Pos(RawUtf8('"stream":true'), json) > 0, 'streaming stays streaming');
   Check(Pos(RawUtf8('"stream":false'), json) = 0, 'and not the smuggled false');
+end;
+
+
+procedure TTestLlmAnthropic.NullContentIsRefused;
+var
+  resp: TLlmChatResponse;
+  raised: boolean;
+begin
+  // "content":null passes a presence check and leaves an empty response behind -
+  // the same silent shape the type:"error" guard exists to stop
+  raised := false;
+  try
+    resp := ParseAnthropicChatResponse(
+      '{"id":"m","type":"message","role":"assistant","content":null}');
+  except
+    on E: ELlmClient do
+      raised := true;
+  end;
+  Check(raised, 'a null content is refused, not read as an empty answer');
+
+  // an EMPTY array is legitimate, though: a model may stop with no block at all
+  resp := ParseAnthropicChatResponse(
+    '{"id":"m","type":"message","role":"assistant","content":[],' +
+    '"stop_reason":"end_turn"}');
+  CheckEqual(resp.Content, '', 'an empty content array still parses');
+  Check(resp.FinishReason = lfrStop, 'and keeps its stop reason');
 end;
 
 end.

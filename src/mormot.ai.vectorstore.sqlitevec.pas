@@ -155,8 +155,7 @@ begin
   // - so one writer could pair its document with the other's vector.
   // Reentrant by contract: TSqlDataBase descends from TObjectOSLock and
   // TOSLock.Lock is explicitly reentrant, so the inner per-statement locking
-  // still works. Readers stay lock-free: SQLite serializes them itself, and the
-  // two hazards above are writer-only.
+  // still works.
   fDB.Lock;
   try
   fDB.TransactionBegin;
@@ -217,8 +216,7 @@ begin
   // - so one writer could pair its document with the other's vector.
   // Reentrant by contract: TSqlDataBase descends from TObjectOSLock and
   // TOSLock.Lock is explicitly reentrant, so the inner per-statement locking
-  // still works. Readers stay lock-free: SQLite serializes them itself, and the
-  // two hazards above are writer-only.
+  // still works.
   fDB.Lock;
   try
   fDB.TransactionBegin;
@@ -271,6 +269,16 @@ begin
   if aTopK <= 0 then
     exit;
   blob := VectorToBlob(aQuery);
+  // Readers take the lock too. mORMot initializes SQLite with
+  // SQLITE_CONFIG_MULTITHREAD, and its own header spells out what that means:
+  // "application is responsible for serializing access to database
+  // connections and prepared statements - as is the case with our
+  // TSqlDatabase and its explicit Lock/LockJson/UnLock"
+  // (mormot.db.raw.sqlite3.pas, TSqlite3Library.BeforeInitialization). So a
+  // read running concurrently with a write on the SAME connection is not
+  // merely dirty, it is outside what the library was configured to allow.
+  fDB.Lock;
+  try
   r.Prepare(fDB.DB,
     'WITH matches AS (SELECT rowid, distance FROM vec_documents ' +
     '  WHERE embedding MATCH ? AND k = ? ORDER BY distance) ' +
@@ -300,6 +308,9 @@ begin
   finally
     r.Close;
   end;
+  finally
+    fDB.UnLock;
+  end;
 end;
 
 function TVec0Store.RowIdOfKey(const aId: RawUtf8): Int64;
@@ -307,13 +318,19 @@ var
   r: TSqlRequest;
 begin
   result := 0; // 0 = not found (documents.id is AUTOINCREMENT, starts at 1)
-  r.Prepare(fDB.DB, 'SELECT id FROM documents WHERE ext_id = ?;');
+  // reentrant: Upsert/Delete already hold this lock when they call here
+  fDB.Lock;
   try
-    r.Bind(1, aId);
-    if r.Step = SQLITE_ROW then
-      result := r.FieldInt(0);
+    r.Prepare(fDB.DB, 'SELECT id FROM documents WHERE ext_id = ?;');
+    try
+      r.Bind(1, aId);
+      if r.Step = SQLITE_ROW then
+        result := r.FieldInt(0);
+    finally
+      r.Close;
+    end;
   finally
-    r.Close;
+    fDB.UnLock;
   end;
 end;
 
@@ -338,8 +355,7 @@ begin
   // - so one writer could pair its document with the other's vector.
   // Reentrant by contract: TSqlDataBase descends from TObjectOSLock and
   // TOSLock.Lock is explicitly reentrant, so the inner per-statement locking
-  // still works. Readers stay lock-free: SQLite serializes them itself, and the
-  // two hazards above are writer-only.
+  // still works.
   fDB.Lock;
   try
   fDB.TransactionBegin;
@@ -409,8 +425,7 @@ begin
   // - so one writer could pair its document with the other's vector.
   // Reentrant by contract: TSqlDataBase descends from TObjectOSLock and
   // TOSLock.Lock is explicitly reentrant, so the inner per-statement locking
-  // still works. Readers stay lock-free: SQLite serializes them itself, and the
-  // two hazards above are writer-only.
+  // still works.
   fDB.Lock;
   try
   fDB.TransactionBegin;
@@ -448,12 +463,17 @@ var
   r: TSqlRequest;
 begin
   result := 0;
-  r.Prepare(fDB.DB, 'SELECT COUNT(*) FROM documents;');
+  fDB.Lock; // see Search: every access to this connection is ours to serialize
   try
-    if r.Step = SQLITE_ROW then
-      result := r.FieldInt(0);
+    r.Prepare(fDB.DB, 'SELECT COUNT(*) FROM documents;');
+    try
+      if r.Step = SQLITE_ROW then
+        result := r.FieldInt(0);
+    finally
+      r.Close;
+    end;
   finally
-    r.Close;
+    fDB.UnLock;
   end;
 end;
 

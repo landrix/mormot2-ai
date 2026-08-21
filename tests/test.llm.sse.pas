@@ -47,6 +47,8 @@ type
     procedure InbandErrorIsCaptured;
     procedure ParallelToolCallsAllArrive;
     procedure RawBodyIsActuallyBounded;
+    procedure EndlessLineIsRefused;
+    procedure FalsyErrorKeyDoesNotAbortTheStream;
   end;
 
 
@@ -351,6 +353,57 @@ begin
     Check(length(s.RawBody) > 0, 'a diagnostic excerpt is still kept');
     Check(length(s.RawBody) <= 8 shl 10,
       'but it is capped - it exists to make an error readable, nothing more');
+  finally
+    s.Free;
+    coll.Free;
+  end;
+end;
+
+
+procedure TTestLlmSse.EndlessLineIsRefused;
+var
+  s: TLlmSseStream;
+  huge: RawUtf8;
+  raised: boolean;
+begin
+  // fRaw was capped, but fBuf - the line buffer - is the REAL memory path: it
+  // keeps every byte until an LF arrives, and MaxResponseBytes (the only other
+  // bound) is opt-in and set by no factory. One endless line grew it forever.
+  SetLength(huge, 5 shl 20); // 5 MB, no LF anywhere
+  FillCharFast(pointer(huge)^, length(huge), ord('x'));
+  s := TLlmSseStream.Create(nil);
+  try
+    raised := false;
+    try
+      s.Write(pointer(huge)^, length(huge));
+    except
+      on E: ESynException do
+        raised := true;
+    end;
+    Check(raised, 'an SSE line that never ends is refused, not buffered');
+  finally
+    s.Free;
+  end;
+end;
+
+procedure TTestLlmSse.FalsyErrorKeyDoesNotAbortTheStream;
+const
+  // every chunk carries "error":null - what a server with a fixed response
+  // struct sends on success. Aborting on the KEY would fail the whole stream on
+  // its very first delta.
+  NULL_ERROR =
+    'data: {"error":null,"choices":[{"delta":{"content":"Hel"}}]}'#10#10 +
+    'data: {"error":null,"choices":[{"delta":{"content":"lo"}}]}'#10#10 +
+    'data: [DONE]'#10#10;
+var
+  s: TLlmSseStream;
+  coll: TSseCollector;
+begin
+  coll := Parse(NULL_ERROR, 0, s);
+  try
+    CheckEqual(s.StreamError, '', 'a null error key is not an inband error');
+    CheckEqual(s.FullText, 'Hello', 'and the content still arrives');
+    Check(s.Done, 'and the stream completes normally');
   finally
     s.Free;
     coll.Free;

@@ -33,6 +33,7 @@ type
     procedure StrictModeInjectsAdditionalProperties;
     procedure IncompleteAnswerIsNotASuccess;
     procedure StrictModeDoesNotDuplicateAdditionalProperties;
+    procedure OptionalFieldsAreNotDemandedBack;
   end;
 
 
@@ -196,6 +197,48 @@ begin
       inc(n);
   CheckEqual(n, 1, 'exactly one additionalProperties key');
   Check(not d^.B['additionalProperties'], 'and strict mode won');
+end;
+
+
+procedure TTestLlmStructured.OptionalFieldsAreNotDemandedBack;
+var
+  stub: TStubLlmClient;
+  client: ILlmClient;
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  person: TPerson;
+  optional: TRawUtf8DynArray;
+begin
+  EnsureRtti;
+  stub := TStubLlmClient.Create;
+  client := stub;
+  SetLength(msgs, 1);
+  msgs[0] := LlmMessage(lrUser, 'Extract the person.');
+  req := LlmChatRequest('test-model', msgs);
+  SetLength(optional, 1);
+  optional[0] := 'age';
+
+  // RTTI knows nothing about optional fields, so without this every field is
+  // published as required AND demanded back - which would make any record with
+  // a genuinely optional field unusable: each otherwise-correct extraction
+  // discarded in full. Same escape hatch MCP tools get from MarkOptional.
+  stub.Push(JsonResponse('{"name":"Alice"}'));
+  person.name := 'STALE';
+  person.age := 99;
+  Check(ChatStructured(client, req, TypeInfo(TPerson), person, 'result',
+    {strict=}false, optional), 'the optional field may be omitted');
+  CheckEqual(person.name, 'Alice', 'and what came through is used');
+  CheckEqual(person.age, 0, 'the omitted one is zero, not the stale value');
+
+  // the published schema follows the same declaration - we do not advertise a
+  // contract stricter than the one we enforce
+  Check(Pos(RawUtf8('"required":["name"]'), stub.LastRequest.ResponseFormat) > 0,
+    'the schema lists only the truly required field');
+
+  // ...and a field that is NOT declared optional is still demanded
+  stub.Push(JsonResponse('{"age":30}'));
+  Check(not ChatStructured(client, req, TypeInfo(TPerson), person, 'result',
+    {strict=}false, optional), 'a missing required field still fails');
 end;
 
 end.

@@ -30,6 +30,7 @@ uses
   classes,
   mormot.core.base,
   mormot.core.text,
+  mormot.core.unicode, // Utf8TruncatedLength: cut the excerpt on a codepoint
   mormot.core.variants,
   mormot.core.json,
   mormot.ai.llm.types;
@@ -106,6 +107,11 @@ const
   /// how much of a non-SSE response body is kept for the error message
   // - it exists to make a provider's JSON/HTML error readable, nothing more
   SSE_RAW_DIAGNOSTIC_MAX = 8 shl 10;
+  /// the largest single SSE line (event) accepted before giving up
+  // - generous: a chunk carrying a whole tool-call argument blob stays well
+  //   inside it, while an endless line - the one shape that makes the line
+  //   buffer grow without bound - is refused
+  SSE_MAX_LINE_BYTES = 4 shl 20;
 
 { TLlmSseStreamBase }
 
@@ -140,6 +146,24 @@ begin
     exit;
   FastSetString(chunk, @Buffer, Count);
   fBuf := fBuf + chunk;
+  // fBuf is the REAL memory path: fRaw stops growing at the first data: line,
+  // but a server sending one endless line without an LF makes this grow
+  // forever - and MaxResponseBytes, the only other bound, is opt-in and set by
+  // no factory. A single SSE event that large is malformed by any reasonable
+  // reading, so refusing is the honest answer.
+  if length(fBuf) > SSE_MAX_LINE_BYTES then
+    ESynException.RaiseUtf8(
+      '%.Write: no line break within % bytes - malformed SSE stream',
+      [self, SSE_MAX_LINE_BYTES]);
+  // fBuf is the REAL memory path: fRaw stops growing at the first data: line,
+  // but a server sending one endless line without an LF makes this grow
+  // forever - and MaxResponseBytes, the only other bound, is opt-in and set
+  // by no factory. A single SSE event that large is malformed by any
+  // reasonable reading, so refusing is the honest answer.
+  if length(fBuf) > SSE_MAX_LINE_BYTES then
+    ESynException.RaiseUtf8(
+      '%.Write: no line break within % bytes - malformed SSE stream',
+      [self, SSE_MAX_LINE_BYTES]);
   inc(fPosition, Count);
   // Keep the leading raw body until the first real SSE event, so a non-SSE
   // (e.g. JSON error) response stays available for diagnostics. Hard cap: the
@@ -149,7 +173,10 @@ begin
   // without limit. A few KB is all a diagnostic excerpt needs.
   if not fSawData and
      (length(fRaw) < SSE_RAW_DIAGNOSTIC_MAX) then
-    fRaw := fRaw + copy(chunk, 1, SSE_RAW_DIAGNOSTIC_MAX - length(fRaw));
+    // on a codepoint boundary: a plain byte cut splits a multi-byte character
+    // sitting on the limit, and this excerpt ends up in an exception message
+    fRaw := fRaw + copy(chunk, 1,
+      Utf8TruncatedLength(chunk, SSE_RAW_DIAGNOSTIC_MAX - length(fRaw)));
   // process every complete line currently buffered
   repeat
     nl := IndexOfLF(fBuf);
@@ -243,13 +270,12 @@ begin
   // Anthropic wire has handled this from the start ("rather than hand back a
   // silently truncated answer"); on this side it used to be swallowed as an
   // empty chunk and the caller kept whatever text had arrived so far.
-  if d^.GetValueIndex('error') >= 0 then
-  begin
-    fStreamError := d^.O['error']^.U['message'];
-    if fStreamError = '' then
-      fStreamError := aPayload;
+  // by VALUE, not by key: a server with a fixed response struct serializes
+  // "error":null in every chunk, and aborting on key presence would turn each
+  // one of its perfectly good streams into a failure on the very first delta
+  fStreamError := LlmProviderError(d);
+  if fStreamError <> '' then
     exit;
-  end;
   if d^.Count > 0 then
   begin
     delta.Raw := v;
