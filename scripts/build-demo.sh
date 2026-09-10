@@ -12,6 +12,8 @@ set -euo pipefail
 
 # Wurzel dieser Extension (scripts/..) - unabhaengig vom Einbindungsort.
 LAI="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Compiler fest auf die Baseline (setzt $FPC/$FPC_VERSION, Override: FPC=<compiler>).
+source "$LAI/scripts/fpc-env.sh"
 # Konsumenten-Repo: im Submodul-Fall liegt die Extension unter
 # <konsument>/shared/delphi/landrixai, also drei Ebenen ueber LAI. Nur noch
 # fuer den mORMot2-Default unten relevant.
@@ -27,7 +29,7 @@ OUT="$LAI/bin/fpc"
 DEMO_OUT="$OUT/demos"
 UNIT_OUT="$OUT/lib"      # geteilt mit run-fpc-tests.sh (mORMot-Cache)
 TARGET="${TARGET:-linux}"
-ARCH="${ARCH:-$(fpc -iTP)}"
+ARCH="${ARCH:-$("$FPC" -iTP)}"
 
 UNITS="$SRC/app;$SRC/core;$SRC/crypt;$SRC/db;$SRC/lib;$SRC/net;$SRC/orm;$SRC/rest;$SRC/soa;$SRC/script;$SRC/misc;$SRC/tools/mget"
 INCLUDES="$SRC;$SRC/core;$SRC/net"
@@ -50,9 +52,9 @@ build_one() {
   local lpr="$1"
   local name; name="$(basename "$lpr" .lpr)"
   local log="$DEMO_OUT/$name.buildlog"
-  echo ">>> demo $name ($ARCH-$TARGET)"
+  echo ">>> demo $name ($ARCH-$TARGET, FPC $FPC_VERSION)"
   set +e
-  fpc -MDelphi -Sci -Ci -O2 -g -gl -gw2 \
+  "$FPC" -MDelphi -Sci -Ci -O2 -g -gl -gw2 \
     -T"$TARGET" -P"$ARCH" \
     -Fi"$INCLUDES;$LAI/vendor" \
     -Fu"$LIB_SRC;$DEMO_SRC;$LAI/vendor;$UNITS" \

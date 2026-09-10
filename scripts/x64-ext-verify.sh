@@ -11,6 +11,8 @@ MORMOT2="$ROOT/shared/delphi/libs/_git_Synopse2"
 SRC="$MORMOT2/src"
 STATIC="$MORMOT2/static"
 LAI="${LAI_ROOT:-$ROOT/shared/delphi/landrixai}"
+# Compiler fest auf die Baseline (setzt $FPC/$FPC_VERSION, Override: FPC=<compiler>).
+source "$LAI/scripts/fpc-env.sh"
 LIB_SRC="$LAI/src"
 DEMO_SRC="$LAI/demos"
 VENDOR="$LAI/vendor"
@@ -22,8 +24,8 @@ mkdir -p "$UNIT_OUT"
 UNITS="$SRC/app;$SRC/core;$SRC/crypt;$SRC/db;$SRC/lib;$SRC/net;$SRC/orm;$SRC/rest;$SRC/soa;$SRC/script;$SRC/misc;$SRC/tools/mget"
 INCLUDES="$SRC;$SRC/core;$SRC/net"
 
-echo ">>> fpc $(fpc -iV) target=$ARCH-linux"
-fpc -MDelphi -Sci -Ci -O2 -Tlinux -P"$ARCH" \
+echo ">>> fpc $FPC_VERSION ($FPC) target=$ARCH-linux"
+"$FPC" -MDelphi -Sci -Ci -O2 -Tlinux -P"$ARCH" \
   -Fi"$INCLUDES;$VENDOR" \
   -Fu"$LIB_SRC;$DEMO_SRC;$VENDOR;$UNITS" \
   -Fl"$STATIC/$ARCH-linux" \

@@ -14,6 +14,8 @@ set -euo pipefail
 
 # Wurzel dieser Extension (scripts/..) - unabhaengig vom Einbindungsort.
 LAI="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Compiler fest auf die Baseline (setzt $FPC/$FPC_VERSION, Override: FPC=<compiler>).
+source "$LAI/scripts/fpc-env.sh"
 # Konsumenten-Repo: im Submodul-Fall liegt die Extension unter
 # <konsument>/shared/delphi/landrixai, also drei Ebenen ueber LAI. Nur noch
 # fuer den mORMot2-Default unten relevant.
@@ -28,7 +30,7 @@ TEST_SRC="$LAI/tests"
 OUT="$LAI/bin/fpc"
 UNIT_OUT="$OUT/lib"
 TARGET="${TARGET:-linux}"
-ARCH="${ARCH:-$(fpc -iTP)}"
+ARCH="${ARCH:-$("$FPC" -iTP)}"
 
 # vec0 selbst finden. Die Extension liegt (gitignored) im Repo, aber der
 # Vectorstore-Test ueberspringt sich stumm ohne SQLITE_EXT_DIR - und meldet
@@ -60,9 +62,9 @@ mkdir -p "$UNIT_OUT"
 rm -f "$UNIT_OUT"/mormot.ai.*.ppu "$UNIT_OUT"/mormot.ai.*.o
 rm -f "$UNIT_OUT"/test.*.ppu "$UNIT_OUT"/test.*.o
 
-echo ">>> $PROG ($ARCH-$TARGET)"
+echo ">>> $PROG ($ARCH-$TARGET, FPC $FPC_VERSION)"
 set +e
-fpc -MDelphi -Sci -Ci -O2 -g -gl -gw2 \
+"$FPC" -MDelphi -Sci -Ci -O2 -g -gl -gw2 \
   -T"$TARGET" -P"$ARCH" \
   -Fi"$INCLUDES" \
   -Fu"$LIB_SRC;$TEST_SRC;$UNITS" \
