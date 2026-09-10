@@ -245,6 +245,8 @@ begin
   for i := 0 to 19 do
   begin
     port := base + i;
+    // nil first: if Create itself raises, the handler below frees this variable
+    transport := nil;
     try
       transport := TMcpHttpTransport.Create(aServer);
       transport.Port := port;
@@ -668,8 +670,9 @@ begin
     end;
     responseText := StringFromFile(outputFile);
     responseText := TrimU(responseText);
-    if PosEx(#10, responseText) > 0 then
-      responseText := Copy(responseText, LastDelimiter(#10, responseText) + 1, MaxInt);
+    // only the last line counts; SplitRight works on the RawUtf8 itself (no match
+    // -> the whole text) - LastDelimiter takes a string and forced a conversion
+    responseText := SplitRight(responseText, #10);
     responseText := TrimU(responseText);
     docVar := _JsonFast(responseText);
     doc := _Safe(docVar);
@@ -852,6 +855,8 @@ begin
   for i := 0 to 19 do
   begin
     port := base + i;
+    // nil first: if Create itself raises, the handler below frees this variable
+    transport := nil;
     try
       transport := TMcpStreamableHttpTransport.Create(aServer);
       transport.Port := port;
@@ -1255,11 +1260,15 @@ begin
     CheckEqual(status, HTTP_SUCCESS, 'integers compare numerically, not as text');
 
     // a value that is not header-safe travels base64-encoded and MUST be
-    // decoded before the comparison, or every non-ASCII value would mismatch
-    status := CallWith('{"A":1,"B":1,"Name":"M' + #$C3#$BC + 'ller"}',
+    // decoded before the comparison, or every non-ASCII value would mismatch.
+    // The source stays pure ASCII: the u-umlaut travels as the JSON escape
+    // \u00fc in the body and as
+    // its precomputed UTF-8 base64 in the header. A #$C3#$BC literal is two
+    // WideChars (U+00C3 U+00BC) in Delphi and was re-encoded into the body but
+    // not into BinToBase64 - the test then failed on the literal, not the server.
+    status := CallWith('{"A":1,"B":1,"Name":"M\u00fcller"}',
       'Mcp-Param-A-Value: 1'#13#10 +
-      'Mcp-Param-Who: =?base64?' + BinToBase64('M' + #$C3#$BC + 'ller') +
-      '?='#13#10);
+      'Mcp-Param-Who: =?base64?TcO8bGxlcg==?='#13#10);
     CheckEqual(status, HTTP_SUCCESS, 'a base64 sentinel value is decoded first');
   finally
     client.Free;

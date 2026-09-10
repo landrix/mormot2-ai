@@ -888,6 +888,11 @@ nicht ein grüner Testlauf.
 > wird eine **eigenständige FPC-only-Extension** in eigenem Repo. Begründung und Plan:
 > [CONCEPT.md §1 / §7](CONCEPT.md). Dieses Dokument ist ein historisches Bau-Log;
 > maßgeblich ist CONCEPT.md.
+>
+> **Überholt (2026-09-10):** „FPC-only" gilt nicht mehr — FPC bleibt primär, Delphi 13
+> wird **soweit möglich** mitgebaut und mitgetestet (`scripts/run-delphi-tests.ps1`).
+> Die Einträge unten, die „FPC-only" nennen (z. B. „Delphi-Artefakte entfernt"), sind
+> Stand ihres Datums.
 
 Lizenz bleibt die mORMot-Drei-Lizenz (MPL 1.1 / GPL 2.0 / LGPL 2.1) — die adoptierten
 MCP-Units verlangen es. Namespace `mormot.ai.*` bleibt, ist aber bei

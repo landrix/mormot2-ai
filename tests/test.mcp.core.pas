@@ -1450,7 +1450,7 @@ var
 
   // read the hints off one result; aTtl < 0 asserts they are ABSENT
   procedure CheckHints(const aRequest: RawUtf8; aTtl: integer;
-    const aScope, aWhat: RawUtf8);
+    const aScope: RawUtf8; const aWhat: string);
   begin
     rv := _JsonFast(Exec(server, aRequest));
     resv := _Safe(rv)^.GetValueOrNull('result');
@@ -1466,9 +1466,10 @@ var
     end;
     Check(VariantToInt64(rd^.GetValueOrDefault('ttlMs', -1), ttl),
       aWhat + ' has ttlMs');
-    CheckEqual(integer(ttl), aTtl, aWhat + ' ttlMs');
+    // Check/CheckFailed take a string message, CheckEqual a RawUtf8 one
+    CheckEqual(integer(ttl), aTtl, StringToUtf8(aWhat) + ' ttlMs');
     Check(rd^.GetAsRawUtf8('cacheScope', tmp), aWhat + ' has cacheScope');
-    CheckEqual(tmp, aScope, aWhat + ' cacheScope');
+    CheckEqual(tmp, aScope, StringToUtf8(aWhat) + ' cacheScope');
   end;
 
 begin
@@ -2363,6 +2364,10 @@ var
   pages, i: integer;
   hasNext: boolean;
 begin
+  // doc is re-parsed below as "Clear, then InitJson" - and the FIRST Clear would
+  // hit a never-initialized record: Delphi zeroes only the managed fields of a
+  // local, VType keeps stack garbage and VarClear raises "Invalid variant type"
+  doc.InitFast;
   server := TMcpServer.Create('paging', '1.0');
   try
     // Registered in deliberately NON-alphabetical order: a dictionary
@@ -2484,6 +2489,9 @@ var
   doc: TDocVariantData;
   res, arr, entry, msgs: PDocVariantData;
 begin
+  // initialized once: the first "doc.Clear" below must not touch garbage VType
+  // (see ListsAreSortedAndPaginated)
+  doc.InitFast;
   server := TMcpServer.Create('prompts', '1.0');
   try
     server.RegisterPrompt(TReviewPrompt.Create('code_review'));
@@ -2624,6 +2632,9 @@ var
   doc: TDocVariantData;
   res, arr, entry, comp: PDocVariantData;
 begin
+  // initialized once: the first "doc.Clear" below must not touch garbage VType
+  // (see ListsAreSortedAndPaginated)
+  doc.InitFast;
   server := TMcpServer.Create('templates', '1.0');
   try
     server.RegisterResourceTemplate(TFilesTemplate.Create);
@@ -3154,7 +3165,7 @@ begin
   Check(not McpCheckSchema(_JsonFast(
     '{"properties":{"a":{"$ref":"https://evil.example/s.json"}}}'),
     32, 4096, reason), 'an https $ref is refused');
-  Check(PosEx('outside the document', reason) > 0, 'and says why: ' + reason);
+  Check(PosEx('outside the document', reason) > 0, 'and says why: ' + Utf8ToString(reason));
   Check(not McpCheckSchema(_JsonFast(
     '{"properties":{"a":{"$ref":"//evil.example/s.json"}}}'),
     32, 4096, reason), 'a protocol-relative $ref is the network as well');
@@ -3169,12 +3180,12 @@ begin
     deep := '{"properties":{"a":' + deep + '}}';
   Check(not McpCheckSchema(_JsonFast(deep), 32, 4096, reason),
     'a schema nested past the depth limit is refused');
-  Check(PosEx('deeper', reason) > 0, 'and says why: ' + reason);
+  Check(PosEx('deeper', reason) > 0, 'and says why: ' + Utf8ToString(reason));
   Check(McpCheckSchema(_JsonFast(deep), 200, 4096, reason),
     'the same schema passes when the limit allows it');
   Check(not McpCheckSchema(_JsonFast(deep), 200, 5, reason),
     'the node cap bites independently of depth');
-  Check(PosEx('subschemas', reason) > 0, 'and says why: ' + reason);
+  Check(PosEx('subschemas', reason) > 0, 'and says why: ' + Utf8ToString(reason));
 end;
 
 

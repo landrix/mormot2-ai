@@ -14,8 +14,8 @@
 ## 1. Was LandrixAI ist (und was nicht)
 
 LandrixAI ist eine **mORMot-basierte AI-/LLM-Toolbox** im Namespace `mormot.ai.*`,
-**FPC-only** (Linux/Windows, x64/aarch64), veröffentlicht als **eigenständige
-Extension in einem eigenen Repository**.
+**FPC primär** (Linux/Windows, x64/aarch64) und **Delphi 13 soweit möglich** (Win64),
+veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
 
 - **Eigene Extension statt mORMot-PR** (Entscheidung 2026-07-29). Ein Pull Request
   an Synopse mORMot ist **nicht** mehr das Ziel. Grund: Ein Upstream-PR würde uns auf
@@ -24,8 +24,14 @@ Extension in einem eigenen Repository**.
   (§5). Als eigenständige Extension können wir sie **voll** nutzen. mORMot2 bleibt
   die **Grundlage** (Basis-Units, HTTP, JSON, SQLite, Crypto) — wir liefern nur
   nicht dorthin ab.
-- **FPC-only, bewusst.** Kein Delphi-Zweig, keine `{$ifdef}`-Doppelpflege. Deckt sich
-  mit der plattformweiten Landrix-Entscheidung (FPC ist einziges Lauf-/Build-Ziel).
+- **FPC primär, Delphi 13 soweit möglich** (Entscheidung 2026-09-10 — revidiert das
+  „FPC-only" vom 2026-07-29). FPC bleibt Referenz und Gate (`scripts/run-fpc-*.sh`, fest
+  auf FPC 3.2.2); Delphi 13 wird mitgebaut und mitgetestet
+  (`scripts/run-delphi-tests.ps1`, Win64). Regel: keine FPC-Eigenheit ohne Not — aber
+  auch keine Doppelimplementierung erzwingen. Was nur unter FPC geht (der POSIX-
+  Prozessstart in `vendor/mormot.ext.os`, künftig neural-api), bleibt per `{$ifdef FPC}`
+  abgegrenzt und fehlt unter Delphi eben. Die Landrix-Plattform selbst bleibt FPC-only;
+  diese Ausnahme gilt nur für die Extension.
 - **Die eiserne Regel bleibt**: **kein Landrix-Domänenwissen im `mormot.ai.*`-Code.**
   Sie begründet sich jetzt aus der **Repo-Grenze** (die Extension muss ohne Landrix
   brauchbar sein), nicht mehr aus der Upstream-Fähigkeit.
@@ -54,7 +60,7 @@ bleiben als Bezeichner; „Schicht M" gibt es nicht mehr.)
 
 | Schicht | Namespace | Repo | Inhalt | Landrix-abhängig? |
 |---|---|---|---|---|
-| **A — Extension** | `mormot.ai.*`, `mormot.db.*` | **eigenes Repo** (§7), FPC-only | Alles Generische: LLM-Wire-Treiber, Embeddings, VectorStore + pgvector-Binding, RAG-Engine, MCP, SSE, Structured Output, Agent-Loop, Skill-/Memory-/Session-**Interfaces**, CLI | **nein** |
+| **A — Extension** | `mormot.ai.*`, `mormot.db.*` | **eigenes Repo** (§7), FPC primär, Delphi 13 soweit möglich | Alles Generische: LLM-Wire-Treiber, Embeddings, VectorStore + pgvector-Binding, RAG-Engine, MCP, SSE, Structured Output, Agent-Loop, Skill-/Memory-/Session-**Interfaces**, CLI | **nein** |
 | **B — Backend** | `landrix.server.ai.*` | landrix-platform | Landrix-Bindungen: Memory/Sessions als `TOrm` in `TLandrixDatabase`, guard-/scope-geprüfte Tools, Audit-Anbindung, Domänen-Skills, REST-Endpunkte | **ja** |
 
 **Konsequenz für Interfaces vs. Implementierungen — „Interface tief, Bindung hoch":**
@@ -155,7 +161,7 @@ RAG-Zerlegung, chunk) — blockiert nichts; (2) SDK-Teil erst nach Lizenzzusage.
 **Wir übernehmen nur den Code** — kein Fork, kein geteiltes Repository, keine
 Upstream-PRs. Unser **Namespace `mormot.ai.*` bleibt unverändert**, auch dort, wo er
 mit flydevs kollidiert; adoptierte Units werden in unseren Baum eingepasst/umbenannt.
-Das hält uns unabhängig (FPC-only, neural-api, MCP 2026-07-28) — Punkte, die flydev
+Das hält uns unabhängig (eigene Compiler-Strategie, neural-api, MCP 2026-07-28) — Punkte, die flydev
 nicht mitträgt.
 
 **Preis dieser Freiheit: manuelles Nachziehen.** Damit spätere flydev-Änderungen
@@ -211,7 +217,8 @@ Embeddings **und** Chat.
 2. ~~**FPC/Lazarus only** (master; Delphi nur v2.0.0)~~ — **erledigt**: seit der
    Entscheidung „eigene Extension statt mORMot-PR, FPC-only" (§1) ist das **kein
    Hindernis mehr, sondern der Grund dafür**. neural-api darf **Kern-Abhängigkeit**
-   werden.
+   werden — als FPC-only-Backend hinter der Naht. Daran ändert auch Delphi 13 „soweit
+   möglich" (§1, 2026-09-10) nichts: unter Delphi fehlt dieses Backend dann eben.
 3. **Embedding-Tauglichkeit unverifiziert.** Das `EmbeddingSearch`-Beispiel fährt ein
    Pico-Test-Fixture (`tiny_e5`, 2 Layer, hidden 8), kein Produktionsmodell. Ob
    **bge-m3** (XLM-RoBERTa, 1024 dim) sauber konvertiert und rechnet, ist offen.
@@ -219,8 +226,8 @@ Embeddings **und** Chat.
 
 **Entscheidung: neural-api ist das strategische Ziel-Backend** (§1) — eingebunden
 über dieselbe Naht: neue Units `mormot.ai.embed.neuralapi` / `mormot.ai.llm.neuralapi`
-hinter `IEmbedder`/`ILlmClient`. Die Naht bleibt **trotzdem** bestehen — nicht mehr
-wegen Delphi, sondern weil Provider-/Ollama-/lembed-Backends weiter sinnvoll sind
+hinter `IEmbedder`/`ILlmClient`. Die Naht bleibt **trotzdem** bestehen — auch wegen
+Delphi (dort fehlt neural-api), vor allem aber, weil Provider-/Ollama-/lembed-Backends weiter sinnvoll sind
 (Cloud-Modelle, bestehende Ollama-Deployments, Fallback).
 
 **Reihenfolge (Risiko zuerst):** ein **Spike** mit harten Kriterien, bevor umgestellt
@@ -481,8 +488,9 @@ Roadmap — DESIGN.md verweist hierher.
 7. **neural-api integrieren** (§5) — Units `mormot.ai.embed.neuralapi` /
    `mormot.ai.llm.neuralapi` hinter der bestehenden Naht; **Spike zuerst** (echtes
    E5/BGE-Modell konvertieren, Qualität gegen lembed, Durchsatz, RAM). Ziel: alle
-   nativen Fremd-`.so` + der Docker-Bundle-Download entfallen. Seit §1 (FPC-only,
-   eigene Extension) **darf** es Kern-Abhängigkeit werden.
+   nativen Fremd-`.so` + der Docker-Bundle-Download entfallen. Seit §1 (eigene
+   Extension, Delphi nur „soweit möglich") **darf** es Kern-Abhängigkeit werden —
+   FPC-only hinter der Naht.
 8. **Tests**: TVec0Store hat einen **env-gated Real-vec0-Test** (Keyed-Ops
    `Upsert`/`Delete`/`Search`-Key, `test.llm.rag`, läuft bei gesetztem `SQLITE_EXT_DIR`,
    sonst Skip). Offen: TLembedEmbedder-Realtest + RAG-Atomar-Rollback (brauchen die

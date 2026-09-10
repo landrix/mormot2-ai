@@ -565,7 +565,7 @@ end;
 
 procedure TTestLlmAnthropic.NonMessageBodyIsRefused;
 
-  procedure MustRaise(const aBody, aWhat: RawUtf8);
+  procedure MustRaise(const aBody: RawUtf8; const aWhat: string);
   var
     resp: TLlmChatResponse;
     raised: boolean;

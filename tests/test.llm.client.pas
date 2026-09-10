@@ -347,6 +347,7 @@ const
 var
   vecs: TLlmEmbeddingDynArray;
   saved: TFormatSettings;
+  rtlfs: ^TFormatSettings;
 begin
   // A value mORMot cannot hold in currency is stored as TEXT unless the parser
   // was allowed doubles - and reading it back then goes through the RTL's
@@ -356,9 +357,11 @@ begin
   // point of every vector component simply vanishes.
   // Set here rather than trusting the host locale, so the test proves the same
   // thing on the Linux CI as on the German Windows box where it was found.
-  saved := DefaultFormatSettings;
+  // The global is DefaultFormatSettings in FPC and FormatSettings in Delphi.
+  rtlfs := @{$ifdef FPC}DefaultFormatSettings{$else}FormatSettings{$endif};
+  saved := rtlfs^;
   try
-    DefaultFormatSettings.ThousandSeparator := '.';
+    rtlfs^.ThousandSeparator := '.';
     vecs := ParseOpenAIEmbeddings(EMB_RESP);
     CheckEqual(length(vecs), 1, 'one vector');
     CheckEqual(length(vecs[0]), 3, 'three components');
@@ -368,7 +371,7 @@ begin
     CheckSame(vecs[0][1], 0.12345678, 1e-6, 'eight decimals');
     CheckSame(vecs[0][2], 4.9e-5, 1e-9, 'exponent notation');
   finally
-    DefaultFormatSettings := saved;
+    rtlfs^ := saved;
   end;
 end;
 
@@ -401,7 +404,7 @@ end;
 
 procedure TTestLlmClient.NonChatBodyIsRefusedNotSilentlyEmpty;
 
-  procedure MustRaise(const aBody, aWhat: RawUtf8);
+  procedure MustRaise(const aBody: RawUtf8; const aWhat: string);
   var
     resp: TLlmChatResponse;
     raised: boolean;

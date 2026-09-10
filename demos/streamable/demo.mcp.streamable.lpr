@@ -12,6 +12,7 @@ uses
   mormot.core.base,
   mormot.core.os,
   mormot.core.text,
+  mormot.core.unicode,
   mormot.ai.mcp,
   mormot.ai.mcp.server,
   demo.mcp.shared,
@@ -27,7 +28,8 @@ var
 begin
   port := 8082;
   if ParamCount > 0 then
-    ToInteger(PChar(ParamStr(1)), port);
+    // StringToUtf8, not PChar(): PChar is PWideChar under Delphi
+    ToInteger(StringToUtf8(ParamStr(1)), port);
 
   // SECURITY: the 'ask_claude' tool hands arbitrary remote prompts to the local
   // Claude CLI (cost abuse + workspace/data exfiltration if reachable). This

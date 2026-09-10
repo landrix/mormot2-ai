@@ -14,6 +14,7 @@ uses
   mormot.core.base,
   mormot.core.os,
   mormot.core.text,
+  mormot.core.unicode,
   mormot.ai.mcp,
   mormot.ai.mcp.server,
   demo.mcp.shared;
@@ -25,7 +26,8 @@ var
 begin
   port := 8080;
   if ParamCount > 0 then
-    ToInteger(PChar(ParamStr(1)), port);
+    // StringToUtf8, not PChar(): PChar is PWideChar under Delphi
+    ToInteger(StringToUtf8(ParamStr(1)), port);
 
   server := CreateDemoServer('HttpDemoServer', '1.0');
   try

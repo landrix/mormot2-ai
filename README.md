@@ -1,12 +1,16 @@
-# mormot2-ai — the `mormot.ai.*` extension for mORMot2 (FPC)
+# mormot2-ai — the `mormot.ai.*` extension for mORMot2 (FPC · Delphi 13)
 
-A **mORMot-native** AI/LLM extension for **Free Pascal**: an MCP server, LLM clients,
+A **mORMot-native** AI/LLM extension for **Free Pascal** — and, as far as the code
+allows, for **Delphi 13**: an MCP server, LLM clients,
 embeddings, vector stores and RAG. Built on mORMot2 — its HTTP stack, JSON, RTTI and
 crypto are the foundation, not a dependency we tolerate.
 
 > **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
 > (stateless) and only that one. Build, tests and demos green on aarch64-linux/FPC 3.2.2:
-> **892 assertions** MCP suite, **361 assertions** LLM suite. Open: phase E
+> **892 assertions** MCP suite, **361 assertions** LLM suite. Library and both suites also
+> green under **Delphi 13** (Win64): 892 MCP, 364 LLM (the Windows `vec0` tests run too);
+> all 14 demos compile with Delphi 13 as well, but are not run there and have no Delphi
+> build script yet. Open: phase E
 > (layering / merge / backend binding) — see [CONCEPT.md](CONCEPT.md).
 
 ## Why a standalone extension
@@ -15,7 +19,10 @@ crypto are the foundation, not a dependency we tolerate.
   dual-compiler promise (FPC *and* Delphi) and thereby rule out **neural-api** (FPC-only)
   as an inference backend. mORMot2 stays the **foundation**, not the delivery target.
   Rationale: [CONCEPT.md §1](CONCEPT.md).
-- **FPC-only** — no Delphi branch, no `{$ifdef}` double maintenance.
+- **FPC first, Delphi 13 where it works** (since 2026-09-10). FPC is the reference
+  compiler and the gate; Delphi 13 (Win64) builds the library and runs both test suites.
+  Parts that only exist under FPC — the POSIX process launcher in `vendor/`, later
+  neural-api — stay behind `{$ifdef FPC}` instead of being duplicated.
 - **Spec-driven, not diff-driven** — we follow the published specs (MCP, JSON-RPC,
   provider wires) rather than chasing another library's changes.
 - **License stays MPL/GPL/LGPL** — the adopted MCP units require it, and it composes with
@@ -37,6 +44,7 @@ mormot2-ai/
   docs/specs/mcp-2026-07-28/   verbatim copy of the protocol spec (see below)
   vendor/   mormot.ext.os (adopted) · models, sqlite-ext (gitignored, not in git)
   scripts/  run-fpc-tests.sh · run-fpc-llm-tests.sh · build-demo.sh · x64-ext-verify.sh
+            fpc-env.sh (compiler pin) · run-delphi-tests.ps1
   CONCEPT.md  DESIGN.md  LICENSE  NOTICE  SECURITY.md  UPSTREAM_BASE
 ```
 
@@ -115,9 +123,21 @@ bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agen
 # VERBOSE=1 for the full compiler/test log; logs land in bin/fpc/
 ```
 
-**Requirements:** FPC 3.2.2 or newer and a mORMot2 source tree. Verified on aarch64-linux
-and x86_64-linux; Windows builds from the same sources (mORMot2 handles the platform
-split), but the build scripts are bash — use WSL or call the compiler directly. Lazarus is
+```powershell
+# Delphi 13, on Windows:
+.\scripts\run-delphi-tests.ps1               # MCP + LLM suite (-Suite mcp|llm, -ShowAll)
+# logs and binaries land in bin\delphi\
+```
+
+**Requirements:** a mORMot2 source tree, plus
+- **FPC 3.2.2** for the bash scripts. They pin it (`scripts/fpc-env.sh`: a `fpc322`
+  wrapper if one is on the PATH, else `fpc`) and stop on any other version, because a
+  machine with several FPCs otherwise builds with whichever one the shell finds first.
+  Override deliberately with `FPC=<compiler>`.
+- **Delphi 13** (`dcc64`, compiler 37.0) for `run-delphi-tests.ps1`; override with
+  `-Dcc <path>`. On ARM64 Windows the x64 test programs run under emulation.
+
+Verified on aarch64-linux and x86_64-linux (FPC) and Win64 (Delphi 13). Lazarus is
 optional; `.lpi` files exist for the test projects, the scripts do not need the IDE.
 
 The two native extensions used by RAG (`sqlite-vec`, `lembed`) are **optional**: without
