@@ -245,9 +245,31 @@ Die Spec **2026-07-28** ist die größte Änderung seit MCP-Launch
 entfernt, wird bei uns **gelöscht** — keine Multi-Version-Negotiation, keine
 Legacy-Pfade, kein Deprecation-Ballast (Greenfield-Regel des Projekts).
 
+> **Ausnahme seit 2026-09-10 — Legacy-Brücke für stdio, zum Rückbau vorgesehen**
+> (Marker `LEGACY-ERA` im Code). `src/mormot.ai.mcp.legacy.pas` beantwortet auf **stdio**
+> zusätzlich den `initialize`-Handshake (Lifecycle 2025-11-25, dazu `ping` und
+> `notifications/initialized`) und reicht danach Requests ohne `_meta` mit eingesetztem
+> `_meta` an den **unveränderten** 2026-07-28-Kern weiter. Die Spec erlaubt genau das
+> (`docs/specs/mcp-2026-07-28/basic/versioning.mdx`: ein Server **MAY** beide Eras
+> bedienen, `initialize` wählt die Legacy-Semantik für den stdio-Prozess).
+> **Warum:** Claude Code (2.1.267) öffnet stdio standardmäßig mit `initialize`; selbst mit
+> aktivierter Negotiation (`MCP_PROTOCOL_NEGOTIATION=auto` + `MCP_SDK_GENERATION=v2`) gibt
+> seine `server/discover`-Probe nach 3 s auf, ein per `wsl` gestarteter Server braucht kalt
+> rund 7 s — ohne Brücke verbindet sich z. B. codenav nicht zuverlässig.
+> **Grenzen:** nur stdio (HTTP bleibt modern-only); kein `logging/setLevel`, keine
+> server-initiierten Requests, kein `resources/subscribe`; ein `input_required`-Ergebnis
+> wird zum JSON-RPC-Fehler. Requests **mit** `_meta` laufen weiter rein modern.
+> **Rückbau, sobald** die Ziel-Clients stdio standardmäßig per `server/discover` öffnen
+> **und** ihre Probe einen langsamen Prozessstart übersteht. Dann: die Unit löschen, die mit
+> `LEGACY-ERA` markierten Zeilen in `mormot.ai.mcp.stdio.pas` und `mcp.tests`-Tests
+> (`StdioTransportLegacyInitialize`, `LegacyBridgeTranslation`) entfernen, diesen Absatz
+> und den README-Abschnitt „One temporary exception … stdio legacy bridge“ streichen.
+> Vorab abschaltbar per `TMcpStdioTransport.AcceptLegacyInitialize := false`.
+
 **RAUS (ersatzlos löschen):**
 - `initialize` / `notifications/initialized` **und die gesamte Versions-Negotiation**
   (2024-11-05 / 2025-03-26 / 2025-06-18 / 2025-11-25) — Protokoll ist stateless.
+  *(Einzige Ausnahme: die Legacy-Brücke für stdio oben.)*
 - **Protokoll-Sessions + `Mcp-Session-Id`** im Streamable HTTP → damit auch unsere
   Session-Registry, Ablauf-Logik und das FSafe-Re-Resolve.
 - **SSE-Resumability**: `Last-Event-ID`, SSE-Event-IDs, `NextSessionEventId`.

@@ -26,7 +26,8 @@ uses
   mormot.core.unicode,
   mormot.core.text,
   mormot.core.threads,
-  mormot.ai.mcp;
+  mormot.ai.mcp,
+  mormot.ai.mcp.legacy; // LEGACY-ERA
 
 
 { ************ Stdio Transport }
@@ -58,6 +59,8 @@ type
     fWorker: TMcpStdioWorker;
     fActive: boolean;
     fOutputLock: TLightLock;
+    fLegacy: TMcpLegacyStdioBridge;     // LEGACY-ERA
+    fAcceptLegacyInitialize: boolean;   // LEGACY-ERA
     procedure WriteOutput(const aLine: RawUtf8);
   public
     /// initialize with MCP server instance
@@ -75,6 +78,14 @@ type
     function IsActive: boolean;
     /// process a single request (called by worker thread)
     procedure ProcessRequest(const aRequest: RawUtf8);
+    /// LEGACY-ERA: also answer the pre-2026-07-28 "initialize" handshake
+    // - true by default: clients that open stdio with "initialize" would
+    //   otherwise never connect (see mormot.ai.mcp.legacy for why and when
+    //   this goes away)
+    // - false = modern only: "initialize" is rejected like any request
+    //   without _meta
+    property AcceptLegacyInitialize: boolean
+      read fAcceptLegacyInitialize write fAcceptLegacyInitialize;
   end;
 
 
@@ -135,11 +146,14 @@ begin
   fServer := aServer;
   fActive := false;
   fOutputLock.Init;
+  fLegacy := TMcpLegacyStdioBridge.Create(aServer); // LEGACY-ERA
+  fAcceptLegacyInitialize := true;                   // LEGACY-ERA
 end;
 
 destructor TMcpStdioTransport.Destroy;
 begin
   Stop;
+  fLegacy.Free; // LEGACY-ERA
   fOutputLock.Done;
   inherited;
 end;
@@ -165,14 +179,28 @@ end;
 
 procedure TMcpStdioTransport.ProcessRequest(const aRequest: RawUtf8);
 var
-  response: RawUtf8;
+  request, response: RawUtf8;
+  route: TMcpLegacyRoute; // LEGACY-ERA
 begin
   if not fActive then
     exit;
 
   try
-    // Execute MCP request
-    response := fServer.ExecuteRequest(aRequest);
+    request := aRequest;
+    // LEGACY-ERA: a client of the "initialize" era is answered or translated by
+    // the bridge; everything else reaches the core exactly as it came in
+    if fAcceptLegacyInitialize then
+      route := fLegacy.Route(request, response)
+    else
+      route := lrPassThrough;
+    if route <> lrAnswered then
+    begin
+      // Execute MCP request
+      response := fServer.ExecuteRequest(request);
+      if (route = lrRewritten) and
+         (response <> '') then
+        response := fLegacy.AdaptResponse(response); // LEGACY-ERA
+    end;
 
     // Send response if not a notification
     if response <> '' then

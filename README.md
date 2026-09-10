@@ -6,9 +6,10 @@ embeddings, vector stores and RAG. Built on mORMot2 — its HTTP stack, JSON, RT
 crypto are the foundation, not a dependency we tolerate.
 
 > **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
-> (stateless) and only that one. Build, tests and demos green on aarch64-linux/FPC 3.2.2:
-> **892 assertions** MCP suite, **361 assertions** LLM suite. Library and both suites also
-> green under **Delphi 13** (Win64): 892 MCP, 364 LLM (the Windows `vec0` tests run too);
+> (stateless) and only that one — plus a temporary stdio bridge for the legacy `initialize`
+> handshake, marked for removal. Build, tests and demos green on aarch64-linux/FPC 3.2.2:
+> **935 assertions** MCP suite, **361 assertions** LLM suite. Library and both suites also
+> green under **Delphi 13** (Win64): 935 MCP, 364 LLM (the Windows `vec0` tests run too);
 > all 14 demos compile with Delphi 13 as well, but are not run there and have no Delphi
 > build script yet. Open: phase E
 > (layering / merge / backend binding) — see [CONCEPT.md](CONCEPT.md).
@@ -211,6 +212,17 @@ and client capabilities in `params._meta`; `server/discover` replaces the handsh
 We deleted the removed machinery rather than keeping it behind a negotiation layer. There
 is **no multi-version support** — a greenfield project has nothing to be compatible with,
 and a second code path is a second thing to get wrong.
+
+**One temporary exception, marked for removal: the stdio legacy bridge**
+(`mormot.ai.mcp.legacy`, code marker `LEGACY-ERA`). Clients still open stdio servers with
+the old `initialize` handshake — Claude Code does so by default, and its `server/discover`
+probe gives up after 3 s, which a slowly starting process misses. On stdio only, the bridge
+answers `initialize` (2025-11-25 lifecycle), `notifications/initialized` and `ping`, then
+passes requests without `_meta` to the unchanged 2026-07-28 core with the metadata filled
+in. The spec allows a server to serve both eras. Requests that carry `_meta` stay purely
+modern; `TMcpStdioTransport.AcceptLegacyInitialize := false` switches the bridge off. It
+goes away once clients probe by default and survive a slow start — see
+[CONCEPT.md §6](CONCEPT.md).
 
 What that buys, beyond simplicity: session expiry, the use-after-free surface around the
 streamable transport and the legacy SSE session map all stopped being problems, because

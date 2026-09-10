@@ -22,7 +22,8 @@ uses
   mormot.net.client,
   mormot.ai.mcp,
   mormot.ai.mcp.server,
-  mormot.ai.mcp.stdio;
+  mormot.ai.mcp.stdio,
+  mormot.ai.mcp.legacy; // LEGACY-ERA
 
 const
   HTTP_KEEPALIVE_MS = 10000;
@@ -73,6 +74,8 @@ type
     procedure StdioTransportProcess;
     procedure StdioTransportMultiple;
     procedure StdioTransportBadJson;
+    procedure StdioTransportLegacyInitialize; // LEGACY-ERA
+    procedure LegacyBridgeTranslation;        // LEGACY-ERA
   end;
 
   TTestMcpStreamableTransport = class(TSynTestCase)
@@ -803,6 +806,290 @@ begin
     server.Free;
     DeleteFile(inputFile);
     DeleteFile(outputFile);
+  end;
+end;
+
+procedure TTestMcpTransports.StdioTransportLegacyInitialize;
+// LEGACY-ERA: remove together with mormot.ai.mcp.legacy (CONCEPT.md section 6)
+const
+  CALL_CALC = '"params":{"name":"calc","arguments":{"a":2,"b":4,"enabled":true,"name":"x"}';
+var
+  server: TMcpServer;
+  transport, modernOnly: TMcpStdioTransport;
+  tool: IMcpTool;
+  outputFile: TFileName;
+  responseText, line: RawUtf8;
+  p: PUtf8Char;
+  responses: array[1..9] of variant;
+  count: integer;
+  id: Int64;
+  docVar, caps: variant;
+  inputBackup, outputBackup: TMcpTextRec;
+
+  function Field(const aDoc: variant; const aName: RawUtf8): variant;
+  begin
+    result := _Safe(aDoc)^.GetValueOrNull(aName);
+  end;
+
+  function Has(const aDoc: variant; const aName: RawUtf8): boolean;
+  begin
+    result := _Safe(aDoc)^.GetValueIndex(aName) >= 0;
+  end;
+
+  function IsEmptyObject(const aDoc: variant): boolean;
+  begin
+    result := _Safe(aDoc)^.IsObject and
+              (_Safe(aDoc)^.Count = 0);
+  end;
+
+  function ErrorCode(const aResponse: variant): Int64;
+  begin
+    if not VariantToInt64Loose(Field(Field(aResponse, 'error'), 'code'), result) then
+      result := 0;
+  end;
+
+begin
+  // the lines are fed directly: a worker thread would read the real stdin
+  if not RunFromSynTests then
+    exit;
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('StdioTestServer', '1.0');
+  transport := nil;
+  modernOnly := nil;
+  outputFile := TemporaryFileName;
+  try
+    tool := TCalcTool.Create('calc', 'Add two numbers');
+    server.RegisterTool(tool);
+    server.Start;
+    Check(FileFromString('', outputFile));
+
+    BackupStdIo(inputBackup, outputBackup);
+    AssignFile(Output, outputFile);
+    Rewrite(Output);
+    try
+      transport := TMcpStdioTransport.Create(server);
+      transport.Start;
+      // before "initialize", a request without _meta keeps its modern answer
+      transport.ProcessRequest('{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}');
+      // legacy liveness check, allowed at any time
+      transport.ProcessRequest('{"jsonrpc":"2.0","id":2,"method":"ping"}');
+      // the handshake, with a legacy version the bridge knows
+      transport.ProcessRequest('{"jsonrpc":"2.0","id":3,"method":"initialize","params":' +
+        '{"protocolVersion":"2025-06-18","capabilities":{},' +
+        '"clientInfo":{"name":"legacy-test","version":"1"}}}');
+      transport.ProcessRequest('{"jsonrpc":"2.0","method":"notifications/initialized"}');
+      // a request of the legacy session: no _meta, served by the modern core
+      transport.ProcessRequest('{"jsonrpc":"2.0","id":4,"method":"tools/call",' +
+        CALL_CALC + '}}');
+      // a request WITH _meta stays purely modern on the same connection
+      transport.ProcessRequest('{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{' +
+        MCP_TEST_META + '}}');
+      // an unknown version is answered with the latest legacy one
+      transport.ProcessRequest('{"jsonrpc":"2.0","id":6,"method":"initialize","params":' +
+        '{"protocolVersion":"1999-01-01","capabilities":{}}}');
+      // no params at all: the bridge has to create them to carry _meta
+      transport.ProcessRequest('{"jsonrpc":"2.0","id":7,"method":"tools/list"}');
+      // a legacy _meta (progressToken) does not make the request modern
+      transport.ProcessRequest('{"jsonrpc":"2.0","id":9,"method":"tools/call",' +
+        CALL_CALC + ',"_meta":{"progressToken":"p1"}}}');
+
+      // switched off: "initialize" is just another request without _meta
+      modernOnly := TMcpStdioTransport.Create(server);
+      modernOnly.AcceptLegacyInitialize := false;
+      modernOnly.Start;
+      modernOnly.ProcessRequest('{"jsonrpc":"2.0","id":8,"method":"initialize","params":' +
+        '{"protocolVersion":"2025-06-18","capabilities":{}}}');
+
+      CloseFile(Output);
+      transport.Stop;
+      modernOnly.Stop;
+    finally
+      RestoreStdIo(inputBackup, outputBackup);
+    end;
+
+    responseText := StringFromFile(outputFile);
+    count := 0;
+    p := pointer(responseText);
+    while p <> nil do
+    begin
+      line := GetNextLine(p, p, true);
+      if line = '' then
+        continue;
+      inc(count);
+      docVar := _JsonFast(line);
+      if VariantToInt64Loose(Field(docVar, 'id'), id) and
+         (id >= 1) and
+         (id <= 9) then
+        responses[id] := docVar;
+    end;
+    CheckEqual(count, 9, 'one line per request, none for the notification');
+
+    CheckEqual(ErrorCode(responses[1]), JSONRPC_INVALID_PARAMS,
+      'before initialize: the modern -32602 for a request without _meta');
+    Check(IsEmptyObject(Field(responses[2], 'result')),
+      'ping gets an empty result object');
+    CheckEqual(VariantToUtf8(Field(Field(responses[3], 'result'), 'protocolVersion')),
+      '2025-06-18', 'the requested legacy version is echoed');
+    CheckEqual(VariantToUtf8(Field(Field(Field(responses[3], 'result'), 'serverInfo'),
+      'name')), 'StdioTestServer', 'initialize reports the server identity');
+    caps := Field(Field(responses[3], 'result'), 'capabilities');
+    Check(Has(caps, 'tools'), 'initialize reports the tools capability');
+    Check(not Has(Field(caps, 'tools'), 'listChanged'),
+      'but no list-changed notifications a legacy client could never receive');
+    Check(not Has(Field(caps, 'resources'), 'subscribe'),
+      'and no resource subscriptions either');
+    Check(PosEx('2 + 4 = 6', VariantToUtf8(Field(responses[4], 'result'))) > 0,
+      'a legacy tools/call reaches the tool');
+    Check(not Has(Field(responses[4], 'result'), 'resultType'),
+      'a legacy result carries no resultType');
+    Check(Has(Field(responses[5], 'result'), 'resultType'),
+      'a request with _meta stays modern after initialize');
+    CheckEqual(VariantToUtf8(Field(Field(responses[6], 'result'), 'protocolVersion')),
+      '2025-11-25', 'an unknown version is answered with the latest legacy one');
+    Check(Has(Field(responses[7], 'result'), 'tools'),
+      'a legacy request without params still reaches the core');
+    Check(not Has(Field(responses[7], 'result'), 'resultType') and
+          not Has(Field(responses[7], 'result'), 'ttlMs') and
+          not Has(Field(responses[7], 'result'), 'cacheScope'),
+      'and comes back without the 2026-07-28-only fields');
+    CheckEqual(ErrorCode(responses[8]), JSONRPC_INVALID_PARAMS,
+      'AcceptLegacyInitialize = false rejects initialize like any request without _meta');
+    Check(PosEx('2 + 4 = 6', VariantToUtf8(Field(responses[9], 'result'))) > 0,
+      'a legacy request with its own _meta (progressToken) still reaches the tool');
+  finally
+    modernOnly.Free;
+    transport.Free;
+    server.Free;
+    DeleteFile(outputFile);
+  end;
+end;
+
+procedure TTestMcpTransports.LegacyBridgeTranslation;
+// LEGACY-ERA: remove together with mormot.ai.mcp.legacy (CONCEPT.md section 6)
+const
+  ERROR_RESPONSE = '{"jsonrpc":"2.0","id":10,"error":{"code":-32602,"message":"m"}}';
+var
+  server: TMcpServer;
+  bridge: TMcpLegacyStdioBridge;
+  request, response, adapted: RawUtf8;
+  doc, res, tools, caps: variant;
+
+  function Field(const aDoc: variant; const aName: RawUtf8): variant;
+  begin
+    result := _Safe(aDoc)^.GetValueOrNull(aName);
+  end;
+
+  function Has(const aDoc: variant; const aName: RawUtf8): boolean;
+  begin
+    result := _Safe(aDoc)^.GetValueIndex(aName) >= 0;
+  end;
+
+  function Item(const aArray: variant; aIndex: integer): variant;
+  begin
+    result := _Safe(aArray)^.Values[aIndex];
+  end;
+
+begin
+  server := TMcpServer.Create('BridgeTestServer', '1.0');
+  bridge := TMcpLegacyStdioBridge.Create(server);
+  try
+    // the core's envelope check comes first: the bridge answers nothing the
+    // core would reject
+    request := '{"jsonrpc":"1.0","id":1,"method":"ping"}';
+    Check(bridge.Route(request, response) = lrPassThrough,
+      'an invalid JSON-RPC envelope is left to the core');
+    Check(response = '', 'and not answered by the bridge');
+
+    request := '{"jsonrpc":"2.0","id":2,"method":"tools/list"}';
+    Check(bridge.Route(request, response) = lrPassThrough,
+      'before initialize nothing is rewritten');
+
+    request := '{"jsonrpc":"2.0","id":3,"method":"initialize","params":' +
+      '{"protocolVersion":"2025-03-26","capabilities":{"roots":{}}}}';
+    Check(bridge.Route(request, response) = lrAnswered, 'initialize is answered');
+    CheckEqual(bridge.ProtocolVersion, '2025-03-26', 'the requested version is agreed');
+    doc := _JsonFast(response);
+    caps := Field(Field(doc, 'result'), 'capabilities');
+    Check(Has(caps, 'tools') and Has(caps, 'resources'),
+      'the capabilities of server/discover are reported');
+    Check(not Has(Field(caps, 'tools'), 'listChanged') and
+          not Has(Field(caps, 'resources'), 'subscribe'),
+      'without the notifications only subscriptions/listen delivers');
+
+    // a legacy _meta is kept and completed, and a float argument stays a number
+    request := '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"x",' +
+      '"arguments":{"f":0.12345678},"_meta":{"progressToken":"p1"}}}';
+    Check(bridge.Route(request, response) = lrRewritten,
+      'a legacy _meta does not make a request modern');
+    Check(PosEx('"progressToken":"p1"', request) > 0, 'the legacy _meta is kept');
+    Check(PosEx(MCP_META_PROTOCOL_VERSION, request) > 0,
+      'and completed with the modern protocol version');
+    Check(PosEx(MCP_META_CLIENT_CAPABILITIES, request) > 0,
+      'and with the capabilities declared in initialize');
+    Check(PosEx('0.12345678', request) > 0, 'a float argument survives the rewrite');
+    Check(PosEx('"0.12345678"', request) = 0, 'as a number, not as a string');
+
+    request := '{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{' +
+      MCP_TEST_META + '}}';
+    Check(bridge.Route(request, response) = lrPassThrough,
+      'a request with the modern protocol version is left alone');
+
+    // input_required has no legacy form: an error with the same id
+    adapted := bridge.AdaptResponse('{"jsonrpc":"2.0","id":6,"result":' +
+      '{"resultType":"input_required","inputRequests":{}}}');
+    doc := _JsonFast(adapted);
+    Check(Has(doc, 'error') and not Has(doc, 'result'),
+      'input_required becomes a JSON-RPC error');
+    CheckEqual(VariantToUtf8(Field(doc, 'id')), '6', 'correlated with the request');
+
+    // tools/list: 2026-07-28-only fields dropped, schemas kept inside the legacy rules
+    adapted := bridge.AdaptResponse('{"jsonrpc":"2.0","id":7,"result":{"tools":[' +
+      '{"name":"a","inputSchema":{"properties":{}}},' +
+      '{"name":"b","inputSchema":{"type":"string"},"outputSchema":{"type":"array"}}],' +
+      '"ttlMs":0,"cacheScope":"public","resultType":"complete"}}');
+    res := Field(_JsonFast(adapted), 'result');
+    Check(not Has(res, 'resultType') and
+          not Has(res, 'ttlMs') and
+          not Has(res, 'cacheScope'),
+      'resultType and the caching hints are dropped');
+    tools := Field(res, 'tools');
+    CheckEqual(VariantToUtf8(Field(Field(Item(tools, 0), 'inputSchema'), 'type')),
+      'object', 'an implied object schema states its type');
+    CheckEqual(VariantToUtf8(Field(Field(Item(tools, 1), 'inputSchema'), 'type')),
+      'object', 'a non-object inputSchema becomes an object schema');
+    Check(not Has(Item(tools, 1), 'outputSchema'),
+      'a non-object outputSchema is dropped');
+
+    // structuredContent: an array has no legacy form, an object keeps its numbers
+    adapted := bridge.AdaptResponse('{"jsonrpc":"2.0","id":8,"result":{"content":' +
+      '[{"type":"text","text":"x"}],"structuredContent":[1,2],"resultType":"complete"}}');
+    Check(PosEx('structuredContent', adapted) = 0,
+      'an array structuredContent is dropped');
+    adapted := bridge.AdaptResponse('{"jsonrpc":"2.0","id":9,"result":{"content":[],' +
+      '"structuredContent":{"v":0.12345678},"resultType":"complete"}}');
+    Check(PosEx('"v":0.12345678', adapted) > 0,
+      'numbers in structuredContent stay numbers');
+
+    // boolean subschemas are valid JSON Schema, but legacy SDKs want objects
+    adapted := bridge.AdaptResponse('{"jsonrpc":"2.0","id":11,"result":{"tools":[' +
+      '{"name":"c","inputSchema":{"type":"object","properties":{"x":true,"y":false}}}]}}');
+    res := Field(Field(Item(Field(Field(_JsonFast(adapted), 'result'), 'tools'), 0),
+      'inputSchema'), 'properties');
+    CheckEqual(VariantToUtf8(Field(res, 'x')), '{}',
+      'a true subschema becomes the equivalent {}');
+    Check(Has(Field(res, 'y'), 'not'),
+      'a false subschema becomes the equivalent {"not":{}}');
+
+    // positional params, even empty ones, are the core's business
+    request := '{"jsonrpc":"2.0","id":12,"method":"tools/list","params":[]}';
+    Check(bridge.Route(request, response) = lrPassThrough,
+      'empty array params are left to the core, not given a _meta');
+
+    CheckEqual(bridge.AdaptResponse(ERROR_RESPONSE), ERROR_RESPONSE,
+      'an error response travels unchanged');
+  finally
+    bridge.Free;
+    server.Free;
   end;
 end;
 
