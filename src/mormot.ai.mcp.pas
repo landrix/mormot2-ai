@@ -1599,6 +1599,7 @@ type
   TMcpResponseBuilder = class
   private
     fContent: TDocVariantData;
+    fIsError: boolean;
   public
     /// initialize builder
     constructor Create;
@@ -1606,6 +1607,11 @@ type
     function AddText(const aText: RawUtf8): TMcpResponseBuilder;
     /// add base64-encoded file content
     function AddFile(const aFilePath: RawUtf8; const aFileName: RawUtf8 = ''): TMcpResponseBuilder;
+    /// flag the result as a tool error - Build then adds "isError": true
+    // - a failure the model can react to (bad input, nothing to read, a tool
+    // that refused) belongs INSIDE a normal result, not into a JSON-RPC error
+    // (docs/specs/mcp-2026-07-28/server/tools.mdx, "Error Handling")
+    function SetError(aIsError: boolean = true): TMcpResponseBuilder;
     /// build final response as variant
     function Build: variant;
   end;
@@ -5262,6 +5268,12 @@ begin
   result := self;
 end;
 
+function TMcpResponseBuilder.SetError(aIsError: boolean): TMcpResponseBuilder;
+begin
+  fIsError := aIsError;
+  result := self;
+end;
+
 function TMcpResponseBuilder.Build: variant;
 var
   contentCopy: TDocVariantData;
@@ -5274,6 +5286,9 @@ begin
     contentCopy.AddItem(fContent.Values[i]);
 
   _ObjAddProp('content', contentCopy, result);
+  // only when set: a successful result carries no isError at all, as before
+  if fIsError then
+    _ObjAddProp('isError', true, result);
 end;
 
 

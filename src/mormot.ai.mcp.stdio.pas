@@ -39,17 +39,19 @@ type
   TMcpStdioWorker = class(TSynThread)
   private
     fTransport: TObject;  // TMcpStdioTransport
+    fInputClosed: boolean;
     procedure ProcessLine(const aLine: RawUtf8);
   protected
     procedure Execute; override;
   public
-    constructor Create(aTransport: TObject);
+    constructor Create(aTransport: TObject); reintroduce;
   end;
 
   /// Stdio transport for MCP over standard input/output
   // - reads JSON-RPC requests line-by-line from stdin
   // - writes JSON-RPC responses to stdout
   // - suitable for CLI tools and process-based integrations
+  // - the session ends when the client closes stdin: IsActive turns false
   TMcpStdioTransport = class(TObject)
   private
     fServer: TMcpServer;
@@ -65,8 +67,11 @@ type
     /// start stdio communication
     procedure Start;
     /// stop stdio communication
+    // - the worker reads stdin blocking: while the client keeps stdin open and
+    // silent, Stop waits for its next line (or for EOF)
     procedure Stop;
     /// check if transport is active
+    // - false once stopped, and once the client closed stdin (EOF)
     function IsActive: boolean;
     /// process a single request (called by worker thread)
     procedure ProcessRequest(const aRequest: RawUtf8);
@@ -76,7 +81,9 @@ type
 implementation
 
 uses
-   classes, sysutils, strutils;
+  classes,
+  sysutils,
+  mormot.core.json;
 
 { ************ TMcpStdioWorker }
 
@@ -97,22 +104,25 @@ procedure TMcpStdioWorker.Execute;
 var
   line: string;
 begin
-  while not SleepOrTerminated(500) do
-  begin
-    try
-      // Read line from stdin
+  // Blocking read loop. ReadLn waits for the next request by itself - the loop
+  // used to sleep 500 ms BEFORE every read, adding half a second to each
+  // request. It also never noticed EOF: {$I-} suppresses the I/O exception it
+  // waited for, so a client closing stdin left the server process running.
+  // Text I/O decodes with the system code page by default (ANSI on Windows, for
+  // Delphi and FPC alike); MCP stdio messages are UTF-8 on every platform
+  SetTextCodePage(Input, CP_UTF8);
+  try
+    while not Terminated do
+    begin
+      if Eof(Input) then
+        break;            // the client closed stdin: the session is over
       ReadLn(line);
-
-      // Process the line
+      if IOResult <> 0 then
+        break;
       ProcessLine(StringToUtf8(line));
-    except
-      on E: ESynException do
-      begin
-        // EOF or error - terminate gracefully
-        if not Terminated then
-          Terminate;
-      end;
     end;
+  finally
+    fInputClosed := true;
   end;
 end;
 
@@ -135,17 +145,18 @@ begin
 end;
 
 procedure TMcpStdioTransport.WriteOutput(const aLine: RawUtf8);
-var
-  ansiLine: AnsiString;
 begin
   fOutputLock.Lock;
   try
-    {$ifdef OSWINDOWS}
-    ansiLine := Utf8Decode(aLine);
-    WriteLn(ansiLine);
-    {$else}
+    // MCP stdio messages are UTF-8 on every platform. Declaring the Output text
+    // file as UTF-8 lets the RTL pass the RawUtf8 bytes through unchanged. The
+    // Windows branch used to Utf8Decode into an AnsiString instead, which turned
+    // every character outside the ANSI code page into '?'.
+    // Still through Output, not the raw handle: a host (or a test) may redirect
+    // Output with AssignFile. Set on every write, because that redirection
+    // resets the code page of the text file.
+    SetTextCodePage(Output, CP_UTF8);
     WriteLn(aLine);
-    {$endif OSWINDOWS}
     Flush(Output);  // Ensure immediate delivery
   finally
     fOutputLock.UnLock;
@@ -158,23 +169,23 @@ var
 begin
   if not fActive then
     exit;
-    
+
   try
     // Execute MCP request
     response := fServer.ExecuteRequest(aRequest);
-    
+
     // Send response if not a notification
     if response <> '' then
       WriteOutput(response);
-      
+
   except
-    on E: ESynException do
-    begin
-      // Log error but don't crash
-      response := '{"jsonrpc":"2.0","error":{"code":-32603,"message":"' + 
-        StringToUtf8(E.Message) + '"},"id":null}';
-      WriteOutput(response);
-    end;
+    on E: Exception do
+      // Any exception, not only ESynException: an uncaught one would end the
+      // worker thread silently and leave a server that reads no more requests.
+      // The message goes through QuotedStrJson - a quote or backslash in it
+      // used to produce invalid JSON.
+      WriteOutput('{"jsonrpc":"2.0","error":{"code":-32603,"message":' +
+        QuotedStrJson(StringToUtf8(E.Message)) + '},"id":null}');
   end;
 end;
 
@@ -182,7 +193,7 @@ procedure TMcpStdioTransport.Start;
 begin
   if fActive then
     exit;
-    
+
   fActive := true;
   if RunFromSynTests then
     exit;
@@ -195,9 +206,9 @@ procedure TMcpStdioTransport.Stop;
 begin
   if not fActive then
     exit;
-    
+
   fActive := false;
-  
+
   // Stop worker thread
   if fWorker <> nil then
   begin
@@ -209,7 +220,11 @@ end;
 
 function TMcpStdioTransport.IsActive: boolean;
 begin
-  result := fActive;
+  // EOF on stdin ends the session, so a host loop "while IsActive" returns and
+  // the process exits instead of lingering after the client went away
+  result := fActive and
+            ((fWorker = nil) or
+             not fWorker.fInputClosed);
 end;
 
 
