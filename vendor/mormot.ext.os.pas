@@ -101,6 +101,13 @@ type
     /// block until the process exits or timeout expires
     // - returns the exit code, or -1 on timeout
     function WaitFor(waitms: cardinal = INFINITE): integer;
+    /// block until the background reader has drained the child's output
+    // - WaitFor() only watches the process: when it returns, the reader thread
+    // may still hold the last chunk in the pipe, so ReadAvailable() right after
+    // WaitFor() could return truncated output
+    // - returns true once the reader finished, false after waitms (a grandchild
+    // that inherited the pipe can keep it open, hence the timeout)
+    function WaitForOutput(waitms: cardinal = 5000): boolean;
     /// whether the process was started and is still running
     property Running: boolean read GetRunning;
     /// exit code of the process (valid only after the process has exited)
@@ -159,6 +166,25 @@ uses
 {$endif OSPOSIX}
 
 
+{ TExternalProcess - platform-neutral part }
+
+function TExternalProcess.WaitForOutput(waitms: cardinal): boolean;
+var
+  endtix: Int64;
+begin
+  result := not fStarted or
+            fReaderFinished;
+  if result then
+    exit;
+  endtix := GetTickCount64 + waitms;
+  repeat
+    SleepHiRes(5);
+    result := fReaderFinished;
+  until result or
+        (GetTickCount64 > endtix);
+end;
+
+
 { RunRedirect overload with stdinput }
 
 function RunRedirect(const cmd: TRunArg;
@@ -187,6 +213,12 @@ begin
     else
       proc.CloseStdin;
     proc.WaitFor(waitfordelayms);
+    // The child can exit before the reader thread pulled its last chunk out of
+    // the pipe; reading right away returned truncated output (seen as empty or
+    // cut ctags JSON although the command succeeded). After a timeout the
+    // process still runs - take what is there, the destructor kills it.
+    if not proc.Running then
+      proc.WaitForOutput;
     if setresult then
       result := proc.ReadAvailable;
     if exitcode <> nil then

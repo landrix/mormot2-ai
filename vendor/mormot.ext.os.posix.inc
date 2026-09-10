@@ -15,6 +15,20 @@ begin
   result := FpPoll(@p, 1, timeoutms) > 0;
 end;
 
+{ local helper: exit code from a waitpid() status }
+
+// WEXITSTATUS is only meaningful when WIFEXITED: a child killed by a signal has
+// no exit code, and the former "res shr 8" read as 0 there - a killed process
+// looked like a successful one. -1 is the "no regular exit" value callers
+// already get for a process that is still running.
+function ExtExitCode(status: cint): integer;
+begin
+  if wifexited(status) then
+    result := wexitstatus(status)
+  else
+    result := -1;
+end;
+
 { background reader thread }
 
 function ExtProcessReaderThread(p: pointer): PtrInt;
@@ -61,6 +75,7 @@ var
   stdin_fds, stdout_fds: tfildes;
   args: array[0..3] of PAnsiChar;
   cmdstr: RawUtf8;
+  wrkdirstr: AnsiString;
   cpid: TPid;
 begin
   result := false;
@@ -82,8 +97,12 @@ begin
     fpclose(stdin_fds[1]);
     exit;
   end;
-  if wrkdir <> '' then
-    ChDir(wrkdir);
+  // Everything the child needs is prepared BEFORE fork: between fork and execve
+  // only async-signal-safe calls are allowed in a multi-threaded process.
+  // The working directory used to be set with ChDir in the PARENT - that moved
+  // the whole server into wrkdir, for every thread, for good.
+  cmdstr := cmd;
+  wrkdirstr := AnsiString(wrkdir);
   cpid := FpFork;
   if cpid < 0 then
   begin
@@ -103,7 +122,9 @@ begin
     fpdup2(stdout_fds[1], 2);   // stderr -> stdout
     fpclose(stdin_fds[0]);
     fpclose(stdout_fds[1]);
-    cmdstr := cmd;
+    if (wrkdirstr <> '') and
+       (FpChdir(PAnsiChar(wrkdirstr)) <> 0) then
+      FpExit(127);
     args[0] := '/bin/sh';
     args[1] := '-c';
     args[2] := pointer(cmdstr);
@@ -197,7 +218,7 @@ begin
     result := true
   else if wr = cint(fPid) then
   begin
-    fExitCode := res shr 8; // WEXITSTATUS
+    fExitCode := ExtExitCode(res); // WEXITSTATUS
     fTerminated := true;
   end;
 end;
@@ -222,7 +243,7 @@ begin
     begin
       if FpWaitPid(fPid, @res, WNOHANG) <> 0 then
       begin
-        fExitCode := res shr 8;
+        fExitCode := ExtExitCode(res);
         fTerminated := true;
         result := true;
         exit;
@@ -264,7 +285,7 @@ begin
   if waitms = INFINITE then
   begin
     FpWaitPid(fPid, @res, 0);
-    fExitCode := res shr 8;
+    fExitCode := ExtExitCode(res);
     fTerminated := true;
     result := fExitCode;
     exit;
@@ -273,7 +294,7 @@ begin
   repeat
     if FpWaitPid(fPid, @res, WNOHANG) <> 0 then
     begin
-      fExitCode := res shr 8;
+      fExitCode := ExtExitCode(res);
       fTerminated := true;
       result := fExitCode;
       exit;
