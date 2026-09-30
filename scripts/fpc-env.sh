@@ -12,7 +12,8 @@
 #   1. $FPC gesetzt -> genau dieser Compiler, ohne Baseline-Pruefung (bewusste Gegenprobe,
 #                     z. B. `FPC=fpc322 scripts/run-fpc-tests.sh`); FPC_EXPECT=<version>
 #                     verlangt dabei trotzdem eine bestimmte Version
-#   2. fpc324       -> Wrapper im PATH, falls vorhanden (Eigenbau mit isolierter Config)
+#   2. fpc324       -> Wrapper im PATH, falls vorhanden (Eigenbau mit isolierter Config);
+#                      ohne Login-Shell (`wsl -e bash ...`) direkt $HOME/.local/bin/fpc324
 #   3. fpc          -> PATH-Default (z. B. Distributions-FPC im Container)
 # In Fall 2/3 muss die Version der Baseline entsprechen, sonst bricht der Build ab.
 
