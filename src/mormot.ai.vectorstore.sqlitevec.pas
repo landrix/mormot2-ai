@@ -104,6 +104,28 @@ begin
 end;
 
 
+// TSqlDataBase.Commit clears TransactionActive even when COMMIT itself fails
+// (e.g. SQLITE_BUSY), and RollBack checks exactly that flag - so an
+// `except RollBack` after a failed Commit is a no-op and the transaction stays
+// open: every later TransactionBegin fails and single writes silently join it.
+// Decide on SQLite's own state (get_autocommit) instead. Never raises: a failed
+// rollback must not hide the original exception.
+procedure RollbackIfOpen(aDB: TSqlDataBase);
+begin
+  if (aDB = nil) or (aDB.DB = 0) then
+    exit;
+  try
+    if sqlite3.get_autocommit(aDB.DB) = 0 then
+      if aDB.TransactionActive then
+        aDB.RollBack // also resets mORMot's flag
+      else
+        aDB.Execute('ROLLBACK TRANSACTION;'); // flag already gone (failed Commit)
+  except
+    // keep the original exception
+  end;
+end;
+
+
 { TVec0Store }
 
 constructor TVec0Store.Create(const aDbPath, aExtDir: RawUtf8; aDim: integer);
@@ -111,6 +133,9 @@ begin
   inherited Create;
   fDim := aDim;
   fDB := TSqlDataBase.Create(Utf8ToString(aDbPath), '');
+  // mORMot sets no busy timeout: a lock held by another process (backup tool,
+  // sqlite3 CLI) would fail at once with SQLITE_BUSY instead of waiting briefly.
+  fDB.BusyTimeout := 5000;
   EnableSqliteExtensions(fDB.DB);
   LoadSqliteExtension(fDB.DB, aExtDir + '/vec0' + SqliteExtSuffix);
   // ext_id is the OPTIONAL stable external key (entity id) for Upsert/Delete rows;
@@ -178,7 +203,7 @@ begin
     end;
     fDB.Commit;
   except
-    fDB.RollBack;
+    RollbackIfOpen(fDB);
     raise;
   end;
   finally
@@ -247,7 +272,7 @@ begin
     fDB.Commit;
     result := length(aTexts);
   except
-    fDB.RollBack;
+    RollbackIfOpen(fDB);
     raise;
   end;
   finally
@@ -404,7 +429,7 @@ begin
     end;
     fDB.Commit;
   except
-    fDB.RollBack;
+    RollbackIfOpen(fDB);
     raise;
   end;
   finally
@@ -450,7 +475,7 @@ begin
     end;
     fDB.Commit;
   except
-    fDB.RollBack;
+    RollbackIfOpen(fDB);
     raise;
   end;
   finally
