@@ -26,7 +26,7 @@ veröffentlicht als **eigenständige Extension in einem eigenen Repository**.
   nicht dorthin ab.
 - **FPC primär, Delphi 13 soweit möglich** (Entscheidung 2026-09-10 — revidiert das
   „FPC-only" vom 2026-07-29). FPC bleibt Referenz und Gate (`scripts/run-fpc-*.sh`, fest
-  auf FPC 3.2.2); Delphi 13 wird mitgebaut und mitgetestet
+  auf FPC 3.2.4 — seit 2026-09-30, vorher 3.2.2); Delphi 13 wird mitgebaut und mitgetestet
   (`scripts/run-delphi-tests.ps1`, Win64). Regel: keine FPC-Eigenheit ohne Not — aber
   auch keine Doppelimplementierung erzwingen. Was nur unter FPC geht (der POSIX-
   Prozessstart in `vendor/mormot.ext.os`, künftig neural-api), bleibt per `{$ifdef FPC}`

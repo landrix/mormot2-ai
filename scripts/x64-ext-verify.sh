@@ -18,7 +18,7 @@ DEMO_SRC="$LAI/demos"
 VENDOR="$LAI/vendor"
 ARCH="x86_64"
 OUT="/tmp/x64-ext"
-UNIT_OUT="$OUT/lib"
+UNIT_OUT="$OUT/lib/$FPC_VERSION"
 mkdir -p "$UNIT_OUT"
 
 UNITS="$SRC/app;$SRC/core;$SRC/crypt;$SRC/db;$SRC/lib;$SRC/net;$SRC/orm;$SRC/rest;$SRC/soa;$SRC/script;$SRC/misc;$SRC/tools/mget"

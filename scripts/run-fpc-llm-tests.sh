@@ -28,7 +28,7 @@ STATIC="$MORMOT2/static"
 LIB_SRC="$LAI/src"
 TEST_SRC="$LAI/tests"
 OUT="$LAI/bin/fpc"
-UNIT_OUT="$OUT/lib"
+UNIT_OUT="$OUT/lib/$FPC_VERSION"
 TARGET="${TARGET:-linux}"
 ARCH="${ARCH:-$("$FPC" -iTP)}"
 

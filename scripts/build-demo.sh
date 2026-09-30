@@ -27,7 +27,7 @@ LIB_SRC="$LAI/src"
 DEMO_SRC="$LAI/demos"
 OUT="$LAI/bin/fpc"
 DEMO_OUT="$OUT/demos"
-UNIT_OUT="$OUT/lib"      # geteilt mit run-fpc-tests.sh (mORMot-Cache)
+UNIT_OUT="$OUT/lib/$FPC_VERSION"      # geteilt mit run-fpc-tests.sh (mORMot-Cache)
 TARGET="${TARGET:-linux}"
 ARCH="${ARCH:-$("$FPC" -iTP)}"
 

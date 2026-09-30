@@ -7,7 +7,7 @@ crypto are the foundation, not a dependency we tolerate.
 
 > **Status:** phases A · B · C · D complete. MCP speaks revision **2026-07-28**
 > (stateless) and only that one — plus a temporary stdio bridge for the legacy `initialize`
-> handshake, marked for removal. Build, tests and demos green on aarch64-linux/FPC 3.2.2:
+> handshake, marked for removal. Build, tests and demos green on aarch64-linux/FPC 3.2.4:
 > **935 assertions** MCP suite, **361 assertions** LLM suite. Library and both suites also
 > green under **Delphi 13** (Win64): 935 MCP, 364 LLM (the Windows `vec0` tests run too);
 > all 14 demos compile with Delphi 13 as well, but are not run there and have no Delphi
@@ -131,10 +131,12 @@ bash scripts/build-demo.sh           # all demos (or pass one, e.g. llm/llm-agen
 ```
 
 **Requirements:** a mORMot2 source tree, plus
-- **FPC 3.2.2** for the bash scripts. They pin it (`scripts/fpc-env.sh`: a `fpc322`
-  wrapper if one is on the PATH, else `fpc`) and stop on any other version, because a
-  machine with several FPCs otherwise builds with whichever one the shell finds first.
-  Override deliberately with `FPC=<compiler>`.
+- **FPC 3.2.4** (currently the release candidate) for the bash scripts. They pin it
+  (`scripts/fpc-env.sh`: a `fpc324` wrapper if one is on the PATH, else `fpc`) and stop on
+  any other version, because a machine with several FPCs otherwise builds with whichever one
+  the shell finds first. Override deliberately with `FPC=<compiler>`; `FPC_EXPECT=<version>`
+  still insists on a version. Unit caches live under `lib/<fpc version>`, so builds with
+  different compilers never share `.ppu` files.
 - **Delphi 13** (`dcc64`, compiler 37.0) for `run-delphi-tests.ps1`; override with
   `-Dcc <path>`. On ARM64 Windows the x64 test programs run under emulation.
 
