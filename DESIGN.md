@@ -882,6 +882,44 @@ das entfernte `Stream`-Feld übrig ist, dass `_JsonFastFloat` Integers unangetas
 Nebenläufigkeitstest wäre hier unzuverlässig. Der Beleg ist mORMots eigene Header-Zusage,
 nicht ein grüner Testlauf.
 
+### Typprüfung der Werkzeug-Argumente (2026-10, MCP **992** grün, FPC und Delphi 13)
+
+Seit Runde 5b war `required` erzwungen, die **Typen** des `inputSchema` aber nicht.
+`RecordLoadJson` wandelt bewusst tolerant um — aus `0.5` wurde 0, aus `"5"` die 5, und ein
+`4294967297` lief in einem 32-Bit-Feld zu 1 über. Der Client bekam still ein anderes Ergebnis
+statt eines Fehlers, aus dem ein Modell lernen kann. Jetzt prüft `TMcpToolBase<T>.Execute` jedes
+**gesendete** Argument vor dem Laden (`InvalidArguments` → `TMcpSchemaGenerator.ArgumentTypeError`)
+und weist Abweichungen als `isError` mit Feldnamen und erwartetem Typ ab.
+
+Der Weg dahin war lehrreich, weil drei Fassungen an mORMots Eigenheiten scheiterten:
+
+- **Nach Parser-Kennung entscheiden** war falsch: `char` läuft unter `ptByte`/`ptWord`,
+  eigene Serializer behalten ihre Kennung, Enumerationen liest der Loader auch als Zahl,
+  `RawJson` nimmt jedes JSON. **Nach RTTI-Kind** war zu breit: `TTimeLog`/`TUnixTime` sind
+  `Int64`-Aliase mit ISO-Text-Form, und `RegisterCustomSerializerFunction` hinterlässt keine
+  Spur. Was trägt, ist eine **Positivliste nach `TypeInfo`-Identität** — geprüft werden nur
+  die Standardtypen selbst; jeder eigene Typ bleibt Sache des Loaders.
+- **`2.0` als Ganzzahl** stimmt nur, solange der Wert exakt zurückgeschrieben wird: `Execute`
+  serialisiert die Argumente vor dem Laden neu. Currency (bis vier Nachkommastellen) ist
+  exakt; ein Double (`2e9`) kommt in Exponentenform zurück und wird von seinen ersten Ziffern
+  gelesen. Also: Ganzzahl oder ganzzahlige Currency, nie Double. Dasselbe für Currency-Felder,
+  dort zusätzlich im Currency-Bereich — eine größere Ganzzahl liefe beim Skalieren mit 10000 über.
+- **`ShortInt`/`SmallInt`** lädt mORMot vorzeichenlos (`GetCardinal`): `-1` wird 0. Sie
+  bleiben ungeprüft und veröffentlichen keinen Bereich, der etwas anderes verspricht —
+  Upstream-Kandidat für mORMot.
+
+Unbekannte Argumente bleiben **bewusst toleriert** (unverändert seit Runde 5b). Das Schema
+trägt für Ganzzahlen jetzt `minimum`/`maximum` und für `RawJson` keinen `type` mehr — **nur**
+im Tool-`inputSchema`; der `ChatStructured`-Weg zu LLM-Providern bleibt unverändert, weil deren
+Strict-Modi beides ablehnen und dort nichts erzwungen würde.
+
+Gegenproben: Prüfung heraus → 23 Assertions rot; Currency-Zweig heraus → der `2.0`-Fall rot.
+Getestet über den **echten** Parserpfad (`ExecRawArgs`): der alte Test-Helfer `Exec` parst und
+schreibt die Anfrage neu und machte aus `2.0` schon vorher eine `2` — die Behauptung „`2.0` ist
+in Ordnung" galt anfangs nur im Test. Codex hat das in der dritten von vier Runden gefunden,
+der Claude-Review danach den `ChatStructured`-Seiteneffekt und den leergelaufenen
+Loader-Regressionstest.
+
 ## Lizenz / Veröffentlichung
 
 > **Überholt (2026-07-29):** Ein Synopse-PR ist **nicht** mehr das Ziel — LandrixAI

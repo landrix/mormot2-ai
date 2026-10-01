@@ -27,6 +27,23 @@ type
     Name: RawUtf8;
   end;
 
+  /// a field of each kind whose JSON form is NOT one fixed scalar type: the
+  /// type check must leave them to RecordLoadJson instead of refusing a valid
+  /// form (an enumeration may come as name or ordinal, RawJson as any value)
+  TEdgeMode = (emOff, emOn);
+  TEdgeParams = packed record
+    Mode: TEdgeMode;
+    Payload: RawJson;
+    Amount: double;
+    Price: Currency;
+  end;
+
+  TEdgeTool = class(TMcpToolBase<TEdgeParams>)
+  protected
+    function ExecuteTyped(const aParams: TEdgeParams;
+      const aAuthCtx: TMcpAuthContext): variant; override;
+  end;
+
   /// every tool here shares TCalcParams, where A and B are the actual
   /// arguments and Enabled/Name are decoration - exactly the situation
   /// MarkOptional exists for. Without it the generated schema would publish
@@ -250,6 +267,8 @@ type
     //   passed through untouched so the negative tests still exercise the
     //   parser and the notification path
     function Exec(aServer: TMcpServer; const aJson: RawUtf8): RawUtf8;
+    function ExecRawArgs(aServer: TMcpServer; aId: integer;
+      const aTool, aRawArgs: RawUtf8): RawUtf8;
     /// like Exec, but with client capabilities the caller chooses
     // - Exec goes through McpRequestParams, which declares NO capabilities; the
     //   MRTR gate is precisely about what the client did or did not declare
@@ -295,6 +314,8 @@ type
     procedure ScopeRefusalUsesAnApplicationCode;
     procedure RequiredSchemaIsHonestAndEnforced;
     procedure TypedToolRefusesArgumentsThatDoNotParse;
+    procedure ToolArgumentsAreTypeChecked;
+    procedure TypeCheckLeavesAmbiguousFormsToTheLoader;
   end;
 
 implementation
@@ -305,6 +326,23 @@ constructor TCalcToolBase.Create(const aName, aDescription: RawUtf8);
 begin
   inherited Create(aName, aDescription);
   MarkOptional(['Enabled', 'Name']);
+end;
+
+{ TEdgeTool }
+
+function TEdgeTool.ExecuteTyped(const aParams: TEdgeParams;
+  const aAuthCtx: TMcpAuthContext): variant;
+var
+  builder: TMcpResponseBuilder;
+begin
+  builder := TMcpResponseBuilder.Create;
+  try
+    builder.AddText(FormatUtf8('mode=% payload=% amount=% price=%',
+      [ord(aParams.Mode), aParams.Payload, aParams.Amount, Curr64ToString(PInt64(@aParams.Price)^)]));
+    result := builder.Build;
+  finally
+    builder.Free;
+  end;
 end;
 
 { TCalcTool }
@@ -1172,6 +1210,23 @@ begin
   finally
     server.Free;
   end;
+end;
+
+// Like Exec, but the tool arguments go in as RAW text. Exec parses and
+// re-writes the whole request, which already turns 2.0 into 2 - so a test
+// through it never sees what the server's own parser (_JsonFastFloat) makes of
+// a number. Found by Codex: the "2.0 is fine" claim held only in the test.
+function TTestMcpCore.ExecRawArgs(aServer: TMcpServer; aId: integer;
+  const aTool, aRawArgs: RawUtf8): RawUtf8;
+var
+  envelope: RawUtf8;
+begin
+  envelope := _Safe(McpRequestParams(_ObjFast(['name', aTool, 'arguments', '@ARGS@']),
+    'mcp.tests', '1.0'))^.ToJson;
+  envelope := FormatUtf8('{"jsonrpc":"2.0","id":%,"method":"tools/call","params":%}',
+    [aId, envelope]);
+  result := aServer.ExecuteRequest(
+    StringReplaceAll(envelope, '"@ARGS@"', aRawArgs));
 end;
 
 function TTestMcpCore.Exec(aServer: TMcpServer; const aJson: RawUtf8): RawUtf8;
@@ -3241,10 +3296,12 @@ begin
   try
     server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
     server.Start;
-    // `A` is declared integer and gets an array: the record parser refuses the
-    // payload. Its result used to be discarded, and since the default options
-    // do not include jpoClearValues the record was not even zeroed - the tool
-    // ran on whatever the stack held.
+    // `A` is declared integer and gets an array. Since the type check this is
+    // refused BEFORE the record parser runs; the parser's own refusal (its result
+    // used to be discarded, and without jpoClearValues the record was not even
+    // zeroed - the tool ran on whatever the stack held) is covered separately
+    // in TypeCheckLeavesAmbiguousFormsToTheLoader with a form the type check
+    // does not judge.
     // The refusal is a TOOL error (isError), NOT a JSON-RPC error: the spec
     // files 'Input validation errors' under the half a model can self-correct
     // from (docs/specs/mcp-2026-07-28/server/tools.mdx:760-783), and reserves
@@ -3268,6 +3325,192 @@ begin
   end;
 end;
 
+
+procedure TTestMcpCore.ToolArgumentsAreTypeChecked;
+var
+  server: TMcpServer;
+  tool: TCalcTool;
+  response: RawUtf8;
+  schema: variant;
+  props, a: PDocVariantData;
+
+  function Call(id: integer; const args: RawUtf8): RawUtf8;
+  begin
+    result := Exec(server, FormatUtf8(
+      '{"jsonrpc":"2.0","id":%,"method":"tools/call","params":{"name":"calc",' +
+      '"arguments":%}}', [id, args]));
+  end;
+
+  // why ist ein string, kein RawUtf8: Check nimmt unter Delphi einen string (sonst W1057)
+  procedure Refused(id: integer; const args, field: RawUtf8; const why: string);
+  begin
+    response := Call(id, args);
+    Check(PosEx('"isError":true', response) > 0, why + ' is refused as a tool error');
+    Check(PosEx(field + ' (expected', response) > 0, why + ' names the field');
+    Check(PosEx(' = ', response) = 0, why + ': the tool did not run');
+  end;
+
+begin
+  // The schema publishes a type per field, but only `required` used to be
+  // enforced. RecordLoadJson then converts leniently - 1e30 became 1, 0.5
+  // became 0, "5" became 5, 4294967296 wrapped to 0 in a 32-bit field - and the
+  // caller silently got an answer to a question it never asked.
+  EnsureCalcParamsRtti;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    tool := TCalcTool.Create('calc', 'Add two numbers');
+    server.RegisterTool(tool);
+    server.Start;
+
+    // integer fields take true JSON integers only
+    Refused(1, '{"A":1.5,"B":1}', 'a', 'a decimal for an integer');
+    Refused(2, '{"A":"2","B":1}', 'a', 'a numeric string for an integer');
+    Refused(3, '{"A":1e30,"B":1}', 'a', 'an exponent for an integer');
+    // ... within the width of the record field
+    Refused(4, '{"A":4294967296,"B":1}', 'a', 'an integer beyond 32 bits');
+    Check(PosEx('[-2147483648, 2147483647]', response) > 0, 'and says the range');
+    // the other JSON types
+    Refused(5, '{"A":1,"B":1,"Enabled":"true"}', 'enabled', 'a string for a boolean');
+    Refused(6, '{"A":1,"B":1,"Name":5}', 'name', 'a number for a string');
+    // null: refused where a value is required ...
+    Refused(7, '{"A":null,"B":1}', 'a', 'null for a required field');
+    // ... and every offending field is named at once, not one per round trip
+    response := Call(8, '{"A":"x","B":2.5}');
+    Check((PosEx('a (expected', response) > 0) and (PosEx('b (expected', response) > 0),
+      'all offending fields are named together');
+
+    // what the schema allows still goes through
+    response := Call(9, '{"A":2,"B":3,"Enabled":true,"Name":"x"}');
+    Check(PosEx('2 + 3 = 5', response) > 0, 'valid arguments still execute');
+    // null for an OPTIONAL field means "not given"
+    response := Call(10, '{"A":2,"B":3,"Name":null}');
+    Check(PosEx('2 + 3 = 5', response) > 0, 'null for an optional field is absence');
+    // the boundaries themselves are inside the range
+    response := Call(11, '{"A":2147483647,"B":-2147483648}');
+    Check(PosEx('"isError":true', response) = 0, 'the range boundaries are accepted');
+
+    // and the client can learn the bound from the schema, not from a refusal
+    schema := tool.GetInputSchema;
+    if CheckFailed(_Safe(schema)^.GetAsDocVariant('properties', props), 'properties') or
+       CheckFailed(props^.GetAsDocVariant('a', a), 'property a') then
+      exit;
+    CheckEqual(a^.I['minimum'], -2147483648, 'minimum is published');
+    CheckEqual(a^.I['maximum'], 2147483647, 'maximum is published');
+    Check(a^.GetValueIndex('minimum') >= 0, 'an integer field carries its bound');
+    Check(_Safe(props^.Value['name'])^.GetValueIndex('minimum') < 0,
+      'a string field does not');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.TypeCheckLeavesAmbiguousFormsToTheLoader;
+var
+  server: TMcpServer;
+  tool: TEdgeTool;
+  response: RawUtf8;
+  schema: variant;
+  props, payload: PDocVariantData;
+
+  function Call(id: integer; const name, args: RawUtf8): RawUtf8;
+  begin
+    result := Exec(server, FormatUtf8(
+      '{"jsonrpc":"2.0","id":%,"method":"tools/call","params":{"name":"%",' +
+      '"arguments":%}}', [id, name, args]));
+  end;
+
+begin
+  // Review of the type check (Codex): judging by the RTTI PARSER refused forms
+  // RecordLoadJson reads correctly - enumerations as ordinals, RawJson holding
+  // an object, and integers written as 2.0. And the check looked at the first
+  // of two case-variant keys while the loader takes both.
+  EnsureCalcParamsRtti;
+  if not RecordHasFields(TypeInfo(TEdgeParams)) then
+  begin
+    Rtti.RegisterType(TypeInfo(TEdgeMode));
+    Rtti.RegisterFromText(TypeInfo(TEdgeParams),
+      'Mode:TEdgeMode Payload:RawJson Amount:double Price:currency');
+  end;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TCalcTool.Create('calc', 'Add two numbers'));
+    tool := TEdgeTool.Create('edge', 'Fields with several valid JSON forms');
+    tool.MarkOptional(['Mode', 'Payload', 'Amount', 'Price']);
+    server.RegisterTool(tool);
+    server.Start;
+
+    // Through the server's REAL parser (ExecRawArgs, not Exec): 2e9 arrives as a
+    // Double, is written back in exponent form and would load as 2 - refused.
+    response := ExecRawArgs(server, 1, 'calc', '{"A":2e9,"B":3}');
+    Check(PosEx('a (expected an integer)', response) > 0, '2e9 is refused');
+    Check(PosEx('2 + 3 = 5', response) = 0, '... instead of running as 2');
+    // 2.0 arrives as Currency - exact, written back as 2 - so it is accepted,
+    // which is also what JSON Schema says about a zero fraction
+    response := ExecRawArgs(server, 2, 'calc', '{"A":2.0,"B":3}');
+    Check(PosEx('2 + 3 = 5', response) > 0, '2.0 is a whole number and runs');
+    // ... but 2.5 is not
+    response := ExecRawArgs(server, 21, 'calc', '{"A":2.5,"B":3}');
+    Check(PosEx('a (expected an integer)', response) > 0, '2.5 is refused');
+
+    // the loader takes EVERY case-variant key, so the check must see every one
+    response := Call(3, 'calc', '{"A":1,"a":"x","B":1}');
+    Check(PosEx('"isError":true', response) > 0, 'a second, case-variant key is checked too');
+
+    // an enumeration may come as its ordinal or its name
+    response := Call(4, 'edge', '{"Mode":1}');
+    Check(PosEx('mode=1', response) > 0, 'an enumeration as ordinal');
+    response := Call(5, 'edge', '{"Mode":"emOn"}');
+    Check(PosEx('mode=1', response) > 0, 'an enumeration as name');
+
+    // RawJson takes any JSON value - and the schema says so by naming no type
+    response := Call(6, 'edge', '{"Payload":{"x":1}}');
+    Check(PosEx('"isError":true', response) = 0, 'RawJson takes an object');
+    // held in a local: props points INTO the schema, a temporary would be gone
+    schema := tool.GetInputSchema;
+    if CheckFailed(_Safe(schema)^.GetAsDocVariant('properties', props),
+         'properties') or
+       CheckFailed(props^.GetAsDocVariant('payload', payload), 'payload') then
+      exit;
+    Check(payload^.GetValueIndex('type') < 0, 'RawJson publishes no type constraint');
+
+    // a float field takes numbers - and since requests are read with
+    // _JsonFastFloat, a string there really was a string
+    response := Call(7, 'edge', '{"Amount":1.5}');
+    Check(PosEx('amount=1.5', response) > 0, 'a number for a float');
+    response := Call(8, 'edge', '{"Amount":"1.5"}');
+    Check(PosEx('amount (expected a number)', response) > 0, 'a numeric string is refused');
+
+    // Currency takes what is exact as Currency - through the REAL parser
+    response := ExecRawArgs(server, 10, 'edge', '{"Price":12.5}');
+    Check(PosEx('price=12.5', response) > 0, 'a currency value with decimals');
+    response := ExecRawArgs(server, 11, 'edge', '{"Price":1e-5}');
+    Check(PosEx('price (expected', response) > 0, 'a Double for Currency is refused');
+    // ... and nothing the loader would overflow when it scales by 10000 (Codex)
+    response := ExecRawArgs(server, 12, 'edge', '{"Price":1000000000000000}');
+    Check(PosEx('price (expected a number within the Currency range)', response) > 0,
+      'an integer beyond the Currency range is refused');
+
+    // the record parser's OWN refusal still counts: an object for an
+    // enumeration is not judged by the type check, so it reaches RecordLoadJson
+    // - which must refuse it instead of handing the tool an unparsed record
+    response := Call(9, 'edge', '{"Mode":{"x":1}}');
+    Check(PosEx('"isError":true', response) > 0, 'what the loader cannot read is refused');
+    Check(PosEx('(expected', response) = 0, '... by the loader, not the type check');
+    Check(PosEx('mode=', response) = 0, '... and the tool did not run');
+
+    // the ChatStructured path must not change: no bounds, RawJson still typed
+    schema := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TEdgeParams));
+    if not CheckFailed(_Safe(schema)^.GetAsDocVariant('properties', props), 'plain props') and
+       not CheckFailed(props^.GetAsDocVariant('payload', payload), 'plain payload') then
+      CheckEqual(payload^.U['type'], 'string', 'structured output keeps RawJson as string');
+    schema := TMcpSchemaGenerator.GenerateSchema(TypeInfo(TCalcParams));
+    if not CheckFailed(_Safe(schema)^.GetAsDocVariant('properties', props), 'calc props') and
+       not CheckFailed(props^.GetAsDocVariant('a', payload), 'calc a') then
+      Check(payload^.GetValueIndex('minimum') < 0, 'structured output publishes no bounds');
+  finally
+    server.Free;
+  end;
+end;
 
 procedure TTestMcpCore.SubscriptionCapIsPerPrincipalToo;
 var

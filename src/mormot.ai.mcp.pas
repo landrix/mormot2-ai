@@ -922,8 +922,52 @@ type
     // - aOptional names the properties (case-insensitive) that must NOT be
     //   listed as required: RTTI carries no optional marker, so the tool has
     //   to say which of its fields a caller may leave out
+    // - aToolInput: the schema is a TOOL's inputSchema, which TMcpToolBase
+    //   enforces. Only then do integer properties publish `minimum`/`maximum`
+    //   and does a RawJson property publish no type at all. Without it - the
+    //   ChatStructured path (mormot.ai.llm.structured), whose schema goes to an
+    //   LLM provider's structured-output mode - the output stays as before:
+    //   providers reject numeric bounds or a missing `type` in strict mode, and
+    //   nothing on that path would enforce them anyway
     class function GenerateSchema(aTypeInfo: PRttiInfo;
-      const aOptional: TRawUtf8DynArray = nil): variant;
+      const aOptional: TRawUtf8DynArray = nil; aToolInput: boolean = false): variant;
+    /// the JSON Schema `type` published for a record field
+    class function JsonTypeOf(aRtti: TRttiCustom): RawUtf8;
+    /// the value range of an integer record field narrower than Int64
+    // - false for Int64 (and non-integer types): every JSON integer the parser
+    //   hands over already fits, so there is no bound to publish or enforce
+    class function IntegerRange(aRtti: TRttiCustom; out aMin, aMax: Int64): boolean;
+    /// '' if aValue is acceptable for a field of type aRtti, else what was expected
+    // - checks the value the JSON parser produced BEFORE RecordLoadJson converts
+    //   it: that conversion is lenient on purpose (it truncates 0.5, parses "5",
+    //   and wraps 4294967297 into a 32-bit field), so after it a mismatch can no
+    //   longer be seen
+    // - null counts as absent for an optional field and is refused otherwise
+    // - ONLY fields of the plain standard types are judged, matched by TypeInfo
+    //   IDENTITY: Integer, Cardinal, Int64, QWord, Byte, Word, Boolean, RawUtf8,
+    //   string, UnicodeString, WideString, Double, Single, Currency. Not
+    //   ShortInt/SmallInt: mORMot files them under ptByte/ptWord and loads them
+    //   UNSIGNED (GetCardinal), so -1 arrives as 0 - judging the sent value would
+    //   approve a number the tool never sees. Any type of its own - `type TTimeLog = type Int64`,
+    //   TDateTime, enumerations, chars, RawJson, records, sets, arrays - has a
+    //   distinct TypeInfo and may have a second valid JSON form (ISO text, a
+    //   name, any JSON value) or a custom serializer; RecordLoadJson stays the
+    //   judge for those. Deciding by RTTI kind or parser id was tried and was
+    //   too broad: aliases share both, and RegisterCustomSerializerFunction
+    //   leaves no trace on them
+    // - an integer field takes a JSON integer, and a whole number the parser
+    //   delivers as Currency (2.0 - up to four decimals, no exponent, under
+    //   _JsonFastFloat): Currency is exact and is written back as a plain
+    //   integer. NOT a Double: Execute re-serializes the arguments before
+    //   RecordLoadJson, and a large Double (2e9) is written back in exponent
+    //   form and read by its leading digits - the tool would run on 2 instead of
+    //   the 2000000000 checked here. Refused across the board, also where it
+    //   would have been harmless (1e3), rather than reasoning about magnitudes
+    // - a process that re-registers the JSON serializer of one of these
+    //   STANDARD types (RegisterCustomSerializer on TypeInfo(Integer) …) changes
+    //   their wire form everywhere; that is not supported here
+    class function ArgumentTypeError(aRtti: TRttiCustom; const aValue: variant;
+      aOptional: boolean): RawUtf8;
   end;
 
 
@@ -1026,6 +1070,11 @@ type
     fOptional: TRawUtf8DynArray;
     /// '' when every required parameter is present, else their names
     function MissingRequired(aArgs: PDocVariantData): RawUtf8;
+    /// '' when every SENT parameter matches the type its schema publishes, else
+    /// "name (expected …)" for each one that does not
+    // - arguments the record does not declare are not judged here: they are
+    //   tolerated on purpose (see TypedToolRefusesArgumentsThatDoNotParse)
+    function InvalidArguments(aArgs: PDocVariantData): RawUtf8;
     /// override this to implement tool logic
     function ExecuteTyped(const aParams: T; const aAuthCtx: TMcpAuthContext): variant; virtual; abstract;
   public
@@ -1994,8 +2043,211 @@ end;
 
 { ************ TMcpSchemaGenerator Implementation }
 
+class function TMcpSchemaGenerator.JsonTypeOf(aRtti: TRttiCustom): RawUtf8;
+begin
+  if aRtti = nil then
+  begin
+    result := 'string';
+    exit;
+  end;
+  // a char is serialized as a one-character string, although mORMot files it
+  // under ptByte/ptWord - publishing 'integer' would describe the wrong form
+  if aRtti.Kind in [rkChar, rkWChar] then
+  begin
+    result := 'string';
+    exit;
+  end;
+  // RawJson takes ANY JSON value; '' means "publish no type constraint"
+  if aRtti.Parser = ptRawJson then
+  begin
+    result := '';
+    exit;
+  end;
+  case aRtti.Parser of
+    ptBoolean:
+      result := 'boolean';
+    ptByte, ptCardinal, ptInt64, ptInteger, ptQWord, ptWord, ptOrm:
+      result := 'integer';
+    ptCurrency, ptDouble, ptExtended, ptSingle, ptDateTime, ptDateTimeMS,
+    ptUnixTime, ptUnixMSTime:
+      result := 'number';
+    ptRawByteString, ptRawUtf8, ptString, ptSynUnicode,
+    ptUnicodeString, ptWideString, ptWinAnsi, ptGuid, ptHash128, ptHash256,
+    ptHash512, ptTimeLog, ptPUtf8Char, ptEnumeration:
+      result := 'string';
+    ptSet, ptArray, ptDynArray:
+      result := 'array';
+    ptRecord, ptClass, ptInterface:
+      result := 'object';
+    ptVariant, ptCustom:
+      result := 'object';
+  else
+    result := 'string';
+  end;
+end;
+
+class function TMcpSchemaGenerator.IntegerRange(aRtti: TRttiCustom;
+  out aMin, aMax: Int64): boolean;
+begin
+  result := false;
+  aMin := 0;
+  aMax := 0;
+  if aRtti = nil then
+    exit;
+  if aRtti.Parser = ptQWord then
+  begin
+    // the JSON parser hands over at most an Int64, so that is the reachable top
+    aMax := High(Int64);
+    result := true;
+    exit;
+  end;
+  if aRtti.Kind <> rkInteger then
+    exit; // Int64/ptOrm: the full Int64 range, nothing narrower to enforce
+  result := true;
+  case aRtti.Cache.RttiOrd of
+    roSByte, roSWord:
+      // ShortInt/SmallInt: mORMot loads them unsigned (see ArgumentTypeError) -
+      // a published negative minimum would promise what the loader cannot keep
+      result := false;
+    roUByte:
+      aMax := 255;
+    roUWord:
+      aMax := 65535;
+    roSLong:
+      begin
+        aMin := -2147483648;
+        aMax := 2147483647;
+      end;
+    roULong:
+      aMax := 4294967295;
+  else
+    result := false; // 64-bit ordinal kinds of newer FPC RTTI: nothing narrower
+  end;
+end;
+
+class function TMcpSchemaGenerator.ArgumentTypeError(aRtti: TRttiCustom;
+  const aValue: variant; aOptional: boolean): RawUtf8;
+type
+  TJudged = (jNone, jInteger, jBoolean, jString, jNumber, jCurrency);
+var
+  info: PRttiInfo;
+  judged: TJudged;
+  vt: cardinal;
+  i64, lo, hi: Int64;
+
+  function IsIntVType(v: cardinal): boolean;
+  begin
+    case v of
+      varShortInt, varSmallint, varInteger, varInt64, varByte, varWord, varLongWord:
+        result := true;
+    else
+      result := false;
+    end;
+  end;
+
+  function IsFloatVType(v: cardinal): boolean;
+  begin
+    case v of
+      varSingle, varDouble, varCurrency:
+        result := true;
+    else
+      result := false;
+    end;
+  end;
+
+begin
+  result := '';
+  if aRtti = nil then
+    exit;
+  info := aRtti.Info;
+  if (info = TypeInfo(Integer)) or
+     (info = TypeInfo(Cardinal)) or
+     (info = TypeInfo(Int64)) or
+     (info = TypeInfo(QWord)) or
+     (info = TypeInfo(Byte)) or
+     (info = TypeInfo(Word)) then
+    judged := jInteger
+  else if info = TypeInfo(Boolean) then
+    judged := jBoolean
+  else if (info = TypeInfo(RawUtf8)) or
+          (info = TypeInfo(string)) or
+          (info = TypeInfo(UnicodeString)) or
+          (info = TypeInfo(WideString)) then
+    judged := jString
+  else if (info = TypeInfo(Double)) or
+          (info = TypeInfo(Single)) then
+    judged := jNumber
+  else if info = TypeInfo(Currency) then
+    judged := jCurrency
+  else
+    exit; // a type of its own: RecordLoadJson decides (see the declaration)
+  vt := TVarData(aValue).VType;
+  if (vt = varNull) or
+     (vt = varEmpty) then
+  begin
+    if not aOptional then
+      result := 'a value, not null';
+    exit;
+  end;
+  case judged of
+    jInteger:
+      begin
+        if IsIntVType(vt) then
+          VariantToInt64(aValue, i64)
+        else if (vt = varCurrency) and
+                (TVarData(aValue).VInt64 mod 10000 = 0) then
+          // Currency is an Int64 scaled by 10000: exact, no rounding on the way
+          i64 := TVarData(aValue).VInt64 div 10000
+        else if (vt = varWord64) and
+                (info = TypeInfo(QWord)) then
+          exit // above High(Int64): only an unsigned 64-bit field can take it
+        else
+        begin
+          result := 'an integer';
+          exit;
+        end;
+        if IntegerRange(aRtti, lo, hi) and
+           ((i64 < lo) or
+            (i64 > hi)) then
+          result := FormatUtf8('an integer in [%, %]', [lo, hi]);
+      end;
+    jBoolean:
+      if vt <> varBoolean then
+        result := 'a boolean';
+    jString:
+      if (vt <> varString) and
+         (vt <> varOleStr)
+         {$ifdef HASVARUSTRING} and (vt <> varUString){$endif} then
+        result := 'a string';
+    jNumber:
+      // arguments from ParseRequest are read with _JsonFastFloat, so there a
+      // JSON number arrives as a number and a string IS a string. (A caller
+      // invoking Execute directly with a variant parsed WITHOUT the float
+      // option would see such a number as text and get it refused.)
+      if not (IsIntVType(vt) or
+              IsFloatVType(vt)) then
+        result := 'a number';
+    jCurrency:
+      // only what is exact as Currency: a Double (1e-5, 1E15) would be written
+      // back in exponent form and read by StrToCurr64 up to its leading part -
+      // the same trap as for integers
+      if not (IsIntVType(vt) or
+              (vt = varCurrency)) then
+        result := 'a number with at most four decimals'
+      else if IsIntVType(vt) then
+      begin
+        // an integer beyond the Currency range would overflow when the loader
+        // scales it by 10000 (StrToCurr64) - a different, even negative, value
+        VariantToInt64(aValue, i64);
+        if (i64 > 922337203685477) or
+           (i64 < -922337203685477) then
+          result := 'a number within the Currency range';
+      end;
+  end;
+end;
+
 class function TMcpSchemaGenerator.GenerateSchema(aTypeInfo: PRttiInfo;
-  const aOptional: TRawUtf8DynArray): variant;
+  const aOptional: TRawUtf8DynArray; aToolInput: boolean): variant;
 var
   rc: TRttiCustom;
   prop: PRttiCustomProp;
@@ -2004,36 +2256,7 @@ var
   i: PtrInt;
   propSchema: TDocVariantData;
   jsonType, propName: RawUtf8;
-
-  function JsonTypeFromRtti(const aRtti: TRttiCustom): RawUtf8;
-  begin
-    if aRtti = nil then
-    begin
-      result := 'string';
-      exit;
-    end;
-    case aRtti.Parser of
-      ptBoolean:
-        result := 'boolean';
-      ptByte, ptCardinal, ptInt64, ptInteger, ptQWord, ptWord, ptOrm:
-        result := 'integer';
-      ptCurrency, ptDouble, ptExtended, ptSingle, ptDateTime, ptDateTimeMS,
-      ptUnixTime, ptUnixMSTime:
-        result := 'number';
-      ptRawByteString, ptRawJson, ptRawUtf8, ptString, ptSynUnicode,
-      ptUnicodeString, ptWideString, ptWinAnsi, ptGuid, ptHash128, ptHash256,
-      ptHash512, ptTimeLog, ptPUtf8Char, ptEnumeration:
-        result := 'string';
-      ptSet, ptArray, ptDynArray:
-        result := 'array';
-      ptRecord, ptClass, ptInterface:
-        result := 'object';
-      ptVariant, ptCustom:
-        result := 'object';
-    else
-      result := 'string';
-    end;
-  end;
+  lo, hi: Int64;
 begin
   // Initialize schema structure
   schema.InitObject(['type', 'object'], JSON_FAST);
@@ -2063,10 +2286,23 @@ begin
     // Initialize property schema
     propSchema.InitObject([], JSON_FAST);
 
-    // Determine JSON type from RTTI
-    jsonType := JsonTypeFromRtti(prop.Value);
+    // Determine JSON type from RTTI ('' = any JSON value, e.g. RawJson)
+    jsonType := JsonTypeOf(prop.Value);
+    if (jsonType = '') and
+       not aToolInput then
+      jsonType := 'string'; // structured output: unchanged, see the declaration
 
-    propSchema.AddValue('type', jsonType);
+    if jsonType <> '' then
+      propSchema.AddValue('type', jsonType);
+    // the bound TMcpToolBase enforces (ArgumentTypeError), published so a client
+    // learns it from the schema instead of from a refused call - tool input only
+    if aToolInput and
+       (jsonType = 'integer') and
+       IntegerRange(prop.Value, lo, hi) then
+    begin
+      propSchema.AddValue('minimum', lo);
+      propSchema.AddValue('maximum', hi);
+    end;
 
     // Add to properties
     propName := LowerCaseU(prop.Name);
@@ -2466,6 +2702,38 @@ begin
     SetLength(result, length(result) - 2);
 end;
 
+function TMcpToolBase<T>.InvalidArguments(aArgs: PDocVariantData): RawUtf8;
+var
+  rc: TRttiCustom;
+  i, j: PtrInt;
+  name, expected: RawUtf8;
+begin
+  result := '';
+  if (aArgs = nil) or
+     not aArgs^.IsObject then
+    exit; // not an object at all: RecordLoadJson refuses it below
+  rc := Rtti.RegisterType(System.TypeInfo(T));
+  if rc = nil then
+    exit;
+  // walk what was SENT, not what the record declares: the loader matches names
+  // case-insensitively and takes EVERY entry, so {"limit":1,"Limit":9e9} would
+  // otherwise get its first value checked and its second one loaded
+  for j := 0 to aArgs^.Count - 1 do
+    for i := 0 to rc.Props.Count - 1 do
+      if (rc.Props.List[i].Name <> '') and
+         IdemPropNameU(rc.Props.List[i].Name, aArgs^.Names[j]) then
+      begin
+        name := LowerCaseU(rc.Props.List[i].Name);
+        expected := TMcpSchemaGenerator.ArgumentTypeError(rc.Props.List[i].Value,
+          aArgs^.Values[j], FindPropName(fOptional, name) >= 0);
+        if expected <> '' then
+          result := FormatUtf8('%% (expected %)', [result, name, expected]) + ', ';
+        break;
+      end;
+  if result <> '' then
+    SetLength(result, length(result) - 2);
+end;
+
 function TMcpToolBase<T>.GetInputSchema: variant;
 var
   typeInfo: PRttiInfo;
@@ -2473,7 +2741,7 @@ var
   i, k, idx: PtrInt;
 begin
   typeInfo := System.TypeInfo(T);
-  result := TMcpSchemaGenerator.GenerateSchema(typeInfo, fOptional);
+  result := TMcpSchemaGenerator.GenerateSchema(typeInfo, fOptional, {aToolInput=}true);
   if fMirrored = nil then
     exit;
   schema := _Safe(result);
@@ -2506,7 +2774,7 @@ function TMcpToolBase<T>.Execute(const aArgs: variant;
 var
   params: T;
   doc: PDocVariantData;
-  json, missing: RawUtf8;
+  json, missing, invalid: RawUtf8;
 begin
   // Deserialize arguments into typed record
   if _Safe(aArgs, doc) then
@@ -2528,6 +2796,24 @@ begin
       'content', _Arr([_ObjFast([
         'type', 'text',
         'text', 'Missing required argument(s): ' + missing])]),
+      'isError', true]);
+    exit;
+  end;
+  // ... and so is the TYPE it publishes for each field (the plain standard types
+  // only - see TMcpSchemaGenerator.ArgumentTypeError). RecordLoadJson below is
+  // lenient by design - it takes the leading integer of 1e30, truncates 0.5,
+  // parses "5" and wraps 4294967297 into a 32-bit field - so a caller asking for
+  // one thing silently got another. Checked on the parsed values, before that
+  // conversion can hide the mismatch; refused as a tool error like the line
+  // above, naming every offending field and what it should have been.
+  invalid := InvalidArguments(doc);
+  if invalid <> '' then
+  begin
+    result := _ObjFast([
+      'content', _Arr([_ObjFast([
+        'type', 'text',
+        'text', 'Invalid arguments: they do not match the input schema ' +
+                'this tool declares - ' + invalid])]),
       'isError', true]);
     exit;
   end;
