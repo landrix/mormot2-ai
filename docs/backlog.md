@@ -585,3 +585,63 @@ Tiny-Modell und Qwen3-30B-A3B bitgleich oder nur noch in den letzten Bits versch
 der Decode unter Delphi nicht langsamer ist (`llm-bench`). Danach die Delphi-Ausnahme in den
 Vergleichstests entfernen, falls die Vorgabe der Expertenwahl (B4, D3) sie nicht schon
 überflüssig gemacht hat.
+
+## B14 — Rückmeldungen aus dem TTS-Projekt von flydev (aufgenommen 2026-10-18)
+
+Anlass: flydev (flydev-fr/mormot.ai) baut mit Teilen von mormot2-ai ein TTS-Modell nativ in
+Delphi 13 (Win64, Vulkan auf einer AMD RX 9060 XT): safetensors-Loader, Tokenizer, CPU- und
+Vulkan-Backend und Sampler aus der Bibliothek, Talker, Code-Predictor und 12-Hz-Audio-Decoder
+selbst gebaut; rund 5,9-fache Echtzeit, erster Ton nach rund 95 ms. Seine Stolpersteine im
+Synopse-Forum (Thread „mormot2-ai“, Beitrag #31,
+<https://synopse.info/forum/viewtopic.php?pid=45876#p45876>). Gegen den Code geprüft am
+2026-10-18 (landrixai `a9ab1a7`):
+
+1. **`InferRowToF32` kann kein BF16 (und kein F16).** Stimmt: `mormot.ai.infer.tensor.pas`
+   kennt F32, Q8_0, Q4_K und Q6_K; BF16 wird im Decoder gesondert verbreitert
+   (`TDecoderModel.WidenTensor`). Er hat die Zeilen selbst verbreitert.
+   *Vorhaben:* BF16 und F16 in `InferRowToF32`; die Decoder-Verbreiterung darauf umstellen,
+   wenn es nichts kostet. *Test:* Zeilen aus BF16 und F16 gegen die bekannten Werte
+   (auch Unterlauf, Unendlich, NaN), Gegenprobe mit vertauschten Bytes.
+
+2. **`TBpeTokenizer` lädt nur `tokenizer.json`.** Stimmt: es gibt `Create(tokenizer.json)`
+   und `CreateFromGguf`. Sein Modell bringt `vocab.json` und `merges.txt` (das ältere
+   GPT-2-Format); er hat abgeleitet und das geschützte `Build` gerufen.
+   *Vorhaben:* ein Konstruktor für das Paar (`vocab.json` + `merges.txt`, dazu
+   `added_tokens.json` und `special_tokens_map.json`, wenn vorhanden), der in dasselbe `Build`
+   mündet; die Pre-Tokenizer-Regel muss dann ausdrücklich gewählt werden (GPT-2 als Vorgabe),
+   weil die beiden Dateien sie nicht mitbringen. *Test:* dieselben Texte mit beiden
+   Formaten geben dieselben Ids (Referenz aus `transformers`, Version vermerken).
+
+3. **Kein Einstieg mit fertigen Embeddings.** Stimmt: `TQwen3Vulkan` (und ebenso CPU und
+   CUDA) ruft `fModel.Embed(aIds, ...)` fest im Ablauf; er hat die Push-Constant-Records
+   kopiert, um denselben Durchlauf selbst aufzubauen. TTS, Vision und Audio brauchen genau
+   das. *Vorhaben:* in `TDecoderModel`/`TDecoderDevice` ein Forward, das statt Ids eine
+   Matrix aus Embeddings (Zeilen x Hidden, F32) nimmt, gemischt mit Ids pro Chunk möglich
+   (Text-Tokens plus eingeschobene Bild-/Audio-Embeddings), für CPU, Vulkan und CUDA gleich;
+   Positionen und KV-Cache wie bei Ids. Passt zu Phase D (D1 hat den Decoder schon
+   generisch gemacht); vor D6 Gemma 4 klären, ob dessen multimodale Teile dieselbe
+   Schnittstelle brauchen. *Test:* Embeddings, die aus denselben Ids gewonnen wurden, geben
+   dieselben Logits wie die Ids, auf allen drei Backends; gemischter Chunk gegen zwei
+   getrennte.
+
+4. **F16-KV-Cache ungenauer als F32** (bei ihm 2,3e-2 relativ gegen 2,6e-5). Kein Fehler:
+   der Halbfloat-Cache ist die Vorgabe (`KvF16`), abschaltbar, und für langen Kontext gedacht.
+   *Vorhaben:* in `native-inference.md` und am Property deutlicher sagen, was er kostet und
+   wann man ihn abschaltet (kurzer Kontext, Talker-/Predictor-Schleifen, in denen Fehler
+   über Schritte anwachsen); prüfen, ob die Vorgabe vom Kontext abhängen soll (z. B. F32 bis
+   zu einer Länge). Entscheidung beim Nutzer.
+
+5. **Heap-Allokation in einem Job des `TInferThreadPool` serialisiert am Memory Manager**
+   (seine Umwandlung nach Q8 mit 22 Threads: 3,5 s statt 0,6 s mit einem Puffer auf dem Stack).
+   Unsere eigenen Jobs in `mormot.ai.infer.backend.cpu.pas` allokieren nicht (die `SetLength`
+   stehen vor dem Verteilen); der Fall war sein Job. Die Lücke ist die Schnittstelle:
+   `TOnInferItem = procedure(aItem: integer)` kennt den Worker nicht, ein Job kann also keinen
+   eigenen Scratch-Puffer je Thread nehmen. *Vorhaben:* die Regel am Pool dokumentieren (im
+   Job nicht allokieren) und einen Weg zu Puffern je Worker anbieten - entweder der
+   Worker-Index im Aufruf (neuer Job-Typ neben dem alten) oder ein Scratch-Speicher je Worker,
+   den der Pool hält. *Test:* der Index liegt immer in 0 bis Workers und ist innerhalb eines
+   Laufs je Thread eindeutig; Messung vorher/nachher mit einem allokierenden Job.
+
+**Reihenfolge:** 3 zuerst (größter Nutzen, berührt die Phase-D-Schnittstellen), dann 1, 2 und
+5 (klein, unabhängig), 4 nur Doku und Entscheidung. Rückmeldung an flydev im Forum, wenn
+etwas davon gepusht ist.
