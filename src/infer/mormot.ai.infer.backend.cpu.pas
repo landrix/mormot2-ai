@@ -107,9 +107,13 @@ function InferDotQ6K(w: PInferBlockQ6_K; x: PInferBlockQ8_K; aBlocks: PtrInt): d
 // value - exact, so every Q8_0 kernel computes the Q4_0 x Q8_0 dot product
 procedure InferQ4ToQ8(aSrc: PInferBlockQ4_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
 
+/// aBlocks Q5_0 blocks as Q8_0 blocks: the same scale, q - 16 as the signed
+// value - exact, so every Q8_0 kernel computes the Q5_0 x Q8_0 dot product
+procedure InferQ5ToQ8(aSrc: PInferBlockQ5_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
+
 type
   /// scalar reference backend: every operation; Linear takes F32, Q8_0, Q4_0,
-  // Q4_K or Q6_K
+  // Q5_0, Q4_K or Q6_K
   TInferCpuBackend = class(TInferBackend)
   protected
     /// query rows aFirst..aLast of one head: scores, masked softmax, weighted
@@ -953,6 +957,77 @@ begin
   end;
 end;
 
+{$ifdef INFERQ4WORDS}
+var
+  /// the eight bits of a byte, bit k moved to bit 4 of byte k (Q5ToQ8)
+  Q5_HIGH: array[byte] of Int64;
+
+procedure InitQ5High;
+var
+  i, k: PtrInt;
+begin
+  for i := 0 to 255 do
+  begin
+    Q5_HIGH[i] := 0;
+    for k := 0 to 7 do
+      if (i shr k) and 1 <> 0 then
+        Q5_HIGH[i] := Q5_HIGH[i] or (Int64($10) shl (k * 8));
+  end;
+end;
+
+// eight values x (0..31) of an Int64 as the eight int8 x - 16, bitwise as
+// Q4Minus8: y = x xor 16, then bits 5..7 set where bit 4 of y is set
+function Q5Minus16(x: Int64): Int64;
+  {$ifdef HASINLINE} inline; {$endif}
+var
+  t: Int64;
+begin
+  result := x xor Int64($1010101010101010);
+  t := result and Int64($1010101010101010);
+  result := result or (t shl 1) or (t shl 2) or (t shl 3);
+end;
+{$endif INFERQ4WORDS}
+
+procedure InferQ5ToQ8(aSrc: PInferBlockQ5_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
+var
+  b: PtrInt;
+  qh: cardinal;
+  {$ifdef INFERQ4WORDS}
+  s, d: PInt64Array;
+  {$else}
+  j, v: PtrInt;
+  {$endif INFERQ4WORDS}
+begin
+  for b := 0 to aBlocks - 1 do
+  begin
+    aDst^.d := aSrc^.d;
+    qh := aSrc^.qh[0] or (cardinal(aSrc^.qh[1]) shl 8) or
+      (cardinal(aSrc^.qh[2]) shl 16) or (cardinal(aSrc^.qh[3]) shl 24);
+    // qs[j] low nibble -> qs[j], high nibble -> qs[j + 16]; bit i of qh is
+    // the fifth bit of value i
+    {$ifdef INFERQ4WORDS}
+    s := @aSrc^.qs;
+    d := @aDst^.qs;
+    d^[0] := Q5Minus16((s^[0] and Int64($0F0F0F0F0F0F0F0F)) or Q5_HIGH[qh and 255]);
+    d^[1] := Q5Minus16((s^[1] and Int64($0F0F0F0F0F0F0F0F)) or
+      Q5_HIGH[(qh shr 8) and 255]);
+    d^[2] := Q5Minus16(((s^[0] shr 4) and Int64($0F0F0F0F0F0F0F0F)) or
+      Q5_HIGH[(qh shr 16) and 255]);
+    d^[3] := Q5Minus16(((s^[1] shr 4) and Int64($0F0F0F0F0F0F0F0F)) or
+      Q5_HIGH[qh shr 24]);
+    {$else}
+    for j := 0 to 15 do
+    begin
+      v := aSrc^.qs[j];
+      aDst^.qs[j] := ((v and 15) or PtrInt(((qh shr j) and 1) shl 4)) - 16;
+      aDst^.qs[j + 16] := ((v shr 4) or PtrInt(((qh shr (j + 16)) and 1) shl 4)) - 16;
+    end;
+    {$endif INFERQ4WORDS}
+    inc(aSrc);
+    inc(aDst);
+  end;
+end;
+
 const
   /// CausalRows keeps its scores on the stack up to this many keys
   CAUSAL_STACK = 4096;
@@ -1115,7 +1190,7 @@ end;
 function TInferCpuBackend.Supports(aOp: TInferOp; aWeights: TInferDType): boolean;
 begin
   if aOp = ioLinear then
-    result := aWeights in [idtF32, idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]
+    result := aWeights in [idtF32, idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K]
   else
     result := aWeights = idtF32;
 end;
@@ -1196,6 +1271,17 @@ begin
         // the reference: the whole matrix as Q8_0 blocks, then the Q8_0 path
         SetLength(w8, aOut * (aIn shr 5));
         InferQ4ToQ8(w.Data, length(w8), pointer(w8));
+        LinearQ8_0(x, aRows, aIn, pointer(w8), aOut, bias, y);
+        exit;
+      end;
+    idtQ5_0:
+      begin
+        if aIn and 31 <> 0 then
+          EInferError.RaiseUtf8('%.Linear: % inputs are no whole Q5_0 blocks',
+            [self, aIn]);
+        // as Q4_0: the whole matrix as Q8_0 blocks, then the Q8_0 path
+        SetLength(w8, aOut * (aIn shr 5));
+        InferQ5ToQ8(w.Data, length(w8), pointer(w8));
         LinearQ8_0(x, aRows, aIn, pointer(w8), aOut, bias, y);
         exit;
       end;
@@ -1576,7 +1662,7 @@ var
   xr, wo: PSingleArray;
   wq, wb: PInferBlockQ8_0;
   pair: boolean;
-  // the weight rows of the tile as Q8_0: the matrix itself, or its Q4_0 rows
+  // the weight rows of the tile as Q8_0: the matrix itself, or its Q4_0 / Q5_0 rows
   // unpacked once per tile (on the stack up to 128 blocks per row)
   wbase: PInferBlockQ8_0Array;
   wfirst: PtrInt;
@@ -1694,7 +1780,7 @@ begin
     nb := aJob.Blocks;
     wbase := aJob.W.Data;
     wfirst := 0;
-    if aJob.W.DType = idtQ4_0 then
+    if aJob.W.DType in [idtQ4_0, idtQ5_0] then
     begin
       wfirst := aTile * TILE;
       if nb <= 128 then
@@ -1704,7 +1790,10 @@ begin
         SetLength(unpackedHeap, (oEnd - wfirst + 1) * nb);
         wbase := pointer(unpackedHeap);
       end;
-      if Assigned(InferQ4Unpack) then
+      if aJob.W.DType = idtQ5_0 then
+        InferQ5ToQ8(@PInferBlockQ5_0Array(aJob.W.Data)^[wfirst * nb],
+          (oEnd - wfirst + 1) * nb, @wbase^[0])
+      else if Assigned(InferQ4Unpack) then
         InferQ4Unpack(@PInferBlockQ4_0Array(aJob.W.Data)^[wfirst * nb],
           (oEnd - wfirst + 1) * nb, @wbase^[0])
       else
@@ -1849,7 +1938,7 @@ var
   r, t, n: PtrInt;
   kq: boolean;
 begin
-  if not (w.DType in [idtF32, idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]) or
+  if not (w.DType in [idtF32, idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K]) or
      ((w.DType <> idtF32) and (aIn mod INFER_DTYPE_BLOCK[w.DType] <> 0)) then
   begin
     inherited Linear(x, aRows, aIn, w, aOut, bias, y); // raises
@@ -1869,7 +1958,7 @@ begin
     job.Blocks := aIn shr 5;
   if kq then
     job.Fp32 := false // the exact block sums for now
-  else if w.DType <> idtF32 then // Q4_0 tiles become Q8_0: the same kernels
+  else if w.DType <> idtF32 then // Q4_0 / Q5_0 tiles become Q8_0: the same kernels
     job.Fp32 := not fExact and Assigned(InferQ8DotF32x4x2)
   else
     // the float row kernel needs whole lanes of 16
@@ -2317,5 +2406,8 @@ end;
 
 initialization
   InitGeluTable;
+  {$ifdef INFERQ4WORDS}
+  InitQ5High;
+  {$endif INFERQ4WORDS}
 
 end.

@@ -1,13 +1,13 @@
 // LandrixAI - y[r, o] = bias[o] + sum_i w[o, i] * x[r, i] on the device
 // (phase 4b of docs/native-inference.md)
-// - w in its storage type: F32, Q8_0, Q4_K or Q6_K (ggml block layouts, see
+// - w in its storage type: F32, Q8_0, Q4_K, Q6_K or Q5_0 (ggml block layouts, see
 //   mormot.ai.infer.tensor), dequantized per element in float, x in F32 - the
 //   arithmetic of InferRowToF32 followed by an F32 dot product, in another
 //   summation order (a tolerance, not bits)
 // - one work group of 128 per output feature and token row; work groups loop
 //   over the outputs, so no dimension of the dispatch exceeds 65535
 // - correct first: bytes are read one by one from a uint view of the weights
-//   (blocks of 34 or 210 bytes are not 4-byte aligned); speed comes with 4d
+//   (blocks of 34, 22 or 210 bytes are not 4-byte aligned); speed comes with 4d
 #version 450
 
 layout(local_size_x = 128) in;
@@ -17,7 +17,7 @@ layout(std430, binding = 1) readonly buffer BufX { float x[]; };
 layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 
-// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K (TInferVulkanBackend)
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0 (TInferVulkanBackend)
 layout(push_constant) uniform Push {
   uint rows, nin, nout, dtype, hasBias;
 } p;
@@ -76,6 +76,21 @@ float weight(uint rowBase, uint i)
     float m1 = halfAt(base + 2u) * float(m);
     return d1 * float(q) - m1;
   }
+  if (p.dtype == 5u)
+  {
+    // Q5_0: 22 bytes per 32 values - d, qh[4], qs[16]; value = d * (q - 16)
+    // with the low 4 bits of value j in qs[j & 15] (low nibble below 16,
+    // high from 16) and its fifth bit bit j of qh
+    uint base = rowBase + (i >> 5) * 22u;
+    uint j = i & 31u;
+    uint q = byteAt(base + 6u + (j & 15u));
+    if (j >= 16u)
+      q = q >> 4;
+    else
+      q = q & 15u;
+    q = q | (((byteAt(base + 2u + (j >> 3)) >> (j & 7u)) & 1u) << 4);
+    return halfAt(base) * float(int(q) - 16);
+  }
   // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d (Q6KValue)
   uint base = rowBase + (i >> 8) * 210u;
   uint k = i & 255u;
@@ -106,6 +121,8 @@ void main()
     rowBytes = (p.nin >> 5) * 34u;
   else if (p.dtype == 3u)
     rowBytes = (p.nin >> 8) * 144u;
+  else if (p.dtype == 5u)
+    rowBytes = (p.nin >> 5) * 22u;
   else
     rowBytes = (p.nin >> 8) * 210u;
   for (uint o = gl_WorkGroupID.x; o < p.nout; o += gl_NumWorkGroups.x)

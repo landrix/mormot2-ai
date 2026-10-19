@@ -1,6 +1,6 @@
 // LandrixAI - CUDA: y[r, o] = bias[o] + sum_i w[o, i] * x[r, i] (backlog B3,
 // slice C2) - the CUDA form of tools/vk/linear.comp
-// - w in its storage type: F32, Q8_0, Q4_K or Q6_K (ggml block layouts, see
+// - w in its storage type: F32, Q8_0, Q4_K, Q6_K or Q5_0 (ggml block layouts, see
 //   mormot.ai.infer.tensor), dequantized per element in float, x in F32 - the
 //   arithmetic of InferRowToF32 followed by an F32 dot product, in another
 //   summation order (a tolerance, not bits)
@@ -10,7 +10,7 @@
 //   load is aligned; converted by cvt.f32.f16 (no cuda_fp16.h: it needs headers
 //   the nvcc wheel does not carry)
 
-// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K (TInferCudaBackend)
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0 (TInferCudaBackend)
 
 __device__ __forceinline__ float halfAt(const unsigned char* p)
 {
@@ -54,6 +54,18 @@ __device__ float weight(const unsigned char* row, unsigned int dtype, unsigned i
     float m1 = halfAt(b + 2u) * float(m);
     return d1 * float(q) - m1;
   }
+  if (dtype == 5u)
+  {
+    // Q5_0: 22 bytes per 32 values - d, qh[4], qs[16]; value = d * (q - 16)
+    // with the low 4 bits of value j in qs[j & 15] (low nibble below 16,
+    // high from 16) and its fifth bit bit j of qh
+    const unsigned char* b = row + (i >> 5) * 22u;
+    unsigned int j = i & 31u;
+    unsigned int q = b[6u + (j & 15u)];
+    q = j >= 16u ? q >> 4 : q & 15u;
+    q |= ((b[2u + (j >> 3)] >> (j & 7u)) & 1u) << 4;
+    return halfAt(b) * float(int(q) - 16);
+  }
   // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d (Q6KValue)
   const unsigned char* b = row + (i >> 8) * 210u;
   unsigned int k = i & 255u;
@@ -85,6 +97,8 @@ extern "C" __global__ void linear(const unsigned char* w, const float* x,
     rowBytes = (nin >> 5) * 34ull;
   else if (dtype == 3u)
     rowBytes = (nin >> 8) * 144ull;
+  else if (dtype == 5u)
+    rowBytes = (nin >> 5) * 22ull;
   else
     rowBytes = (nin >> 8) * 210ull;
   const unsigned char* row = w + o * rowBytes;
@@ -165,6 +179,8 @@ __device__ __forceinline__ unsigned long long rowBytesOf(unsigned int dtype,
     return (nin >> 5) * 34ull;
   if (dtype == 3u)
     return (nin >> 8) * 144ull;
+  if (dtype == 5u)
+    return (nin >> 5) * 22ull;
   return (nin >> 8) * 210ull;
 }
 
@@ -223,6 +239,27 @@ __device__ __forceinline__ void weights8(const unsigned int* w, unsigned int dty
     {
       wv[k] = d1 * float((u8(q0, k) >> sh) & 15u) - m1;
       wv[k + 4u] = d1 * float((u8(q1, k) >> sh) & 15u) - m1;
+    }
+  }
+  else if (dtype == 5u)
+  {
+    // Q5_0: 22 bytes per 32 values - d, qh[4], qs[16]; value = d * (q - 16)
+    // with the low 4 bits of value j in qs[j & 15] (low nibble below 16,
+    // high from 16) and its fifth bit bit j of qh; 8 values in one block -
+    // the 8 fifth bits are one byte of qh (as linear8.comp, where the
+    // Adreno X1-85 driver got the whole qh word shifted by j wrong)
+    unsigned long long base = rowBase + (e >> 5) * 22ull;
+    unsigned int j = e & 31u;
+    float d = halfWord(w, base);
+    unsigned int hb = byteAt(w, base + 2u + (j >> 3));
+    uint2 q = bytes8(w, base + 6u + (j & 15u));
+    unsigned int sh = j >= 16u ? 4u : 0u;
+#pragma unroll
+    for (unsigned int k = 0u; k < 4u; k++)
+    {
+      wv[k] = d * float(int(((u8(q.x, k) >> sh) & 15u) | (((hb >> k) & 1u) << 4)) - 16);
+      wv[k + 4u] = d * float(int(((u8(q.y, k) >> sh) & 15u) |
+        (((hb >> (k + 4u)) & 1u) << 4)) - 16);
     }
   }
   else

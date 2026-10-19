@@ -1,14 +1,14 @@
 // LandrixAI - y[r, o] = bias[o] + sum_i w[o, i] * x[r, i], the fast form of
 // linear.comp (phase 4e of docs/native-inference.md)
 // - same bindings, push constants and arithmetic contract as linear.comp: w in
-//   its storage type (F32, Q8_0, Q4_K, Q6_K), dequantized as InferRowToF32,
-//   times F32 activations - only the summation order differs
+//   its storage type (F32, Q8_0, Q4_K, Q6_K, Q5_0), dequantized as
+//   InferRowToF32, times F32 activations - only the summation order differs
 // - a work group of 128 = 4 output features x 32 invocations; each invocation
 //   dequantizes 8 consecutive weights per step of 256 inputs (whole words
 //   loaded, bytes taken from registers) and multiplies them with up to ROWS
 //   token rows, so prefill reuses every dequantized weight ROWS times
-// - needs nin to be a multiple of 8 (F32) / 32 (Q8_0) / 256 (K-quants): the
-//   backend falls back to linear.comp otherwise
+// - needs nin to be a multiple of 8 (F32) / 32 (Q8_0, Q5_0) / 256 (K-quants):
+//   the backend falls back to linear.comp otherwise
 // - built twice (tools/vk/build-shaders.sh): as is for Vulkan 1.0, the 32
 //   partial sums of a feature added in shared memory; with -DSUBGROUP for
 //   Vulkan 1.1 (SPV_LINEAR8_SG), added by subgroupClusteredAdd without a
@@ -43,7 +43,7 @@ layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 layout(std430, binding = 4) readonly buffer BufI { int ids[]; };
 #endif
 
-// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K (TInferVulkanBackend)
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0 (TInferVulkanBackend)
 layout(push_constant) uniform Push {
   uint rows, nin, nout, dtype, hasBias;
 #ifdef IDS
@@ -140,6 +140,26 @@ void weights8(uint rowBase, uint e, out float wv[8])
       wv[k + 4u] = d1 * float((u8(q1, k) >> sh) & 15u) - m1;
     }
   }
+  else if (p.dtype == 5u)
+  {
+    // Q5_0: 22 bytes per 32 values - d, qh[4], qs[16]; value = d * (q - 16)
+    // with the low 4 bits of value j in qs[j & 15] (low nibble below 16,
+    // high from 16) and its fifth bit bit j of qh; 8 values in one block -
+    // the 8 fifth bits are one byte of qh (the Adreno X1-85 driver computed
+    // wrong bits from the whole qh word shifted by j)
+    uint base = rowBase + (e >> 5) * 22u;
+    uint j = e & 31u;
+    float d = halfAt(base);
+    uint hb = byteAt(base + 2u + (j >> 3));
+    uvec2 q = bytes8(base + 6u + (j & 15u));
+    uint sh = j >= 16u ? 4u : 0u;
+    for (uint k = 0u; k < 4u; k++)
+    {
+      wv[k] = d * float(int(((u8(q.x, k) >> sh) & 15u) | (((hb >> k) & 1u) << 4)) - 16);
+      wv[k + 4u] = d * float(int(((u8(q.y, k) >> sh) & 15u) |
+        (((hb >> (k + 4u)) & 1u) << 4)) - 16);
+    }
+  }
   else
   {
     // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d
@@ -199,6 +219,8 @@ void main()
     rowBytes = (p.nin >> 5) * 34u;
   else if (p.dtype == 3u)
     rowBytes = (p.nin >> 8) * 144u;
+  else if (p.dtype == 5u)
+    rowBytes = (p.nin >> 5) * 22u;
   else
     rowBytes = (p.nin >> 8) * 210u;
   for (uint ob = gl_WorkGroupID.x * 4u; ob < p.nout; ob += gl_NumWorkGroups.x * 4u)

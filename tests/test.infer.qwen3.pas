@@ -1410,7 +1410,7 @@ begin
         name := 'model.embed_tokens.weight'
       else
         name := FormatUtf8('model.layers.%.%', [i, HF_MATRICES[k]]);
-      if not (w[k].DType in [idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]) then
+      if not (w[k].DType in INFER_BLOCK_DTYPES) then
       begin
         aWorst := FormatUtf8('% is %', [name, INFER_DTYPE_NAME[w[k].DType]]);
         result := -1;
@@ -1441,6 +1441,86 @@ begin
         result := cs;
         aWorst := name;
       end;
+    end;
+  end;
+end;
+
+/// the lowest cosine between the matrices of two models of one architecture:
+// every 61st embedding row (read per token), every layer matrix and the head
+function ModelCosine(a, b: TQwen3Model; out aWorst: RawUtf8): double;
+var
+  i, k, n, r, h: PtrInt;
+  wa, wb: array[0..6] of TInferWeight;
+  rows, cols: array[0..6] of PtrInt;
+  ra, rb: TSingleDynArray;
+  id: integer;
+  dot, na, nb, cs: double;
+
+  procedure Add(aCount: PtrInt);
+  var
+    j: PtrInt;
+  begin
+    for j := 0 to aCount - 1 do
+    begin
+      dot := dot + ra[j] * rb[j];
+      na := na + ra[j] * ra[j];
+      nb := nb + rb[j] * rb[j];
+    end;
+  end;
+
+  procedure Take(const aName: RawUtf8);
+  begin
+    cs := dot / Sqrt(na * nb);
+    if cs < result then
+    begin
+      result := cs;
+      aWorst := aName;
+    end;
+  end;
+
+begin
+  result := 2;
+  aWorst := '';
+  h := a.Config.Hidden;
+  SetLength(ra, h);
+  SetLength(rb, h);
+  dot := 0;
+  na := 0;
+  nb := 0;
+  id := 0;
+  while id < a.Config.VocabSize do
+  begin
+    a.Embed(@id, 1, pointer(ra));
+    b.Embed(@id, 1, pointer(rb));
+    Add(h);
+    inc(id, 61);
+  end;
+  Take('embedding');
+  for i := -1 to a.Config.Layers - 1 do
+  begin
+    LayerMatrices(a, i, wa, rows, cols);
+    LayerMatrices(b, i, wb, rows, cols);
+    n := 7;
+    if i < 0 then
+      n := 1;
+    for k := 0 to n - 1 do
+    begin
+      SetLength(ra, cols[k]);
+      SetLength(rb, cols[k]);
+      dot := 0;
+      na := 0;
+      nb := 0;
+      for r := 0 to rows[k] - 1 do
+      begin
+        InferRowToF32(wa[k].Data, wa[k].DType, r, cols[k], pointer(ra));
+        InferRowToF32(wb[k].Data, wb[k].DType, r, cols[k], pointer(rb));
+        Add(cols[k]);
+      end;
+      if i < 0 then
+        Take('head')
+      else
+        Take(FormatUtf8('layer % % (% against %)', [i, HF_MATRICES[k],
+          INFER_DTYPE_NAME[wa[k].DType], INFER_DTYPE_NAME[wb[k].DType]]));
     end;
   end;
 end;
@@ -2234,7 +2314,10 @@ procedure TTestInferQwen3.Qwen25Gguf;
 var
   dir, gguf: TFileName;
   f: integer;
-  why: RawUtf8;
+  q8: TFileName;
+  g, g8: TQwen3Model;
+  detail: RawUtf8;
+  cs: double;
 const
   FILES: array[0..1] of TFileName = (
     'qwen2.5-0.5b-instruct-q8_0.gguf', 'qwen2.5-0.5b-instruct-q4_k_m.gguf');
@@ -2260,16 +2343,35 @@ begin
       Qwen3Quantized(idtQ8_0, 0.98, 3, 3, gguf, 'qwen25', dir)
     else
     begin
-      // llama.cpp falls back to Q5_0 where a row is no multiple of 256: not
-      // supported (backlog), refused by name
-      why := '';
-      try
-        NewDecoderModelFromGguf(gguf, fCpu).Free;
-      except
-        on E: EInferError do
-          why := StringToUtf8(E.Message);
+      // llama.cpp falls back to Q5_0 where a row is no multiple of 256 (hidden
+      // 896): Q5_0 for the embedding and most matrices, Q4_K and Q6_K only for
+      // ffn_down, Q8_0 for the head and half of attn_v. Against Qwen's Q8_0
+      // file, not the BF16 weights: both GGUF files come from another
+      // checkpoint than model.safetensors (Q8_0 itself has cosine 0.81 there
+      // for layer 9 k_proj, measured 2026-10-19) - every matrix close to its
+      // Q8_0 form, which a wrong fifth bit would not be
+      q8 := FindVendorModel(FILES[0]);
+      if q8 <> '' then
+      begin
+        g := NewDecoderModelFromGguf(gguf, fFast) as TQwen3Model;
+        g8 := nil;
+        try
+          Check(g.Layers[0].Q.DType = idtQ5_0, 'Q5_0 layer matrices');
+          Check(g.Head.DType = idtQ8_0, 'a Q8_0 head');
+          g8 := NewDecoderModelFromGguf(q8, fFast) as TQwen3Model;
+          cs := ModelCosine(g, g8, detail);
+          AddConsole(FormatString('Qwen2.5 Q4_K_M against Q8_0: lowest cosine % (%)',
+            [cs, detail]));
+          CheckUtf8(cs >= 0.995, 'Qwen2.5 Q4_K_M like Q8_0: % %', [cs, detail]);
+        finally
+          g8.Free;
+          g.Free;
+        end;
       end;
-      CheckUtf8(PosEx('(Q5_0)', why) > 0, 'Qwen2.5 Q4_K_M refused: %', [why]);
+      // against the FP32 reference (measured 2026-10-19, NEON): logits cosine
+      // 0.968 (chat_tool) to 0.991, max error 3.9; greedy leaves the reference
+      // where it was 0.87 sure at most
+      Qwen3Quantized(idtQ5_0, 0.95, 6, 2, gguf, 'qwen25', dir);
     end;
   end;
 end;

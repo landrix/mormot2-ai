@@ -2,9 +2,9 @@
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - backlog B3, slice C2: TInferCudaBackend is the fast CPU backend whose
-//   Linear runs on a CUDA device for F32, Q8_0, Q4_K and Q6_K weights; every
-//   other operation, every other weight type and every call while the device
-//   is busy stay on the CPU (as TInferVulkanBackend)
+//   Linear runs on a CUDA device for F32, Q8_0, Q5_0, Q4_K and Q6_K weights;
+//   every other operation, every other weight type and every call while the
+//   device is busy stay on the CPU (as TInferVulkanBackend)
 // - weights and biases are uploaded once, on first use, and kept on the
 //   device, keyed by their address, type and size: they must neither change
 //   nor be freed while the backend lives (model weights and biases do not; a
@@ -71,8 +71,8 @@ type
     // (TInferCuda.Create: raises EInferCuda without one)
     constructor Create(aThreads: integer = 0); reintroduce;
     destructor Destroy; override;
-    /// y = x * w^T + bias on the device for F32, Q8_0, Q4_K and Q6_K weights,
-    // on the CPU otherwise (and while another thread uses the device)
+    /// y = x * w^T + bias on the device for F32, Q8_0, Q5_0, Q4_K and Q6_K
+    // weights, on the CPU otherwise (and while another thread uses the device)
     procedure Linear(x: PSingleArray; aRows, aIn: PtrInt; const w: TInferWeight;
       aOut: PtrInt; bias: PSingleArray; y: PSingleArray); override;
     /// release every weight kept on the device
@@ -127,9 +127,10 @@ implementation
 
 const
   /// the dtype parameter of tools/cuda/linear.cu
-  // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K; 0 = CPU
+  // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K, Q5_0;
+  // 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
-    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4);
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5);
 
   /// the threads of a block of linear and linear8 in tools/cuda/linear.cu
   LINEAR_BLOCK = 128;

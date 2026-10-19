@@ -2,9 +2,9 @@
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - phase 4b of docs/native-inference.md: TInferVulkanBackend is the fast CPU
-//   backend whose Linear runs on a Vulkan device for F32, Q8_0, Q4_K and Q6_K
-//   weights; every other operation, every other weight type and every call
-//   while the device is busy stay on the CPU
+//   backend whose Linear runs on a Vulkan device for F32, Q8_0, Q5_0, Q4_K and
+//   Q6_K weights; every other operation, every other weight type and every
+//   call while the device is busy stay on the CPU
 // - weights and biases are uploaded once, on first use, and kept on the
 //   device, keyed by their address, type and size: they must neither change
 //   nor be freed while the backend lives (model weights and biases do not; a
@@ -79,8 +79,8 @@ type
     // (TInferVulkan.Create: raises EInferVulkan without one)
     constructor Create(aThreads: integer = 0); reintroduce;
     destructor Destroy; override;
-    /// y = x * w^T + bias on the device for F32, Q8_0, Q4_K and Q6_K weights,
-    // on the CPU otherwise (and while another thread uses the device)
+    /// y = x * w^T + bias on the device for F32, Q8_0, Q5_0, Q4_K and Q6_K
+    // weights, on the CPU otherwise (and while another thread uses the device)
     procedure Linear(x: PSingleArray; aRows, aIn: PtrInt; const w: TInferWeight;
       aOut: PtrInt; bias: PSingleArray; y: PSingleArray); override;
     /// release every weight kept on the device
@@ -168,9 +168,10 @@ implementation
 
 const
   /// the dtype push constant of tools/vk/linear.comp
-  // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K; 0 = CPU
+  // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K, Q5_0;
+  // 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
-    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4);
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5);
 
   /// from this many rows on a Linear runs the tiled gemm8.comp (UseGemm)
   GEMM_ROWS = 16;

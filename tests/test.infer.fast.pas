@@ -64,6 +64,9 @@ type
     /// Q4_0 Linear: exact on all cores = the reference bit for bit (partial
     // tiles, rows beyond the stack buffer), the float path within tolerance
     procedure LinearQ4MatchesReference;
+    /// Q5_0 Linear: the unpacking against its definition, exact = the
+    // reference bit for bit, the float path within tolerance
+    procedure LinearQ5MatchesReference;
     /// Q4_K and Q6_K Linear: exact on all cores = the reference bit for bit,
     // the float path within tolerance, both near F32 of the dequantized rows
     procedure LinearKMatchesReference;
@@ -94,6 +97,8 @@ procedure Fill(var aValues: TSingleDynArray; aCount: PtrInt; aSeed: cardinal;
 function RandomQ8(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// random Q4_0 rows: every nibble, finite scales of both signs
 function RandomQ4(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+/// Q5_0 weights [aOut, aIn] with random scales, nibbles and fifth bits
+function RandomQ5(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// random K-quant rows (Q4_K, Q6_K): every bit pattern, finite scales
 function RandomK(aType: TInferDType; aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// true when both float arrays hold the same bits
@@ -150,6 +155,31 @@ begin
   begin
     aSeed := aSeed * 1103515245 + 12345;
     blk^.d := InferSingleToHalf((integer((aSeed shr 8) and 1023) - 512) / 16384 + 1e-4);
+    for j := 0 to 15 do
+    begin
+      aSeed := aSeed * 1103515245 + 12345;
+      blk^.qs[j] := aSeed shr 24;
+    end;
+    inc(blk);
+  end;
+end;
+
+function RandomQ5(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+var
+  b, j: PtrInt;
+  blk: PInferBlockQ5_0;
+begin
+  SetLength(result, aOut * (aIn div 32) * SizeOf(TInferBlockQ5_0));
+  blk := pointer(result);
+  for b := 0 to aOut * (aIn div 32) - 1 do
+  begin
+    aSeed := aSeed * 1103515245 + 12345;
+    blk^.d := InferSingleToHalf((integer((aSeed shr 8) and 1023) - 512) / 16384 + 1e-4);
+    for j := 0 to 3 do
+    begin
+      aSeed := aSeed * 1103515245 + 12345;
+      blk^.qh[j] := aSeed shr 24;
+    end;
     for j := 0 to 15 do
     begin
       aSeed := aSeed * 1103515245 + 12345;
@@ -709,6 +739,91 @@ begin
       nil, pointer(y1));
     e := RelError(pointer(y3), pointer(y1), rows * nout);
     CheckUtf8(e <= 2e-6, 'Q4_0 float % x % x %: relative error %', [rows, nin, nout, e]);
+  end;
+end;
+
+procedure TTestInferFast.LinearQ5MatchesReference;
+const
+  // rows, in, out: partial tiles, 896 inputs (Qwen2.5-0.5B: no multiple of
+  // 256), and 4352 inputs = 136 blocks per row, beyond the tile buffer on the
+  // stack
+  SHAPES: array[0..5, 0..2] of integer = (
+    (1, 32, 1), (3, 96, 17), (37, 896, 33), (64, 1024, 100), (1, 896, 70),
+    (2, 4352, 20));
+var
+  i, j, k, rows, nin, nout: PtrInt;
+  x, bias, y1, y2, y3, row: TSingleDynArray;
+  wq: RawByteString;
+  e: double;
+  q5: array[0..15] of TInferBlockQ5_0;
+  q8: array[0..15] of TInferBlockQ8_0;
+  qh: cardinal;
+  ok: boolean;
+begin
+  // the unpacking against the definition of a Q5_0 value: every byte value
+  // in the nibbles, every fifth bit set and clear
+  for i := 0 to 15 do
+  begin
+    q5[i].d := i * 7 + 1;
+    for j := 0 to 15 do
+      q5[i].qs[j] := i * 16 + j;
+    qh := cardinal(i) * 2654435761 xor $A5A5A5A5;
+    if i = 0 then
+      qh := 0
+    else if i = 1 then
+      qh := $FFFFFFFF;
+    for j := 0 to 3 do
+      q5[i].qh[j] := (qh shr (j * 8)) and 255;
+  end;
+  InferQ5ToQ8(@q5, 16, @q8);
+  ok := true;
+  SetLength(row, 32);
+  for i := 0 to 15 do
+  begin
+    if q8[i].d <> q5[i].d then
+      ok := false;
+    qh := q5[i].qh[0] or (cardinal(q5[i].qh[1]) shl 8) or
+      (cardinal(q5[i].qh[2]) shl 16) or (cardinal(q5[i].qh[3]) shl 24);
+    for k := 0 to 31 do
+    begin
+      if k < 16 then
+        j := q5[i].qs[k] and 15
+      else
+        j := q5[i].qs[k - 16] shr 4;
+      j := j + PtrInt((qh shr k) and 1) * 16 - 16;
+      if q8[i].qs[k] <> j then
+        ok := false;
+    end;
+    // and the dequantization: d * (q - 16) per value
+    InferRowToF32(@q5, idtQ5_0, i, 32, pointer(row));
+    for k := 0 to 31 do
+      if row[k] <> InferHalfToSingle(q5[i].d) * q8[i].qs[k] then
+        ok := false;
+  end;
+  Check(ok, 'InferQ5ToQ8 and InferRowToF32 = d * (q - 16) for all values');
+  for i := 0 to high(SHAPES) do
+  begin
+    rows := SHAPES[i, 0];
+    nin := SHAPES[i, 1];
+    nout := SHAPES[i, 2];
+    Fill(x, rows * nin, 311 + i, 3);
+    Fill(bias, nout, 331 + i, 1);
+    wq := RandomQ5(nout, nin, 341 + i);
+    SetLength(y1, rows * nout);
+    SetLength(y2, rows * nout);
+    SetLength(y3, rows * nout);
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ5_0), nout,
+      pointer(bias), pointer(y1));
+    fExact.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ5_0), nout,
+      pointer(bias), pointer(y2));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), rows * nout), 'Q5_0 exact % x % x %',
+      [rows, nin, nout]);
+    fFast.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ5_0), nout,
+      nil, pointer(y3));
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ5_0), nout,
+      nil, pointer(y1));
+    e := RelError(pointer(y3), pointer(y1), rows * nout);
+    CheckUtf8(e <= 2e-6, 'Q5_0 float % x % x %: relative error %', [rows, nin, nout, e]);
   end;
 end;
 

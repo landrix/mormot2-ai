@@ -32,9 +32,9 @@ type
 
   /// element type of a tensor
   // - names follow safetensors: F32, F16, BF16, I32, I64, U8, I8
-  // - idtQ8_0 and idtQ4_0 are block types of GGUF files: 32 elements share one
-  // FP16 scale (see TInferBlockQ8_0, TInferBlockQ4_0) - only GGUF files hold
-  // them, safetensors never
+  // - idtQ8_0, idtQ4_0 and idtQ5_0 are block types of GGUF files: 32 elements
+  // share one FP16 scale (see TInferBlockQ8_0, TInferBlockQ4_0,
+  // TInferBlockQ5_0) - only GGUF files hold them, safetensors never
   TInferDType = (
     idtUnknown,
     idtF32,
@@ -47,7 +47,8 @@ type
     idtQ8_0,
     idtQ4_0,
     idtQ4_K,
-    idtQ6_K);
+    idtQ6_K,
+    idtQ5_0);
 
   /// one Q8_0 block as ggml stores it: value[i] = d * qs[i]
   // - d is an IEEE half float (raw bits), 34 bytes per 32 elements
@@ -71,6 +72,21 @@ type
   TInferBlockQ4_0Array = array[0..(MaxInt div SizeOf(TInferBlockQ4_0)) - 1] of
     TInferBlockQ4_0;
   PInferBlockQ4_0Array = ^TInferBlockQ4_0Array;
+
+  /// one Q5_0 block as ggml stores it: value[i] = d * (q[i] - 16), q in 0..31
+  // - d is an IEEE half float (raw bits); the low 4 bits of q[j] sit in the
+  // low and those of q[j + 16] in the high nibble of qs[j], the fifth bit of
+  // q[i] is bit i of qh read as a little-endian 32-bit word - 22 bytes per 32
+  // elements (llama.cpp writes it where a K-quant row is no multiple of 256)
+  TInferBlockQ5_0 = packed record
+    d: word;
+    qh: array[0..3] of byte;
+    qs: array[0..15] of byte;
+  end;
+  PInferBlockQ5_0 = ^TInferBlockQ5_0;
+  TInferBlockQ5_0Array = array[0..(MaxInt div SizeOf(TInferBlockQ5_0)) - 1] of
+    TInferBlockQ5_0;
+  PInferBlockQ5_0Array = ^TInferBlockQ5_0Array;
 
   /// one Q4_K super-block of 256 values as ggml stores it
   // - 8 sub-blocks of 32: value = d * sc[j] * q - dmin * m[j], q in 0..15, sc
@@ -130,16 +146,19 @@ type
 const
   /// size in bytes of one block of each type (0 = unknown)
   INFER_DTYPE_SIZE: array[TInferDType] of byte = (
-    0, 4, 2, 2, 4, 8, 1, 1, 34, 18, 144, 210);
+    0, 4, 2, 2, 4, 8, 1, 1, 34, 18, 144, 210, 22);
 
   /// elements per block of each type: 1 for plain element types
   INFER_DTYPE_BLOCK: array[TInferDType] of word = (
-    0, 1, 1, 1, 1, 1, 1, 1, 32, 32, 256, 256);
+    0, 1, 1, 1, 1, 1, 1, 1, 32, 32, 256, 256, 32);
+
+  /// the block types of GGUF matrices the engine reads in place
+  INFER_BLOCK_DTYPES = [idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K];
 
   /// the name of each type (safetensors names, ggml's for block types)
   INFER_DTYPE_NAME: array[TInferDType] of RawUtf8 = (
     '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8', 'Q8_0', 'Q4_0', 'Q4_K',
-    'Q6_K');
+    'Q6_K', 'Q5_0');
 
 /// the element type of a safetensors dtype name, idtUnknown if not supported
 // - block types are no safetensors types and never returned
@@ -163,9 +182,9 @@ function InferHalfToSingleBits(aHalf: word): cardinal;
 function InferSingleToHalf(aValue: single): word;
 
 /// row aRow of a [rows, aCols] matrix of type aType, as F32 into aDst
-// - F32 is copied, Q8_0 and Q4_0 dequantized (d * q, d * (q - 8): exact in
-// single), Q4_K and Q6_K with the single steps of ggml's dequantize_row_*;
-// aCols must be a multiple of the block size
+// - F32 is copied, Q8_0, Q4_0 and Q5_0 dequantized (d * q, d * (q - 8),
+// d * (q - 16): exact in single), Q4_K and Q6_K with the single steps of
+// ggml's dequantize_row_*; aCols must be a multiple of the block size
 procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
   aDst: PSingleArray);
 
@@ -378,7 +397,9 @@ var
   b, j, nb: PtrInt;
   blk: PInferBlockQ8_0;
   b4: PInferBlockQ4_0;
+  b5: PInferBlockQ5_0;
   d: single;
+  qh: cardinal;
 begin
   case aType of
     idtF32:
@@ -422,6 +443,25 @@ begin
             aDst^[b * 32 + j + 16] := d * (integer(b4^.qs[j] shr 4) - 8);
           end;
           inc(b4);
+        end;
+      end;
+    idtQ5_0:
+      begin
+        nb := aCols div 32;
+        b5 := @PInferBlockQ5_0Array(aData)^[aRow * nb];
+        for b := 0 to nb - 1 do
+        begin
+          d := InferHalfToSingle(b5^.d);
+          qh := b5^.qh[0] or (cardinal(b5^.qh[1]) shl 8) or
+            (cardinal(b5^.qh[2]) shl 16) or (cardinal(b5^.qh[3]) shl 24);
+          for j := 0 to 15 do
+          begin
+            aDst^[b * 32 + j] := d * (integer((b5^.qs[j] and 15) or
+              (((qh shr j) and 1) shl 4)) - 16);
+            aDst^[b * 32 + j + 16] := d * (integer((b5^.qs[j] shr 4) or
+              (((qh shr (j + 16)) and 1) shl 4)) - 16);
+          end;
+          inc(b5);
         end;
       end;
   else

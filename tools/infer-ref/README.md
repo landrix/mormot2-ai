@@ -22,8 +22,10 @@ VIRTUAL_ENV=~/.venvs/lai-infer-ref uv pip install -r tools/infer-ref/requirement
 ```
 
 Ziele: `ops`, `tiny`, `bge-m3` (Modell, Fälle, Korpusvektoren), `tokens` (Tokenizer-Gate),
-dazu für Phase 1b `q8`, `tiny-gguf` und `lembed-tokens` und für Phase 3e `q4` (Q4_0 aus
-ggml selbst: `quantize_row_q4_0_ref`, `dequantize_row_q4_0`, `ggml_vec_dot_q4_0_q8_0`).
+dazu für Phase 1b `q8`, `tiny-gguf` und `lembed-tokens`, für Phase 3e `q4` (Q4_0 aus
+ggml selbst: `quantize_row_q4_0_ref`, `dequantize_row_q4_0`, `ggml_vec_dot_q4_0_q8_0`)
+und für Backlog B16 `q5` (Q5_0: `quantize_row_q5_0_ref`, `dequantize_row_q5_0`,
+`ggml_vec_dot_q5_0_q8_0`).
 Mit `bge-m3` oder `tokens` lädt das Skript BAAI/bge-m3 in der festen Revision
 `5617a9f61b028005a4858fdac845db406aefb181` (rund 2,3 GB in den Hugging-Face-Cache).
 

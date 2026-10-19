@@ -165,7 +165,7 @@ const
     1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8);
 
 /// the engine type of a ggml type id, idtUnknown if not supported
-// - 0 F32, 1 F16, 8 Q8_0, 30 BF16
+// - 0 F32, 1 F16, 2 Q4_0, 6 Q5_0, 8 Q8_0, 12 Q4_K, 14 Q6_K, 30 BF16
 function GgufTensorType(aGgmlType: cardinal): TInferDType;
 
 
@@ -202,6 +202,8 @@ begin
       result := idtF16;
     2:
       result := idtQ4_0;
+    6:
+      result := idtQ5_0;
     8:
       result := idtQ8_0;
     12:

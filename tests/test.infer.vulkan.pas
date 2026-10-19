@@ -113,8 +113,12 @@ type
     // against the CPU - safetensors and the Q8_0 GGUF, a prompt of two chunks,
     // decoding, the float and the half-float cache
     procedure TinyQwen2MatchesCpu;
-    /// Qwen2.5-0.5B-Instruct (Q8_0 GGUF) on the device against the fast CPU
-    // backend, teacher-forced - skipped without the model
+    /// RecordLinearIds (linear8.comp -DIDS) against the reference Linear of
+    // the expert each slot names: F32, Q8_0, Q5_0, Q4_K, ids repeated, x per
+    // slot and shared
+    procedure LinearIdsMatchesReference;
+    /// Qwen2.5-0.5B-Instruct (Q8_0 and Q4_K_M GGUF) on the device against the
+    // fast CPU backend, teacher-forced - skipped without the model
     procedure Qwen25GgufMatchesCpu;
     /// D4: a model with a sliding window (tiny Qwen3 with one) or with layers
     // without rotary positions (tiny SmolLM3 without its windows) is refused
@@ -421,11 +425,14 @@ procedure TTestInferVulkan.LinearMatchesReference;
 const
   // rows, in, out: one row, partial work, many rows, odd outputs, more
   // outputs than one dispatch dimension holds, and several gemm8.comp tiles
-  // of rows and features
-  SHAPES: array[0..5, 0..2] of integer = (
+  // of rows and features; the last four not for the K-quants: whole blocks
+  // of 32 but no multiple of 256 (Qwen2.5's 896), an odd number of blocks
+  // (rows not 4-aligned for Q8_0 and Q5_0)
+  SHAPES: array[0..9, 0..2] of integer = (
     (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001),
-    (70, 512, 130));
-  TYPES: array[0..3] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K);
+    (70, 512, 130), (1, 32, 3), (3, 96, 17), (1, 896, 65), (20, 896, 33));
+  TYPES: array[0..4] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
+    idtQ5_0);
 var
   gpu: TInferVulkanBackend;
   ref: TInferCpuBackend;
@@ -465,6 +472,8 @@ begin
         kind := TYPES[t];
         for i := 0 to high(SHAPES) do
         begin
+          if (i > 5) and (kind in [idtQ4_K, idtQ6_K]) then
+            continue;
           rows := SHAPES[i, 0];
           nin := SHAPES[i, 1];
           nout := SHAPES[i, 2];
@@ -482,6 +491,11 @@ begin
             idtQ8_0:
               begin
                 wq := RandomQ8(nout, nin, 41 + i);
+                data := pointer(wq);
+              end;
+            idtQ5_0:
+              begin
+                wq := RandomQ5(nout, nin, 141 + i);
                 data := pointer(wq);
               end;
           else
@@ -1505,12 +1519,132 @@ begin
   end;
 end;
 
+procedure TTestInferVulkan.LinearIdsMatchesReference;
+const
+  EXPERTS = 5;
+  SLOTS = 4;
+  NOUT = 33;
+  IDS: array[0..SLOTS - 1] of integer = (3, 0, 4, 3);
+  // type, inputs: the K-quant at 256, the others also at 896
+  KINDS: array[0..6] of TInferDType = (
+    idtF32, idtQ8_0, idtQ5_0, idtQ4_K, idtQ8_0, idtQ5_0, idtF32);
+  INPUTS: array[0..6] of integer = (256, 256, 256, 256, 896, 896, 896);
+var
+  gpu: TInferVulkanBackend;
+  ref: TInferCpuBackend;
+  vk: TInferVulkan;
+  c, s, o, nin, xr, sg: PtrInt;
+  kind: TInferDType;
+  perSlot: boolean;
+  x, wf, wd, y1, y2: TSingleDynArray;
+  wq: RawByteString;
+  data: pointer;
+  stride: Int64;
+  wb, xb, yb, ib: TInferVkBuffer;
+  e: double;
+begin
+  if not HasDevice then
+    exit;
+  gpu := TInferVulkanBackend.Create;
+  ref := TInferCpuBackend.Create;
+  try
+    vk := gpu.Vulkan;
+    // both builds where the device has subgroups
+    for sg := ord(not gpu.SubgroupLinear) to 1 do
+    for c := 0 to high(KINDS) do
+      for perSlot := false to true do
+      begin
+        gpu.UseSubgroups := sg = 0;
+        kind := KINDS[c];
+        nin := INPUTS[c];
+        case kind of
+          idtF32:
+            begin
+              Fill(wf, EXPERTS * NOUT * nin, 81 + c, 0.1);
+              data := pointer(wf);
+            end;
+          idtQ8_0:
+            begin
+              wq := RandomQ8(EXPERTS * NOUT, nin, 82 + c);
+              data := pointer(wq);
+            end;
+          idtQ5_0:
+            begin
+              wq := RandomQ5(EXPERTS * NOUT, nin, 83 + c);
+              data := pointer(wq);
+            end;
+        else
+          begin
+            wq := RandomK(kind, EXPERTS * NOUT, nin, 84 + c);
+            data := pointer(wq);
+          end;
+        end;
+        stride := Int64(NOUT) * (nin div INFER_DTYPE_BLOCK[kind]) *
+          INFER_DTYPE_SIZE[kind];
+        SetLength(wd, EXPERTS * NOUT * nin);
+        for o := 0 to EXPERTS * NOUT - 1 do
+          InferRowToF32(data, kind, o, nin, @wd[o * nin]);
+        Fill(x, SLOTS * nin, 85 + c, 2);
+        // the reference: slot s through expert IDS[s], x row s or row 0
+        SetLength(y1, SLOTS * NOUT);
+        SetLength(y2, SLOTS * NOUT);
+        for s := 0 to SLOTS - 1 do
+        begin
+          xr := 0;
+          if perSlot then
+            xr := s;
+          ref.Linear(@x[xr * nin], 1, nin, InferWeight(@wd[IDS[s] * NOUT * nin],
+            idtF32), NOUT, nil, @y1[s * NOUT]);
+        end;
+        xb := nil;
+        yb := nil;
+        ib := nil;
+        gpu.GpuLock;
+        try
+          wb := gpu.DeviceWeight(data, kind, stride * EXPERTS);
+          CheckUtf8(gpu.GpuLinearIds(kind, nin, wb), '% x % by ids',
+            [INFER_DTYPE_NAME[kind], nin]);
+          xb := TInferVkBuffer.Create(vk, SLOTS * nin * 4, true);
+          yb := TInferVkBuffer.Create(vk, SLOTS * NOUT * 4, true);
+          ib := TInferVkBuffer.Create(vk, SLOTS * 4, true);
+          vk.Upload(xb, 0, pointer(x), SLOTS * nin * 4);
+          vk.Upload(ib, 0, @IDS, SLOTS * 4);
+          vk.BatchBegin;
+          try
+            gpu.RecordLinearIds(xb, nin, kind, wb, stride, NOUT, ib, SLOTS,
+              perSlot, yb);
+          except
+            vk.BatchAbort;
+            raise;
+          end;
+          vk.BatchSubmit;
+          vk.Download(yb, 0, pointer(y2), SLOTS * NOUT * 4);
+        finally
+          ib.Free;
+          yb.Free;
+          xb.Free;
+          gpu.GpuUnLock;
+        end;
+        e := RelError(pointer(y2), pointer(y1), SLOTS * NOUT);
+        CheckUtf8(e <= 1e-5, '% x % by ids (x per slot %, subgroups %): ' +
+          'relative error %', [INFER_DTYPE_NAME[kind], nin, perSlot, sg = 0, e]);
+      end;
+    gpu.UseSubgroups := gpu.SubgroupLinear;
+  finally
+    ref.Free;
+    gpu.Free;
+  end;
+end;
+
 procedure TTestInferVulkan.Qwen25GgufMatchesCpu;
 const
   STEPS = 16;
+  FILES: array[0..1] of TFileName = (
+    'qwen2.5-0.5b-instruct-q8_0.gguf', 'qwen2.5-0.5b-instruct-q4_k_m.gguf');
+  KINDS: array[0..1] of RawUtf8 = ('Q8_0', 'Q4_K_M');
 var
   gguf: TFileName;
-  i, v, agree: PtrInt;
+  i, v, agree, f: PtrInt;
   gpu: TInferVulkanBackend;
   cpu: TInferCpuFastBackend;
   model: TDecoderModel;
@@ -1538,14 +1672,6 @@ begin
   AddConsole('SKIP Qwen2.5 on the device: a 32-bit process');
   exit;
   {$endif CPU32}
-  gguf := FindVendorModel('qwen2.5-0.5b-instruct-q8_0.gguf');
-  if gguf = '' then
-  begin
-    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
-      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen2.5-0.5b-instruct-q8_0.gguf');
-    AddConsole('SKIP Qwen2.5 on the device: no vendor/models/qwen2.5-0.5b-instruct-q8_0.gguf');
-    exit;
-  end;
   refdir := FindInferRefDir('qwen25');
   if CheckFailed(refdir <> '', 'qwen25 reference found') then
     exit;
@@ -1558,51 +1684,64 @@ begin
   finally
     ref.Free;
   end;
-  gpu := TInferVulkanBackend.Create;
-  cpu := TInferCpuFastBackend.Create;
-  model := nil;
-  vk := nil;
-  c1 := nil;
-  c2 := nil;
-  try
-    model := NewDecoderModelFromGguf(gguf, cpu);
-    Check(model is TQwen2Model, 'a Qwen2 model');
-    v := model.Config.VocabSize;
-    vk := TQwen3Vulkan.Create(model, gpu);
-    c1 := model.NewContext;
-    c2 := vk.NewContext;
-    SetLength(l1, v);
-    SetLength(l2, v);
-    model.Forward(c1, pointer(prompt), length(prompt), pointer(l1));
-    vk.Forward(c2, pointer(prompt), length(prompt), pointer(l2));
-    worst := 1;
-    agree := 0;
-    for i := 0 to STEPS - 1 do
+  for f := 0 to high(FILES) do
+  begin
+    // Q4_K_M: Q5_0 for most matrices (hidden 896), Q4_K, Q6_K and Q8_0
+    gguf := FindVendorModel(FILES[f]);
+    if gguf = '' then
     begin
-      cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
-      if cmp.Cosine < worst then
-        worst := cmp.Cosine;
-      // InferCompare leaves a NaN or an infinity out of the cosine
-      if cmp.NonFinite <> 0 then
-        worst := -1;
-      id := InferArgMax(pointer(l1), v);
-      if InferArgMax(pointer(l2), v) = id then
-        inc(agree);
-      // the CPU's token to both: the comparison stays on one path
-      model.Forward(c1, @id, 1, pointer(l1));
-      vk.Forward(c2, @id, 1, pointer(l2));
+      CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+        'LAI_REQUIRE_MODEL=1 but no vendor/models/%', [FILES[f]]);
+      AddConsole('SKIP Qwen2.5 on the device: no vendor/models/%', [FILES[f]]);
+      continue;
     end;
-    AddConsole('Qwen2.5-0.5B Q8_0 on %: lowest logits cosine %, argmax agrees % of %',
-      [fVk.DeviceName, worst, agree, STEPS]);
-    CheckUtf8(worst >= 0.99, 'Qwen2.5 logits cosine %', [worst]);
-    CheckUtf8(agree >= STEPS - 2, 'Qwen2.5 argmax agrees % of %', [agree, STEPS]);
-  finally
-    c2.Free;
-    c1.Free;
-    vk.Free;
-    model.Free;
-    cpu.Free;
-    gpu.Free;
+    gpu := TInferVulkanBackend.Create;
+    cpu := TInferCpuFastBackend.Create;
+    model := nil;
+    vk := nil;
+    c1 := nil;
+    c2 := nil;
+    try
+      model := NewDecoderModelFromGguf(gguf, cpu);
+      Check(model is TQwen2Model, 'a Qwen2 model');
+      v := model.Config.VocabSize;
+      vk := TQwen3Vulkan.Create(model, gpu);
+      c1 := model.NewContext;
+      c2 := vk.NewContext;
+      SetLength(l1, v);
+      SetLength(l2, v);
+      model.Forward(c1, pointer(prompt), length(prompt), pointer(l1));
+      vk.Forward(c2, pointer(prompt), length(prompt), pointer(l2));
+      worst := 1;
+      agree := 0;
+      for i := 0 to STEPS - 1 do
+      begin
+        cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+        if cmp.Cosine < worst then
+          worst := cmp.Cosine;
+        // InferCompare leaves a NaN or an infinity out of the cosine
+        if cmp.NonFinite <> 0 then
+          worst := -1;
+        id := InferArgMax(pointer(l1), v);
+        if InferArgMax(pointer(l2), v) = id then
+          inc(agree);
+        // the CPU's token to both: the comparison stays on one path
+        model.Forward(c1, @id, 1, pointer(l1));
+        vk.Forward(c2, @id, 1, pointer(l2));
+      end;
+      AddConsole('Qwen2.5-0.5B % on %: lowest logits cosine %, argmax agrees % of %',
+        [KINDS[f], fVk.DeviceName, worst, agree, STEPS]);
+      CheckUtf8(worst >= 0.99, 'Qwen2.5 % logits cosine %', [KINDS[f], worst]);
+      CheckUtf8(agree >= STEPS - 2, 'Qwen2.5 % argmax agrees % of %',
+        [KINDS[f], agree, STEPS]);
+    finally
+      c2.Free;
+      c1.Free;
+      vk.Free;
+      model.Free;
+      cpu.Free;
+      gpu.Free;
+    end;
   end;
 end;
 

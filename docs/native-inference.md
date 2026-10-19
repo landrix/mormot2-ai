@@ -897,6 +897,61 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
     X-Bereich gesichert). i9-14900K, Q4_K_M-Prefill bei 200 Tokens: 462 → 579 Tokens/s.
     Der SysV-Einsprung (Linux x86_64) ist nur statisch geprüft.
 
+- *B16 erledigt (2026-10-19): Q5_0.* llama.cpp schreibt Q5_0, wo eine K-Quant-Zeile kein
+  Vielfaches von 256 ist: Qwens `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Hidden 896) hat 133
+  Q5_0-Tensoren, das Embedding eingeschlossen, daneben nur 12 Q4_K, 12 Q6_K und 13 Q8_0.
+  - `idtQ5_0` und `TInferBlockQ5_0` (22 Bytes: FP16-Skala, 32 fünfte Bits als
+    Little-Endian-Wort, 32 Nibbles wie Q4_0; Wert = d · (q − 16)); `InferRowToF32`,
+    GGUF-Typ 6, `INFER_BLOCK_DTYPES` als gemeinsame Liste der Blocktypen, die der Decoder
+    an Ort und Stelle liest.
+  - CPU: `InferQ5ToQ8` packt verlustfrei nach Q8_0 aus (q − 16 passt in ein int8), wie
+    Q4_0 je Kachel; danach dieselben Q8_0-Kernel, `Exact` bitgleich mit der Referenz.
+    Ohne eigenen SIMD-Code: 8 Werte je Int64, die fünften Bits über eine Tabelle von
+    256 Einträgen.
+  - Vulkan (`linear8.comp` auch mit `-DIDS`, `gemm8.comp`, `linear.comp`) und CUDA
+    (`linear`, `linear8`, `gemm8`, `linear8ids`): `dtype` 5, die Gewichte im Shader
+    ausgepackt wie die anderen Typen. `matvec8.comp` kennt Q5_0 nicht, ein Decode-Schritt
+    nimmt dort `linear8`. Die Adreno X1-85 rechnete die fünften Bits aus dem ganzen
+    `qh`-Wort, um j verschoben, falsch (NVIDIA richtig); gelesen wird deshalb das eine
+    Byte von `qh`, das die acht Werte brauchen - auf beiden Backends gleich.
+  - *Gemessen* auf der RTX 5090 (i9-14900K), Qwen2.5-0.5B-Instruct, 200 Tokens Prompt, 64
+    neue, Qwens Q8_0-Datei gegen seine Q4_K_M-Datei:
+
+    | | Q8_0 | Q4_K_M (meist Q5_0) |
+    |---|---|---|
+    | Speicher-Peak CPU | 718 MB | 542 MB |
+    | CPU Prefill / Decode | 931 / 98 Tokens/s | 891 / 101 Tokens/s |
+    | CUDA Decode | 462 Tokens/s | 447 Tokens/s |
+    | Vulkan Decode | 418 Tokens/s | 386 Tokens/s |
+
+    Der Nutzen ist, dass die Datei überhaupt lädt, und ein Viertel weniger Speicher;
+    schneller wird ein so kleines Modell nicht (der Kopf bleibt Q8_0, 136 Mio. der 494
+    Mio. Parameter). Vulkan verliert 8 %, weil `matvec8` fehlt.
+  - *Tests:* `Q5LikeGgml` (Datensatz `q5` aus ggml selbst: Blöcke von
+    `quantize_row_q5_0_ref` mit jedem q von 0 bis 31 samt Clip, Nullblock, winzigen und
+    großen Zeilen, einem wiederholten Wert, lauter gelöschten fünften Bits, exakt dequantisiert wie
+    `dequantize_row_q5_0`; Linear wie `ggml_vec_dot_q5_0_q8_0`), `LinearQ5MatchesReference`
+    (Auspacken gegen die Definition für alle Nibble-Bytes und fünften Bits, `Exact` bitgleich,
+    896 und 4352 Eingänge), auf CUDA und Vulkan `LinearMatchesReference` mit Q5_0 (auch 32,
+    96 und 896 Eingänge, ungerade Blockzahlen) und `LinearIdsMatchesReference` (F32, Q8_0,
+    Q5_0, Q4_K über Experten-Ids, Ids doppelt, x je Platz und gemeinsam - von Codex als
+    Lücke gemeldet), `Qwen25GgufMatchesCpu` auch mit Q4_K_M (Logits-Kosinus 0,9986 auf der
+    RTX 5090, 0,9988 auf der Adreno). `Qwen25Gguf` lädt Q4_K_M: jede Matrix gegen Qwens
+    Q8_0-Datei (niedrigster Kosinus 0,9972, eine Q4_K-Matrix), nicht gegen die
+    BF16-Gewichte - beide GGUF-Dateien stammen aus einem anderen Checkpoint als
+    `model.safetensors` (schon Q8_0 kommt bei Layer 9 `k_proj` nur auf 0,81; ggml's eigenes
+    `dequantize_row_q5_0` liefert dieselben Werte wie unseres). Gegen die FP32-Referenz:
+    Logits-Kosinus 0,968 bis 0,991, größter Fehler 3,9.
+  - Grün auf dem RTX-Rechner unter FPC und Delphi 13 (4786 Assertions) und Delphi 7 (3169),
+    auf der Adreno X1-85 (Vulkan-Suite 787) und dem M2 Pro (MoltenVK, 4025). Gegenprobe:
+    12 eingebaute Fehler (fünftes Bit der oberen Hälfte, falsches `qh`-Byte, Vorzeichen
+    in `Q5Minus16`, Q5_0-Kacheln als Q4_0 ausgepackt; auf CUDA und Vulkan hohe Nibbles nie,
+    fünftes Bit verschoben, falsches `qh`-Byte, Zeilen zu 20 bzw. 24 Bytes, Nibbles ab dem
+    falschen Byte) - alle scheitern. Review: Claude-Finder ein veralteter Kommentar, Codex
+    die zwei Testlücken oben; behoben.
+  - *Offen, nur bei Bedarf:* Q5_1 (llama.cpp nimmt es als Ersatz für Q5_K, Q5_K_M-Dateien
+    brauchen also zuerst Q5_K); `matvec8.comp` für Q5_0; Auspacken mit NEON/AVX2.
+
 ### Phase 4 — GPU: Vulkan zuerst, CUDA danach
 
 Entscheidung 2026-10-15: **Vulkan zuerst** (herstellerübergreifend: NVIDIA, AMD, Intel,

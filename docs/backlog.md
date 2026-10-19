@@ -292,7 +292,7 @@ vergessen, Bias auf O, Norm je Kopf doch an). Revision des Modells pinnen.
 GGUF), Bias auf Q/K/V in `TDecoderLayer` (CPU, Vulkan, CUDA; `RecordLinear`/`EnqueueLinear`
 mit Bias, `qkrope` mit Schalter `norm`), `TQwen2ChatTemplate`, `TQwen2OutputParser`, Familie
 registriert. Qwen2.5-0.5B-Instruct in FP32 Greedy identisch mit transformers, Client mit
-Tool-Aufruf; Qwens Q4_K_M-GGUF braucht Q5_0 (B16).
+Tool-Aufruf; Qwens Q4_K_M-GGUF läuft seit B16 (Q5_0).
 
 **D4 — Sliding Window und Cache-Semantik.** Erst voller KV mit Fenstermaske als Referenz,
 dann Ringpuffer mit absoluten Positionen (spart den Speicher). Chunk-Prefill darf benötigte
@@ -780,7 +780,7 @@ statt das Werkzeug zu rufen) - deshalb steht F32 bisher als Vorgabe.
 und läuft (CPU, und mit Vulkan/CUDA, wenn vorhanden), und das README den Einstieg in
 wenigen Zeilen zeigt. Weitere Ideen ohne Termin: [ideas.md](ideas.md).
 
-## B16 — Q5_0 (und Q5_1) für die K-Quant-Dateien kleiner Modelle (aufgenommen 2026-10-19)
+## B16 — Q5_0 (und Q5_1) für die K-Quant-Dateien kleiner Modelle (aufgenommen 2026-10-19, Q5_0 erledigt 2026-10-19)
 
 Anlass: Qwens `qwen2.5-0.5b-instruct-q4_k_m.gguf` hat 133 Q5_0-Tensoren, nur 12 Q4_K und 12
 Q6_K - llama.cpp nimmt Q5_0, wo eine Zeile kein Vielfaches von 256 ist (Hidden 896), auch für
@@ -796,3 +796,17 @@ aus ggml's Referenz-Quantisierer (`make_reference.py`, Ggml), Bits wie ggml; Qwe
 Q4_K_M gegen FP32 (Kosinus, Greedy bis zur knappen Stelle) auf CPU, Vulkan, CUDA;
 Gegenproben (hohes Bit vertauscht, Minimum vergessen). *Nutzen messen:* Q5_0 gegen Q8_0 bei
 Qwen2.5-0.5B (Speicher, Decode) - übernehmen nur, wenn der Nutzen trägt.
+
+*Erledigt 2026-10-19 für Q5_0* (`native-inference.md`, Phase 3): Typ, Loader, CPU (verlustfrei
+nach Q8_0 ausgepackt), Vulkan und CUDA (`dtype` 5); Qwens Q4_K_M von Qwen2.5-0.5B läuft auf
+CPU, Vulkan und CUDA, Speicher-Peak 542 statt 718 MB (Q8_0), Decode etwa gleich (CPU 101 /
+98, CUDA 447 / 462, Vulkan 386 / 418 Tokens/s). Die Adreno X1-85 rechnete das um j
+verschobene `qh`-Wort falsch; gelesen wird das eine Byte. *Offen, nur bei Bedarf:*
+
+- **Q5_1** (Block 24: zusätzlich FP16-Minimum): llama.cpp nimmt es als Ersatz für Q5_K -
+  eine Q5_K_M-Datei braucht also zuerst Q5_K. Auf der CPU nicht verlustfrei nach Q8_0
+  auszupacken (Wert d · q + m): der Summand m · Summe(x) je Block käme dazu.
+- **`matvec8.comp` für Q5_0**: Vulkan dekodiert Q5_0 mit `linear8`, 8 % langsamer als Q8_0
+  mit `matvec8`.
+- **Auspacken mit NEON/AVX2** wie `InferQ4Unpack`: Prefill auf der CPU 4 % langsamer als
+  Q8_0 (891 / 931 Tokens/s).

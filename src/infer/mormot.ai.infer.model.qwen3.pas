@@ -15,8 +15,8 @@
 // - head_dim comes from the configuration: Qwen3-0.6B has 16 heads of 128 for
 //   a hidden size of 1024, not 1024 / 16
 // - or a llama.cpp GGUF file of the qwen3 architecture (CreateFromGguf): its
-//   metadata for the settings, its Q8_0 / Q4_0 / Q4_K / Q6_K matrices used in
-//   place
+//   metadata for the settings, its Q8_0 / Q4_0 / Q5_0 / Q4_K / Q6_K matrices
+//   used in place
 // - TQwen2Model: Qwen2 and Qwen2.5 (model_type and GGUF architecture qwen2,
 //   looked up in modeling_qwen2.py): the same decoder with a bias on the Q, K
 //   and V projections and no RMSNorm per head; config.json has no head_dim
@@ -498,7 +498,7 @@ begin
   fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h],
     fGguf <> nil);
   // read per token: its scales checked here, also when the head is untied
-  if fEmbedSrc^.DType in [idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K] then
+  if fEmbedSrc^.DType in INFER_BLOCK_DTYPES then
     CheckBlockScales(fEmbedSrc, 'model.embed_tokens.weight');
   if (fGguf = nil) and (fWeights = idtF32) then
     fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),

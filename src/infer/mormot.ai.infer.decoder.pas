@@ -353,8 +353,8 @@ type
     constructor Create(const aFolder: TFileName; aBackend: TInferBackend;
       aWeights: TInferDType = idtF32); virtual;
     /// load a llama.cpp GGUF file of the architecture: the settings from its
-    // metadata, every matrix as stored (Q8_0, Q4_0, Q4_K and Q6_K used in
-    // place, F16 and BF16 widened to F32), a head tied to token_embd when the
+    // metadata, every matrix as stored (Q8_0, Q4_0, Q5_0, Q4_K and Q6_K used
+    // in place, F16 and BF16 widened to F32), a head tied to token_embd when the
     // file has no output.weight
     // - raises EInferError for another architecture, a tensor of another type
     // or shape, a scale that is not finite, or a tensor not understood
@@ -779,11 +779,11 @@ begin
     EInferError.RaiseUtf8('%: % is shaped %, expected %',
       [self, aName, InferShapeText(t^.Shape), InferShapeText(want)]);
   end;
-  // F32 and BF16 from safetensors; a GGUF file adds F16, and Q8_0 and Q4_0
+  // F32 and BF16 from safetensors; a GGUF file adds F16, and the block types
   // for a matrix (aBlocks)
   if not ((t^.DType in [idtF32, idtBF16]) or
           ((fGguf <> nil) and ((t^.DType = idtF16) or
-           (aBlocks and (t^.DType in [idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]))))) then
+           (aBlocks and (t^.DType in INFER_BLOCK_DTYPES))))) then
     EInferError.RaiseUtf8('%: % is %, not supported here',
       [self, aName, INFER_DTYPE_NAME[t^.DType]]);
   result := t;
@@ -846,7 +846,7 @@ begin
           PCardinalArray(aDest)^[i] := InferHalfToSingleBits(src^[i]);
       end;
   else
-    InferRowToF32(t^.Data, t^.DType, aRow, aCols, aDest); // F32, Q8_0, Q4_0
+    InferRowToF32(t^.Data, t^.DType, aRow, aCols, aDest); // F32 and the block types
   end;
 end;
 
@@ -857,7 +857,7 @@ var
   p: PByteArray;
 begin
   size := INFER_DTYPE_SIZE[t^.DType];
-  // where the half-float scales sit: d first (Q8_0, Q4_0), d and dmin first
+  // where the half-float scales sit: d first (Q8_0, Q4_0, Q5_0), d and dmin first
   // (Q4_K), d last (Q6_K)
   first := 0;
   second := -1;
@@ -898,7 +898,7 @@ begin
   if not InferShapeIs(t^, [aExperts, aRows, aCols]) then
     EInferError.RaiseUtf8('%: % is shaped %, expected [%,%,%]',
       [self, aGgufName, InferShapeText(t^.Shape), aExperts, aRows, aCols]);
-  if not (t^.DType in [idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K]) then
+  if not (t^.DType in INFER_BLOCK_DTYPES) then
     EInferError.RaiseUtf8('%: % is %, not supported for experts here',
       [self, aGgufName, INFER_DTYPE_NAME[t^.DType]]);
   if not fBackend.Supports(ioLinear, t^.DType) then
@@ -926,7 +926,7 @@ begin
     // a GGUF file decides: blocks in place, F32 in place, F16 / BF16 widened
     t := Checked(aName, [aRows, aCols], true);
     case t^.DType of
-      idtQ8_0, idtQ4_0, idtQ4_K, idtQ6_K:
+      idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K:
         begin
           CheckScales(t, aName, self);
           result := InferWeight(t^.Data, t^.DType);
