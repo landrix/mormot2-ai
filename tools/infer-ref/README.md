@@ -1,136 +1,136 @@
-# infer-ref — Referenzdaten für die native Inferenz
+# infer-ref — reference data for the native inference
 
-`make_reference.py` erzeugt die Referenzdaten, gegen die die native Engine
-([docs/native-inference.md](../../docs/native-inference.md)) geprüft wird. Das Werkzeug
-läuft nur bei der Bereitstellung, nie zur Laufzeit und nie im Test. Die Tests lesen die
-eingecheckten Ergebnisse unter [tests/data/infer-ref/](../../tests/data/infer-ref/).
+`make_reference.py` generates the reference data the native engine
+([docs/native-inference.md](../../docs/native-inference.md)) is checked against. The tool
+runs only during provisioning, never at run time and never in a test. The tests read the
+checked-in results under [tests/data/infer-ref/](../../tests/data/infer-ref/).
 
-## Referenzumgebung
+## Reference environment
 
-Verbindlich ist **CPU auf WSL aarch64**: Python 3.12.13, torch 2.14.1+cpu,
-transformers 5.19.0. Die vollständige Paketauflösung steht in
-[requirements.txt](requirements.txt). Die Umgebung liegt außerhalb des Repos:
+The authoritative reference is **CPU on WSL aarch64**: Python 3.12.13, torch 2.14.1+cpu,
+transformers 5.19.0. The full package resolution is in
+[requirements.txt](requirements.txt). The environment lives outside the repo:
 
 ```bash
 uv venv -p 3.12 ~/.venvs/lai-infer-ref
 VIRTUAL_ENV=~/.venvs/lai-infer-ref uv pip install \
   --index-url https://download.pytorch.org/whl/cpu torch==2.14.1+cpu
 VIRTUAL_ENV=~/.venvs/lai-infer-ref uv pip install -r tools/infer-ref/requirements.txt
-~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py            # alles
-~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py ops tiny   # ohne Modell
-~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py tokens     # nur Tokenizer
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py            # everything
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py ops tiny   # without model
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py tokens     # tokenizer only
 ```
 
-Ziele: `ops`, `tiny`, `bge-m3` (Modell, Fälle, Korpusvektoren), `tokens` (Tokenizer-Gate),
-dazu für Phase 1b `q8`, `tiny-gguf` und `lembed-tokens`, für Phase 3e `q4` (Q4_0 aus
-ggml selbst: `quantize_row_q4_0_ref`, `dequantize_row_q4_0`, `ggml_vec_dot_q4_0_q8_0`)
-und für Backlog B16 `q5` (Q5_0: `quantize_row_q5_0_ref`, `dequantize_row_q5_0`,
+Targets: `ops`, `tiny`, `bge-m3` (model, cases, corpus vectors), `tokens` (tokenizer gate),
+plus for phase 1b `q8`, `tiny-gguf` and `lembed-tokens`, for phase 3e `q4` (Q4_0 from
+ggml itself: `quantize_row_q4_0_ref`, `dequantize_row_q4_0`, `ggml_vec_dot_q4_0_q8_0`)
+and for backlog B16 `q5` (Q5_0: `quantize_row_q5_0_ref`, `dequantize_row_q5_0`,
 `ggml_vec_dot_q5_0_q8_0`).
-Mit `bge-m3` oder `tokens` lädt das Skript BAAI/bge-m3 in der festen Revision
-`5617a9f61b028005a4858fdac845db406aefb181` (rund 2,3 GB in den Hugging-Face-Cache).
+With `bge-m3` or `tokens` the script loads BAAI/bge-m3 in the fixed revision
+`5617a9f61b028005a4858fdac845db406aefb181` (about 2.3 GB into the Hugging Face cache).
 
-Die Ziele der Phase 1b rechnen mit **ggml selbst**, nicht mit einer Nachbildung: Sie laden
-`libggml-base.so` und `libggml-cpu.so` aus `vendor/sqlite-ext/aarch64-linux/` (der Build
-des lembed-Orakels, mit `LAI_GGML_DIR` umlenkbar) und rufen deren exportierte Funktionen
-auf (`quantize_row_q8_0`, `ggml_vec_dot_q8_0_q8_0`, `quantize_row_q8_0_ref`,
-`dequantize_row_q8_0`, `ggml_fp32_to_fp16`). Die SHA-256 der Bibliotheken stehen in den
-Manifesten. `lembed-tokens` lädt zusätzlich `lembed0.so` in Pythons `sqlite3` und das
-GGUF `vendor/models/bge-m3-q8_0.gguf` (mit `LAI_GGUF` umlenkbar); das Skript bricht ab,
-wenn dessen SHA-256 nicht die des Referenzvertrags v1 ist. Aufruf:
+The phase 1b targets compute with **ggml itself**, not with a reimplementation: they load
+`libggml-base.so` and `libggml-cpu.so` from `vendor/sqlite-ext/aarch64-linux/` (the build
+of the lembed oracle, redirectable with `LAI_GGML_DIR`) and call their exported functions
+(`quantize_row_q8_0`, `ggml_vec_dot_q8_0_q8_0`, `quantize_row_q8_0_ref`,
+`dequantize_row_q8_0`, `ggml_fp32_to_fp16`). The SHA-256 hashes of the libraries are in the
+manifests. `lembed-tokens` also loads `lembed0.so` into Python's `sqlite3` and the
+GGUF `vendor/models/bge-m3-q8_0.gguf` (redirectable with `LAI_GGUF`); the script aborts
+if its SHA-256 is not the one of reference contract v1. Invocation:
 
 ```bash
 LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 q4 tiny-gguf lembed-tokens
 ```
 
-## Sliding Window und NoPE (Phase D, D4)
+## Sliding window and NoPE (phase D, D4)
 
-`make_reference_d4.py` nutzt dieselbe Umgebung und die Helfer von `make_reference_qwen3.py`
-und lädt kein Modell: es erzeugt `tiny-smollm3` (jede Kombination aus Fenster und RoPE) und
-`tiny-qwen3-sliding` (Fenster aus `max_window_layers`). Greedy läuft ohne EOS über
-24 Tokens, mit dem Cache von transformers und ohne Cache gleich; dazu prüft es, dass die
-Logits ohne Fenster abweichen (die Referenz misst wirklich ein Fenster).
+`make_reference_d4.py` uses the same environment and the helpers of `make_reference_qwen3.py`
+and loads no model: it generates `tiny-smollm3` (every combination of window and RoPE) and
+`tiny-qwen3-sliding` (windows from `max_window_layers`). Greedy runs without EOS over
+24 tokens, equal with the transformers cache and without a cache; it also checks that the
+logits differ without a window (the reference really measures a window).
 
 ```bash
-~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d4.py          # beide
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d4.py          # both
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d4.py tiny-smollm3
 ```
 
-## Decoder-Stapel (Backlog B14)
+## Decoder stacks (backlog B14)
 
-`make_reference_b14.py` braucht nur Python: es legt `tiny-qwen3/stack/` an - die Gewichte von
-`tiny-qwen3` unter dem Präfix `outer.model.`, einen eigenen Kopf, einen fremden Tensor, einen
-kaputten Stapel mit einem Tensor zu viel und in `config.json` die Einstellungen als Objekte
-(mit der multimodalen RoPE eines Talkers, einer fehlerhaften und einer skalierten). Gerechnet
-wird nichts: `CreateStack` muss die Bits von `tiny-qwen3` geben.
+`make_reference_b14.py` needs only Python: it creates `tiny-qwen3/stack/` - the weights of
+`tiny-qwen3` under the prefix `outer.model.`, its own head, a foreign tensor, a
+broken stack with one tensor too many and in `config.json` the settings as objects
+(with the multimodal RoPE of a talker, a faulty one and a scaled one). Nothing is
+computed: `CreateStack` must give the bits of `tiny-qwen3`.
 
 ```bash
 python tools/infer-ref/make_reference_b14.py
 ```
 
-## Qwen2.5 (Phase D, D1b)
+## Qwen2.5 (phase D, D1b)
 
-`make_reference_qwen2.py` nutzt dieselbe Umgebung und die Helfer von
-`make_reference_qwen3.py`. Es lädt Qwen/Qwen2.5-0.5B-Instruct in der Revision
-`7ae557604adf67be50417f59c2c2f167def9a775` nach `vendor/models/qwen2.5-0.5b-instruct/` (mit
-`LAI_QWEN25_DIR` umlenkbar) und aus Qwen/Qwen2.5-0.5B-Instruct-GGUF (Revision
-`9217f5db79a29953eb74d5343926648285ec7e67`) die Dateien `q8_0` und `q4_k_m` nach
+`make_reference_qwen2.py` uses the same environment and the helpers of
+`make_reference_qwen3.py`. It loads Qwen/Qwen2.5-0.5B-Instruct in the revision
+`7ae557604adf67be50417f59c2c2f167def9a775` into `vendor/models/qwen2.5-0.5b-instruct/`
+(redirectable with `LAI_QWEN25_DIR`) and from Qwen/Qwen2.5-0.5B-Instruct-GGUF (revision
+`9217f5db79a29953eb74d5343926648285ec7e67`) the files `q8_0` and `q4_k_m` into
 `vendor/models/`.
 
 ```bash
-~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen2.py          # alles
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen2.py          # everything
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen2.py tiny-qwen2
 ```
 
-Ziele: `tiny-qwen2` (mit `gguf/`), `qwen25-chat`, `qwen25`. Greedy mit `repetition_penalty`
-1: die `generation_config.json` des Modells verlangt 1,1, und `generate` wendet sie auch ohne
-Sampling an - die Referenz soll das reine Argmax sein.
+Targets: `tiny-qwen2` (with `gguf/`), `qwen25-chat`, `qwen25`. Greedy with `repetition_penalty`
+1: the model's `generation_config.json` asks for 1.1, and `generate` applies it even without
+sampling - the reference is meant to be the pure argmax.
 
-## Qwen3 (Phase 2)
+## Qwen3 (phase 2)
 
-`make_reference_qwen3.py` nutzt dieselbe Umgebung und schreibt die Qwen3-Datensätze. Es
-lädt Qwen/Qwen3-0.6B in der Revision `c1899de289a04d12100db370d81485cdf75e47ca` (rund
-1,5 GB) und kopiert die Dateien nach `vendor/models/qwen3-0.6b/` (gitignored, mit
-`LAI_QWEN3_DIR` umlenkbar).
+`make_reference_qwen3.py` uses the same environment and writes the Qwen3 datasets. It
+loads Qwen/Qwen3-0.6B in the revision `c1899de289a04d12100db370d81485cdf75e47ca` (about
+1.5 GB) and copies the files to `vendor/models/qwen3-0.6b/` (gitignored, redirectable with
+`LAI_QWEN3_DIR`).
 
 ```bash
-~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen3.py          # alles
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen3.py          # everything
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen3.py qwen3-unicode
 ```
 
-Ziele:
-- `qwen3-unicode` schreibt `src/infer/mormot.ai.infer.unicode.inc`. Es misst jede
-  Codepoint-Klasse am Pre-Tokenizer von tokenizer.json und baut die NFC-Tabellen so,
-  dass eine Nachbildung des Pascal-Algorithmus den HF-Normalisierer für jeden Codepoint,
-  jedes Paar und Starter mal Zeichen trifft. Der HF-Normalisierer beruht auf älteren
-  Unicode-Daten als Python, deshalb ist er der Vertrag und nicht `unicodedata`.
-- `qwen3-tokens` und `qwen3-chat` sind die Gates von 2a.
-- `tiny-qwen3moe` gehört zu Phase D (D2, MoE).
-- `tiny-qwen3` und `qwen3` gehören zu 2b und 2c. Das echte Modell braucht rund 6 GB RAM
-  und läuft auf einem Thread einige Minuten.
+Targets:
+- `qwen3-unicode` writes `src/infer/mormot.ai.infer.unicode.inc`. It measures every
+  code point class against the pre-tokenizer of tokenizer.json and builds the NFC tables so
+  that a reimplementation of the Pascal algorithm matches the HF normalizer for every code
+  point, every pair and starter times character. The HF normalizer is based on older
+  Unicode data than Python, so it is the contract and not `unicodedata`.
+- `qwen3-tokens` and `qwen3-chat` are the gates of 2a.
+- `tiny-qwen3moe` belongs to phase D (D2, MoE).
+- `tiny-qwen3` and `qwen3` belong to 2b and 2c. The real model needs about 6 GB RAM
+  and runs for several minutes on one thread.
 
-## Was das Skript festlegt
+## What the script pins down
 
-- **FP32, eval(), ein Thread, deterministische Algorithmen, Attention „eager".** Jeder
-  Fall läuft zweimal und muss bitgleich herauskommen. Zwei Läufe des Skripts schreiben
-  bytegleiche Blobs und ein bytegleiches `model.safetensors`; nur der Zeitstempel in den
-  Manifesten ändert sich.
-- **Pooling aus der Revision selbst:** `1_Pooling/config.json` muss nur CLS verlangen und
-  `modules.json` ein `Normalize` enthalten, sonst bricht das Skript ab.
-- **Gewichte als safetensors.** Die Revision enthält nur `pytorch_model.bin` (Pickle). Das
-  Skript lädt es mit `weights_only=True` und schreibt ein F32-`model.safetensors` nach
-  `vendor/models/bge-m3/` (gitignored, mit `LAI_MODEL_DIR` umlenkbar), zusammen mit
-  Tokenizer und Konfiguration. Danach lädt es die Datei erneut und vergleicht Tensor für
-  Tensor. Außerdem muss der Forward aus beiden Quellen bitgleich sein. Fehlende Gewichte
-  brechen ab; ungenutzt bleibt nur der Pooler (`pooler.dense.*`), weil BGE-M3 dense den
-  CLS-Zustand nimmt, nicht `pooler_output`.
-- **Token-IDs aus SentencePiece**, nicht aus dem HF-Tokenizer. SentencePiece erkennt seine
-  Steuersymbole (`<s>`, `</s>`, `<pad>`) nie im Text. Das ist `parse_special=false`, und
-  so muss der native Tokenizer arbeiten. Der HF-Tokenizer erkennt `<s>` dagegen auch mit
-  `split_special_tokens` oder `encode_special_tokens`, weil `<s>` ein Eintrag seines
-  Unigram-Vokabulars ist (gemessen, siehe `tokenizer_checks` im Manifest). Für jeden Text
-  ohne solches Literal prüft das Skript, dass beide dieselben IDs liefern. Abbildung auf
-  XLM-R: SentencePiece-ID + 1, außer `<unk>` 0→3, `<s>` 1→0, `</s>` 2→2.
+- **FP32, eval(), one thread, deterministic algorithms, attention "eager".** Every
+  case runs twice and must come out bit-identical. Two runs of the script write
+  byte-identical blobs and a byte-identical `model.safetensors`; only the timestamp in the
+  manifests changes.
+- **Pooling from the revision itself:** `1_Pooling/config.json` must ask for CLS only and
+  `modules.json` must contain a `Normalize`, otherwise the script aborts.
+- **Weights as safetensors.** The revision contains only `pytorch_model.bin` (pickle). The
+  script loads it with `weights_only=True` and writes an F32 `model.safetensors` to
+  `vendor/models/bge-m3/` (gitignored, redirectable with `LAI_MODEL_DIR`), together with
+  tokenizer and configuration. Then it loads the file again and compares tensor by
+  tensor. The forward pass from both sources must also be bit-identical. Missing weights
+  abort; only the pooler (`pooler.dense.*`) stays unused, because BGE-M3 dense takes the
+  CLS state, not `pooler_output`.
+- **Token IDs from SentencePiece**, not from the HF tokenizer. SentencePiece never recognizes
+  its control symbols (`<s>`, `</s>`, `<pad>`) in the text. That is `parse_special=false`, and
+  this is how the native tokenizer must work. The HF tokenizer, in contrast, recognizes `<s>`
+  even with `split_special_tokens` or `encode_special_tokens`, because `<s>` is an entry of its
+  Unigram vocabulary (measured, see `tokenizer_checks` in the manifest). For every text
+  without such a literal the script checks that both give the same IDs. Mapping to
+  XLM-R: SentencePiece ID + 1, except `<unk>` 0→3, `<s>` 1→0, `</s>` 2→2.
 
-Neu erzeugen nur, wenn sich Modell, Umgebung oder Fälle ändern. Dann alle Datensätze
-gemeinsam neu schreiben, `requirements.txt` und [UPSTREAM_BASE](../../UPSTREAM_BASE)
-nachziehen und im Commit nennen, was sich geändert hat.
+Regenerate only when the model, the environment or the cases change. Then rewrite all
+datasets together, update `requirements.txt` and [UPSTREAM_BASE](../../UPSTREAM_BASE)
+and state in the commit what changed.
