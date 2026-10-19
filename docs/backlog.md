@@ -242,6 +242,30 @@ Für CUDA und Vulkan gleich; die Gegenprobe muss zeigen, dass ein falsches Routi
 (z. B. Router-Logits der falschen Zeile) in Prüfung 2 scheitert, obwohl Prüfung 1 es nicht
 sehen kann.
 
+**D3c — Expertenwahl auf dem Gerät (aufgenommen 2026-10-19).** Anlass: Decode von
+Qwen3-30B-A3B bleibt auf der RTX 5090 bei 41 (CUDA) und 43 bis 44 Tokens/s (Vulkan), weil der
+Host in jedem MoE-Layer die Router-Logits abholt, die Experten wählt und Listen hochlädt
+(CUDA drei Wartepunkte je Layer, Vulkan einer) und für jeden Experten mit Tokens sechs
+Kernel startet - die Rechenleistung ist nicht der Engpass.
+*Bau:*
+1. Route-Kernel/-Shader: Softmax in double-genauer Reihenfolge wie `TDecoderModel.Route`
+   (oder float mit begründeter Toleranz), die k höchsten Logits, bei Gleichstand die niedrigere
+   Id, Normierung nach `NormTopK` - Ids und Gewichte in Gerätepuffer.
+2. Die Token-Zeilen je Experte auf dem Gerät (Zählen, Präfixsumme, Einsortieren in
+   Id-Reihenfolge): dieselbe Reihenfolge wie heute, damit Summen gleich bleiben.
+3. Decode (eine Zeile): ein Matvec-Aufruf über die k gewählten Experten, die Experten-Ids aus
+   dem Gerätepuffer (Gewichte eines Layers ein Puffer, Versatz je Id) statt einer Schleife
+   über alle Experten; Prefill weiter gruppiert je Experte, die Gruppen ohne Host-Wissen
+   (Dispatch über die Höchstzahl, leere Gruppen tun nichts, oder indirekter Dispatch).
+4. CUDA: Decode wieder als CUDA-Graph (`UseGraphs`); Vulkan: ein Token wieder ein Batch ohne
+   Zwischen-Submit.
+*Gate:* die heutigen Tests unverändert grün (`TinyMoeMatchesCpu`, `Qwen3MoeGgufMatchesCpu`);
+das Routing-Band vergleicht dann die Wahl des Geräts direkt mit der CPU (`TDecoderRouteTape`
+braucht dafür eine Rückmeldung der Wahl aus dem Gerätepuffer, oder ein Test liest die Ids
+zurück); Gegenproben (falscher Tie-Break, Gewicht nicht normiert, Gruppe eines Experten
+leer, Graph mit veralteten Ids). Decode vorher und nachher auf RTX 5090 (CUDA, Vulkan) und M2
+Pro (Tiny) - übernommen nur, wenn messbar schneller.
+
 **D1b — Qwen2.5 als Familie (aufgenommen 2026-10-19).** Anlass: neural-api zeigt einen Chat mit
 Qwen2.5-0.5B-Instruct in wenigen Zeilen (nur die Funktion als Anregung, kein Code - LGPL, keine
 Vorlage). Qwen2 ist Qwen3 ohne `q_norm`/`k_norm` je Kopf, dafür mit Bias auf Q, K und V (O ohne
