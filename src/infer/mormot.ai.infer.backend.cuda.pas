@@ -86,15 +86,20 @@ type
     /// the device copy of a weight (uploaded on first use) - GpuLock held
     function DeviceWeight(aData: pointer; aType: TInferDType;
       aBytes: Int64): TInferCuBuffer;
-    /// enqueue y = x * w^T (no bias), the weights from the cache - GpuLock
+    /// enqueue y = x * w^T (+ aBias), the weights from the cache - GpuLock
     // held; x and y are [aRows, aIn] and [aRows, aOut] at offset 0; no wait
+    // - aBias ([aOut] floats) from the cache too: upload it beforehand
+    // (DeviceWeight) when the call is captured into a graph
     procedure EnqueueLinear(x: TInferCuBuffer; aRows, aIn: PtrInt;
-      const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer);
+      const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer;
+      aBias: PSingleArray = nil);
     /// the same with weights of aType already on the device at aWeight - e.g.
     // one expert inside the buffer of all experts of a layer (DeviceWeight of
-    // the whole tensor, then an offset); aRows up to 65535
+    // the whole tensor, then an offset); aRows up to 65535; aBias: a device
+    // address of [aOut] floats, or 0
     procedure EnqueueLinearAt(x: TInferCuBuffer; aRows, aIn: PtrInt;
-      aType: TInferDType; aWeight: TCuDevicePtr; aOut: PtrInt; y: TInferCuBuffer);
+      aType: TInferDType; aWeight: TCuDevicePtr; aOut: PtrInt; y: TInferCuBuffer;
+      aBias: TCuDevicePtr = 0);
     /// the device context
     property Cuda: TInferCuda read fCu;
     /// how many Linear calls ran on the device
@@ -216,18 +221,24 @@ begin
 end;
 
 procedure TInferCudaBackend.EnqueueLinear(x: TInferCuBuffer; aRows, aIn: PtrInt;
-  const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer);
+  const w: TInferWeight; aOut: PtrInt; y: TInferCuBuffer; aBias: PSingleArray);
+var
+  pb: TCuDevicePtr;
 begin
   if not GpuLinear(w.DType, aIn) or (aOut < 1) or (Int64(aOut) > high(integer)) or
      (Int64(aIn) > high(integer)) then
     raise EInferCuda.CreateUtf8('%.EnqueueLinear: % rows of % % into %',
       [self, aRows, aIn, INFER_DTYPE_NAME[w.DType], aOut]);
+  pb := 0;
+  if aBias <> nil then
+    pb := Weight(aBias, idtF32, Int64(aOut) * 4).Ptr;
   EnqueueLinearAt(x, aRows, aIn, w.DType, Weight(w.Data, w.DType, Int64(aOut) *
-    (aIn div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType]).Ptr, aOut, y);
+    (aIn div INFER_DTYPE_BLOCK[w.DType]) * INFER_DTYPE_SIZE[w.DType]).Ptr, aOut, y, pb);
 end;
 
 procedure TInferCudaBackend.EnqueueLinearAt(x: TInferCuBuffer; aRows, aIn: PtrInt;
-  aType: TInferDType; aWeight: TCuDevicePtr; aOut: PtrInt; y: TInferCuBuffer);
+  aType: TInferDType; aWeight: TCuDevicePtr; aOut: PtrInt; y: TInferCuBuffer;
+  aBias: TCuDevicePtr);
 var
   pw, px, pb, py: TCuDevicePtr;
   rows, nin, nout, dtype, hasBias, gx, gy, block: cardinal;
@@ -240,13 +251,13 @@ begin
       [self, aRows, aIn, INFER_DTYPE_NAME[aType], aOut]);
   pw := aWeight;
   px := x.Ptr;
-  pb := 0;
+  pb := aBias; // never read without a bias
   py := y.Ptr;
   rows := aRows;
   nin := aIn;
   nout := aOut;
   dtype := LINEAR_DTYPE[aType];
-  hasBias := 0;
+  hasBias := ord(aBias <> 0);
   LinearShape(aType, aIn, aRows, aOut, kernel, gx, gy, block);
   fCu.Enqueue(kernel, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
     @hasBias], gx, block, gy);

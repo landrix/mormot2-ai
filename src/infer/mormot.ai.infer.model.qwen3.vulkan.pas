@@ -219,6 +219,7 @@ type
   TQkRopePush = record
     Rows, Heads, KvHeads, HeadDim, Past: cardinal;
     Eps: single;
+    Norm: cardinal; // 1: RMSNorm of every Q and K head (QNorm, KNorm)
   end;
 
   /// gatherrows.comp and scatteradd.comp
@@ -583,8 +584,17 @@ begin
     end;
     Vector(ly^.InputNorm, c.Hidden);
     Vector(ly^.PostNorm, c.Hidden);
-    Vector(ly^.QNorm, c.HeadDim);
-    Vector(ly^.KNorm, c.HeadDim);
+    if ly^.QNorm <> nil then
+    begin
+      Vector(ly^.QNorm, c.HeadDim);
+      Vector(ly^.KNorm, c.HeadDim);
+    end;
+    if ly^.QBias <> nil then
+    begin
+      Vector(ly^.QBias, qw);
+      Vector(ly^.KBias, kvw);
+      Vector(ly^.VBias, kvw);
+    end;
   end;
   Vector(fModel.FinalNorm, c.Hidden);
   // the head: 165 MB in Qwen3-0.6B Q8_0, more than some GPUs bind at once
@@ -864,6 +874,7 @@ var
   n, h, f, qw, kvw, half, past, l, outRows, splits, most, hb, rb, blocks,
     queries: PtrInt;
   attention, qkrope: TInferVkPipeline;
+  qn, kn: TInferVkBuffer;
   ly: ^TQwen3Layer;
   p: PSingleArray;
   qk: TQkRopePush;
@@ -977,12 +988,28 @@ begin
       // attention block: the three projections side by side (no barrier
       // between them: they only read fDevH), then per head the norms, rotary
       // positions and the store of k and v into the cache
-      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, false);
-      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, false);
-      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV);
-      fVk.BatchDispatch(qkrope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV,
-        Vector(ly^.QNorm, c.HeadDim), Vector(ly^.KNorm, c.HeadDim), aCtx.fDevCos,
-        aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk, c.Heads + c.KvHeads, n);
+      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, false, nil,
+        ly^.QBias);
+      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, false, nil,
+        ly^.KBias);
+      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, true, nil,
+        ly^.VBias);
+      // without head norms (Qwen2) the shader reads no qn or kn: bound to
+      // the rotary factors, any buffer would do
+      qk.Norm := ord(ly^.QNorm <> nil);
+      if ly^.QNorm <> nil then
+      begin
+        qn := Vector(ly^.QNorm, c.HeadDim);
+        kn := Vector(ly^.KNorm, c.HeadDim);
+      end
+      else
+      begin
+        qn := aCtx.fDevCos;
+        kn := aCtx.fDevCos;
+      end;
+      fVk.BatchDispatch(qkrope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV, qn, kn,
+        aCtx.fDevCos, aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk,
+        c.Heads + c.KvHeads, n);
       fVk.BatchDispatch(attention, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
         aCtx.fDevAttn, part], @att, c.Heads div hb, blocks, splits);
       if splits > 1 then

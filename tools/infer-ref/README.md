@@ -40,6 +40,24 @@ wenn dessen SHA-256 nicht die des Referenzvertrags v1 ist. Aufruf:
 LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 q4 tiny-gguf lembed-tokens
 ```
 
+## Qwen2.5 (Phase D, D1b)
+
+`make_reference_qwen2.py` nutzt dieselbe Umgebung und die Helfer von
+`make_reference_qwen3.py`. Es lädt Qwen/Qwen2.5-0.5B-Instruct in der Revision
+`7ae557604adf67be50417f59c2c2f167def9a775` nach `vendor/models/qwen2.5-0.5b-instruct/` (mit
+`LAI_QWEN25_DIR` umlenkbar) und aus Qwen/Qwen2.5-0.5B-Instruct-GGUF (Revision
+`9217f5db79a29953eb74d5343926648285ec7e67`) die Dateien `q8_0` und `q4_k_m` nach
+`vendor/models/`.
+
+```bash
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen2.py          # alles
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_qwen2.py tiny-qwen2
+```
+
+Ziele: `tiny-qwen2` (mit `gguf/`), `qwen25-chat`, `qwen25`. Greedy mit `repetition_penalty`
+1: die `generation_config.json` des Modells verlangt 1,1, und `generate` wendet sie auch ohne
+Sampling an - die Referenz soll das reine Argmax sein.
+
 ## Qwen3 (Phase 2)
 
 `make_reference_qwen3.py` nutzt dieselbe Umgebung und schreibt die Qwen3-Datensätze. Es

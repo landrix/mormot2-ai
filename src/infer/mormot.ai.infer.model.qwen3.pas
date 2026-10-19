@@ -17,6 +17,10 @@
 // - or a llama.cpp GGUF file of the qwen3 architecture (CreateFromGguf): its
 //   metadata for the settings, its Q8_0 / Q4_0 / Q4_K / Q6_K matrices used in
 //   place
+// - TQwen2Model: Qwen2 and Qwen2.5 (model_type and GGUF architecture qwen2,
+//   looked up in modeling_qwen2.py): the same decoder with a bias on the Q, K
+//   and V projections and no RMSNorm per head; config.json has no head_dim
+//   (hidden_size / num_attention_heads), nor has the GGUF attention.key_length
 // - TQwen3MoeModel: Qwen3-MoE (model_type qwen3_moe, GGUF architecture
 //   qwen3moe, e.g. Qwen3-30B-A3B) - the same attention, a mixture of experts
 //   as feed-forward block (looked up in modeling_qwen3_moe.py: a softmax router,
@@ -29,6 +33,7 @@ unit mormot.ai.infer.model.qwen3;
 
     - TQwen3Model: the qwen3 family of TDecoderModel
     - TQwen3MoeModel: Qwen3-MoE, the experts as feed-forward block
+    - TQwen2Model: Qwen2 / Qwen2.5, a bias on Q, K and V instead of the head norms
     - TQwen3Config, TQwen3Context, TQwen3Device...: the decoder types under
       their former names
 
@@ -82,10 +87,28 @@ type
     // 'model.layers.N.'); returns how many tensors they took - here the dense
     // gate, up and down
     function LoadFfn(aLayer: PtrInt; const aPrefix: RawUtf8): PtrInt; virtual;
+    /// true: an RMSNorm of every Q and K head and no bias (Qwen3); false: a
+    // bias on Q, K and V and no head norm, head_dim from hidden / heads when
+    // the settings do not name it (Qwen2)
+    class function HeadNorm: boolean; virtual;
   public
     /// 'qwen3'
     class function ModelType: RawUtf8; override;
     /// 'qwen3'
+    class function Architecture: RawUtf8; override;
+  end;
+
+  /// a Qwen2 or Qwen2.5 causal language model (e.g. Qwen2.5-0.5B-Instruct)
+  // - config.json (model_type qwen2) or GGUF (architecture qwen2); the Q, K and
+  // V projections with a bias (q_proj.bias ... / attn_q.bias ...), no q_norm
+  // or k_norm; a sliding window (use_sliding_window) is refused
+  TQwen2Model = class(TQwen3Model)
+  protected
+    class function HeadNorm: boolean; override;
+  public
+    /// 'qwen2'
+    class function ModelType: RawUtf8; override;
+    /// 'qwen2'
     class function Architecture: RawUtf8; override;
   end;
 
@@ -128,11 +151,25 @@ begin
   result := 'qwen3';
 end;
 
+class function TQwen3Model.HeadNorm: boolean;
+begin
+  result := true;
+end;
+
 const
-  REQUIRED_KEYS: array[0..9] of RawUtf8 = (
+  REQUIRED_KEYS: array[0..8] of RawUtf8 = (
     'vocab_size', 'hidden_size', 'num_hidden_layers', 'num_attention_heads',
-    'num_key_value_heads', 'head_dim', 'intermediate_size',
-    'max_position_embeddings', 'rms_norm_eps', 'hidden_act');
+    'num_key_value_heads', 'intermediate_size', 'max_position_embeddings',
+    'rms_norm_eps', 'hidden_act');
+
+/// hidden / heads, for a family whose settings do not name the head size -
+// raises unless it divides
+function HeadDimOf(aSelf: TObject; aHidden, aHeads: PtrInt): PtrInt;
+begin
+  if (aHeads <= 0) or (aHidden <= 0) or (aHidden mod aHeads <> 0) then
+    EInferError.RaiseUtf8('%: a hidden size of % for % heads', [aSelf, aHidden, aHeads]);
+  result := aHidden div aHeads;
+end;
 
 procedure TQwen3Model.LoadConfig(const aConfigFile: TFileName);
 var
@@ -145,11 +182,13 @@ begin
   if doc.U['model_type'] <> ModelType then
     EInferError.RaiseUtf8('%: model_type "%" is not %',
       [self, doc.U['model_type'], ModelType]);
-  // a missing key would read as 0: refused, also head_dim (no hidden / heads
-  // fallback - that is exactly the value Qwen3 does not have)
+  // a missing key would read as 0: refused, also head_dim for Qwen3 (no
+  // hidden / heads fallback - that is exactly the value Qwen3 does not have)
   for i := 0 to high(REQUIRED_KEYS) do
     if doc.GetValueIndex(REQUIRED_KEYS[i]) < 0 then
       EInferError.RaiseUtf8('%: % has no "%"', [self, aConfigFile, REQUIRED_KEYS[i]]);
+  if HeadNorm and (doc.GetValueIndex('head_dim') < 0) then
+    EInferError.RaiseUtf8('%: % has no "head_dim"', [self, aConfigFile]);
   if doc.U['hidden_act'] <> 'silu' then
     EInferError.RaiseUtf8('%: hidden_act "%" not supported', [self, doc.U['hidden_act']]);
   if doc.B['attention_bias'] then
@@ -178,7 +217,10 @@ begin
   fConfig.Layers := doc.I['num_hidden_layers'];
   fConfig.Heads := doc.I['num_attention_heads'];
   fConfig.KvHeads := doc.I['num_key_value_heads'];
-  fConfig.HeadDim := doc.I['head_dim'];
+  if doc.GetValueIndex('head_dim') >= 0 then
+    fConfig.HeadDim := doc.I['head_dim']
+  else
+    fConfig.HeadDim := HeadDimOf(self, fConfig.Hidden, fConfig.Heads);
   fConfig.Intermediate := doc.I['intermediate_size'];
   fConfig.MaxPositions := doc.I['max_position_embeddings'];
   fConfig.RmsEps := doc.D['rms_norm_eps'];
@@ -233,7 +275,11 @@ begin
   fConfig.Layers := GgufCount(a + 'block_count');
   fConfig.Heads := GgufCount(a + 'attention.head_count');
   fConfig.KvHeads := GgufCount(a + 'attention.head_count_kv');
-  fConfig.HeadDim := GgufCount(a + 'attention.key_length');
+  // qwen2 files name no key length: hidden / heads
+  if HeadNorm or fGguf.Has(a + 'attention.key_length') then
+    fConfig.HeadDim := GgufCount(a + 'attention.key_length')
+  else
+    fConfig.HeadDim := HeadDimOf(self, fConfig.Hidden, fConfig.Heads);
   // RoPE over a part of each head only would be another arithmetic
   if fGguf.Has(a + 'rope.dimension_count') and
      (GgufCount(a + 'rope.dimension_count') <> fConfig.HeadDim) then
@@ -254,7 +300,7 @@ end;
 
 const
   /// Hugging Face names and llama.cpp's for the tensors of one layer
-  LAYER_NAMES: array[0..11, 0..1] of RawUtf8 = (
+  LAYER_NAMES: array[0..14, 0..1] of RawUtf8 = (
     ('self_attn.q_proj.weight', 'attn_q.weight'),
     ('self_attn.k_proj.weight', 'attn_k.weight'),
     ('self_attn.v_proj.weight', 'attn_v.weight'),
@@ -266,7 +312,10 @@ const
     ('mlp.down_proj.weight', 'ffn_down.weight'),
     ('input_layernorm.weight', 'attn_norm.weight'),
     ('post_attention_layernorm.weight', 'ffn_norm.weight'),
-    ('mlp.gate.weight', 'ffn_gate_inp.weight')); // the router of Qwen3-MoE
+    ('mlp.gate.weight', 'ffn_gate_inp.weight'), // the router of Qwen3-MoE
+    ('self_attn.q_proj.bias', 'attn_q.bias'), // the biases of Qwen2
+    ('self_attn.k_proj.bias', 'attn_k.bias'),
+    ('self_attn.v_proj.bias', 'attn_v.bias'));
 
 function TQwen3Model.GgufName(const aName: RawUtf8): RawUtf8;
 var
@@ -356,11 +405,22 @@ begin
     l^.K := Matrix(p + 'self_attn.k_proj.weight', kvw, h, fWeights);
     l^.V := Matrix(p + 'self_attn.v_proj.weight', kvw, h, fWeights);
     l^.O := Matrix(p + 'self_attn.o_proj.weight', h, qw, fWeights);
-    l^.QNorm := Weight(p + 'self_attn.q_norm.weight', [fConfig.HeadDim]);
-    l^.KNorm := Weight(p + 'self_attn.k_norm.weight', [fConfig.HeadDim]);
+    if HeadNorm then
+    begin
+      l^.QNorm := Weight(p + 'self_attn.q_norm.weight', [fConfig.HeadDim]);
+      l^.KNorm := Weight(p + 'self_attn.k_norm.weight', [fConfig.HeadDim]);
+      inc(used, 2);
+    end
+    else
+    begin
+      l^.QBias := Weight(p + 'self_attn.q_proj.bias', [qw]);
+      l^.KBias := Weight(p + 'self_attn.k_proj.bias', [kvw]);
+      l^.VBias := Weight(p + 'self_attn.v_proj.bias', [kvw]);
+      inc(used, 3);
+    end;
     l^.InputNorm := Weight(p + 'input_layernorm.weight', [h]);
     l^.PostNorm := Weight(p + 'post_attention_layernorm.weight', [h]);
-    inc(used, 8 + LoadFfn(i, p));
+    inc(used, 6 + LoadFfn(i, p));
   end;
   // an unknown tensor means a model we do not understand
   if used <> TensorCount then
@@ -380,6 +440,24 @@ begin
   l^.Up := Matrix(aPrefix + 'mlp.up_proj.weight', f, h, fWeights);
   l^.Down := Matrix(aPrefix + 'mlp.down_proj.weight', h, f, fWeights);
   result := 3;
+end;
+
+
+{ TQwen2Model }
+
+class function TQwen2Model.ModelType: RawUtf8;
+begin
+  result := 'qwen2';
+end;
+
+class function TQwen2Model.Architecture: RawUtf8;
+begin
+  result := 'qwen2';
+end;
+
+class function TQwen2Model.HeadNorm: boolean;
+begin
+  result := false;
 end;
 
 
@@ -497,5 +575,6 @@ end;
 initialization
   RegisterDecoderModel(TQwen3Model);
   RegisterDecoderModel(TQwen3MoeModel);
+  RegisterDecoderModel(TQwen2Model);
 
 end.

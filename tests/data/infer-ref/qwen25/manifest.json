@@ -1,0 +1,1238 @@
+{
+ "dataset": "qwen25",
+ "note": "Qwen2.5-0.5B-Instruct in FP32 (BF16 weights upcast exactly), eager attention, one thread. Per prompt: ids (chat prompts through the chat template with the generation prompt), logits_last, greedy (up to 48 tokens or eos [151645, 151643], HF KV cache) with the top-2 margin per step. With states: embed, layerNN outputs, layer00_attn, layer00_mlp, norm",
+ "model": {
+  "id": "Qwen/Qwen2.5-0.5B-Instruct",
+  "revision": "7ae557604adf67be50417f59c2c2f167def9a775",
+  "files": {
+   "config.json": "18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45",
+   "generation_config.json": "e558847a8b4402616f1273797b015104dc266fe4b520056fca88823ba8f8ebe6",
+   "tokenizer.json": "c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539",
+   "tokenizer_config.json": "5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583",
+   "vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+   "merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+   "model.safetensors": "fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe",
+   "LICENSE": "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e"
+  },
+  "gguf": {
+   "id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+   "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+   "files": {
+    "qwen2.5-0.5b-instruct-q8_0.gguf": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "qwen2.5-0.5b-instruct-q4_k_m.gguf": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+   }
+  }
+ },
+ "environment": {
+  "created_utc": "2026-10-19T08:36:20Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "prompts": [
+  {
+   "id": "raw_fox",
+   "tokens": 4,
+   "text": "The quick brown fox",
+   "greedy": [
+    34208,
+    916,
+    264,
+    15678,
+    5562,
+    11,
+    323,
+    279,
+    5562,
+    374,
+    264,
+    943,
+    315,
+    9864,
+    13,
+    2160,
+    279,
+    2701,
+    5114,
+    830,
+    476,
+    895,
+    30,
+    576,
+    5562,
+    374,
+    264,
+    943,
+    315,
+    9864,
+    624,
+    1249,
+    8253,
+    3425,
+    279,
+    5114,
+    330,
+    785,
+    5562,
+    374,
+    264,
+    943,
+    315,
+    9864,
+    1,
+    374,
+    830,
+    476
+   ],
+   "greedy_text": " jumps over a lazy dog, and the dog is a type of animal. Is the following statement true or false? The dog is a type of animal.\nTo determine whether the statement \"The dog is a type of animal\" is true or",
+   "min_margin": 0.08969879150390625,
+   "no_cache_equal": true,
+   "states": true
+  },
+  {
+   "id": "chat_de",
+   "tokens": 43,
+   "text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWie verlege ich ein Kupferrohr in der Wand?<|im_end|>\n<|im_start|>assistant\n",
+   "greedy": [
+    40369,
+    15719,
+    43860,
+    88028,
+    31357,
+    73455,
+    17739,
+    5016,
+    98280,
+    17312,
+    6250,
+    273,
+    6996,
+    2185,
+    6538,
+    730,
+    454,
+    802,
+    299,
+    71,
+    1440,
+    304,
+    2694,
+    68929,
+    56500,
+    13,
+    8408,
+    6250,
+    273,
+    6996,
+    2185,
+    6538,
+    730,
+    454,
+    802,
+    299,
+    71,
+    1440,
+    304,
+    2694,
+    68929,
+    5999,
+    4368,
+    2341,
+    8345,
+    36807,
+    2030,
+    2799
+   ],
+   "greedy_text": "Ich kann Ihnen leider keine praktischen Schritte zur Verleihung von Kupferrohren in der Wand geben. Die Verleihung von Kupferrohren in der Wand ist ein spezielles und techn",
+   "min_margin": 0.013422012329101562,
+   "no_cache_equal": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie verlege ich ein Kupferrohr in der Wand?"
+    }
+   ],
+   "tools": [],
+   "states": true
+  },
+  {
+   "id": "chat_en",
+   "tokens": 41,
+   "text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France? Answer in one word.<|im_end|>\n<|im_start|>assistant\n",
+   "greedy": [
+    59604,
+    151645
+   ],
+   "greedy_text": "Paris<|im_end|>",
+   "min_margin": 1.3100299835205078,
+   "no_cache_equal": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France? Answer in one word."
+    }
+   ],
+   "tools": []
+  },
+  {
+   "id": "chat_system",
+   "tokens": 37,
+   "text": "<|im_start|>system\nDu bist ein hilfreicher Assistent f\u00fcr Handwerker.<|im_end|>\n<|im_start|>user\nNenne drei Werkzeuge zum Fliesenlegen.<|im_end|>\n<|im_start|>assistant\n",
+   "greedy": [
+    16,
+    13,
+    2988,
+    93840,
+    848,
+    811,
+    25,
+    51310,
+    31287,
+    1777,
+    89423,
+    2986,
+    4733,
+    11,
+    2746,
+    71935,
+    6395,
+    11722,
+    50656,
+    5999,
+    2030,
+    42046,
+    10712,
+    31287,
+    1777,
+    89423,
+    2986,
+    4733,
+    7180,
+    2988,
+    93840,
+    74191,
+    14821,
+    382,
+    17,
+    13,
+    2988,
+    93840,
+    848,
+    1194,
+    25,
+    51310,
+    38158,
+    59638,
+    20005,
+    89423,
+    2986,
+    4733
+   ],
+   "greedy_text": "1. Fliesenpanne: Eine einfache Werkzeuge, die leicht zu bearbeiten ist und oft als einfache Werkzeuge f\u00fcr Fliesen verwendet wird.\n\n2. Fliesenpanner: Eine zus\u00e4tzliche Werkzeuge",
+   "min_margin": 0.056748390197753906,
+   "no_cache_equal": true,
+   "messages": [
+    {
+     "role": "system",
+     "content": "Du bist ein hilfreicher Assistent f\u00fcr Handwerker."
+    },
+    {
+     "role": "user",
+     "content": "Nenne drei Werkzeuge zum Fliesenlegen."
+    }
+   ],
+   "tools": []
+  },
+  {
+   "id": "raw_code",
+   "tokens": 4,
+   "text": "def fibonacci(n):\n",
+   "greedy": [
+    262,
+    421,
+    308,
+    2651,
+    220,
+    16,
+    510,
+    286,
+    470,
+    308,
+    198,
+    262,
+    770,
+    510,
+    286,
+    470,
+    75698,
+    1445,
+    12,
+    16,
+    8,
+    488,
+    75698,
+    1445,
+    12,
+    17,
+    692,
+    750,
+    1887,
+    3932,
+    262,
+    308,
+    284,
+    526,
+    5384,
+    445,
+    6269,
+    279,
+    1372,
+    315,
+    3793,
+    25,
+    40964,
+    262,
+    1173,
+    955,
+    579,
+    39345
+   ],
+   "greedy_text": "    if n <= 1:\n        return n\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)\n\ndef main():\n    n = int(input(\"Enter the number of terms: \"))\n    print(fibonacci",
+   "min_margin": 0.037322998046875,
+   "no_cache_equal": true
+  },
+  {
+   "id": "chat_tool",
+   "tokens": 205,
+   "text": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Aktuelles Wetter f\u00fcr einen Ort\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Stadt, z. B. M\u00fcnchen\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWie ist das Wetter in Berlin?<|im_end|>\n<|im_start|>assistant\n",
+   "greedy": [
+    151657,
+    198,
+    4913,
+    606,
+    788,
+    330,
+    455,
+    69364,
+    497,
+    330,
+    16370,
+    788,
+    5212,
+    8926,
+    788,
+    330,
+    94409,
+    95642,
+    151658,
+    151645
+   ],
+   "greedy_text": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Berlin\"}}\n</tool_call><|im_end|>",
+   "min_margin": 0.17437171936035156,
+   "no_cache_equal": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ]
+  }
+ ],
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 8366056,
+  "sha256": "5409bcec2dd214d1cb5103186c534c6a2447b627cfecc7a1aa8cd72387d966bd",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "raw_fox.ids",
+   "dtype": "i32",
+   "shape": [
+    4
+   ],
+   "offset": 0,
+   "bytes": 16,
+   "sha256": "7d1721078963b41e93d7f927d860f4cd921340d6cdd6c317d2511d6c97eef6b2"
+  },
+  {
+   "name": "raw_fox.embed",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 16,
+   "bytes": 14336,
+   "sha256": "2bedf436680468a6eba8dfe8e6df4f4a699a0c05335a61618f1f526c53f1b958"
+  },
+  {
+   "name": "raw_fox.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 14352,
+   "bytes": 14336,
+   "sha256": "d33b01c7bbf4cc762c77fad17b6a9854adfcfca1b258860091a9ae1ea9460959"
+  },
+  {
+   "name": "raw_fox.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 28688,
+   "bytes": 14336,
+   "sha256": "82088a6e81aec5a4bbe4649336a49dd8999e9b40ae08e030ff614043ac9784b5"
+  },
+  {
+   "name": "raw_fox.layer00",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 43024,
+   "bytes": 14336,
+   "sha256": "2a628eab4593cf9aae41bc58a6d1e3ff9209bd5163f1bfd3e9a93366d7430d0f"
+  },
+  {
+   "name": "raw_fox.layer01",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 57360,
+   "bytes": 14336,
+   "sha256": "a55f78375a9faecc9baa8544e6645e2f309dd2e5947935d0f8a7a906e1c979b7"
+  },
+  {
+   "name": "raw_fox.layer02",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 71696,
+   "bytes": 14336,
+   "sha256": "8336a9b05178bcab3f8efbe4d2b592c46eb2616c198b18ed939660fa5631d97f"
+  },
+  {
+   "name": "raw_fox.layer03",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 86032,
+   "bytes": 14336,
+   "sha256": "20b804b1ec34907e3b6c1ba8373749f23406e57f718b4f5e2b9c30fb59f975d3"
+  },
+  {
+   "name": "raw_fox.layer04",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 100368,
+   "bytes": 14336,
+   "sha256": "1ee4750f5836a775e0670124f19f1322d6c9f91f30f204393313d005edd5361f"
+  },
+  {
+   "name": "raw_fox.layer05",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 114704,
+   "bytes": 14336,
+   "sha256": "bd5cf0db1b6c627d56027f1fad0c783ab69a0094ab4d95aae6f69458074da8bf"
+  },
+  {
+   "name": "raw_fox.layer06",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 129040,
+   "bytes": 14336,
+   "sha256": "db132fadcb934e89251f8d297443411b738362df837c1a34238af8d1a1dba63c"
+  },
+  {
+   "name": "raw_fox.layer07",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 143376,
+   "bytes": 14336,
+   "sha256": "ef436eb47fcbdbf829673e433cb7f5af28108b3aff586dd15d74464148c3f199"
+  },
+  {
+   "name": "raw_fox.layer08",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 157712,
+   "bytes": 14336,
+   "sha256": "41d2e253df5cd0d74da02357749ebdabc90f2c876930e424c8d793abc83fff6d"
+  },
+  {
+   "name": "raw_fox.layer09",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 172048,
+   "bytes": 14336,
+   "sha256": "88f8b1b9fbbf73631130e01f03758407ada462b5ba8daf5280079a299142012c"
+  },
+  {
+   "name": "raw_fox.layer10",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 186384,
+   "bytes": 14336,
+   "sha256": "de3b96dffba680aa94ad9fff96e1f0d9879e32c99e03e70e54a934871d2b17e5"
+  },
+  {
+   "name": "raw_fox.layer11",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 200720,
+   "bytes": 14336,
+   "sha256": "51294cfc8c655bf51e5f8df7a0e8761551013cab2beb5128e1fb3e0a0b81939a"
+  },
+  {
+   "name": "raw_fox.layer12",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 215056,
+   "bytes": 14336,
+   "sha256": "4973b6eaad955aed86e40c48149b7825de971e12cdff35e7ed7427b9ba523a2a"
+  },
+  {
+   "name": "raw_fox.layer13",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 229392,
+   "bytes": 14336,
+   "sha256": "22e9e45fb7c7ec24feca4871945c2b14238a08457ca877a2aea36beaf4255f83"
+  },
+  {
+   "name": "raw_fox.layer14",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 243728,
+   "bytes": 14336,
+   "sha256": "dab6b00d3aaa885ffc2cc486d5aec9d562625165c219ba115fef049b6929bbec"
+  },
+  {
+   "name": "raw_fox.layer15",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 258064,
+   "bytes": 14336,
+   "sha256": "93c2c0bd01cfcb11dc4db1375be416364c1ef7a88a946c58a31d2b146a4cba43"
+  },
+  {
+   "name": "raw_fox.layer16",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 272400,
+   "bytes": 14336,
+   "sha256": "bfd2444a09b3e6659a3339e9c2aa12b0602758af7a57d5042f54a6379ed79959"
+  },
+  {
+   "name": "raw_fox.layer17",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 286736,
+   "bytes": 14336,
+   "sha256": "0f5ebd12135212d4367493b96ebf7cf215c27efbc26b6a7d202bc983f79946b7"
+  },
+  {
+   "name": "raw_fox.layer18",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 301072,
+   "bytes": 14336,
+   "sha256": "aa1d74acf8867cd5d2ce9027fb2875f976e6237655b9d3b623ab0d51be8bc20f"
+  },
+  {
+   "name": "raw_fox.layer19",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 315408,
+   "bytes": 14336,
+   "sha256": "f58a7c4b261d5c987f57b2e7172c910e814eb4486d79ed3678cb8c3ae7e6a4d4"
+  },
+  {
+   "name": "raw_fox.layer20",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 329744,
+   "bytes": 14336,
+   "sha256": "da2bf371a8e481045e9110eb22d59da1a354d804b9ca69613be9db0258bf82ea"
+  },
+  {
+   "name": "raw_fox.layer21",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 344080,
+   "bytes": 14336,
+   "sha256": "08d2be5f928cbea12b8bb84b0a7bf8b93271e916599ac5469a25375ad749278b"
+  },
+  {
+   "name": "raw_fox.layer22",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 358416,
+   "bytes": 14336,
+   "sha256": "4db7225ffb6a6dc1eebe1a0865a2f235d7e175f394b837f13e745ab05541a038"
+  },
+  {
+   "name": "raw_fox.layer23",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 372752,
+   "bytes": 14336,
+   "sha256": "6a6a30e96712b278c29a5de3e2713d1fcc5e74e898a579c16c078127b2da8d16"
+  },
+  {
+   "name": "raw_fox.norm",
+   "dtype": "f32",
+   "shape": [
+    4,
+    896
+   ],
+   "offset": 387088,
+   "bytes": 14336,
+   "sha256": "108d58645264be1b1930b4c77c612eef240764bf04c0bd6fb787a57eb29bfd7a"
+  },
+  {
+   "name": "raw_fox.logits_last",
+   "dtype": "f32",
+   "shape": [
+    151936
+   ],
+   "offset": 401424,
+   "bytes": 607744,
+   "sha256": "448ad279a83bcf9ae2e9565f25270e7d37357c3a0c6e529eac9265c8b64e5bb5",
+   "note": "logits of the last prompt position (the first generated token)"
+  },
+  {
+   "name": "raw_fox.greedy",
+   "dtype": "i32",
+   "shape": [
+    48
+   ],
+   "offset": 1009168,
+   "bytes": 192,
+   "sha256": "b1081f98f3b2c558a79f497fb82e0186e414dfb9442fa862e65e72bb5f8b8e95"
+  },
+  {
+   "name": "raw_fox.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    48
+   ],
+   "offset": 1009360,
+   "bytes": 192,
+   "sha256": "183954f5f6d3be91430e00a5304995b40225033e4c63692436bb7ddb034db368",
+   "note": "top-1 minus top-2 logit per step: small values mark near ties"
+  },
+  {
+   "name": "chat_de.ids",
+   "dtype": "i32",
+   "shape": [
+    43
+   ],
+   "offset": 1009552,
+   "bytes": 172,
+   "sha256": "5f97bfede94724971755f7824ad8b0d5e8c5450e4137d7e84a42c59598a1bbfb"
+  },
+  {
+   "name": "chat_de.embed",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 1009724,
+   "bytes": 154112,
+   "sha256": "4bc8d9bfad480a484f0080ed92193f2e6f371a4beb11dba4ce1826a2400fdc8a"
+  },
+  {
+   "name": "chat_de.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 1163836,
+   "bytes": 154112,
+   "sha256": "e7bf25b03a55c2f0bf34569966f8ac9e61d5e758f7cfbc29f498604d9e45cd90"
+  },
+  {
+   "name": "chat_de.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 1317948,
+   "bytes": 154112,
+   "sha256": "653ff73a64649afcebc39852547e72f00de3ca3f694123ae8a702a2b4ddb2401"
+  },
+  {
+   "name": "chat_de.layer00",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 1472060,
+   "bytes": 154112,
+   "sha256": "389ea5c9e1d204e903c936ed354352151615fc6c5a74d95e6c569255be5464d6"
+  },
+  {
+   "name": "chat_de.layer01",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 1626172,
+   "bytes": 154112,
+   "sha256": "092cf686cccdbbbcccb458a0b54d94eb4f2b1df0cb4435e126be503ebf931464"
+  },
+  {
+   "name": "chat_de.layer02",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 1780284,
+   "bytes": 154112,
+   "sha256": "919b4688b5a31114e9b5d9d404fde2a307751fe461e31b4461a505430fc80993"
+  },
+  {
+   "name": "chat_de.layer03",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 1934396,
+   "bytes": 154112,
+   "sha256": "875372024958c8ec3c047cb26706def4789e9df923918ea2e1fb4c25709e4b74"
+  },
+  {
+   "name": "chat_de.layer04",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 2088508,
+   "bytes": 154112,
+   "sha256": "70ed9a27cf139a6d202b91d4d685ed2af50c0ac876caa64d6177af2d67805ae8"
+  },
+  {
+   "name": "chat_de.layer05",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 2242620,
+   "bytes": 154112,
+   "sha256": "9130138b34a067229de4605636f3ef73de2edf98b501532c60960204aa78f062"
+  },
+  {
+   "name": "chat_de.layer06",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 2396732,
+   "bytes": 154112,
+   "sha256": "e4d58949c4af9aa6f0c2ee87eff624095a16d9040a3bc9282176a51065b7c871"
+  },
+  {
+   "name": "chat_de.layer07",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 2550844,
+   "bytes": 154112,
+   "sha256": "42536e35c6fc6c5f1abbc2e3e7fa0fb79207e188b497ceee61f6b9a30d8077b1"
+  },
+  {
+   "name": "chat_de.layer08",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 2704956,
+   "bytes": 154112,
+   "sha256": "f32d19e9516f22e61820e1645752dc33d8d19cc2cf9984091a8a0fa66e8f1cca"
+  },
+  {
+   "name": "chat_de.layer09",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 2859068,
+   "bytes": 154112,
+   "sha256": "5911dcfb2a6bb5295815b7368081d9b2495baf610411225ec27cd4d86f6d7e2a"
+  },
+  {
+   "name": "chat_de.layer10",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 3013180,
+   "bytes": 154112,
+   "sha256": "6f0c21f82ba3c8c336432d881d37fe28868ab368a6addf709d9a3fd450fc9a49"
+  },
+  {
+   "name": "chat_de.layer11",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 3167292,
+   "bytes": 154112,
+   "sha256": "8a3de66f7f0919920b9e5e35e69c2b7d3530184ca84d1d2887023b9d8c10bafd"
+  },
+  {
+   "name": "chat_de.layer12",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 3321404,
+   "bytes": 154112,
+   "sha256": "a749fe8cbae2532dedc820bb235d351b32190ac6cfe51eaa6fd3b386fd0ba8a0"
+  },
+  {
+   "name": "chat_de.layer13",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 3475516,
+   "bytes": 154112,
+   "sha256": "90c299154846c7359316aa91574268744ee3ac3e5bb13488bbb9127388236e67"
+  },
+  {
+   "name": "chat_de.layer14",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 3629628,
+   "bytes": 154112,
+   "sha256": "b1f1bab7f08a216da9c64f9b85b7a9ba7d72fae0db0ec9188da54e39d751f211"
+  },
+  {
+   "name": "chat_de.layer15",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 3783740,
+   "bytes": 154112,
+   "sha256": "7a85d5a2910eed2a343bddd493e5363a574cd486fb6d8a95fb25e01dfc220582"
+  },
+  {
+   "name": "chat_de.layer16",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 3937852,
+   "bytes": 154112,
+   "sha256": "eb5429a8f4ff33f8e8bccc4c86cf8c61470bee801bb2a58a4a31190e657fdb08"
+  },
+  {
+   "name": "chat_de.layer17",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 4091964,
+   "bytes": 154112,
+   "sha256": "3e71d9bd56eb8bdbfe1c56a70921050d7e5d5a31f7f1869b876445b5f10ae9bd"
+  },
+  {
+   "name": "chat_de.layer18",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 4246076,
+   "bytes": 154112,
+   "sha256": "2519adf311623f567b0402c06f3ec0c196acd1b622433b201e472b468a5be26e"
+  },
+  {
+   "name": "chat_de.layer19",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 4400188,
+   "bytes": 154112,
+   "sha256": "ce13a608f0e60cce7a1b27b31039243e1daf9af78a60cee80ea4332b8660882a"
+  },
+  {
+   "name": "chat_de.layer20",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 4554300,
+   "bytes": 154112,
+   "sha256": "84b805ffd1cf35aabc62da84a321a9fc6861505c071fae93e69f98accac0f5a4"
+  },
+  {
+   "name": "chat_de.layer21",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 4708412,
+   "bytes": 154112,
+   "sha256": "31450f23fb7e9d5e469b349453ca4be99e75601e5a8aa953332ede7b1870d815"
+  },
+  {
+   "name": "chat_de.layer22",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 4862524,
+   "bytes": 154112,
+   "sha256": "be1a9a0d902361a4f6d8f723638f78f3993ba823c2bf22f676a2aaaef41f5b9c"
+  },
+  {
+   "name": "chat_de.layer23",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 5016636,
+   "bytes": 154112,
+   "sha256": "0a044ceb314c6cc354edc45ec9b3847caadb9c2ac33ac4f8701c88d33a44d593"
+  },
+  {
+   "name": "chat_de.norm",
+   "dtype": "f32",
+   "shape": [
+    43,
+    896
+   ],
+   "offset": 5170748,
+   "bytes": 154112,
+   "sha256": "9a5dec54d5b89e38254dd60e9134ae6078bb1fd1d2b58f27d42f8dfe5f04a84a"
+  },
+  {
+   "name": "chat_de.logits_last",
+   "dtype": "f32",
+   "shape": [
+    151936
+   ],
+   "offset": 5324860,
+   "bytes": 607744,
+   "sha256": "eff6a75c9d2eaa3f6f4bbe709b05e2cf5a18ccdaee816dba35bf898f1229dc0c",
+   "note": "logits of the last prompt position (the first generated token)"
+  },
+  {
+   "name": "chat_de.greedy",
+   "dtype": "i32",
+   "shape": [
+    48
+   ],
+   "offset": 5932604,
+   "bytes": 192,
+   "sha256": "f3e4f366d61effac384ebf34585da4c4be1ccf1aa0c996b09a2abfb9b49bc85e"
+  },
+  {
+   "name": "chat_de.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    48
+   ],
+   "offset": 5932796,
+   "bytes": 192,
+   "sha256": "742edbf9f5138c0966cb6956ff6e841528225469420515cdec9ed0abf3b7a89a",
+   "note": "top-1 minus top-2 logit per step: small values mark near ties"
+  },
+  {
+   "name": "chat_en.ids",
+   "dtype": "i32",
+   "shape": [
+    41
+   ],
+   "offset": 5932988,
+   "bytes": 164,
+   "sha256": "7dd874a401423d9b6d6779f7e607676214d70e81df66d9525a221bb3b1596c71"
+  },
+  {
+   "name": "chat_en.logits_last",
+   "dtype": "f32",
+   "shape": [
+    151936
+   ],
+   "offset": 5933152,
+   "bytes": 607744,
+   "sha256": "cc778ec4e70b8cea98ef48be8b234fc7acd67823ec750b4f2c28e924e5356b50",
+   "note": "logits of the last prompt position (the first generated token)"
+  },
+  {
+   "name": "chat_en.greedy",
+   "dtype": "i32",
+   "shape": [
+    2
+   ],
+   "offset": 6540896,
+   "bytes": 8,
+   "sha256": "32531fe53f2c75c386ae509ddaf1b8a1b5d9625526ec178159386d8da38d97d4"
+  },
+  {
+   "name": "chat_en.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    2
+   ],
+   "offset": 6540904,
+   "bytes": 8,
+   "sha256": "8184c5d10f4daa3b5f7d1450c30e7490604398c9f7a0fad584cd8d168720eb66",
+   "note": "top-1 minus top-2 logit per step: small values mark near ties"
+  },
+  {
+   "name": "chat_system.ids",
+   "dtype": "i32",
+   "shape": [
+    37
+   ],
+   "offset": 6540912,
+   "bytes": 148,
+   "sha256": "d3dabc08a91c52bf6becf87758ee2d34ab04e06c2dc63b4ff3ea28b115c04c85"
+  },
+  {
+   "name": "chat_system.logits_last",
+   "dtype": "f32",
+   "shape": [
+    151936
+   ],
+   "offset": 6541060,
+   "bytes": 607744,
+   "sha256": "44ff6829cb6a9ab7310f56b0e8b1a70e1dee9b7436ee063f89ad2575ed2403ec",
+   "note": "logits of the last prompt position (the first generated token)"
+  },
+  {
+   "name": "chat_system.greedy",
+   "dtype": "i32",
+   "shape": [
+    48
+   ],
+   "offset": 7148804,
+   "bytes": 192,
+   "sha256": "3a75dd23a545021034f70e6b97e3ae4dc2bd702e584be02d312680c5e3dc2875"
+  },
+  {
+   "name": "chat_system.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    48
+   ],
+   "offset": 7148996,
+   "bytes": 192,
+   "sha256": "2fb92c281ddbaf4fae8508f4ee9eb0cb6efab48de1a4204f6fa4e9bb2e5ef746",
+   "note": "top-1 minus top-2 logit per step: small values mark near ties"
+  },
+  {
+   "name": "raw_code.ids",
+   "dtype": "i32",
+   "shape": [
+    4
+   ],
+   "offset": 7149188,
+   "bytes": 16,
+   "sha256": "0ef14c0434fc31cb3b39ceb7e1ddf1075eaf8b3a0d79f80842fa96eb1b107aeb"
+  },
+  {
+   "name": "raw_code.logits_last",
+   "dtype": "f32",
+   "shape": [
+    151936
+   ],
+   "offset": 7149204,
+   "bytes": 607744,
+   "sha256": "3ca13301addd0b511208805da58800136edb0eacbf5aadc9d16c081350469f11",
+   "note": "logits of the last prompt position (the first generated token)"
+  },
+  {
+   "name": "raw_code.greedy",
+   "dtype": "i32",
+   "shape": [
+    48
+   ],
+   "offset": 7756948,
+   "bytes": 192,
+   "sha256": "c08cd35acc1b2ec73fb13805c782c5e9b90e49100be724a42a5d26ae384f00be"
+  },
+  {
+   "name": "raw_code.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    48
+   ],
+   "offset": 7757140,
+   "bytes": 192,
+   "sha256": "3ffbee8da26c5dc5dda574826b8ac1af3153366ef48026cd0027d74434df3f80",
+   "note": "top-1 minus top-2 logit per step: small values mark near ties"
+  },
+  {
+   "name": "chat_tool.ids",
+   "dtype": "i32",
+   "shape": [
+    205
+   ],
+   "offset": 7757332,
+   "bytes": 820,
+   "sha256": "307a0dfea0e59bbb07c2e0a52d3769dad22a2dd7dae0073d687417a2e6fa0ccd"
+  },
+  {
+   "name": "chat_tool.logits_last",
+   "dtype": "f32",
+   "shape": [
+    151936
+   ],
+   "offset": 7758152,
+   "bytes": 607744,
+   "sha256": "7d72d2e7f57b812a13d973333edd6b4ed95cdd3fdbac9856d5c56a99fb508632",
+   "note": "logits of the last prompt position (the first generated token)"
+  },
+  {
+   "name": "chat_tool.greedy",
+   "dtype": "i32",
+   "shape": [
+    20
+   ],
+   "offset": 8365896,
+   "bytes": 80,
+   "sha256": "193d198a673b04e2bd8358f49671c1d4b35bfb86f28ea0e04618e1478c726eb6"
+  },
+  {
+   "name": "chat_tool.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    20
+   ],
+   "offset": 8365976,
+   "bytes": 80,
+   "sha256": "6f1dbe11b9880b523ab6bf801171683dce64d0de1258dab6dd59a366efe50fe0",
+   "note": "top-1 minus top-2 logit per step: small values mark near ties"
+  }
+ ]
+}

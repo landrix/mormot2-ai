@@ -28,6 +28,7 @@ unit mormot.ai.llm.native;
 
     - TNativeOutputParser: generated token ids to content, reasoning, tool calls
     - TQwen3OutputParser: the parser of Qwen3
+    - TQwen2OutputParser: the parser of Qwen2.5 (no reasoning)
     - NativeChatPrompt: a TLlmChatRequest as prompt ids
     - RegisterNativeFamily: the classes of a decoder family
     - TNativeLlmClient: ILlmClient over a model folder or a GGUF file
@@ -176,11 +177,21 @@ type
     /// stop on <|im_end|> or <|endoftext|>
     function Token(aId: integer): boolean; override;
     procedure FlushOpen; override;
+    /// true: the model may open its answer with <think> (Qwen3)
+    class function Thinks: boolean; virtual;
   public
-    /// aTokenizer (not owned) must know <|im_end|>, <think>, </think>,
-    // <tool_call> and </tool_call> - raises EInferError otherwise
+    /// aTokenizer (not owned) must know <|im_end|>, <tool_call> and
+    // </tool_call>, and <think> and </think> when Thinks - raises EInferError
+    // otherwise
     constructor Create(aTokenizer: TInferTokenizer;
       const aOnDelta: TLlmStreamDeltaEvent = nil); override;
+  end;
+
+  /// the output parser of Qwen2.5: that of Qwen3 without reasoning - the same
+  // <tool_call> blocks, no <think> (the tokenizer has none)
+  TQwen2OutputParser = class(TQwen3OutputParser)
+  protected
+    class function Thinks: boolean; override;
   end;
 
 /// the enable_thinking switch of a request: Extra.chat_template_kwargs.
@@ -688,10 +699,25 @@ begin
   inherited Create(aTokenizer, aOnDelta);
   fStop := NeedToken(aTokenizer, '<|im_end|>');
   fEndOfText := aTokenizer.TokenId('<|endoftext|>'); // -1 when absent
-  fThink := NeedToken(aTokenizer, '<think>');
-  fThinkEnd := NeedToken(aTokenizer, '</think>');
+  fThink := -1; // no id: never matched
+  fThinkEnd := -1;
+  if Thinks then
+  begin
+    fThink := NeedToken(aTokenizer, '<think>');
+    fThinkEnd := NeedToken(aTokenizer, '</think>');
+  end;
   fToolCall := NeedToken(aTokenizer, '<tool_call>');
   fToolCallEnd := NeedToken(aTokenizer, '</tool_call>');
+end;
+
+class function TQwen3OutputParser.Thinks: boolean;
+begin
+  result := true;
+end;
+
+class function TQwen2OutputParser.Thinks: boolean;
+begin
+  result := false;
 end;
 
 procedure TQwen3OutputParser.EndToolCall;
@@ -1385,5 +1411,7 @@ initialization
     TQwen3OutputParser);
   RegisterNativeFamily(TQwen3MoeModel, TBpeTokenizer, TQwen3ChatTemplate,
     TQwen3OutputParser);
+  RegisterNativeFamily(TQwen2Model, TBpeTokenizer, TQwen2ChatTemplate,
+    TQwen2OutputParser);
 
 end.

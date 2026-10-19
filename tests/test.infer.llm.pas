@@ -103,6 +103,9 @@ type
     procedure NativeFamilies;
     /// Qwen3-30B-A3B (Q4_K_M GGUF) behind the client, where it was put
     procedure Qwen3MoeChatClientGguf;
+    /// D1b: Qwen2.5-0.5B-Instruct behind the client - its own template (the
+    // prompt tokens of the reference), a plain answer, a tool call parsed
+    procedure Qwen25ChatClient;
   end;
 
 
@@ -1664,6 +1667,10 @@ begin
   Check(f.Parser = TQwen3OutputParser, 'parser class');
   Check(NativeFamily(TQwen3MoeModel, f) and (f.Template = TQwen3ChatTemplate) and
     (f.Parser = TQwen3OutputParser), 'qwen3_moe: the classes of Qwen3');
+  Check(NativeFamily(TQwen2Model, f) and (f.Tokenizer = TBpeTokenizer) and
+    (f.Template = TQwen2ChatTemplate) and (f.Parser = TQwen2OutputParser),
+    'qwen2: its template and parser');
+  Check(NativeFamily(TQwen3Model, f), 'qwen3 again');
   // the classes create what the client uses
   p := f.Parser.Create(fTokenizer);
   try
@@ -1744,6 +1751,78 @@ begin
     CheckEqual(r.Usage.PromptTokens, p^.I['tokens'], 'chat_en prompt tokens');
     Check(PosEx('Paris', r.Content) > 0, 'chat_en: Paris');
     Check(r.FinishReason = lfrStop, 'chat_en stop');
+  finally
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferLlmNative.Qwen25ChatClient;
+var
+  dir, refdir: TFileName;
+  ref: TInferRefSet;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  p: PDocVariantData;
+  req: TLlmChatRequest;
+  r: TLlmChatResponse;
+  timer: TPrecisionTimer;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen2.5 client: 2 GB of FP32 weights need a 64-bit process');
+  exit;
+  {$endif CPU32}
+  dir := FindVendorModel('qwen2.5-0.5b-instruct' + PathDelim + 'model.safetensors');
+  if dir = '' then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen2.5-0.5b-instruct');
+    AddConsole('SKIP Qwen2.5 client: no vendor/models/qwen2.5-0.5b-instruct');
+    exit;
+  end;
+  dir := ExtractFilePath(dir);
+  refdir := FindInferRefDir('qwen25');
+  if CheckFailed(refdir <> '', 'qwen25 reference found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  try
+    timer.Start;
+    client := TNativeLlmClient.Create(dir);
+    llm := client;
+    AddConsole(FormatString('Qwen2.5-0.5B client loaded in %', [timer.Stop]));
+    Check(client.Model is TQwen2Model, 'a TQwen2Model');
+    Check(client.Template is TQwen2ChatTemplate, 'the Qwen2.5 template');
+    // a plain answer
+    p := FindPrompt(ref, 'chat_en');
+    if CheckFailed(p <> nil, 'chat_en') then
+      exit;
+    req := LlmChatRequest('', nil);
+    RefRequest(p, req);
+    req.MaxTokens := 16;
+    r := llm.ChatComplete(req);
+    CheckEqual(r.Usage.PromptTokens, p^.I['tokens'], 'chat_en prompt tokens');
+    CheckUtf8(r.Content = 'Paris', 'chat_en: "%"', [r.Content]);
+    Check(r.FinishReason = lfrStop, 'chat_en stop');
+    Check(VarIsEmptyOrNull(r.Raw), 'no reasoning');
+    // a tool call, parsed as for Qwen3
+    p := FindPrompt(ref, 'chat_tool');
+    if CheckFailed(p <> nil, 'chat_tool') then
+      exit;
+    req := LlmChatRequest('', nil);
+    RefRequest(p, req);
+    req.MaxTokens := 48;
+    timer.Start;
+    r := llm.ChatComplete(req);
+    AddConsole(FormatString('Qwen2.5 chat_tool: % call(s), "%" (% tokens in %)',
+      [length(r.ToolCalls), r.Content, r.Usage.CompletionTokens, timer.Stop]));
+    CheckEqual(r.Usage.PromptTokens, p^.I['tokens'], 'chat_tool prompt tokens');
+    if not CheckFailed(length(r.ToolCalls) = 1, 'one tool call') then
+    begin
+      CheckUtf8(r.ToolCalls[0].Name = 'get_weather', 'name %', [r.ToolCalls[0].Name]);
+      CheckUtf8(r.ToolCalls[0].ArgumentsJson = '{"city": "Berlin"}', 'arguments %',
+        [r.ToolCalls[0].ArgumentsJson]);
+    end;
+    Check(r.Content = '', 'no content beside the call');
+    Check(r.FinishReason = lfrToolCalls, 'finish reason tool_calls');
   finally
     ref.Free;
   end;

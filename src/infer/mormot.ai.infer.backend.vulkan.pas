@@ -92,16 +92,19 @@ type
       aBytes: Int64): TInferVkBuffer;
     /// true when RecordLinear takes weights of aType with aIn inputs
     function GpuLinear(aType: TInferDType; aIn: PtrInt): boolean;
-    /// record y = x * w^T (no bias) into the running batch of Vulkan, the
+    /// record y = x * w^T (+ aBias) into the running batch of Vulkan, the
     // weights from the cache - GpuLock held, BatchBegin called; x and y are
     // [aRows, aIn] and [aRows, aOut] at offset 0
+    // - aBias ([aOut] floats) comes from the cache too: uploaded beforehand
+    // (DeviceWeight), as a batch cannot upload; no bias for a matrix in parts
     // - a matrix larger than one binding (LinearPart < aOut) goes part by
     // part into aTemp - at least [aRows, LinearPart] floats, given by the
     // caller (no buffer is made or freed while a batch is recorded) - whose
     // rows are then copied into y; the weights uploaded by UploadLinear
     procedure RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
       const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer;
-      aBarrier: boolean = true; aTemp: TInferVkBuffer = nil);
+      aBarrier: boolean = true; aTemp: TInferVkBuffer = nil;
+      aBias: PSingleArray = nil);
     /// record y = x * w^T (no bias) as RecordLinear, the aOut x aIn weights of
     // aType at byte aOffset of aWeight (e.g. one expert of a buffer which holds
     // every expert of a layer): aOffset a multiple of the device's
@@ -369,11 +372,12 @@ end;
 
 procedure TInferVulkanBackend.RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
   const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer; aBarrier: boolean;
-  aTemp: TInferVkBuffer);
+  aTemp: TInferVkBuffer; aBias: PSingleArray);
 var
   push: TLinearPush;
   gx, gy: cardinal;
   pipe: TInferVkPipeline;
+  bias: TInferVkBuffer;
   rowBytes: Int64;
   part, o, n: PtrInt;
 begin
@@ -384,16 +388,23 @@ begin
   push.Rows := aRows;
   push.InCount := aIn;
   push.DType := LINEAR_DTYPE[w.DType];
-  push.HasBias := 0;
+  push.HasBias := ord(aBias <> nil);
   part := LinearPart(w.DType, aIn, aOut);
   if part >= aOut then
   begin
     push.OutCount := aOut;
     pipe := LinearShape(w.DType, aIn, aRows, aOut, gx, gy);
+    if aBias = nil then
+      bias := fNoBias
+    else
+      bias := DeviceWeight(aBias, idtF32, Int64(aOut) * 4);
     fVk.BatchDispatch(pipe, [DeviceWeight(w.Data, w.DType, aOut * rowBytes), x,
-      fNoBias, y], @push, gx, gy, 1, aBarrier);
+      bias, y], @push, gx, gy, 1, aBarrier);
     exit;
   end;
+  if aBias <> nil then
+    raise EInferVulkan.CreateUtf8('%.RecordLinear: a bias for a matrix in parts',
+      [self]);
   // part by part into aTemp, its rows copied to their columns of y
   if (aTemp = nil) or (aTemp.Size < Int64(aRows) * part * 4) then
     raise EInferVulkan.CreateUtf8('%.RecordLinear: % % x % in parts of % ' +

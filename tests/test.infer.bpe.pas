@@ -61,7 +61,15 @@ type
     procedure GgufTokenizer;
     /// every chat case: same ids and same rendered text as transformers
     procedure ChatTemplateMatchesReference;
+    /// the same cases through the Qwen2.5 template (tokenizer.json of
+    // Qwen2.5-0.5B-Instruct): same ids, same text; the Qwen3 template refuses
+    // a tokenizer without <think>
+    procedure Qwen25ChatTemplateMatchesReference;
   end;
+
+/// vendor/models/<aName> (a file) found from the executable upwards, '' when
+// absent
+function FindVendorModel(const aName: TFileName): TFileName;
 
 /// the folder of the Qwen3-0.6B files, '' when absent
 function FindQwen3Folder(const aFile: TFileName): TFileName;
@@ -123,6 +131,23 @@ begin
         result := false;
         exit;
       end;
+end;
+
+
+function FindVendorModel(const aName: TFileName): TFileName;
+var
+  dir: TFileName;
+  i: integer;
+begin
+  dir := ExcludeTrailingPathDelimiter(Executable.ProgramFilePath);
+  for i := 1 to 6 do
+  begin
+    result := MakePath([dir, 'vendor', 'models']) + PathDelim + aName;
+    if FileExists(result) then
+      exit;
+    dir := ExtractFileDir(dir);
+  end;
+  result := '';
 end;
 
 
@@ -715,5 +740,82 @@ begin
     ref.Free;
   end;
 end;
+
+procedure TTestInferBpe.Qwen25ChatTemplateMatchesReference;
+var
+  ref: TInferRefSet;
+  dir, fn: TFileName;
+  tok: TBpeTokenizer;
+  tpl: TQwen2ChatTemplate;
+  cases, c: PDocVariantData;
+  ids, offsets: PIntegerArray;
+  n, i, first, count: PtrInt;
+  mine: TIntegerDynArray;
+  msgs: TLlmMessageDynArray;
+  tools: TLlmToolDynArray;
+  gen, raised: boolean;
+  text: RawUtf8;
+begin
+  fn := FindVendorModel('qwen2.5-0.5b-instruct' + PathDelim + 'tokenizer.json');
+  if fn = '' then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen2.5-0.5b-instruct');
+    AddConsole('SKIP Qwen2.5 chat template: no vendor/models/qwen2.5-0.5b-instruct ' +
+      '(tools/infer-ref, make_reference_qwen2.py)');
+    exit;
+  end;
+  dir := FindInferRefDir('qwen25-chat');
+  if CheckFailed(dir <> '', 'qwen25-chat found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  tok := nil;
+  tpl := nil;
+  try
+    tok := TBpeTokenizer.Create(fn);
+    tpl := TQwen2ChatTemplate.Create(tok);
+    raised := false;
+    try
+      TQwen3ChatTemplate.Create(tok).Free;
+    except
+      on EInferError do
+        raised := true;
+    end;
+    Check(raised, 'the Qwen3 template needs <think>');
+    cases := ref.Manifest^.A['cases'];
+    ids := ref.I32('ids', n);
+    offsets := ref.I32('offsets', n);
+    for i := 0 to cases^.Count - 1 do
+    begin
+      c := _Safe(cases^.Values[i]);
+      msgs := MessagesOf(c);
+      tools := ToolsOf(c);
+      gen := c^.B['add_generation_prompt'];
+      // enable_thinking means nothing to Qwen2.5: both give the same
+      text := tpl.Render(msgs, tools, gen, i and 1 = 0);
+      CheckUtf8(text = c^.U['rendered'], '% rendered%%%', [c^.U['id'], #10, text, #10]);
+      mine := tpl.Encode(msgs, tools, gen, i and 1 = 1);
+      first := offsets^[i];
+      count := offsets^[i + 1] - first;
+      CheckUtf8(SameIds(mine, @ids^[first], count), '% ids % expected %',
+        [c^.U['id'], IdsText(pointer(mine), length(mine)), IdsText(@ids^[first], count)]);
+    end;
+    // a call without arguments: {} (what tojson writes for an empty object)
+    SetLength(msgs, 2);
+    msgs[0] := LlmMessage(lrUser, 'x');
+    msgs[1] := LlmMessage(lrAssistant, '');
+    SetLength(msgs[1].ToolCalls, 1);
+    msgs[1].ToolCalls[0].Name := 'now';
+    msgs[1].ToolCalls[0].ArgumentsJson := '';
+    text := tpl.Render(msgs, nil, false);
+    CheckUtf8(PosEx('{"name": "now", "arguments": {}}', text) > 0, 'no arguments: %',
+      [text]);
+  finally
+    tpl.Free;
+    tok.Free;
+    ref.Free;
+  end;
+end;
+
 
 end.

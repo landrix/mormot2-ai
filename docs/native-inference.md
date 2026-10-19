@@ -1713,7 +1713,50 @@ lässt die Logits bitgleich); behoben.
 *Qwen3-30B-A3B Q4_K_M auf der RTX 5090 (Vulkan):* hochgeladen in 2,3 s, Spitze 17,9 GB;
 Prefill 489 Tokens/s bei 200 Tokens Prompt, 642 bei 2000; Decode 43 bis 44 Tokens/s. CUDA im
 selben Lauf: Prefill 383, Decode 41 - Vulkan ist hier vorn, weil ein MoE-Layer auf CUDA drei
-Wartepunkte hat (Router herunter, zwei Uploads), auf Vulkan einen.
+Wartepunkte hat (Router herunter, zwei Uploads), auf Vulkan einen. Auf dem M2 Pro (MoltenVK)
+ist die volle Suite grün (2942 Assertions, das Tiny-MoE auf der GPU).
+
+**D1b erledigt (2026-10-19): Qwen2 / Qwen2.5 als Familie.**
+
+- `TQwen2Model` (`model_type` und GGUF-Architektur `qwen2`, nachgeschlagen in
+  `modeling_qwen2.py`): derselbe Decoder wie Qwen3 mit einem Bias auf den Q-, K- und
+  V-Projektionen (keiner auf O) und ohne RMSNorm je Kopf. `config.json` nennt kein `head_dim`
+  und die GGUF-Datei keine `attention.key_length`: Hidden durch Köpfe, mit Prüfung. Qwen3
+  verlangt `head_dim` weiter (`TQwen3Model.HeadNorm`).
+- `TDecoderLayer` trägt `QBias`, `KBias`, `VBias` (nil ohne); die CPU gibt sie an `Linear`,
+  die Head-Norms entfallen, wenn `QNorm` nil ist. Vulkan (`RecordLinear` mit Bias) und CUDA
+  (`EnqueueLinear(At)` mit Bias) laden die Biases in `UploadWeights` hoch, damit weder ein
+  Batch noch ein CUDA-Graph hochladen muss; `qkrope.comp` und der CUDA-Kernel `qkrope` haben
+  einen Schalter `norm` (0: q und k bleiben, `qn`/`kn` werden nicht gelesen).
+- `TQwen2ChatTemplate`: das Template von Qwen2.5 (Revision `7ae5576…`): immer ein System-Turn
+  (ohne System-Nachricht der Standardtext von Qwen), Werkzeuge darin, Argumente eines
+  Tool-Aufrufs durch `tojson` (`PythonJson`), `<tool_response>` als Text - Qwen2.5 hat dafür
+  kein Token. `TQwen2OutputParser`: der Parser von Qwen3 ohne `<think>`.
+- Der GGUF-Loader nennt nicht unterstützte Typen beim Namen (`unsupported ggml type 6 (Q5_0)`).
+
+*Referenz:* `tools/infer-ref/make_reference_qwen2.py` - `tiny-qwen2` (2 Layer, Bias ungleich
+null, `head_dim` 16 aus 64/4, BF16, als GGUF Q8_0 ohne `key_length` und eine Datei ohne
+`attn_k.bias`), `qwen25-chat` (die Fälle von `qwen3-chat` durch das Qwen2.5-Template),
+`qwen25` (Qwen2.5-0.5B-Instruct FP32, sechs Prompts; `generate` mit `repetition_penalty` 1,
+weil die `generation_config.json` 1,1 verlangt und `generate` sie auch ohne Sampling
+anwendet).
+
+*Tests:* `TinyQwen2MatchesReference` (alle Zustände, Greedy, GGUF, fehlender Bias abgelehnt),
+`Qwen25MatchesReference` (Zustände und letzte Logits bis 2e-3, Greedy aller sechs Prompts
+identisch), `Qwen25Gguf` (Qwens Q8_0: Kosinus 0,990 bis 0,995, größter Fehler 2,6 - mehr als
+bei Qwen3-0.6B; Greedy gleich bis zu einer Stelle, an der die Referenz weniger als 3 sicher
+war; Q4_K_M abgelehnt, siehe Backlog B16), `Qwen25ChatTemplateMatchesReference` (gleiche Ids
+und gleicher Text wie transformers; das Qwen3-Template lehnt den Tokenizer ohne `<think>` ab),
+`Qwen25ChatClient` (`TNativeLlmClient`: „Paris“, ein Tool-Aufruf `get_weather` mit
+`{"city": "Berlin"}`), auf Vulkan und CUDA `TinyQwen2MatchesCpu` und `Qwen25GgufMatchesCpu`
+(Kosinus 0,999, Argmax 16 von 16 auf RTX 5090 und Adreno X1-85), der CUDA-Op-Test `qkrope`
+auch ohne Norm. Grün auf der RTX 5090 unter FPC und Delphi 13 (3606 Assertions) und Delphi 7
+(2174). Gegenprobe: dreizehn eingebaute Fehler (kein Q-Bias auf der CPU, Head-Norms nie,
+head_dim aus Hidden / 2, `attn_v.bias` falsch benannt, kein Standard-System-Turn, Argumente
+wörtlich, Assistent mit Aufrufen als Text, `<tool_response>` als Id, Parser hält auf einer
+Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und nie die
+Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
+für leere Argumente (`{}`), jetzt da.
 
 ### Danach — nach Bedarf
 

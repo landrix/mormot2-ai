@@ -1,0 +1,33 @@
+{
+ "dataset": "tiny-qwen2/gguf",
+ "environment": {
+  "created_utc": "2026-10-19T08:28:13Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": true,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "ggml": {
+  "dir": "vendor/sqlite-ext/aarch64-linux",
+  "sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  }
+ },
+ "note": "tiny-qwen2 as a qwen2 GGUF file: matrices and token_embd in Q8_0 from ggml's reference quantizer, norms and biases F32, no attention.key_length; bad-nobias: blk.1.attn_k.bias left out",
+ "files": {
+  "bad-nobias.gguf": "b2a105d0873bf32521712bdc4b8a4896d7170f4a179000c8e789bf835d41405c",
+  "q8_0.gguf": "dc97dd952e0eecbe36aa4749d6e0ed28e39330925b3afa0e42cc49d6479da665"
+ }
+}

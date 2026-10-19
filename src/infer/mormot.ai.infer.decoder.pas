@@ -6,9 +6,10 @@
 //   safetensors or a GGUF file, the forward pass over the layers, the hand-over
 //   to a device (GPU) - a family (mormot.ai.infer.model.qwen3) reads its own
 //   settings and tensor names and registers its class
-// - the layers today: pre-norm self-attention (RMSNorm, Q/K/V projections,
-//   RMSNorm of every Q and K head, rotary positions, grouped-query causal
-//   attention, output projection) and a pre-norm SwiGLU feed-forward block,
+// - the layers today: pre-norm self-attention (RMSNorm, Q/K/V projections -
+//   with a bias where the family has one -, RMSNorm of every Q and K head where
+//   it has one, rotary positions, grouped-query causal attention, output
+//   projection) and a pre-norm SwiGLU feed-forward block,
 //   both with a residual; a final RMSNorm and the language-model head (tied to
 //   the embedding or its own matrix) - TDecoderLayerSpec names the kind of
 //   every layer, so another mixer (sliding window, linear attention) docks in
@@ -114,9 +115,13 @@ type
   /// the weights of one decoder layer - F32 views
   // - Gate, Up and Down for a dfDense layer; Router ([Experts, Hidden], F32)
   // and ExpertGate, ExpertUp, ExpertDown ([Experts] each) for a dfMoe one
+  // - QNorm and KNorm ([HeadDim]): the RMSNorm of every Q and K head (Qwen3),
+  // nil without one; QBias, KBias and VBias ([Heads or KvHeads * HeadDim]):
+  // nil without a bias (Qwen2 has one)
   TDecoderLayer = record
     Q, K, V, O, Gate, Up, Down: TInferWeight;
     QNorm, KNorm, InputNorm, PostNorm: PSingleArray;
+    QBias, KBias, VBias: PSingleArray;
     Router: TInferWeight;
     ExpertGate, ExpertUp, ExpertDown: TInferWeightDynArray;
   end;
@@ -1019,13 +1024,16 @@ begin
   // pre-norm, projections, per-head norms, rotary positions
   fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.InputNorm, fConfig.RmsEps,
     pointer(aCtx.fH));
-  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Q, qw, nil, pointer(aCtx.fQ));
-  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.K, kvw, nil, pointer(aCtx.fK));
-  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.V, kvw, nil, pointer(aCtx.fV));
-  fBackend.RmsNorm(pointer(aCtx.fQ), n * fConfig.Heads, fConfig.HeadDim,
-    ly^.QNorm, fConfig.RmsEps, pointer(aCtx.fQ));
-  fBackend.RmsNorm(pointer(aCtx.fK), n * fConfig.KvHeads, fConfig.HeadDim,
-    ly^.KNorm, fConfig.RmsEps, pointer(aCtx.fK));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Q, qw, ly^.QBias, pointer(aCtx.fQ));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.K, kvw, ly^.KBias, pointer(aCtx.fK));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.V, kvw, ly^.VBias, pointer(aCtx.fV));
+  if ly^.QNorm <> nil then
+  begin
+    fBackend.RmsNorm(pointer(aCtx.fQ), n * fConfig.Heads, fConfig.HeadDim,
+      ly^.QNorm, fConfig.RmsEps, pointer(aCtx.fQ));
+    fBackend.RmsNorm(pointer(aCtx.fK), n * fConfig.KvHeads, fConfig.HeadDim,
+      ly^.KNorm, fConfig.RmsEps, pointer(aCtx.fK));
+  end;
   fBackend.Rope(pointer(aCtx.fQ), n, fConfig.Heads, fConfig.HeadDim,
     pointer(aCtx.fCos), pointer(aCtx.fSin));
   fBackend.Rope(pointer(aCtx.fK), n, fConfig.KvHeads, fConfig.HeadDim,

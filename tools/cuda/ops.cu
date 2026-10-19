@@ -136,14 +136,15 @@ extern "C" __global__ void swiglu(float* g, const float* u, unsigned int n)
 }
 
 // per token row (grid y) and head (grid x: the heads, then the KV heads):
-// RMSNorm of q (qn) or k (kn), rotary positions (cs: the cos of every row,
-// then the sin), q in place, k and v stored into the cache at past + row
+// RMSNorm of q (qn) or k (kn) when norm is set (Qwen3; Qwen2 has none: qn
+// and kn are not read), rotary positions (cs: the cos of every row, then the
+// sin), q in place, k and v stored into the cache at past + row
 // - headDim <= 256, even; T: the type of the cache (float or half float)
 template <typename T>
 __device__ __forceinline__ void qkropeT(float* q, const float* k,
   const float* v, const float* qn, const float* kn, const float* cs, T* kc,
   T* vc, unsigned int rows, unsigned int heads, unsigned int kvHeads,
-  unsigned int headDim, unsigned int past, float eps)
+  unsigned int headDim, unsigned int past, float eps, unsigned int norm)
 {
   __shared__ float part[4];
   __shared__ float normed[256];
@@ -166,7 +167,7 @@ __device__ __forceinline__ void qkropeT(float* q, const float* k,
   for (unsigned int c = t; c < d; c += BLOCK)
   {
     float a = isQ ? q[src + c] : k[src + c];
-    normed[c] = (isQ ? qn[c] : kn[c]) * (a * inv);
+    normed[c] = norm ? (isQ ? qn[c] : kn[c]) * (a * inv) : a;
   }
   __syncthreads();
   unsigned long long cbase = (unsigned long long)r * half;
@@ -200,19 +201,20 @@ __device__ __forceinline__ void qkropeT(float* q, const float* k,
 extern "C" __global__ void qkrope(float* q, const float* k, const float* v,
   const float* qn, const float* kn, const float* cs, float* kc, float* vc,
   unsigned int rows, unsigned int heads, unsigned int kvHeads,
-  unsigned int headDim, unsigned int past, float eps)
+  unsigned int headDim, unsigned int past, float eps, unsigned int norm)
 {
   qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
-    eps);
+    eps, norm);
 }
 
 extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
   const float* qn, const float* kn, const float* cs, unsigned short* kc,
   unsigned short* vc, unsigned int rows, unsigned int heads,
-  unsigned int kvHeads, unsigned int headDim, unsigned int past, float eps)
+  unsigned int kvHeads, unsigned int headDim, unsigned int past, float eps,
+  unsigned int norm)
 {
   qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
-    eps);
+    eps, norm);
 }
 
 // causal attention with grouped-query heads - the CUDA form of

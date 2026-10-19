@@ -171,6 +171,28 @@ function GgufTensorType(aGgmlType: cardinal): TInferDType;
 
 implementation
 
+/// the ggml name of a type id, for messages (ggml.h)
+function GgufTypeName(aGgmlType: cardinal): RawUtf8;
+const
+  NAMES: array[0..30] of RawUtf8 = (
+    'F32', 'F16', 'Q4_0', 'Q4_1', '', '', 'Q5_0', 'Q5_1', 'Q8_0', 'Q8_1',
+    'Q2_K', 'Q3_K', 'Q4_K', 'Q5_K', 'Q6_K', 'Q8_K', 'IQ2_XXS', 'IQ2_XS',
+    'IQ3_XXS', 'IQ1_S', 'IQ4_NL', 'IQ3_S', 'IQ2_S', 'IQ4_XS', 'I8', 'I16',
+    'I32', 'I64', 'F64', 'IQ1_M', 'BF16');
+begin
+  result := '';
+  if aGgmlType <= high(NAMES) then
+    result := NAMES[aGgmlType]
+  else if aGgmlType = 34 then
+    result := 'TQ1_0'
+  else if aGgmlType = 35 then
+    result := 'TQ2_0'
+  else if aGgmlType = 39 then
+    result := 'MXFP4';
+  if result = '' then
+    result := '?';
+end;
+
 function GgufTensorType(aGgmlType: cardinal): TInferDType;
 begin
   case aGgmlType of
@@ -466,7 +488,8 @@ begin
     t := r.U32(ti^.Name);
     ti^.DType := GgufTensorType(t);
     if ti^.DType = idtUnknown then
-      EInferError.RaiseUtf8('%: % has unsupported ggml type %', [self, ti^.Name, t]);
+      EInferError.RaiseUtf8('%: % has unsupported ggml type % (%)',
+        [self, ti^.Name, t, GgufTypeName(t)]);
     off := r.U64(ti^.Name);
     // row-major like every other view of the engine: innermost dimension last
     SetLength(ti^.Shape, nd);

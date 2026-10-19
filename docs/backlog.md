@@ -225,9 +225,8 @@ geteilt, wenn die Deskriptor-Sets knapp werden: Qwen3-30B-A3B auf der RTX 5090 D
 44, Prefill 489 bis 642 Tokens/s (schneller als CUDA mit 41 und 383).
 Die Expertenwahl im Vergleichstest ist vorgegeben (`TDecoderRouteTape`, umgesetzt wie unten
 beschrieben; unter Delphi 13 bleibt eine Abweichung aus der CPU-Rechnung, B13).
-*Offen:* die Wahl auf dem Gerät
-(Route-Kernel, Linear mit Experten-Ids, auf CUDA wieder ein Graph) für das Decode-Tempo;
-Lauf auf dem M2 Pro (MoltenVK, Tiny-Modell).
+Auf dem M2 Pro (MoltenVK) grün, 2026-10-19: volle Infer-Suite, 2942 Assertions, darin das
+Tiny-MoE auf der GPU. *Offen:* die Wahl auf dem Gerät (D3c).
 *Mit D3b (entschieden 2026-10-17): Expertenwahl im Vergleichstest vorgeben.* Heute misst
 `Qwen3MoeGgufMatchesCpu` Rechengenauigkeit und Routing in einem Kosinus: unter Delphi 13 kippt
 bei einer knappen Router-Entscheidung ein Experte gegenüber der CPU, deshalb 0,98 und 14 von
@@ -283,6 +282,11 @@ drei Backends; Qwen2.5-0.5B-Instruct (safetensors und GGUF Q8_0) Greedy-Tokens g
 transformers, ohne Modell überspringen; Client-Test mit Tool-Aufruf; Gegenproben (Bias
 vergessen, Bias auf O, Norm je Kopf doch an). Revision des Modells pinnen.
 *Einordnung:* vor D4 oder parallel dazu - klein, unabhängig von MoE.
+*Erledigt 2026-10-19* (`native-inference.md`, Phase D): `TQwen2Model` (`qwen2`, safetensors und
+GGUF), Bias auf Q/K/V in `TDecoderLayer` (CPU, Vulkan, CUDA; `RecordLinear`/`EnqueueLinear`
+mit Bias, `qkrope` mit Schalter `norm`), `TQwen2ChatTemplate`, `TQwen2OutputParser`, Familie
+registriert. Qwen2.5-0.5B-Instruct in FP32 Greedy identisch mit transformers, Client mit
+Tool-Aufruf; Qwens Q4_K_M-GGUF braucht Q5_0 (B16).
 
 **D4 — Sliding Window und Cache-Semantik.** Erst voller KV mit Fenstermaske als Referenz,
 dann Ringpuffer mit absoluten Positionen (spart den Speicher). Chunk-Prefill darf benötigte
@@ -756,3 +760,20 @@ statt das Werkzeug zu rufen) - deshalb steht F32 bisher als Vorgabe.
 **Fertig, wenn:** die Entscheidung zu 1 umgesetzt ist, das Demo unter FPC und Delphi 13 baut
 und läuft (CPU, und mit Vulkan/CUDA, wenn vorhanden), und das README den Einstieg in
 wenigen Zeilen zeigt. Weitere Ideen ohne Termin: [ideas.md](ideas.md).
+
+## B16 — Q5_0 (und Q5_1) für die K-Quant-Dateien kleiner Modelle (aufgenommen 2026-10-19)
+
+Anlass: Qwens `qwen2.5-0.5b-instruct-q4_k_m.gguf` hat 133 Q5_0-Tensoren, nur 12 Q4_K und 12
+Q6_K - llama.cpp nimmt Q5_0, wo eine Zeile kein Vielfaches von 256 ist (Hidden 896), auch für
+`token_embd`. Der Loader lehnt die Datei ab (`unsupported ggml type 6 (Q5_0)`), Q8_0 läuft.
+Dasselbe betrifft andere Modelle mit Breiten wie 896 oder 1536 (Qwen2.5-0.5B und -1.5B, viele
+Fine-Tunes) und Dateien, die Q5_0/Q5_1 ausdrücklich wählen.
+
+**Vorhaben:** `idtQ5_0` (Block 32: FP16-Skala, 4 Byte hohe Bits, 16 Byte Nibbles) und
+`idtQ5_1` (zusätzlich FP16-Minimum) in Tensor-Typen, GGUF-Loader, `InferRowToF32`; CPU-Kernel
+(Pascal, dann AVX2/NEON wie Q4_0: entpacken nach Q8_0 je Zeile oder eigene Dot-Produkte),
+Vulkan- und CUDA-Linear (`dtype` 5/6 in den Shadern). *Gate:* Tiny-Modell als Q5_0/Q5_1-GGUF
+aus ggml's Referenz-Quantisierer (`make_reference.py`, Ggml), Bits wie ggml; Qwen2.5-0.5B
+Q4_K_M gegen FP32 (Kosinus, Greedy bis zur knappen Stelle) auf CPU, Vulkan, CUDA;
+Gegenproben (hohes Bit vertauscht, Minimum vergessen). *Nutzen messen:* Q5_0 gegen Q8_0 bei
+Qwen2.5-0.5B (Speicher, Decode) - übernehmen nur, wenn der Nutzen trägt.

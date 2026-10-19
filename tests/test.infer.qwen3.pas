@@ -61,8 +61,13 @@ type
     // within aCos / aMaxAbs, greedy equal up to a step the reference was less
     // than aMargin sure of
     // - aGguf: the model from that file instead of quantized at load
+    // - aRefName / aFolder: another model's reference and folder (Qwen2.5)
     procedure Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs, aMargin: double;
-      const aGguf: TFileName = '');
+      const aGguf: TFileName = ''; const aRefName: RawUtf8 = 'qwen3';
+      const aFolder: TFileName = '');
+    /// the folder of Qwen2.5-0.5B-Instruct, '' (SKIP, or a failure with
+    // LAI_REQUIRE_MODEL=1) when absent or in a 32-bit process
+    function Qwen25Folder: TFileName;
   published
     /// the tiny Qwen3 (BF16 weights): every state and all logits
     procedure TinyForwardMatchesReference;
@@ -118,6 +123,15 @@ type
     // tokens differs (with a gap) and changes the logits; nothing left to
     // replay raises
     procedure RouteTapeReplays;
+    /// D1b, the tiny Qwen2 (bias on Q, K, V, no head norm, head_dim = hidden /
+    // heads): every state, greedy; from GGUF (no key_length); a file without
+    // a bias refused
+    procedure TinyQwen2MatchesReference;
+    /// Qwen2.5-0.5B-Instruct in FP32: states, last logits, greedy identical
+    procedure Qwen25MatchesReference;
+    /// Qwen's own GGUF of Qwen2.5-0.5B-Instruct: Q8_0 against FP32; its
+    // Q4_K_M refused - mostly Q5_0 (hidden 896 is no multiple of 256)
+    procedure Qwen25Gguf;
   end;
 
 
@@ -1001,11 +1015,12 @@ begin
 end;
 
 procedure TTestInferQwen3.Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs,
-  aMargin: double; const aGguf: TFileName);
+  aMargin: double; const aGguf: TFileName; const aRefName: RawUtf8;
+  const aFolder: TFileName);
 var
   dir, refdir: TFileName;
   ref: TInferRefSet;
-  model: TQwen3Model;
+  model: TDecoderModel;
   ctx: TQwen3Context;
   prompts, p: PDocVariantData;
   ids, want: PIntegerArray;
@@ -1017,20 +1032,22 @@ var
   margin: double;
   timer: TPrecisionTimer;
 begin
-  dir := RealModel;
+  dir := aFolder;
+  if dir = '' then
+    dir := RealModel;
   if dir = '' then
     exit;
-  refdir := FindInferRefDir('qwen3');
-  if CheckFailed(refdir <> '', 'qwen3 reference found') then
+  refdir := FindInferRefDir(aRefName);
+  if CheckFailed(refdir <> '', Utf8ToString(aRefName + ' reference found')) then
     exit;
   ref := TInferRefSet.CreateFromFolder(refdir);
   model := nil;
   try
     timer.Start;
     if aGguf <> '' then
-      model := TQwen3Model.CreateFromGguf(aGguf, fFast)
+      model := NewDecoderModelFromGguf(aGguf, fFast)
     else
-      model := TQwen3Model.Create(dir, fFast, aType);
+      model := NewDecoderModel(dir, fFast, aType);
     AddConsole(FormatString('% model loaded in %', [INFER_DTYPE_NAME[aType],
       timer.Stop]));
     prompts := ref.Manifest^.A['prompts'];
@@ -1597,7 +1614,8 @@ begin
   Check(DecoderModelClass('qwen3_moe') = TQwen3MoeModel, 'model_type qwen3_moe');
   Check(DecoderModelClassOfArchitecture('qwen3moe') = TQwen3MoeModel,
     'architecture qwen3moe');
-  Check(DecoderModelClass('qwen2') = nil, 'model_type qwen2: none');
+  Check(DecoderModelClass('qwen2') = TQwen2Model, 'model_type qwen2');
+  Check(DecoderModelClass('llama') = nil, 'model_type llama: none');
   Check(DecoderModelClassOfArchitecture('llama') = nil, 'architecture llama: none');
   // registered once: a second registration changes nothing
   RegisterDecoderModel(TQwen3Model);
@@ -1635,8 +1653,8 @@ begin
   try
     Check(Refused(tmp, '', 'cannot read'), 'no config.json');
     FileFromString(StringReplaceAll(StringFromFile(dir + 'config.json'),
-      '"qwen3"', '"qwen2"'), tmp + 'config.json');
-    Check(Refused(tmp, '', 'not supported'), 'model_type qwen2');
+      '"qwen3"', '"llama"'), tmp + 'config.json');
+    Check(Refused(tmp, '', 'not supported'), 'model_type llama');
   finally
     DirectoryDeleteAll(tmp);
   end;
@@ -2038,6 +2056,203 @@ begin
     end;
   finally
     DirectoryDeleteAll(tmp);
+  end;
+end;
+
+function TTestInferQwen3.Qwen25Folder: TFileName;
+begin
+  result := '';
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen2.5-0.5B: 2 GB of FP32 weights need a 64-bit process');
+  exit;
+  {$endif CPU32}
+  result := FindVendorModel('qwen2.5-0.5b-instruct' + PathDelim + 'model.safetensors');
+  if result <> '' then
+  begin
+    result := ExtractFilePath(result);
+    exit;
+  end;
+  CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+    'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen2.5-0.5b-instruct/model.safetensors');
+  AddConsole('SKIP Qwen2.5-0.5B: no vendor/models/qwen2.5-0.5b-instruct (tools/infer-ref, ' +
+    'make_reference_qwen2.py)');
+end;
+
+procedure TTestInferQwen3.TinyQwen2MatchesReference;
+var
+  dir, gdir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  ctx: TDecoderContext;
+  ids: PIntegerArray;
+  prompt, mine: TIntegerDynArray;
+  logits: TSingleDynArray;
+  why: RawUtf8;
+  k, n, diff, m: PtrInt;
+  margin: double;
+  detail: RawUtf8;
+  cmp: TInferCompare;
+begin
+  dir := FindInferRefDir('tiny-qwen2');
+  if CheckFailed(dir <> '', 'tiny-qwen2 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  model := nil;
+  try
+    // the family from config.json, head_dim from hidden / heads
+    model := NewDecoderModel(dir, fCpu);
+    Check(model is TQwen2Model, 'model_type qwen2: a TQwen2Model');
+    CheckEqual(model.Config.HeadDim, 16, 'head_dim = 64 / 4');
+    Check((model.Layers[0].QBias <> nil) and (model.Layers[1].VBias <> nil) and
+      (model.Layers[0].QNorm = nil), 'biases, no head norm');
+    for k := 0 to 2 do
+      CheckStates(TQwen2Model(model), ref, FormatUtf8('case%', [k]), 2e-6, 2e-5, true);
+    // greedy, through the KV cache
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, 16, [2]);
+      finally
+        ctx.Free;
+      end;
+      diff := GreedyDiff(mine, ref, FormatUtf8('case%', [k]), margin, detail);
+      CheckUtf8(diff < 0, 'tiny qwen2 case% greedy differs at step % (margin %, %)',
+        [k, diff, margin, detail]);
+    end;
+    FreeAndNil(model);
+    // as llama.cpp writes a qwen2 file: no key_length, the biases F32
+    gdir := MakePath([dir, 'gguf'], true);
+    model := NewDecoderModelFromGguf(gdir + 'q8_0.gguf', fCpu);
+    Check(model is TQwen2Model, 'architecture qwen2: a TQwen2Model');
+    CheckEqual(model.Config.HeadDim, 16, 'GGUF head_dim = 64 / 4');
+    ids := ref.I32('case2.ids', n);
+    SetLength(logits, model.Config.VocabSize);
+    ctx := model.NewContext;
+    try
+      model.Forward(ctx, ids, n, pointer(logits));
+    finally
+      ctx.Free;
+    end;
+    cmp := InferCompare(pointer(logits),
+      @ref.F32('case2.logits', m)^[(n - 1) * model.Config.VocabSize],
+      model.Config.VocabSize, 0.05, 0.05);
+    CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999), 'tiny qwen2 Q8_0 GGUF: %',
+      [InferCompareText(cmp)]);
+    FreeAndNil(model);
+    why := '';
+    try
+      NewDecoderModelFromGguf(gdir + 'bad-nobias.gguf', fCpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('attn_k.bias', why) > 0, 'a missing bias refused: %', [why]);
+  finally
+    model.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.Qwen25MatchesReference;
+var
+  dir, refdir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  ctx: TDecoderContext;
+  prompts, p: PDocVariantData;
+  ids: PIntegerArray;
+  i, n, diff: PtrInt;
+  prompt, mine: TIntegerDynArray;
+  margin: double;
+  detail: RawUtf8;
+  timer: TPrecisionTimer;
+begin
+  dir := Qwen25Folder;
+  if dir = '' then
+    exit;
+  refdir := FindInferRefDir('qwen25');
+  if CheckFailed(refdir <> '', 'qwen25 reference found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  model := nil;
+  try
+    model := NewDecoderModel(dir, fFast);
+    Check(model is TQwen2Model, 'Qwen2.5: a TQwen2Model');
+    CheckEqual(model.Config.Layers, 24, 'Qwen2.5-0.5B depth');
+    CheckEqual(model.Config.HeadDim, 64, 'head_dim 896 / 14');
+    prompts := ref.Manifest^.A['prompts'];
+    for i := 0 to prompts^.Count - 1 do
+    begin
+      p := _Safe(prompts^.Values[i]);
+      CheckStates(TQwen2Model(model), ref, p^.U['id'], 2e-3, 2e-3, false);
+      ids := ref.I32(p^.U['id'] + '.ids', n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        timer.Start;
+        mine := model.Greedy(ctx, prompt, 48, [151645, 151643]);
+        timer.Stop;
+      finally
+        ctx.Free;
+      end;
+      diff := GreedyDiff(mine, ref, p^.U['id'], margin, detail);
+      CheckUtf8(diff < 0, 'Qwen2.5 % differs at step % (reference margin %, %)',
+        [p^.U['id'], diff, margin, detail]);
+      AddConsole(FormatString('Qwen2.5 % greedy: % + % tokens in %', [p^.U['id'], n,
+        length(mine), timer.Time]));
+    end;
+  finally
+    model.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.Qwen25Gguf;
+var
+  dir, gguf: TFileName;
+  f: integer;
+  why: RawUtf8;
+const
+  FILES: array[0..1] of TFileName = (
+    'qwen2.5-0.5b-instruct-q8_0.gguf', 'qwen2.5-0.5b-instruct-q4_k_m.gguf');
+begin
+  dir := Qwen25Folder;
+  if dir = '' then
+    exit;
+  for f := 0 to high(FILES) do
+  begin
+    gguf := FindVendorModel(FILES[f]);
+    if gguf = '' then
+    begin
+      CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+        'LAI_REQUIRE_MODEL=1 but no vendor/models/%', [FILES[f]]);
+      AddConsole('SKIP Qwen2.5 GGUF: no vendor/models/%', [FILES[f]]);
+      continue;
+    end;
+    if f = 0 then
+      // close, greedy equal up to a step the reference was less sure of than
+      // the logits differ: Qwen2.5-0.5B moves more under Q8_0 than Qwen3-0.6B
+      // (measured 2026-10-19: cosine 0.990 to 0.995, max error 2.6; the
+      // chat_system answer leaves the reference where it was 1.42 sure)
+      Qwen3Quantized(idtQ8_0, 0.98, 3, 3, gguf, 'qwen25', dir)
+    else
+    begin
+      // llama.cpp falls back to Q5_0 where a row is no multiple of 256: not
+      // supported (backlog), refused by name
+      why := '';
+      try
+        NewDecoderModelFromGguf(gguf, fCpu).Free;
+      except
+        on E: EInferError do
+          why := StringToUtf8(E.Message);
+      end;
+      CheckUtf8(PosEx('(Q5_0)', why) > 0, 'Qwen2.5 Q4_K_M refused: %', [why]);
+    end;
   end;
 end;
 

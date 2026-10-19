@@ -90,6 +90,13 @@ type
     /// Qwen3-30B-A3B (Q4_K_M GGUF) on the device against the fast CPU backend,
     // teacher-forced - where the file was put
     procedure Qwen3MoeGgufMatchesCpu;
+    /// D1b: the tiny Qwen2 (bias on Q, K, V, no head norm) on the device
+    // against the CPU - safetensors and the Q8_0 GGUF, a prompt of two chunks,
+    // decoding, the float and the half-float cache
+    procedure TinyQwen2MatchesCpu;
+    /// Qwen2.5-0.5B-Instruct (Q8_0 GGUF) on the device against the fast CPU
+    // backend, teacher-forced - skipped without the model
+    procedure Qwen25GgufMatchesCpu;
   end;
 
 
@@ -825,14 +832,15 @@ var
   // qkrope of aRows new rows after aPast cached ones, then the attention of
   // those rows over the whole cache - both against the CPU; the attention
   // blocks hold aHeadBlock heads times 8 div aHeadBlock rows, the keys of a
-  // row cut into aSplits ranges (merged by attnmerge when more than one)
+  // row cut into aSplits ranges (merged by attnmerge when more than one);
+  // aNorm false: no RMSNorm per head (Qwen2), qn and kn not read
   procedure AttentionCase(aRows, aHeads, aKvHeads, aHeadDim, aPast, aHeadBlock,
-    aSplits: PtrInt);
+    aSplits: PtrInt; aNorm: boolean = true);
   var
     q, k, v, qn, kn, cs, cosv, sinv, keys, values, y, kc, vc, qc, yc,
       part: TSingleDynArray;
     pq, pk, pv, pqn, pkn, pcs, pkc, pvc, py, ppart: TCuDevicePtr;
-    rows, heads, kvHeads, headDim, past, splits, hb, rb: cardinal;
+    rows, heads, kvHeads, headDim, past, splits, hb, rb, norm: cardinal;
     eps: single;
     half, kvw, cp, r, i: PtrInt;
   begin
@@ -876,6 +884,7 @@ var
     hb := aHeadBlock;
     rb := 8 div aHeadBlock;
     eps := 1e-6;
+    norm := ord(aNorm);
     // every buffer up first: the two kernels then run back to back, with no
     // copy (which waits for the stream) between them
     SetLength(y, aRows * aHeads * aHeadDim);
@@ -883,7 +892,7 @@ var
     SetLength(part, aHeads * aRows * aSplits * (aHeadDim + 2));
     ppart := Up(part);
     fCu.Enqueue(kQk, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows, @heads,
-      @kvHeads, @headDim, @past, @eps], aHeads + aKvHeads, 128, aRows);
+      @kvHeads, @headDim, @past, @eps, @norm], aHeads + aKvHeads, 128, aRows);
     fCu.Enqueue(kAtt, [@pq, @pkc, @pvc, @py, @ppart, @rows, @heads, @headDim,
       @kvHeads, @past, @splits, @hb, @rb], aHeads div aHeadBlock, 128,
       (aRows + PtrInt(rb) - 1) div PtrInt(rb), aSplits);
@@ -899,8 +908,11 @@ var
     Down(pvc, vc);
     Down(py, yc);
     // the CPU: per-head norms, rotary positions, the store into the cache
-    ref.RmsNorm(pointer(q), aRows * aHeads, aHeadDim, pointer(qn), eps, pointer(q));
-    ref.RmsNorm(pointer(k), aRows * aKvHeads, aHeadDim, pointer(kn), eps, pointer(k));
+    if aNorm then
+    begin
+      ref.RmsNorm(pointer(q), aRows * aHeads, aHeadDim, pointer(qn), eps, pointer(q));
+      ref.RmsNorm(pointer(k), aRows * aKvHeads, aHeadDim, pointer(kn), eps, pointer(k));
+    end;
     ref.Rope(pointer(q), aRows, aHeads, aHeadDim, pointer(cosv), pointer(sinv));
     ref.Rope(pointer(k), aRows, aKvHeads, aHeadDim, pointer(cosv), pointer(sinv));
     MoveFast(pointer(k)^, keys[aPast * kvw], aRows * kvw * 4);
@@ -942,6 +954,7 @@ begin
     AttentionCase(2, 4, 4, 256, 5, 1, 1);    // the widest head
     AttentionCase(2, 4, 4, 256, 5, 1, 2);
     AttentionCase(9, 8, 1, 64, 130, 8, 4);   // 8 heads of one KV head
+    AttentionCase(5, 14, 2, 64, 10, 7, 1, false); // no head norm (Qwen2.5-0.5B)
   finally
     for i := 0 to high(bufs) do
       bufs[i].Free;
@@ -1572,6 +1585,201 @@ begin
     if model <> nil then
       model.RouteTape := nil;
     tape.Free;
+    c2.Free;
+    c1.Free;
+    vk.Free;
+    model.Free;
+    cpu.Free;
+    gpu.Free;
+  end;
+end;
+
+procedure TTestInferCuda.TinyQwen2MatchesCpu;
+const
+  PROMPT = 300; // more than one chunk of the device forward pass (256)
+  /// float cache as for tiny-qwen3; a half-float cache as AttentionRangesMatchCpu
+  TOL: array[boolean] of double = (1e-4, 4e-3);
+var
+  dir: TFileName;
+  gpu: TInferCudaBackend;
+  ref: TInferCpuBackend;
+  model: TDecoderModel;
+  vk: TQwen3Cuda;
+  c1: TQwen3Context;
+  c2: TQwen3CuContext;
+  ids: TIntegerDynArray;
+  l1, l2: TSingleDynArray;
+  i, k, v: PtrInt;
+  seed: cardinal;
+  e: double;
+  cmp: TInferCompare;
+  id: integer;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen2');
+  if CheckFailed(dir <> '', 'tiny-qwen2 found') then
+    exit;
+  SetLength(ids, PROMPT);
+  seed := 13;
+  for i := 0 to PROMPT - 1 do
+  begin
+    seed := seed * 1103515245 + 12345;
+    ids[i] := 3 + (seed shr 16) mod 93;
+  end;
+  // 0: F32 with a float cache, 1: F32 with a half-float cache, 2: Q8_0 GGUF
+  for k := 0 to 2 do
+  begin
+    gpu := TInferCudaBackend.Create;
+    ref := TInferCpuBackend.Create;
+    model := nil;
+    vk := nil;
+    c1 := nil;
+    c2 := nil;
+    try
+      if k = 2 then
+        model := NewDecoderModelFromGguf(MakePath([dir, 'gguf', 'q8_0.gguf']), ref)
+      else
+        model := NewDecoderModel(dir, ref);
+      Check(model is TQwen2Model, 'a Qwen2 model');
+      v := model.Config.VocabSize;
+      vk := TQwen3Cuda.Create(model, gpu);
+      vk.KvF16 := k = 1;
+      c1 := model.NewContext;
+      c2 := vk.NewContext;
+      SetLength(l1, PROMPT * v);
+      SetLength(l2, PROMPT * v);
+      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+      vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      if k < 2 then
+      begin
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= TOL[k = 1], 'Qwen2 F32 prompt logits (KvF16 %): relative error %',
+          [k = 1, e]);
+      end
+      else
+      begin
+        // Q8_0: the CPU also quantizes the activations, the device not
+        cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
+        CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999),
+          'Qwen2 Q8_0 prompt logits: %', [InferCompareText(cmp)]);
+      end;
+      for i := 0 to 3 do
+      begin
+        id := ids[i];
+        model.Forward(c1, @id, 1, pointer(l1));
+        vk.Forward(c2, @id, 1, pointer(l2));
+        if k < 2 then
+        begin
+          e := RelError(pointer(l2), pointer(l1), v);
+          CheckUtf8(e <= TOL[k = 1], 'Qwen2 F32 decode step % (KvF16 %): relative ' +
+            'error %', [i, k = 1, e]);
+        end
+        else
+        begin
+          cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999),
+            'Qwen2 Q8_0 decode step %: %', [i, InferCompareText(cmp)]);
+        end;
+      end;
+    finally
+      c2.Free;
+      c1.Free;
+      vk.Free;
+      model.Free;
+      ref.Free;
+      gpu.Free;
+    end;
+  end;
+end;
+
+procedure TTestInferCuda.Qwen25GgufMatchesCpu;
+const
+  STEPS = 16;
+var
+  gguf: TFileName;
+  i, v, agree: PtrInt;
+  gpu: TInferCudaBackend;
+  cpu: TInferCpuFastBackend;
+  model: TDecoderModel;
+  vk: TQwen3Cuda;
+  c1: TQwen3Context;
+  c2: TQwen3CuContext;
+  l1, l2: TSingleDynArray;
+  cmp: TInferCompare;
+  worst: double;
+  id: integer;
+  prompt: TIntegerDynArray;
+  ref: TInferRefSet;
+  refdir: TFileName;
+  p: PIntegerArray;
+  n: PtrInt;
+begin
+  if not HasDevice then
+    exit;
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen2.5 on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  gguf := FindVendorModel('qwen2.5-0.5b-instruct-q8_0.gguf');
+  if gguf = '' then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen2.5-0.5b-instruct-q8_0.gguf');
+    AddConsole('SKIP Qwen2.5 on the device: no vendor/models/qwen2.5-0.5b-instruct-q8_0.gguf');
+    exit;
+  end;
+  refdir := FindInferRefDir('qwen25');
+  if CheckFailed(refdir <> '', 'qwen25 reference found') then
+    exit;
+  // the chat_de prompt of the reference (43 tokens through the template)
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  try
+    p := ref.I32('chat_de.ids', n);
+    SetLength(prompt, n);
+    MoveFast(p^, prompt[0], n * SizeOf(integer));
+  finally
+    ref.Free;
+  end;
+  gpu := TInferCudaBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  model := nil;
+  vk := nil;
+  c1 := nil;
+  c2 := nil;
+  try
+    model := NewDecoderModelFromGguf(gguf, cpu);
+    Check(model is TQwen2Model, 'a Qwen2 model');
+    v := model.Config.VocabSize;
+    vk := TQwen3Cuda.Create(model, gpu);
+    c1 := model.NewContext;
+    c2 := vk.NewContext;
+    SetLength(l1, v);
+    SetLength(l2, v);
+    model.Forward(c1, pointer(prompt), length(prompt), pointer(l1));
+    vk.Forward(c2, pointer(prompt), length(prompt), pointer(l2));
+    worst := 1;
+    agree := 0;
+    for i := 0 to STEPS - 1 do
+    begin
+      cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+      if cmp.Cosine < worst then
+        worst := cmp.Cosine;
+      // InferCompare leaves a NaN or an infinity out of the cosine
+      if cmp.NonFinite <> 0 then
+        worst := -1;
+      id := InferArgMax(pointer(l1), v);
+      if InferArgMax(pointer(l2), v) = id then
+        inc(agree);
+      // the CPU's token to both: the comparison stays on one path
+      model.Forward(c1, @id, 1, pointer(l1));
+      vk.Forward(c2, @id, 1, pointer(l2));
+    end;
+    AddConsole('Qwen2.5-0.5B Q8_0 on %: lowest logits cosine %, argmax agrees % of %',
+      [fCu.DeviceName, worst, agree, STEPS]);
+    CheckUtf8(worst >= 0.99, 'Qwen2.5 logits cosine %', [worst]);
+    CheckUtf8(agree >= STEPS - 2, 'Qwen2.5 argmax agrees % of %', [agree, STEPS]);
+  finally
     c2.Free;
     c1.Free;
     vk.Free;

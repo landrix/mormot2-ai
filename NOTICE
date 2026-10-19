@@ -104,3 +104,16 @@ Qwen3-TTS reference data  (flydev-fr; model by Alibaba Cloud, Qwen team)  (ADOPT
   also holds 14 rows of its codec embeddings (BF16 widened to float32). The
   model itself is not part of this repository.
   https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+
+Qwen2.5  (Alibaba Cloud, Qwen team)  (MODEL INTERFACE, NOT CODE)
+  The native decoder reads Qwen/Qwen2.5-0.5B-Instruct (revision
+  7ae557604adf67be50417f59c2c2f167def9a775) and its GGUF files
+  (Qwen/Qwen2.5-0.5B-Instruct-GGUF, revision 9217f5db79a29953eb74d5343926648285ec7e67)
+  at runtime; they are not part of this repository (vendor/models/, gitignored).
+  The chat template of mormot.ai.infer.chat (TQwen2ChatTemplate) is written in
+  Pascal; the default system text and the tool-calling instructions are
+  reproduced from its tokenizer_config.json because the model only works with
+  them. Reference data under tests/data/infer-ref/qwen25* holds token ids,
+  logits and states computed with the model, no weights.
+  License: Apache-2.0.
+  https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct

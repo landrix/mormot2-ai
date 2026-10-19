@@ -387,8 +387,18 @@ begin
     end;
     Vector(ly^.InputNorm, c.Hidden);
     Vector(ly^.PostNorm, c.Hidden);
-    Vector(ly^.QNorm, c.HeadDim);
-    Vector(ly^.KNorm, c.HeadDim);
+    if ly^.QNorm <> nil then
+    begin
+      Vector(ly^.QNorm, c.HeadDim);
+      Vector(ly^.KNorm, c.HeadDim);
+    end;
+    // the biases up front: a captured graph cannot upload
+    if ly^.QBias <> nil then
+    begin
+      Vector(ly^.QBias, qw);
+      Vector(ly^.KBias, kvw);
+      Vector(ly^.VBias, kvw);
+    end;
   end;
   Vector(fModel.FinalNorm, c.Hidden);
   Matrix(fModel.Head, c.VocabSize, c.Hidden);
@@ -623,7 +633,8 @@ var
   ly: ^TQwen3Layer;
   p: PSingleArray;
   pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt: TCuDevicePtr;
-  rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count: cardinal;
+  rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count,
+    norm: cardinal;
   eps: single;
   capture: boolean;
   qkrope, attention: TCuHandle;
@@ -707,15 +718,23 @@ begin
       ly := @fModel.Layers[l];
       // attention block: the projections, per head the norms, rotary positions
       // and the store of k and v into the cache, the attention, the output
-      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ);
-      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK);
-      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV);
-      pqn := Vector(ly^.QNorm, c.HeadDim);
-      pkn := Vector(ly^.KNorm, c.HeadDim);
+      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, ly^.QBias);
+      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, ly^.KBias);
+      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, ly^.VBias);
+      // without head norms (Qwen2) the kernel reads no qn or kn
+      norm := ord(ly^.QNorm <> nil);
+      pqn := 0;
+      pkn := 0;
+      if ly^.QNorm <> nil then
+      begin
+        pqn := Vector(ly^.QNorm, c.HeadDim);
+        pkn := Vector(ly^.KNorm, c.HeadDim);
+      end;
       pkc := aCtx.fDevKeys[l].Ptr;
       pvc := aCtx.fDevValues[l].Ptr;
       fCu.Enqueue(qkrope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
-        @heads, @kvHeads, @headDim, @ppast, @eps], c.Heads + c.KvHeads, OPS_BLOCK, n);
+        @heads, @kvHeads, @headDim, @ppast, @eps, @norm], c.Heads + c.KvHeads,
+        OPS_BLOCK, n);
       fCu.Enqueue(attention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
         @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock], c.Heads div hb,
         OPS_BLOCK, blocks, splits);

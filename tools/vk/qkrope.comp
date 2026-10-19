@@ -1,6 +1,7 @@
 // LandrixAI - the per-head part of a Qwen3 attention block in one dispatch
 // (phase 4e of docs/native-inference.md): for every token row and head,
-// RMSNorm of q (QNorm) and k (KNorm), rotary positions on both, and k and v
+// RMSNorm of q (QNorm) and k (KNorm) when norm is set (Qwen3; Qwen2 has
+// none: then qn and kn are not read), rotary positions on both, and k and v
 // stored into the KV cache at position past + row - what were six dispatches
 // (two norms, two RoPE, two copies); arithmetic as rmsnorm.comp and rope.comp
 // - one work group of 128 per (row, head): heads first, then the KV heads
@@ -29,6 +30,7 @@ layout(std430, binding = 7) writeonly buffer BufVC { float vc[]; };
 layout(push_constant) uniform Push {
   uint rows, heads, kvHeads, headDim, past;
   float eps;
+  uint norm;
 } p;
 
 shared float partial[128];
@@ -63,7 +65,7 @@ void main()
   for (uint c = t; c < d; c += 128u)
   {
     float a = isQ ? q[src + c] : k[src + c];
-    normed[c] = (isQ ? qn[c] : kn[c]) * (a * inv);
+    normed[c] = p.norm != 0u ? (isQ ? qn[c] : kn[c]) * (a * inv) : a;
   }
   barrier();
   // rotary positions: the halves rotated by the factors of the row

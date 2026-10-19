@@ -5,7 +5,9 @@
 //   brings its own descendant (Build) - the Jinja template of a model is not
 //   run: TQwen3ChatTemplate writes the
 //   same text in Pascal (tokenizer_config.json of Qwen/Qwen3-0.6B revision
-//   c1899de289a04d12100db370d81485cdf75e47ca), gate tests/data/infer-ref/qwen3-chat
+//   c1899de289a04d12100db370d81485cdf75e47ca), gate tests/data/infer-ref/qwen3-chat;
+//   TQwen2ChatTemplate that of Qwen2.5 (Qwen/Qwen2.5-0.5B-Instruct revision
+//   7ae557604adf67be50417f59c2c2f167def9a775), gate tests/data/infer-ref/qwen25-chat
 // - one difference by design: the template emits the control tokens
 //   (<|im_start|> <|im_end|> <think> </think> <tool_call> </tool_call>
 //   <tool_response> </tool_response>) as ids, and every message text is text.
@@ -22,6 +24,7 @@ unit mormot.ai.infer.chat;
     - PythonJson: JSON re-serialized the way Python json.dumps writes it
     - TChatTemplate: messages and tools to token ids (and text), per family
     - TQwen3ChatTemplate: the template of Qwen3
+    - TQwen2ChatTemplate: the template of Qwen2.5
 
   *****************************************************************************
 }
@@ -93,12 +96,34 @@ type
   /// a chat template class, as a decoder family registers it
   TChatTemplateClass = class of TChatTemplate;
 
-  /// the chat template of Qwen3 (and Qwen2.5 tool calling): ChatML with
-  // <think> blocks and <tools> in the system turn
+  /// the chat template of Qwen3: ChatML with <think> blocks and <tools> in the
+  // system turn
   TQwen3ChatTemplate = class(TChatTemplate)
   protected
     fImStart, fImEnd, fThink, fThinkEnd, fToolCall, fToolCallEnd,
     fToolResponse, fToolResponseEnd: integer;
+    procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt, aEnableThinking: boolean);
+      override;
+  public
+    /// look up the control tokens in aTokenizer (not owned) - raises
+    // EInferError when one is missing
+    constructor Create(aTokenizer: TInferTokenizer); override;
+  end;
+
+  /// the chat template of Qwen2.5 (Instruct): ChatML, always a system turn
+  // (the model's default text without a system message), <tools> in it, no
+  // reasoning - aEnableThinking is ignored
+  // - the arguments of a tool call in the history go through the template's
+  // tojson: written like Python json.dumps (PythonJson, a float kept as it
+  // stands), '' as {}
+  // - <tool_response> and </tool_response> are text for Qwen2.5 (no added
+  // tokens, as the HF tokenizer splits them); a tokenizer that has them gets
+  // their ids
+  TQwen2ChatTemplate = class(TChatTemplate)
+  protected
+    fImStart, fImEnd, fToolCall, fToolCallEnd, fToolResponse,
+    fToolResponseEnd: integer;
     procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
       const aTools: TLlmToolDynArray; aAddGenerationPrompt, aEnableThinking: boolean);
       override;
@@ -841,6 +866,121 @@ begin
       aOut.Control(fThinkEnd, '</think>');
       aOut.Add(#10#10);
     end;
+  end;
+  aOut.Flush;
+end;
+
+{ TQwen2ChatTemplate }
+
+const
+  /// the system text of the Qwen2.5 template when the conversation has none
+  QWEN25_SYSTEM = 'You are Qwen, created by Alibaba Cloud. You are a helpful ' +
+    'assistant.';
+
+constructor TQwen2ChatTemplate.Create(aTokenizer: TInferTokenizer);
+begin
+  inherited Create(aTokenizer);
+  fImStart := Need('<|im_start|>');
+  fImEnd := Need('<|im_end|>');
+  fToolCall := Need('<tool_call>');
+  fToolCallEnd := Need('</tool_call>');
+  fToolResponse := aTokenizer.TokenId('<tool_response>'); // -1: text
+  fToolResponseEnd := aTokenizer.TokenId('</tool_response>');
+end;
+
+procedure TQwen2ChatTemplate.Build(var aOut: TChatSegments;
+  const aMessages: TLlmMessageDynArray; const aTools: TLlmToolDynArray;
+  aAddGenerationPrompt, aEnableThinking: boolean);
+var
+  n, i, j: PtrInt;
+  args: RawUtf8;
+  m: ^TLlmMessage;
+begin
+  n := length(aMessages);
+  // the system turn: the first message when it is a system one, else the
+  // default; the tool list after it
+  aOut.Control(fImStart, '<|im_start|>');
+  if (n > 0) and (aMessages[0].Role = lrSystem) then
+    aOut.Add('system'#10 + aMessages[0].Content)
+  else
+    aOut.Add('system'#10 + QWEN25_SYSTEM);
+  if aTools <> nil then
+  begin
+    aOut.Add(#10#10 + TOOLS_INTRO);
+    for i := 0 to high(aTools) do
+      aOut.Add(#10 + ToolJson(aTools[i]));
+    aOut.Add(TOOLS_OUTRO);
+    aOut.Control(fToolCall, '<tool_call>');
+    aOut.Control(fToolCallEnd, '</tool_call>');
+    aOut.Add(' XML tags:'#10);
+    aOut.Control(fToolCall, '<tool_call>');
+    aOut.Add(TOOLS_FORMAT);
+    aOut.Control(fToolCallEnd, '</tool_call>');
+  end;
+  aOut.Control(fImEnd, '<|im_end|>');
+  aOut.Add(#10);
+  for i := 0 to n - 1 do
+  begin
+    m := @aMessages[i];
+    if (m^.Role = lrUser) or ((m^.Role = lrSystem) and (i > 0)) or
+       ((m^.Role = lrAssistant) and (m^.ToolCalls = nil)) then
+    begin
+      aOut.Control(fImStart, '<|im_start|>');
+      aOut.Add(LlmRoleText(m^.Role) + #10 + m^.Content);
+      aOut.Control(fImEnd, '<|im_end|>');
+      aOut.Add(#10);
+    end
+    else if m^.Role = lrAssistant then
+    begin
+      aOut.Control(fImStart, '<|im_start|>');
+      aOut.Add('assistant');
+      if m^.Content <> '' then
+        aOut.Add(#10 + m^.Content);
+      for j := 0 to high(m^.ToolCalls) do
+      begin
+        args := m^.ToolCalls[j].ArgumentsJson;
+        if args = '' then
+          args := '{}'
+        else
+          args := PythonJson(args, {keepinexactfloats=}true);
+        aOut.Add(#10);
+        aOut.Control(fToolCall, '<tool_call>');
+        aOut.Add(#10'{"name": "' + m^.ToolCalls[j].Name + '", "arguments": ' + args +
+          '}'#10);
+        aOut.Control(fToolCallEnd, '</tool_call>');
+      end;
+      aOut.Control(fImEnd, '<|im_end|>');
+      aOut.Add(#10);
+    end
+    else if m^.Role = lrTool then
+    begin
+      if (i = 0) or (aMessages[i - 1].Role <> lrTool) then
+      begin
+        aOut.Control(fImStart, '<|im_start|>');
+        aOut.Add('user');
+      end;
+      aOut.Add(#10);
+      if fToolResponse >= 0 then
+        aOut.Control(fToolResponse, '<tool_response>')
+      else
+        aOut.Add('<tool_response>');
+      aOut.Add(#10 + m^.Content + #10);
+      if fToolResponseEnd >= 0 then
+        aOut.Control(fToolResponseEnd, '</tool_response>')
+      else
+        aOut.Add('</tool_response>');
+      if (i = n - 1) or (aMessages[i + 1].Role <> lrTool) then
+      begin
+        aOut.Control(fImEnd, '<|im_end|>');
+        aOut.Add(#10);
+      end;
+    end;
+    // a system message at index 0 was written above
+  end;
+  if aAddGenerationPrompt then
+  begin
+    aOut.Control(fImStart, '<|im_start|>');
+    aOut.Add('assistant'#10);
   end;
   aOut.Flush;
 end;
