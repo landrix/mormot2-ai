@@ -226,7 +226,7 @@ geteilt, wenn die Deskriptor-Sets knapp werden: Qwen3-30B-A3B auf der RTX 5090 D
 Die Expertenwahl im Vergleichstest ist vorgegeben (`TDecoderRouteTape`, umgesetzt wie unten
 beschrieben; unter Delphi 13 bleibt eine Abweichung aus der CPU-Rechnung, B13).
 Auf dem M2 Pro (MoltenVK) grün, 2026-10-19: volle Infer-Suite, 2942 Assertions, darin das
-Tiny-MoE auf der GPU. *Offen:* die Wahl auf dem Gerät (D3c).
+Tiny-MoE auf der GPU. Die Wahl auf dem Gerät: beim Decode erledigt, siehe D3c.
 *Mit D3b (entschieden 2026-10-17): Expertenwahl im Vergleichstest vorgeben.* Heute misst
 `Qwen3MoeGgufMatchesCpu` Rechengenauigkeit und Routing in einem Kosinus: unter Delphi 13 kippt
 bei einer knappen Router-Entscheidung ein Experte gegenüber der CPU, deshalb 0,98 und 14 von
@@ -264,6 +264,12 @@ braucht dafür eine Rückmeldung der Wahl aus dem Gerätepuffer, oder ein Test l
 zurück); Gegenproben (falscher Tie-Break, Gewicht nicht normiert, Gruppe eines Experten
 leer, Graph mit veralteten Ids). Decode vorher und nachher auf RTX 5090 (CUDA, Vulkan) und M2
 Pro (Tiny) - übernommen nur, wenn messbar schneller.
+*Erledigt 2026-10-19 für den Decode* (`native-inference.md`, Phase D): Route-Kernel und
+-Shader, `linear8ids` / `linear8.comp -DIDS`, `moecombine`; Qwen3-30B-A3B auf der RTX 5090 von
+38,9 auf 97,3 Tokens/s (CUDA, wieder ein Graph) und von 42,9 auf 90,4 (Vulkan, ein Batch je
+Token). *Offen:* Prefill ohne Host-Wissen (Punkt 3: Gruppen über die Höchstzahl oder
+indirekter Dispatch) - nur wenn ein Prefill-Profil zeigt, dass die Wartepunkte dort zählen;
+heute 383 / 490 Tokens/s.
 
 **D1b — Qwen2.5 als Familie (aufgenommen 2026-10-19).** Anlass: neural-api zeigt einen Chat mit
 Qwen2.5-0.5B-Instruct in wenigen Zeilen (nur die Funktion als Anregung, kein Code - LGPL, keine

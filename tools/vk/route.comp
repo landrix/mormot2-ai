@@ -1,0 +1,70 @@
+// LandrixAI - the router of TDecoderModel.Route on one row of logits, for a
+// decode step that chooses its experts on the device (phase D of
+// docs/native-inference.md, slice D3c; route of tools/cuda/ops.cu)
+// - the k highest logits, the lower id on a tie - the same experts as the
+//   host for the same logits; the weights softmax / renorm in float (Vulkan
+//   need not have doubles): within a few float steps of the host's
+// - written sorted by id, so the experts are summed in id order as the CPU
+//   does; one invocation (experts <= 4096, k <= 64, checked by the host)
+#version 450
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer BufL { float logits[]; };
+layout(std430, binding = 1) writeonly buffer BufI { int ids[]; };
+layout(std430, binding = 2) writeonly buffer BufW { float w[]; };
+
+layout(push_constant) uniform Push { uint experts; uint k; uint norm; } p;
+
+void main()
+{
+  if (gl_LocalInvocationID.x != 0u)
+    return;
+  uint taken[128];
+  int chosen[64];
+  float wt[64];
+  for (uint i = 0u; i < 128u; i++)
+    taken[i] = 0u;
+  float m = logits[0];
+  for (uint i = 1u; i < p.experts; i++)
+    m = max(m, logits[i]);
+  float sum = 0.0;
+  for (uint i = 0u; i < p.experts; i++)
+    sum += exp(logits[i] - m);
+  float picked = 0.0;
+  for (uint j = 0u; j < p.k; j++)
+  {
+    int best = -1;
+    for (uint i = 0u; i < p.experts; i++)
+      if (((taken[i >> 5] >> (i & 31u)) & 1u) == 0u &&
+          (best < 0 || logits[i] > logits[best]))
+        best = int(i);
+    taken[uint(best) >> 5] |= 1u << (uint(best) & 31u);
+    chosen[j] = best;
+    wt[j] = exp(logits[best] - m) / sum;
+    picked += wt[j];
+  }
+  if (p.norm != 0u)
+    for (uint j = 0u; j < p.k; j++)
+      wt[j] = wt[j] / picked;
+  // by id: an insertion sort of k entries
+  for (uint j = 1u; j < p.k; j++)
+  {
+    int id = chosen[j];
+    float v = wt[j];
+    uint t = j;
+    while (t > 0u && chosen[t - 1u] > id)
+    {
+      chosen[t] = chosen[t - 1u];
+      wt[t] = wt[t - 1u];
+      t--;
+    }
+    chosen[t] = id;
+    wt[t] = v;
+  }
+  for (uint j = 0u; j < p.k; j++)
+  {
+    ids[j] = chosen[j];
+    w[j] = wt[j];
+  }
+}

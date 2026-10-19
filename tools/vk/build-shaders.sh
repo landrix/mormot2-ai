@@ -24,6 +24,10 @@ done
 # variants: linear8.comp with subgroup reductions, for Vulkan 1.1 devices
 "$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -o "$TMP/linear8_sg.spv" linear8.comp   > "$TMP/linear8_sg.log" || { cat "$TMP/linear8_sg.log"; exit 1; }
 ARGS+=("SPV_LINEAR8_SG=$TMP/linear8_sg.spv")
+# linear8.comp for the experts chosen on the device (-DIDS), plain and subgroup
+"$GLSLANG" -V --target-env vulkan1.0 -Os -DIDS -o "$TMP/linear8_ids.spv" linear8.comp > "$TMP/linear8_ids.log" || { cat "$TMP/linear8_ids.log"; exit 1; }
+"$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -DIDS -o "$TMP/linear8_ids_sg.spv" linear8.comp > "$TMP/linear8_ids_sg.log" || { cat "$TMP/linear8_ids_sg.log"; exit 1; }
+ARGS+=("SPV_LINEAR8_IDS=$TMP/linear8_ids.spv" "SPV_LINEAR8_IDS_SG=$TMP/linear8_ids_sg.spv")
 # attndec.comp: subgroup arithmetic (Vulkan 1.1), a float or a half-float cache
 "$GLSLANG" -V --target-env vulkan1.1 -Os -o "$TMP/attndec.spv" attndec.comp > "$TMP/attndec.log" || { cat "$TMP/attndec.log"; exit 1; }
 "$GLSLANG" -V --target-env vulkan1.1 -Os -DKVF16 -o "$TMP/attndec_f16.spv" attndec.comp > "$TMP/attndec_f16.log" || { cat "$TMP/attndec_f16.log"; exit 1; }

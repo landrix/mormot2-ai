@@ -493,3 +493,80 @@ extern "C" __global__ void scatteradd(const float* src, const int* idx,
   for (unsigned int c = threadIdx.x; c < cols; c += BLOCK)
     d[c] = d[c] + f * s[c];
 }
+
+// ---- slice D3c: the choice of the experts on the device, for a decode step
+// (one token row): no wait for the host, the step stays one CUDA graph
+
+// the router of TDecoderModel.Route on one row of logits: softmax in double,
+// the k highest logits (the lower id on a tie), each weight rounded to float,
+// renormed to their sum when norm - then sorted by expert id, so the experts
+// are summed in id order as the CPU does; one thread (experts <= 4096,
+// k <= 64, checked by the host)
+extern "C" __global__ void route(const float* logits, int* ids, float* w,
+  unsigned int experts, unsigned int k, unsigned int norm)
+{
+  if (threadIdx.x != 0u || blockIdx.x != 0u)
+    return;
+  unsigned int taken[128];
+  int chosen[64];
+  float wt[64];
+  for (unsigned int i = 0u; i < 128u; i++)
+    taken[i] = 0u;
+  double m = logits[0];
+  for (unsigned int i = 1u; i < experts; i++)
+    if (logits[i] > m)
+      m = logits[i];
+  double sum = 0.0;
+  for (unsigned int i = 0u; i < experts; i++)
+    sum += exp((double)logits[i] - m);
+  double picked = 0.0;
+  for (unsigned int j = 0u; j < k; j++)
+  {
+    int best = -1;
+    for (unsigned int i = 0u; i < experts; i++)
+      if (((taken[i >> 5] >> (i & 31u)) & 1u) == 0u &&
+          (best < 0 || logits[i] > logits[best]))
+        best = (int)i;
+    taken[best >> 5] |= 1u << (best & 31);
+    chosen[j] = best;
+    wt[j] = (float)(exp((double)logits[best] - m) / sum);
+    picked += (double)wt[j];
+  }
+  if (norm)
+    for (unsigned int j = 0u; j < k; j++)
+      wt[j] = (float)((double)wt[j] / picked);
+  // by id: an insertion sort of k entries
+  for (unsigned int j = 1u; j < k; j++)
+  {
+    int id = chosen[j];
+    float v = wt[j];
+    unsigned int t = j;
+    while (t > 0u && chosen[t - 1u] > id)
+    {
+      chosen[t] = chosen[t - 1u];
+      wt[t] = wt[t - 1u];
+      t--;
+    }
+    chosen[t] = id;
+    wt[t] = v;
+  }
+  for (unsigned int j = 0u; j < k; j++)
+  {
+    ids[j] = chosen[j];
+    w[j] = wt[j];
+  }
+}
+
+// y[i] = sum over the k slots, in slot (= id) order, of w[s] * d[s, i] - the
+// arithmetic of fill0 followed by one scatteradd per expert
+extern "C" __global__ void moecombine(const float* d, const float* w, float* y,
+  unsigned int k, unsigned int n)
+{
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  float acc = 0.0f;
+  for (unsigned int s = 0u; s < k; s++)
+    acc = acc + w[s] * d[(unsigned long long)s * n + i];
+  y[i] = acc;
+}

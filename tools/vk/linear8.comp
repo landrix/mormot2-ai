@@ -20,6 +20,11 @@
 //   subgroups of at least 32 (a device that runs smaller or partial ones
 //   than it reports sums in shared memory also in this build; both values
 //   are the same for the whole work group)
+// - with -DIDS (SPV_LINEAR8_IDS, _IDS_SG; slice D3c): one token row through
+//   the k experts a route shader chose - work group y is slot s, its expert
+//   id ids[s] (binding 4), the expert's matrix at byte ids[s] * stride of w
+//   (the experts of a layer one buffer); x is row s when xslot, else row 0;
+//   y receives row s. The arithmetic of one row of the plain build
 #version 450
 #ifdef SUBGROUP
 #extension GL_KHR_shader_subgroup_basic : require
@@ -34,10 +39,16 @@ layout(std430, binding = 0) readonly buffer BufW { uint w[]; };
 layout(std430, binding = 1) readonly buffer BufX { vec4 x[]; };
 layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+#ifdef IDS
+layout(std430, binding = 4) readonly buffer BufI { int ids[]; };
+#endif
 
 // dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K (TInferVulkanBackend)
 layout(push_constant) uniform Push {
   uint rows, nin, nout, dtype, hasBias;
+#ifdef IDS
+  uint stride, xslot;
+#endif
 } p;
 
 shared float partial[ROWS * 128];
@@ -169,8 +180,18 @@ void main()
     group = gl_SubgroupID * (gl_SubgroupSize >> 5) + (gl_SubgroupInvocationID >> 5);
   }
 #endif
+#ifdef IDS
+  // one row: x row xrow, y row r0 (the slot), the weights from wbase
+  uint r0 = gl_WorkGroupID.y;
+  uint nr = 1u;
+  uint xrow = p.xslot != 0u ? r0 : 0u;
+  uint wbase = uint(ids[r0]) * p.stride;
+#else
   uint r0 = gl_WorkGroupID.y * ROWS;
   uint nr = min(uint(ROWS), p.rows - r0);
+  uint xrow = r0;
+  uint wbase = 0u;
+#endif
   uint rowBytes;
   if (p.dtype == 1u)
     rowBytes = p.nin * 4u;
@@ -190,10 +211,10 @@ void main()
       for (uint e = lane * 8u; e < p.nin; e += 256u)
       {
         float wv[8];
-        weights8(o * rowBytes, e, wv);
+        weights8(wbase + o * rowBytes, e, wv);
         for (uint r = 0u; r < nr; r++)
         {
-          uint xi = ((r0 + r) * p.nin + e) >> 2;
+          uint xi = ((xrow + r) * p.nin + e) >> 2;
           vec4 xa = x[xi];
           vec4 xb = x[xi + 1u];
           acc[r] += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w +

@@ -120,6 +120,10 @@ type
     // without rotary positions (tiny SmolLM3 without its windows) is refused
     // by the device, not computed otherwise
     procedure SlidingWindowRefused;
+    /// D3c: route.comp against the host's choice (TDecoderModel.Route
+    // written out, as in TTestInferCuda): random logits and ties, with and
+    // without renorming
+    procedure RouteMatchesHost;
   end;
 
 
@@ -1096,9 +1100,9 @@ var
   model: TDecoderModel;
   vk: TQwen3Vulkan;
   c1: TQwen3Context;
-  c2: TQwen3VkContext;
+  c2, c3: TQwen3VkContext;
   ids: TIntegerDynArray;
-  l1, l2: TSingleDynArray;
+  l1, l2, l3: TSingleDynArray;
   i, k, v: PtrInt;
   seed: cardinal;
   e: double;
@@ -1129,6 +1133,7 @@ begin
     vk := nil;
     c1 := nil;
     c2 := nil;
+    c3 := nil;
     try
       case k of
         1:
@@ -1140,6 +1145,7 @@ begin
       end;
       Check(model is TQwen3MoeModel, 'a Qwen3-MoE model');
       v := model.Config.VocabSize;
+      SetLength(l3, v);
       vk := TQwen3Vulkan.Create(model, gpu);
       vk.KvF16 := k = 3;
       // the Q8_0 GGUF in batches of 40 dispatches at most: a layer's experts
@@ -1175,13 +1181,37 @@ begin
         CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.998),
           'MoE Q8_0 (%) prompt logits: %', [k, InferCompareText(cmp)]);
       end;
+      // the GGUF has the experts of a layer in one buffer: a decode step
+      // chooses them on the device, the others on the host
+      CheckUtf8(vk.DeviceRoutable = (k = 1), 'case %: routable on the device', [k]);
+      if k = 1 then
+      begin
+        // the same steps with the choice on the host: the weights come from
+        // float instead of double, the rest is the same arithmetic
+        c3 := vk.NewContext;
+        vk.RouteOnDevice := false;
+        vk.Forward(c3, pointer(ids), PROMPT, nil);
+        vk.CheckRoute := true;
+      end;
       // decoding: one token, two experts of it in a layer
       for i := 0 to 4 do
       begin
         id := ids[i];
         vk.SplitKeys := (i and 1) * 64;
         model.Forward(c1, @id, 1, pointer(l1));
+        if k = 1 then
+        begin
+          vk.RouteOnDevice := false;
+          vk.Forward(c3, @id, 1, pointer(l3));
+          vk.RouteOnDevice := true;
+        end;
         vk.Forward(c2, @id, 1, pointer(l2));
+        if k = 1 then
+        begin
+          e := RelError(pointer(l2), pointer(l3), v);
+          CheckUtf8(e <= 1e-5, 'MoE decode step %: the choice on the device against ' +
+            'the host: relative error %', [i, e]);
+        end;
         if k in [0, 3] then
         begin
           e := RelError(pointer(l2), pointer(l1), v);
@@ -1195,6 +1225,27 @@ begin
             'MoE Q8_0 (%) decode step %: %', [k, i, InferCompareText(cmp)]);
         end;
       end;
+      if k = 1 then
+      begin
+        // CheckRoute: every step of every layer with experts compared
+        CheckUtf8((vk.RouteChecks = 5 * 2) and (vk.RouteMismatches = 0) and
+          (vk.RouteMaxDiff <= 1e-6), 'the device routed % rows, % otherwise, weights ' +
+          'within %', [vk.RouteChecks, vk.RouteMismatches, vk.RouteMaxDiff]);
+        vk.CheckRoute := false;
+        // without CheckRoute a token is one batch: against the host's choice
+        for i := 5 to 9 do
+        begin
+          id := ids[i];
+          model.Forward(c1, @id, 1, pointer(l1));
+          vk.RouteOnDevice := false;
+          vk.Forward(c3, @id, 1, pointer(l3));
+          vk.RouteOnDevice := true;
+          vk.Forward(c2, @id, 1, pointer(l2));
+          e := RelError(pointer(l2), pointer(l3), v);
+          CheckUtf8(e <= 1e-5, 'MoE decode step % in one batch against the host''s ' +
+            'choice: relative error %', [i, e]);
+        end;
+      end;
       // the backend forgot its weights: the experts go up again
       gpu.ClearWeights;
       id := ids[200];
@@ -1204,6 +1255,7 @@ begin
       CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999), 'MoE after ClearWeights: %',
         [InferCompareText(cmp)]);
     finally
+      c3.Free;
       c2.Free;
       c1.Free;
       vk.Free;
@@ -1324,6 +1376,23 @@ begin
       'otherwise % of % times', [tape.Differs, tape.Routes]);
     CheckUtf8(tape.DiffersGap <= ROUTE_GAP, 'Qwen3-30B-A3B: the device chose ' +
       'otherwise at a router gap of %', [tape.DiffersGap]);
+    // without the tape a decode step chooses on the device (D3c): route.comp
+    // against TDecoderModel.Route on the same router logits
+    model.RouteTape := nil;
+    Check(vk.DeviceRoutable, 'Qwen3-30B-A3B routable on the device');
+    vk.CheckRoute := true;
+    for i := 0 to 7 do
+    begin
+      id := InferArgMax(pointer(l2), v);
+      vk.Forward(c2, @id, 1, pointer(l2));
+    end;
+    vk.CheckRoute := false;
+    AddConsole('Qwen3-30B-A3B routed on the device: % rows, % chosen otherwise ' +
+      'than the host, weights within %', [vk.RouteChecks, vk.RouteMismatches,
+      vk.RouteMaxDiff]);
+    CheckUtf8((vk.RouteChecks = 8 * model.Config.Layers) and (vk.RouteMismatches = 0) and
+      (vk.RouteMaxDiff <= 1e-6), 'Qwen3-30B-A3B route shader: % rows, % otherwise, %',
+      [vk.RouteChecks, vk.RouteMismatches, vk.RouteMaxDiff]);
   finally
     if model <> nil then
       model.RouteTape := nil;
@@ -1592,6 +1661,100 @@ begin
     ref.Free;
     gpu.Free;
     DirectoryDeleteAll(tmp);
+  end;
+end;
+
+
+procedure TTestInferVulkan.RouteMatchesHost;
+const
+  // experts, chosen, renormed
+  CASES: array[0..3, 0..2] of integer = ((128, 8, 1), (128, 8, 0), (8, 2, 1), (64, 4, 1));
+  ROWS = 24;
+type
+  TRoutePush = record
+    Experts, K, Norm: cardinal;
+  end;
+var
+  pipe: TInferVkPipeline;
+  bl, bi, bw: TInferVkBuffer;
+  logits, w, ww: TSingleDynArray;
+  ids, wids: TIntegerDynArray;
+  c, r, j, ne, k, bad: PtrInt;
+  seed: cardinal;
+  push: TRoutePush;
+  worst: double;
+begin
+  if not HasDevice then
+    exit;
+  pipe := TInferVkPipeline.Create(fVk, @SPV_ROUTE, length(SPV_ROUTE), 3,
+    SizeOf(TRoutePush));
+  bl := nil;
+  bi := nil;
+  bw := nil;
+  try
+    bl := TInferVkBuffer.Create(fVk, 128 * 4, true);
+    bi := TInferVkBuffer.Create(fVk, 64 * 4, true);
+    bw := TInferVkBuffer.Create(fVk, 64 * 4, true);
+    SetLength(logits, 128);
+    SetLength(ids, 64);
+    SetLength(w, 64);
+    SetLength(wids, 64);
+    SetLength(ww, 64);
+    seed := 7;
+    for c := 0 to high(CASES) do
+    begin
+      ne := CASES[c, 0];
+      k := CASES[c, 1];
+      bad := 0;
+      worst := 0;
+      for r := 0 to ROWS - 1 do
+      begin
+        for j := 0 to ne - 1 do
+        begin
+          seed := seed * 1103515245 + 12345;
+          logits[j] := ((seed shr 9) and 4095) / 256 - 8;
+        end;
+        case r mod 4 of
+          1: // the k-th and the (k+1)-th equal: the lower id wins
+            for j := 0 to ne - 1 do
+              logits[j] := (j mod 5) * 0.5;
+          2: // every logit the same
+            for j := 0 to ne - 1 do
+              logits[j] := 1.25;
+          3: // large and very negative values
+            begin
+              logits[0] := 80;
+              logits[ne - 1] := -80;
+            end;
+        end;
+        RouteRef(pointer(logits), ne, k, CASES[c, 2] <> 0, pointer(ids), pointer(w));
+        fVk.Upload(bl, 0, pointer(logits), ne * 4);
+        push.Experts := ne;
+        push.K := k;
+        push.Norm := CASES[c, 2];
+        fVk.Run(pipe, [bl, bi, bw], @push, 1);
+        fVk.Download(bi, 0, pointer(wids), k * 4);
+        fVk.Download(bw, 0, pointer(ww), k * 4);
+        for j := 0 to k - 1 do
+        begin
+          if wids[j] <> ids[j] then
+            inc(bad);
+          // a NaN would pass a plain maximum: counted as a failure
+          if not (Abs(ww[j] - w[j]) <= 1) then
+            worst := 1e30
+          else if Abs(ww[j] - w[j]) > worst then
+            worst := Abs(ww[j] - w[j]);
+        end;
+      end;
+      // the same experts; the weights in float on the device, in double here
+      CheckUtf8((bad = 0) and (worst <= 1e-6), 'route % of % (renormed %): % ids ' +
+        'otherwise, weights within %', [k, ne, CASES[c, 2], bad, worst]);
+    end;
+  finally
+    bw.Free;
+    bi.Free;
+    bl.Free;
+    pipe.Free;
   end;
 end;
 

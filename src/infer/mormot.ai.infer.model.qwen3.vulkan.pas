@@ -22,6 +22,13 @@
 //   experts of a layer stay one buffer when they are one tensor in the file
 //   (GGUF) and each lies at a multiple of minStorageBufferOffsetAlignment,
 //   each expert then bound at its offset (TInferVulkan.BatchDispatchAt)
+// - a decode step (one token, slice D3c) chooses on the device when every
+//   layer with experts has them in one buffer the device binds whole:
+//   route.comp writes the expert ids and weights (as TDecoderModel.Route, the
+//   weights in float, sorted by id), linear8.comp built with -DIDS computes
+//   gate, up and down of the k chosen experts at once, moecombine.comp sums
+//   them in id order - the token is one batch without a wait (RouteOnDevice);
+//   a prefill and a run with a RouteTape choose on the host
 unit mormot.ai.infer.model.qwen3.vulkan;
 
 {
@@ -75,6 +82,12 @@ type
       fMoeIn: TInferVkBuffer;
     fRoute, fChosenW: TSingleDynArray;
     fChosen, fStart: TIntegerDynArray;
+    // a decode step routed on the device (slice D3c): the k expert ids and
+    // weights, the gate / up and down rows of the k experts; CheckRoute reads
+    // the choice back through fKOut
+    fDevKIds, fDevKW, fDevKGate, fDevKUp, fDevKDown, fKOut: TInferVkBuffer;
+    fKIds: TIntegerDynArray;
+    fKW: TSingleDynArray;
     // the head in parts (TQwen3Vulkan.fHeadPart < VocabSize): one part's logits
     fHeadTemp: TInferVkBuffer;
     // host-visible: the inputs of a batch, and the logits it returns
@@ -99,11 +112,19 @@ type
     fNorm, fSwiGlu, fAttention, fMerge, fAdd, fQkRope, fAddNorm,
       fFlash: TInferVkPipeline;
     fFill0, fGather, fScatter: TInferVkPipeline; // a mixture of experts
-    fMoe: boolean; // a layer with experts: a batch per such layer
+    fRouteP, fCombine: TInferVkPipeline; // routed on the device (D3c)
+    fMoe: boolean; // a layer with experts
+    // every layer with experts can route on the device (one buffer each,
+    // bound whole)
+    fDeviceRoutable, fRouteOnDevice, fCheckRoute: boolean;
+    fRouteChecks, fRouteMismatches: Int64;
+    fRouteMaxDiff: double;
     // per layer with experts: the buffer and byte offset of every expert's
-    // gate, up and down
+    // gate, up and down, and the bytes from one expert to the next when they
+    // are one buffer RecordLinearIds can bind (else 0)
     fExpertGate, fExpertUp, fExpertDown: array of TInferVkBufferDynArray;
     fExpertGateAt, fExpertUpAt, fExpertDownAt: array of TInt64DynArray;
+    fStrideGate, fStrideUp, fStrideDown: TInt64DynArray;
     // the same for a KV cache of half floats
     fQkRope16, fAttention16, fFlash16: TInferVkPipeline;
     // attndec.comp, for a float or a half-float cache
@@ -128,6 +149,12 @@ type
     /// the dfMoe block of layer aLayer: fDevH in, fDevTmp out - submits the
     // batch so far and begins the next one
     procedure RecordMoe(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
+    /// the same for one token row, the experts chosen on the device - no
+    // submit in between
+    procedure RecordMoeDevice(aCtx: TQwen3VkContext; aLayer: PtrInt);
+    /// CheckRoute: submit, compare the device's choice with
+    // TDecoderModel.Route on the same logits, begin the next batch
+    procedure CheckDeviceRoute(aCtx: TQwen3VkContext);
     /// submit the batch being recorded and begin the next one when it has
     // room for fewer than aSets dispatches (TInferVulkan.BatchRoom)
     procedure NeedRoom(aSets: PtrInt);
@@ -197,6 +224,29 @@ type
     // next Forward while it is empty (after Reset)
     property KvF16: boolean
       read fKvF16 write fKvF16;
+    /// a decode step chooses the experts on the device (default true) when
+    // every layer with experts holds them in one buffer the device binds
+    // whole (DeviceRoutable) and no RouteTape is set - the token is one batch
+    // without a wait; false: on the host, one wait per layer with experts
+    property RouteOnDevice: boolean
+      read fRouteOnDevice write fRouteOnDevice;
+    /// true when a decode step can route on the device (see RouteOnDevice)
+    property DeviceRoutable: boolean
+      read fDeviceRoutable;
+    /// diagnosis and tests: after every route on the device the batch is
+    // submitted, the router logits and the choice read back and compared
+    // with TDecoderModel.Route on the same logits
+    property CheckRoute: boolean
+      read fCheckRoute write fCheckRoute;
+    /// CheckRoute: rows compared, rows whose ids differ, the largest weight
+    // difference of the rows with the same ids (the shader computes the
+    // weights in float, the host in double)
+    property RouteChecks: Int64
+      read fRouteChecks;
+    property RouteMismatches: Int64
+      read fRouteMismatches;
+    property RouteMaxDiff: double
+      read fRouteMaxDiff;
   end;
 
 
@@ -297,6 +347,12 @@ begin
   FreeAndNil(fDevIdx);
   FreeAndNil(fDevW);
   FreeAndNil(fMoeIn);
+  FreeAndNil(fDevKIds);
+  FreeAndNil(fDevKW);
+  FreeAndNil(fDevKGate);
+  FreeAndNil(fDevKUp);
+  FreeAndNil(fDevKDown);
+  FreeAndNil(fKOut);
   fRows := 0;
 end;
 
@@ -389,6 +445,12 @@ begin
     SizeOf(TRowsPush));
   fScatter := TInferVkPipeline.Create(fVk, @SPV_SCATTERADD, length(SPV_SCATTERADD),
     4, SizeOf(TRowsPush));
+  fRouteP := TInferVkPipeline.Create(fVk, @SPV_ROUTE, length(SPV_ROUTE), 3, 12);
+  fCombine := TInferVkPipeline.Create(fVk, @SPV_MOECOMBINE, length(SPV_MOECOMBINE),
+    3, 8);
+  fRouteP.Name := 'route';
+  fCombine.Name := 'moecombine';
+  fRouteOnDevice := true;
   fFill0.Name := 'fill0';
   fGather.Name := 'gatherrows';
   fScatter.Name := 'scatteradd';
@@ -449,6 +511,8 @@ begin
   // the model no longer hands out contexts of this device
   if (fModel <> nil) and (fModel.Device = self) then
     fModel.Device := nil;
+  fCombine.Free;
+  fRouteP.Free;
   fScatter.Free;
   fGather.Free;
   fFill0.Free;
@@ -497,7 +561,7 @@ var
   // host memory (a tensor of a GGUF file) at offsets the device can bind,
   // else one buffer per expert
   procedure Experts(const w: TInferWeightDynArray; aRows, aCols: PtrInt;
-    out aBuf: TInferVkBufferDynArray; out aAt: TInt64DynArray);
+    out aBuf: TInferVkBufferDynArray; out aAt: TInt64DynArray; out aStride: Int64);
   var
     e: PtrInt;
     slice, align: Int64;
@@ -506,6 +570,7 @@ var
   begin
     SetLength(aBuf, length(w));
     SetLength(aAt, length(w));
+    aStride := 0;
     if length(w) = 0 then
       exit;
     slice := Int64(aRows) * (aCols div INFER_DTYPE_BLOCK[w[0].DType]) *
@@ -535,6 +600,9 @@ var
         aBuf[e] := buf;
         aAt[e] := e * slice;
       end;
+      // RecordLinearIds binds the whole buffer, an expert at id * stride
+      if fBackend.GpuLinearIds(w[0].DType, aCols, buf) and (slice and 3 = 0) then
+        aStride := slice;
     end
     else
       for e := 0 to high(w) do
@@ -564,6 +632,14 @@ begin
   SetLength(fExpertGateAt, c.Layers);
   SetLength(fExpertUpAt, c.Layers);
   SetLength(fExpertDownAt, c.Layers);
+  fStrideGate := nil;
+  fStrideUp := nil;
+  fStrideDown := nil;
+  SetLength(fStrideGate, c.Layers);
+  SetLength(fStrideUp, c.Layers);
+  SetLength(fStrideDown, c.Layers);
+  // route.comp keeps the choice of up to 64 of 4096 experts
+  fDeviceRoutable := fMoe and (c.ExpertsUsed <= 64) and (c.Experts <= 4096);
   for l := 0 to c.Layers - 1 do
   begin
     ly := @fModel.Layers[l];
@@ -575,11 +651,13 @@ begin
     begin
       Matrix(ly^.Router, c.Experts, c.Hidden);
       Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l],
-        fExpertGateAt[l]);
+        fExpertGateAt[l], fStrideGate[l]);
       Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l],
-        fExpertUpAt[l]);
+        fExpertUpAt[l], fStrideUp[l]);
       Experts(ly^.ExpertDown, c.Hidden, c.ExpertIntermediate, fExpertDown[l],
-        fExpertDownAt[l]);
+        fExpertDownAt[l], fStrideDown[l]);
+      if (fStrideGate[l] = 0) or (fStrideUp[l] = 0) or (fStrideDown[l] = 0) then
+        fDeviceRoutable := false;
     end
     else
     begin
@@ -757,6 +835,15 @@ begin
       SetLength(aCtx.fChosen, aRows * c.ExpertsUsed);
       SetLength(aCtx.fChosenW, aRows * c.ExpertsUsed);
       SetLength(aCtx.fStart, c.Experts + 1);
+      NeedDevice(fVk, aCtx.fDevKIds, Int64(c.ExpertsUsed) * 4);
+      NeedDevice(fVk, aCtx.fDevKW, Int64(c.ExpertsUsed) * 4);
+      NeedDevice(fVk, aCtx.fDevKGate, Int64(c.ExpertsUsed) * c.ExpertIntermediate * 4);
+      NeedDevice(fVk, aCtx.fDevKUp, Int64(c.ExpertsUsed) * c.ExpertIntermediate * 4);
+      NeedDevice(fVk, aCtx.fDevKDown, Int64(c.ExpertsUsed) * c.Hidden * 4);
+      // host-visible for CheckRoute: the ids, then the weights
+      aCtx.fKOut := TInferVkBuffer.CreateReadback(fVk, Int64(c.ExpertsUsed) * 8);
+      SetLength(aCtx.fKIds, c.ExpertsUsed);
+      SetLength(aCtx.fKW, c.ExpertsUsed);
     end;
     aCtx.fRows := aRows;
   end;
@@ -869,6 +956,106 @@ begin
       fExpertDown[aLayer][e], fExpertDownAt[aLayer][e], h, aCtx.fDevExpOut);
     fVk.BatchDispatch(fScatter, [aCtx.fDevExpOut, aCtx.fDevIdx, aCtx.fDevW,
       aCtx.fDevTmp], @push, cnt);
+  end;
+end;
+
+type
+  /// the push constants of route.comp and moecombine.comp
+  TRoutePush = record
+    Experts, K, Norm: cardinal;
+  end;
+  TCombinePush = record
+    K, N: cardinal;
+  end;
+
+procedure TQwen3Vulkan.RecordMoeDevice(aCtx: TQwen3VkContext; aLayer: PtrInt);
+var
+  ly: ^TQwen3Layer;
+  h, fi, k: PtrInt;
+  rp: TRoutePush;
+  cp: TCombinePush;
+begin
+  ly := @fModel.Layers[aLayer];
+  h := fModel.Config.Hidden;
+  fi := fModel.Config.ExpertIntermediate;
+  k := fModel.Config.ExpertsUsed;
+  // the router logits, the choice into fDevKIds / fDevKW - no submit
+  fBackend.RecordLinear(aCtx.fDevH, 1, h, ly^.Router, fModel.Config.Experts,
+    aCtx.fDevRoute);
+  rp.Experts := fModel.Config.Experts;
+  rp.K := k;
+  rp.Norm := ord(fModel.Config.NormTopK);
+  fVk.BatchDispatch(fRouteP, [aCtx.fDevRoute, aCtx.fDevKIds, aCtx.fDevKW], @rp, 1);
+  if fCheckRoute then
+    CheckDeviceRoute(aCtx);
+  // gate and up of the k experts side by side, SwiGLU, down per slot
+  fBackend.RecordLinearIds(aCtx.fDevH, h, ly^.ExpertGate[0].DType,
+    fExpertGate[aLayer][0], fStrideGate[aLayer], fi, aCtx.fDevKIds, k, false,
+    aCtx.fDevKGate, false);
+  fBackend.RecordLinearIds(aCtx.fDevH, h, ly^.ExpertUp[0].DType,
+    fExpertUp[aLayer][0], fStrideUp[aLayer], fi, aCtx.fDevKIds, k, false,
+    aCtx.fDevKUp);
+  RecordElementwise(fSwiGlu, [aCtx.fDevKGate, aCtx.fDevKUp], k * fi);
+  fBackend.RecordLinearIds(aCtx.fDevKGate, fi, ly^.ExpertDown[0].DType,
+    fExpertDown[aLayer][0], fStrideDown[aLayer], h, aCtx.fDevKIds, k, true,
+    aCtx.fDevKDown);
+  // the weighted sum in id order into fDevTmp
+  cp.K := k;
+  cp.N := h;
+  fVk.BatchDispatch(fCombine, [aCtx.fDevKDown, aCtx.fDevKW, aCtx.fDevTmp], @cp,
+    (h + 127) div 128);
+end;
+
+procedure TQwen3Vulkan.CheckDeviceRoute(aCtx: TQwen3VkContext);
+var
+  k, ne, j, t, id: PtrInt;
+  v: single;
+  d: double;
+  same: boolean;
+begin
+  k := fModel.Config.ExpertsUsed;
+  ne := fModel.Config.Experts;
+  fVk.BatchCopy(aCtx.fDevRoute, 0, aCtx.fRouteOut, 0, Int64(ne) * 4);
+  fVk.BatchCopy(aCtx.fDevKIds, 0, aCtx.fKOut, 0, Int64(k) * 4);
+  fVk.BatchCopy(aCtx.fDevKW, 0, aCtx.fKOut, Int64(k) * 4, Int64(k) * 4);
+  fVk.BatchSubmit;
+  MoveFast(aCtx.fRouteOut.Mapped^, pointer(aCtx.fRoute)^, ne * SizeOf(single));
+  MoveFast(aCtx.fKOut.Mapped^, pointer(aCtx.fKIds)^, k * SizeOf(integer));
+  MoveFast(PAnsiChar(aCtx.fKOut.Mapped)[k * 4], pointer(aCtx.fKW)^, k * SizeOf(single));
+  fVk.BatchBegin;
+  fModel.Route(pointer(aCtx.fRoute), pointer(aCtx.fChosen), pointer(aCtx.fChosenW));
+  // the host's choice by id, as the shader writes it
+  for j := 1 to k - 1 do
+  begin
+    id := aCtx.fChosen[j];
+    v := aCtx.fChosenW[j];
+    t := j;
+    while (t > 0) and (aCtx.fChosen[t - 1] > id) do
+    begin
+      aCtx.fChosen[t] := aCtx.fChosen[t - 1];
+      aCtx.fChosenW[t] := aCtx.fChosenW[t - 1];
+      dec(t);
+    end;
+    aCtx.fChosen[t] := id;
+    aCtx.fChosenW[t] := v;
+  end;
+  inc(fRouteChecks);
+  same := true;
+  for j := 0 to k - 1 do
+    if aCtx.fChosen[j] <> aCtx.fKIds[j] then
+      same := false;
+  if not same then
+  begin
+    inc(fRouteMismatches);
+    exit;
+  end;
+  for j := 0 to k - 1 do
+  begin
+    d := Abs(aCtx.fChosenW[j] - aCtx.fKW[j]);
+    if not (d <= 1) then
+      d := 1e30; // a NaN or an infinity of the device: never within a tolerance
+    if d > fRouteMaxDiff then
+      fRouteMaxDiff := d;
   end;
 end;
 
@@ -1025,7 +1212,15 @@ begin
       fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp, Vector(ly^.PostNorm, h),
         aCtx.fDevH], @norm, n);
       if c.Spec[l].Ffn = dfMoe then
-        RecordMoe(aCtx, l, n)
+      begin
+        // one token row: chosen on the device, unless a RouteTape needs the
+        // host's choice (TDecoderModel.Route)
+        if (n = 1) and fRouteOnDevice and fDeviceRoutable and
+           (fModel.RouteTape = nil) then
+          RecordMoeDevice(aCtx, l)
+        else
+          RecordMoe(aCtx, l, n);
+      end
       else
       begin
         fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate, false);

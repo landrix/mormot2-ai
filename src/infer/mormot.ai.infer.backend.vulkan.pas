@@ -46,6 +46,8 @@ type
   protected
     fVk: TInferVulkan;
     fLinear, fLinear8, fLinear8Sg, fGemm8: TInferVkPipeline;
+    // linear8.comp for the experts chosen on the device (-DIDS), both builds
+    fLinear8Ids, fLinear8IdsSg: TInferVkPipeline;
     // matvec8.comp per LINEAR_DTYPE (2 Q8_0, 3 Q4_K, 4 Q6_K), plain and with
     // subgroup reductions
     fMatvec, fMatvecSg: array[2..4] of TInferVkPipeline;
@@ -112,6 +114,19 @@ type
     procedure RecordLinearAt(x: TInferVkBuffer; aRows, aIn: PtrInt;
       aType: TInferDType; aWeight: TInferVkBuffer; aOffset: Int64; aOut: PtrInt;
       y: TInferVkBuffer; aBarrier: boolean = true);
+    /// true when RecordLinearIds runs an aOut x aIn matrix of aType per expert
+    // from aWeight: the form of linear8 (any block type, F32 with aIn a
+    // multiple of 8) and the whole buffer in one binding
+    function GpuLinearIds(aType: TInferDType; aIn: PtrInt;
+      aWeight: TInferVkBuffer): boolean;
+    /// record one token row through aSlots experts chosen on the device: slot
+    // s reads its expert id from aIds[s] (int32), the expert's aOut x aIn
+    // matrix of aType at byte id * aStride of aWeight (the experts of a layer
+    // one buffer, bound whole); x is row s of x when aXPerSlot, else row 0;
+    // y receives row s - linear8.comp built with -DIDS
+    procedure RecordLinearIds(x: TInferVkBuffer; aIn: PtrInt; aType: TInferDType;
+      aWeight: TInferVkBuffer; aStride: Int64; aOut: PtrInt; aIds: TInferVkBuffer;
+      aSlots: PtrInt; aXPerSlot: boolean; y: TInferVkBuffer; aBarrier: boolean = true);
     /// the output features of one part of an aOut x aIn matrix of aType on
     // the device: aOut when its bytes fit one binding (maxStorageBufferRange,
     // or MaxLinearBytes), else as many as do - e.g. the 165 MB head of
@@ -166,6 +181,11 @@ type
     Rows, InCount, OutCount, DType, HasBias: cardinal;
   end;
 
+  /// the push constants of linear8.comp built with -DIDS
+  TLinearIdsPush = record
+    Rows, InCount, OutCount, DType, HasBias, Stride, XSlot: cardinal;
+  end;
+
 
 { TInferVulkanBackend }
 
@@ -181,6 +201,9 @@ begin
   fLinear8 := TInferVkPipeline.Create(fVk, @SPV_LINEAR8, length(SPV_LINEAR8), 4,
     SizeOf(TLinearPush));
   fLinear8.Name := 'linear';
+  fLinear8Ids := TInferVkPipeline.Create(fVk, @SPV_LINEAR8_IDS,
+    length(SPV_LINEAR8_IDS), 5, SizeOf(TLinearIdsPush));
+  fLinear8Ids.Name := 'linear';
   fMatvec[2] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q8,
     length(SPV_MATVEC8_Q8), 4, SizeOf(TLinearPush));
   fMatvec[3] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q4K,
@@ -209,6 +232,9 @@ begin
     fLinear8Sg := TInferVkPipeline.Create(fVk, @SPV_LINEAR8_SG,
       length(SPV_LINEAR8_SG), 4, SizeOf(TLinearPush));
     fLinear8Sg.Name := 'linear';
+    fLinear8IdsSg := TInferVkPipeline.Create(fVk, @SPV_LINEAR8_IDS_SG,
+      length(SPV_LINEAR8_IDS_SG), 5, SizeOf(TLinearIdsPush));
+    fLinear8IdsSg.Name := 'linear';
     fMatvecSg[2] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q8_SG,
       length(SPV_MATVEC8_Q8_SG), 4, SizeOf(TLinearPush));
     fMatvecSg[3] := TInferVkPipeline.Create(fVk, @SPV_MATVEC8_Q4K_SG,
@@ -239,6 +265,8 @@ begin
       FreeAndNil(fMatvecSg[i]);
       FreeAndNil(fMatvec[i]);
     end;
+    FreeAndNil(fLinear8IdsSg);
+    FreeAndNil(fLinear8Ids);
     FreeAndNil(fLinear8Sg);
     FreeAndNil(fLinear8);
     FreeAndNil(fLinear);
@@ -456,6 +484,48 @@ begin
   pipe := LinearShape(aType, aIn, aRows, aOut, gx, gy);
   fVk.BatchDispatchAt(pipe, [aWeight, x, fNoBias, y], [aOffset, 0, 0, 0],
     [bytes, 0, 0, 0], @push, gx, gy, 1, aBarrier);
+end;
+
+function TInferVulkanBackend.GpuLinearIds(aType: TInferDType; aIn: PtrInt;
+  aWeight: TInferVkBuffer): boolean;
+begin
+  // the whole buffer in one binding - below MaxLinearBytes too, as LinearPart
+  result := GpuLinear(aType, aIn) and ((aType <> idtF32) or (aIn and 7 = 0)) and
+    (aWeight <> nil) and (aWeight.Size <= fVk.MaxStorageRange) and
+    ((fMaxLinearBytes <= 0) or (aWeight.Size <= fMaxLinearBytes));
+end;
+
+procedure TInferVulkanBackend.RecordLinearIds(x: TInferVkBuffer; aIn: PtrInt;
+  aType: TInferDType; aWeight: TInferVkBuffer; aStride: Int64; aOut: PtrInt;
+  aIds: TInferVkBuffer; aSlots: PtrInt; aXPerSlot: boolean; y: TInferVkBuffer;
+  aBarrier: boolean);
+var
+  push: TLinearIdsPush;
+  pipe: TInferVkPipeline;
+  n: PtrInt;
+begin
+  // the byte address of a weight is a 32-bit value in the shader
+  if not GpuLinearIds(aType, aIn, aWeight) or (aSlots < 1) or (aSlots > 65535) or
+     (aOut < 1) or (aStride <= 0) or (aStride > aWeight.Size) or
+     (aStride and 3 <> 0) or (aIds = nil) then
+    raise EInferVulkan.CreateUtf8('%.RecordLinearIds: % slots of % % into %',
+      [self, aSlots, aIn, INFER_DTYPE_NAME[aType], aOut]);
+  push.Rows := 1;
+  push.InCount := aIn;
+  push.OutCount := aOut;
+  push.DType := LINEAR_DTYPE[aType];
+  push.HasBias := 0;
+  push.Stride := aStride;
+  push.XSlot := ord(aXPerSlot);
+  if fUseSubgroups and (fLinear8IdsSg <> nil) then
+    pipe := fLinear8IdsSg
+  else
+    pipe := fLinear8Ids;
+  n := (aOut + 3) shr 2;
+  if n > 65535 then
+    n := 65535; // the shader loops over the features
+  fVk.BatchDispatch(pipe, [aWeight, x, fNoBias, y, aIds], @push, n, aSlots, 1,
+    aBarrier);
 end;
 
 function TInferVulkanBackend.Weight(aData: pointer; aType: TInferDType;

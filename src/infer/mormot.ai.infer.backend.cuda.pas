@@ -46,7 +46,7 @@ type
   protected
     fCu: TInferCuda;
     fLinearModule: TInferCuModule;
-    fLinear, fLinear8, fGemm8: TCuHandle;
+    fLinear, fLinear8, fGemm8, fLinear8Ids: TCuHandle;
     fFastLinear: boolean;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
@@ -100,6 +100,17 @@ type
     procedure EnqueueLinearAt(x: TInferCuBuffer; aRows, aIn: PtrInt;
       aType: TInferDType; aWeight: TCuDevicePtr; aOut: PtrInt; y: TInferCuBuffer;
       aBias: TCuDevicePtr = 0);
+    /// true when EnqueueLinearIds runs weights of aType with aIn inputs (the
+    // form of linear8: any block type, F32 with aIn a multiple of 8)
+    function GpuLinearIds(aType: TInferDType; aIn: PtrInt): boolean;
+    /// enqueue one token row through aSlots experts chosen on the device:
+    // slot s reads its expert id from aIds[s] (int32 at a device address), the
+    // expert's [aOut, aIn] matrix of aType at aWeight + id * aStride bytes (the
+    // experts of a layer in one buffer); x is row s of x when aXPerSlot, else
+    // row 0; y receives row s - linear8ids, the arithmetic of linear8
+    procedure EnqueueLinearIds(x: TInferCuBuffer; aIn: PtrInt; aType: TInferDType;
+      aWeight: TCuDevicePtr; aStride: Int64; aOut: PtrInt; aIds: TCuDevicePtr;
+      aSlots: PtrInt; aXPerSlot: boolean; y: TInferCuBuffer);
     /// the device context
     property Cuda: TInferCuda read fCu;
     /// how many Linear calls ran on the device
@@ -138,6 +149,7 @@ begin
   fLinear := fLinearModule.Kernel('linear');
   fLinear8 := fLinearModule.Kernel('linear8');
   fGemm8 := fLinearModule.Kernel('gemm8');
+  fLinear8Ids := fLinearModule.Kernel('linear8ids');
   fFastLinear := true;
 end;
 
@@ -261,6 +273,37 @@ begin
   LinearShape(aType, aIn, aRows, aOut, kernel, gx, gy, block);
   fCu.Enqueue(kernel, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
     @hasBias], gx, block, gy);
+end;
+
+function TInferCudaBackend.GpuLinearIds(aType: TInferDType; aIn: PtrInt): boolean;
+begin
+  result := GpuLinear(aType, aIn) and ((aType <> idtF32) or (aIn and 7 = 0));
+end;
+
+procedure TInferCudaBackend.EnqueueLinearIds(x: TInferCuBuffer; aIn: PtrInt;
+  aType: TInferDType; aWeight: TCuDevicePtr; aStride: Int64; aOut: PtrInt;
+  aIds: TCuDevicePtr; aSlots: PtrInt; aXPerSlot: boolean; y: TInferCuBuffer);
+var
+  pw, px, pids, py: TCuDevicePtr;
+  stride: Int64;
+  nin, nout, dtype, xslot: cardinal;
+begin
+  if not GpuLinearIds(aType, aIn) or (aSlots < 1) or (aSlots > 65535) or
+     (aOut < 1) or (Int64(aOut) > high(integer)) or (aStride <= 0) or
+     (aWeight = 0) or (aIds = 0) then
+    raise EInferCuda.CreateUtf8('%.EnqueueLinearIds: % slots of % % into %',
+      [self, aSlots, aIn, INFER_DTYPE_NAME[aType], aOut]);
+  pw := aWeight;
+  px := x.Ptr;
+  pids := aIds;
+  py := y.Ptr;
+  stride := aStride;
+  nin := aIn;
+  nout := aOut;
+  dtype := LINEAR_DTYPE[aType];
+  xslot := ord(aXPerSlot);
+  fCu.Enqueue(fLinear8Ids, [@pw, @px, @pids, @py, @stride, @nin, @nout, @dtype,
+    @xslot], (aOut + 3) shr 2, LINEAR_BLOCK, aSlots);
 end;
 
 function TInferCudaBackend.Weight(aData: pointer; aType: TInferDType;

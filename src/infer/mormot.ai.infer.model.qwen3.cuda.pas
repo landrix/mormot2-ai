@@ -18,7 +18,14 @@
 //   gathered, its SwiGLU block by the Linear kernels, its output added back
 //   with the router weights (gatherrows, scatteradd); the experts of a layer
 //   stay one buffer when they are one tensor in the file (GGUF), each expert
-//   an offset in it - a decode step then is no CUDA graph
+//   an offset in it
+// - a decode step (one token, slice D3c) chooses on the device when every
+//   layer with experts has them in one buffer: the route kernel writes the
+//   expert ids and weights (as TDecoderModel.Route, sorted by id), linear8ids
+//   computes gate, up and down of the k chosen experts at once, moecombine
+//   sums them in id order - no wait for the host, the step stays one CUDA
+//   graph (RouteOnDevice); a prefill and a run with a RouteTape choose on the
+//   host
 unit mormot.ai.infer.model.qwen3.cuda;
 
 {
@@ -72,6 +79,11 @@ type
     // a layer with experts: router logits, the rows of one expert (gathered
     // input, output), the token rows and weights of every expert in id order
     fDevRoute, fDevGather, fDevExpOut, fDevIdx, fDevW: TInferCuBuffer;
+    // a decode step routed on the device: the k expert ids and weights, the
+    // gate / up and down rows of the k experts
+    fDevKIds, fDevKW, fDevKGate, fDevKUp, fDevKDown: TInferCuBuffer;
+    fKIds: TIntegerDynArray; // CheckRoute: the choice read back
+    fKW: TSingleDynArray;
     fRoute, fChosenW, fW: TSingleDynArray;
     fChosen, fIdx, fStart: TIntegerDynArray;
     // the inputs of a chunk on the host: embeddings, then cos, then sin
@@ -99,9 +111,16 @@ type
     fOps, fBasic: TInferCuModule;
     fNorm, fAddNorm, fSwiGlu, fQkRope, fAttention, fMerge, fAdd: TCuHandle;
     fFill0, fGather, fScatter: TCuHandle; // a mixture of experts
-    fMoe: boolean; // a layer with experts: no graph, routed on the host
-    // per layer with experts: where every expert's gate, up and down are
+    fRoute, fCombine: TCuHandle; // routed on the device (D3c)
+    fMoe: boolean; // a layer with experts
+    // every layer with experts can route on the device (one buffer each)
+    fDeviceRoutable, fRouteOnDevice, fCheckRoute: boolean;
+    fRouteChecks, fRouteMismatches: Int64;
+    fRouteMaxDiff: double;
+    // per layer with experts: where every expert's gate, up and down are, and
+    // the bytes from one expert to the next when they are one buffer (else 0)
     fExpertGate, fExpertUp, fExpertDown: array of TCuDevicePtrDynArray;
+    fStrideGate, fStrideUp, fStrideDown: TInt64DynArray;
     fQkRope16, fAttention16: TCuHandle; // for a KV cache of half floats
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     fSplitKeys: integer;
@@ -118,6 +137,10 @@ type
       w: PSingleArray; y: TInferCuBuffer);
     /// the dfMoe block of layer aLayer: fDevH in, fDevTmp out
     procedure EnqueueMoe(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
+    /// the same for one token row, the experts chosen on the device
+    procedure EnqueueMoeDevice(aCtx: TQwen3CuContext; aLayer: PtrInt);
+    /// CheckRoute: the device's choice against TDecoderModel.Route
+    procedure CheckDeviceRoute(aCtx: TQwen3CuContext);
   public
     /// upload every weight of aModel to the device of aBackend; raises
     // EInferError when a matrix type has no kernel (F32, Q8_0, Q4_K, Q6_K do)
@@ -149,7 +172,7 @@ type
     /// a decode step (one token) is recorded as a CUDA graph and launched at
     // once instead of some 370 kernel launches - default true; the graph of
     // the previous step takes the new parameters (TInferCuda.CaptureEnd)
-    // - not for a model with experts: the host chooses them in every layer
+    // - with experts only when they are chosen on the device (RouteOnDevice)
     property UseGraphs: boolean
       read fUseGraphs write fUseGraphs;
     /// the KV cache in half floats (default) instead of floats: half the
@@ -160,6 +183,28 @@ type
     // next Forward while it is empty (after Reset)
     property KvF16: boolean
       read fKvF16 write fKvF16;
+    /// a decode step chooses the experts on the device (default true) when
+    // every layer with experts holds them in one buffer (DeviceRoutable) and
+    // no RouteTape is set - one CUDA graph per step; false: on the host
+    property RouteOnDevice: boolean
+      read fRouteOnDevice write fRouteOnDevice;
+    /// true when the experts of every layer are one buffer and their types
+    // have a linear8ids form: a decode step can route on the device
+    property DeviceRoutable: boolean
+      read fDeviceRoutable;
+    /// diagnosis and tests: after every route on the device the step waits,
+    // reads the router logits and the choice back and compares them with
+    // TDecoderModel.Route on the same logits (no graph meanwhile)
+    property CheckRoute: boolean
+      read fCheckRoute write fCheckRoute;
+    /// CheckRoute: rows compared, rows whose ids differ, the largest weight
+    // difference of the rows with the same ids
+    property RouteChecks: Int64
+      read fRouteChecks;
+    property RouteMismatches: Int64
+      read fRouteMismatches;
+    property RouteMaxDiff: double
+      read fRouteMaxDiff;
   end;
 
 
@@ -220,6 +265,11 @@ begin
   FreeAndNil(fDevExpOut);
   FreeAndNil(fDevIdx);
   FreeAndNil(fDevW);
+  FreeAndNil(fDevKIds);
+  FreeAndNil(fDevKW);
+  FreeAndNil(fDevKGate);
+  FreeAndNil(fDevKUp);
+  FreeAndNil(fDevKDown);
   fRows := 0;
 end;
 
@@ -280,6 +330,9 @@ begin
   fFill0 := fOps.Kernel('fill0');
   fGather := fOps.Kernel('gatherrows');
   fScatter := fOps.Kernel('scatteradd');
+  fRoute := fOps.Kernel('route');
+  fCombine := fOps.Kernel('moecombine');
+  fRouteOnDevice := true;
   fSplitKeys := SPLIT_KEYS;
   fUseGraphs := true;
   fKvF16 := true;
@@ -325,7 +378,7 @@ var
   // the experts of a layer: one buffer when they lie one after the other in
   // host memory (a tensor of a GGUF file), else one buffer per expert
   procedure Experts(const w: TInferWeightDynArray; aRows, aCols: PtrInt;
-    out aPtr: TCuDevicePtrDynArray);
+    out aPtr: TCuDevicePtrDynArray; out aStride: Int64);
   var
     e: PtrInt;
     slice: Int64;
@@ -333,6 +386,7 @@ var
     base: TCuDevicePtr;
   begin
     SetLength(aPtr, length(w));
+    aStride := 0;
     one := true;
     for e := 0 to high(w) do
     begin
@@ -351,6 +405,9 @@ var
       base := fBackend.DeviceWeight(w[0].Data, w[0].DType, slice * length(w)).Ptr;
       for e := 0 to high(w) do
         aPtr[e] := base + e * slice;
+      // linear8ids finds an expert at id * stride: whole words, one type
+      if fBackend.GpuLinearIds(w[0].DType, aCols) and (slice and 3 = 0) then
+        aStride := slice;
     end
     else
       for e := 0 to high(w) do
@@ -370,6 +427,14 @@ begin
   SetLength(fExpertGate, c.Layers);
   SetLength(fExpertUp, c.Layers);
   SetLength(fExpertDown, c.Layers);
+  fStrideGate := nil;
+  fStrideUp := nil;
+  fStrideDown := nil;
+  SetLength(fStrideGate, c.Layers);
+  SetLength(fStrideUp, c.Layers);
+  SetLength(fStrideDown, c.Layers);
+  // the route kernel keeps the choice of up to 64 of 4096 experts
+  fDeviceRoutable := fMoe and (c.ExpertsUsed <= 64) and (c.Experts <= 4096);
   for l := 0 to c.Layers - 1 do
   begin
     ly := @fModel.Layers[l];
@@ -380,9 +445,14 @@ begin
     if c.Spec[l].Ffn = dfMoe then
     begin
       Matrix(ly^.Router, c.Experts, c.Hidden);
-      Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l]);
-      Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l]);
-      Experts(ly^.ExpertDown, c.Hidden, c.ExpertIntermediate, fExpertDown[l]);
+      Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l],
+        fStrideGate[l]);
+      Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l],
+        fStrideUp[l]);
+      Experts(ly^.ExpertDown, c.Hidden, c.ExpertIntermediate, fExpertDown[l],
+        fStrideDown[l]);
+      if (fStrideGate[l] = 0) or (fStrideUp[l] = 0) or (fStrideDown[l] = 0) then
+        fDeviceRoutable := false;
     end
     else
     begin
@@ -526,6 +596,13 @@ begin
       SetLength(aCtx.fIdx, aRows * c.ExpertsUsed);
       SetLength(aCtx.fW, aRows * c.ExpertsUsed);
       SetLength(aCtx.fStart, c.Experts + 1);
+      NeedDevice(fCu, aCtx.fDevKIds, Int64(c.ExpertsUsed) * 4);
+      NeedDevice(fCu, aCtx.fDevKW, Int64(c.ExpertsUsed) * 4);
+      NeedDevice(fCu, aCtx.fDevKGate, Int64(c.ExpertsUsed) * c.ExpertIntermediate * 4);
+      NeedDevice(fCu, aCtx.fDevKUp, Int64(c.ExpertsUsed) * c.ExpertIntermediate * 4);
+      NeedDevice(fCu, aCtx.fDevKDown, Int64(c.ExpertsUsed) * c.Hidden * 4);
+      SetLength(aCtx.fKIds, c.ExpertsUsed);
+      SetLength(aCtx.fKW, c.ExpertsUsed);
     end;
     aCtx.fRows := aRows;
   end;
@@ -630,6 +707,97 @@ begin
   end;
 end;
 
+procedure TQwen3Cuda.EnqueueMoeDevice(aCtx: TQwen3CuContext; aLayer: PtrInt);
+var
+  ly: ^TQwen3Layer;
+  h, fi, k: PtrInt;
+  pr, pids, pw, pg, pu, pd, pt: TCuDevicePtr;
+  experts, used, norm, count: cardinal;
+begin
+  ly := @fModel.Layers[aLayer];
+  h := fModel.Config.Hidden;
+  fi := fModel.Config.ExpertIntermediate;
+  k := fModel.Config.ExpertsUsed;
+  // the router logits, the choice into fDevKIds / fDevKW - no host involved
+  fBackend.EnqueueLinear(aCtx.fDevH, 1, h, ly^.Router, fModel.Config.Experts,
+    aCtx.fDevRoute);
+  pr := aCtx.fDevRoute.Ptr;
+  pids := aCtx.fDevKIds.Ptr;
+  pw := aCtx.fDevKW.Ptr;
+  experts := fModel.Config.Experts;
+  used := k;
+  norm := ord(fModel.Config.NormTopK);
+  fCu.Enqueue(fRoute, [@pr, @pids, @pw, @experts, @used, @norm], 1, 32);
+  if fCheckRoute then
+    CheckDeviceRoute(aCtx);
+  // gate and up of the k experts from the same row, SwiGLU, down per slot
+  fBackend.EnqueueLinearIds(aCtx.fDevH, h, ly^.ExpertGate[0].DType,
+    fExpertGate[aLayer][0], fStrideGate[aLayer], fi, pids, k, false, aCtx.fDevKGate);
+  fBackend.EnqueueLinearIds(aCtx.fDevH, h, ly^.ExpertUp[0].DType,
+    fExpertUp[aLayer][0], fStrideUp[aLayer], fi, pids, k, false, aCtx.fDevKUp);
+  pg := aCtx.fDevKGate.Ptr;
+  pu := aCtx.fDevKUp.Ptr;
+  count := k * fi;
+  fCu.Enqueue(fSwiGlu, [@pg, @pu, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
+    OPS_BLOCK);
+  fBackend.EnqueueLinearIds(aCtx.fDevKGate, fi, ly^.ExpertDown[0].DType,
+    fExpertDown[aLayer][0], fStrideDown[aLayer], h, pids, k, true, aCtx.fDevKDown);
+  // the weighted sum in id order into fDevTmp
+  pd := aCtx.fDevKDown.Ptr;
+  pt := aCtx.fDevTmp.Ptr;
+  count := h;
+  fCu.Enqueue(fCombine, [@pd, @pw, @pt, @used, @count],
+    (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+end;
+
+procedure TQwen3Cuda.CheckDeviceRoute(aCtx: TQwen3CuContext);
+var
+  k, j, t, id: PtrInt;
+  v: single;
+  d: double;
+  same: boolean;
+begin
+  k := fModel.Config.ExpertsUsed;
+  // the downloads wait for the route kernel
+  aCtx.fDevRoute.Download(0, pointer(aCtx.fRoute), Int64(fModel.Config.Experts) * 4);
+  aCtx.fDevKIds.Download(0, pointer(aCtx.fKIds), Int64(k) * 4);
+  aCtx.fDevKW.Download(0, pointer(aCtx.fKW), Int64(k) * 4);
+  fModel.Route(pointer(aCtx.fRoute), pointer(aCtx.fChosen), pointer(aCtx.fChosenW));
+  // the host's choice by id, as the kernel writes it
+  for j := 1 to k - 1 do
+  begin
+    id := aCtx.fChosen[j];
+    v := aCtx.fChosenW[j];
+    t := j;
+    while (t > 0) and (aCtx.fChosen[t - 1] > id) do
+    begin
+      aCtx.fChosen[t] := aCtx.fChosen[t - 1];
+      aCtx.fChosenW[t] := aCtx.fChosenW[t - 1];
+      dec(t);
+    end;
+    aCtx.fChosen[t] := id;
+    aCtx.fChosenW[t] := v;
+  end;
+  inc(fRouteChecks);
+  same := true;
+  for j := 0 to k - 1 do
+    if aCtx.fChosen[j] <> aCtx.fKIds[j] then
+      same := false;
+  if not same then
+  begin
+    inc(fRouteMismatches);
+    exit;
+  end;
+  for j := 0 to k - 1 do
+  begin
+    d := Abs(aCtx.fChosenW[j] - aCtx.fKW[j]);
+    if not (d <= 1) then
+      d := 1e30; // a NaN or an infinity of the device: never within a tolerance
+    if d > fRouteMaxDiff then
+      fRouteMaxDiff := d;
+  end;
+end;
+
 procedure TQwen3Cuda.Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
@@ -641,7 +809,7 @@ var
   rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count,
     norm: cardinal;
   eps: single;
-  capture: boolean;
+  capture, device: boolean;
   qkrope, attention: TCuHandle;
 begin
   c := fModel.Config;
@@ -710,8 +878,11 @@ begin
   pcs := aCtx.fDevCos.Ptr;
   pa := aCtx.fDevAttn.Ptr;
   // a single token: the whole step recorded as a graph, launched at once -
-  // not with experts, which the host chooses in every layer
-  capture := fUseGraphs and (n = 1) and not fMoe;
+  // with experts only when they are chosen on the device; a RouteTape needs
+  // the host's choice (TDecoderModel.Route), CheckRoute waits in every layer
+  device := fMoe and (n = 1) and fRouteOnDevice and fDeviceRoutable and
+    (fModel.RouteTape = nil);
+  capture := fUseGraphs and (n = 1) and (not fMoe or device) and not fCheckRoute;
   if capture then
     fCu.CaptureBegin;
   try
@@ -750,7 +921,12 @@ begin
       // residual and the feed-forward pre-norm, gate and up, SwiGLU, down
       EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, ly^.PostNorm, aCtx.fDevH);
       if c.Spec[l].Ffn = dfMoe then
-        EnqueueMoe(aCtx, l, n)
+      begin
+        if device then
+          EnqueueMoeDevice(aCtx, l)
+        else
+          EnqueueMoe(aCtx, l, n);
+      end
       else
       begin
         fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate);

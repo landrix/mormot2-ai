@@ -306,6 +306,41 @@ extern "C" __global__ void linear8(const unsigned int* w, const float* x,
     }
 }
 
+// linear8ids (slice D3c): linear8 for one token row over the k experts a
+// route kernel chose - slot s (grid y) reads its expert id from ids[s], the
+// expert's matrix at byte ids[s] * stride of w (the experts of a layer in one
+// buffer); x is row s of x when xPerSlot (the down projection), else row 0
+// (gate and up); y is row s of y. The arithmetic of linear8 for one row.
+extern "C" __global__ void linear8ids(const unsigned int* w, const float* x,
+  const int* ids, float* y, unsigned long long stride, unsigned int nin,
+  unsigned int nout, unsigned int dtype, unsigned int xPerSlot)
+{
+  unsigned int t = threadIdx.x;
+  unsigned int lane = t & 31u;
+  unsigned int o = blockIdx.x * 4u + (t >> 5);
+  unsigned int slot = blockIdx.y;
+  if (o >= nout)
+    return; // a whole warp, as in linear8
+  unsigned long long rowBase = (unsigned long long)ids[slot] * stride +
+    o * rowBytesOf(dtype, nin);
+  const float4* x4 = reinterpret_cast<const float4*>(x +
+    (xPerSlot ? (unsigned long long)slot * nin : 0ull));
+  float acc = 0.0f;
+  for (unsigned int e = lane * 8u; e < nin; e += 256u)
+  {
+    float wv[8];
+    weights8(w, dtype, rowBase, e, wv);
+    float4 xa = x4[e >> 2];
+    float4 xb = x4[(e >> 2) + 1u];
+    acc += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w +
+           wv[4] * xb.x + wv[5] * xb.y + wv[6] * xb.z + wv[7] * xb.w;
+  }
+  for (unsigned int off = 16u; off > 0u; off >>= 1)
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  if (lane == 0u)
+    y[(unsigned long long)slot * nout + o] = acc + 0.0f;
+}
+
 #define TM 64
 #define TN 64
 #define TK 32

@@ -1758,6 +1758,62 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D3c erledigt (2026-10-19): Expertenwahl auf dem Gerät beim Decode.** Ein Decode-Schritt
+(eine Token-Zeile) wählt die Experten auf CUDA und Vulkan selbst; der Host wartet nicht mehr
+je MoE-Layer. Prefill wählt weiter auf dem Host (dort zählt der Durchsatz der Experten-Blöcke,
+nicht die Wartepunkte).
+
+- Ein Route-Kernel bzw. -Shader rechnet `TDecoderModel.Route` auf den Router-Logits nach: die
+  k höchsten Logits, bei Gleichstand die niedrigere Id (dieselben Experten wie der Host bei
+  denselben Logits), Softmax und Normierung auf CUDA in double wie der Host, auf Vulkan in
+  float (Vulkan muss keine doubles können); Ids und Gewichte nach Id sortiert in einen
+  Gerätepuffer, so summiert das Gerät in Id-Reihenfolge wie die CPU.
+- `linear8ids` (CUDA, `tools/cuda/linear.cu`) bzw. `linear8.comp` mit `-DIDS` (Vulkan): die
+  Rechnung von `linear8` für eine Zeile, Arbeitsgruppe y ist ein Platz der k gewählten
+  Experten, die Matrix des Experten bei Id mal Abstand im Puffer aller Experten eines Layers;
+  Gate und Up lesen dieselbe Zeile, Down die Zeile seines Platzes.
+  `TInferCudaBackend.EnqueueLinearIds`, `TInferVulkanBackend.RecordLinearIds`.
+- `moecombine` summiert die k Ausgaben mit ihren Gewichten in Platz-Reihenfolge - dieselbe
+  Rechnung wie `fill0` und ein `scatteradd` je Experte.
+- Ein Decode-Schritt ist damit auf CUDA wieder ein CUDA-Graph (die Wahl liegt im Graphen) und
+  auf Vulkan ein Batch ohne Zwischen-Submit.
+- Nur wenn jeder MoE-Layer seine Experten in einem Puffer hat (heute bei GGUF-Dateien), den
+  das Gerät ganz bindet (Vulkan: höchstens `maxStorageBufferRange` bzw. `MaxLinearBytes`), in
+  einem Typ mit `linear8ids`-Form (Blocktypen; F32 bei einer durch 8 teilbaren Breite),
+  höchstens 64 aus höchstens 4096 Experten gewählt werden und kein `RouteTape` gesetzt ist (`DeviceRoutable`,
+  `RouteOnDevice`); sonst wie bisher auf dem Host. `CheckRoute` (Test und Diagnose) liest
+  nach jedem Route die Logits und die Wahl zurück und vergleicht sie mit `TDecoderModel.Route`.
+
+*Gemessen:* Qwen3-30B-A3B Q4_K_M auf der RTX 5090, 200 Tokens Prompt, 64 neue, derselbe Build
+mit `LAI_ROUTE_HOST=1` (Wahl auf dem Host) und ohne:
+
+| | Decode, Wahl auf dem Host | Decode, Wahl auf dem Gerät | Prefill |
+|---|---|---|---|
+| CUDA | 38,9 Tokens/s | 97,3 Tokens/s | 383 (unverändert) |
+| Vulkan | 42,9 Tokens/s | 90,4 Tokens/s | 490 (unverändert) |
+
+*Tests:* `RouteMatchesHost` auf CUDA und Vulkan (Kernel bzw. Shader gegen `RouteRef`, die
+ausgeschriebene Wahl des Hosts, die auf CUDA zuerst gegen `TDecoderModel.Route` geprüft wird;
+8 aus 128 mit und ohne Normierung, 2 aus 8, 4 aus 64; Zufallswerte, Gleichstände an der
+k-Grenze, lauter gleiche Logits, große und sehr negative Werte; ein NaN-Gewicht zählt als
+Fehler). `TinyMoeMatchesCpu`: das GGUF (Experten in einem Puffer) wählt auf dem Gerät, die
+anderen Fälle auf dem Host; Decode-Schritte mit `CheckRoute` (jede Wahl gleich der des Hosts)
+und ohne, auf CUDA als Graph, jeweils gegen die Wahl des Hosts auf demselben Gerät (CUDA
+relativ 1e-6, Vulkan 1e-5 - dort kommen die Gewichte aus float). Gegen die CPU prüfen die
+ersten Schritte nur per Kosinus (0,999), die späteren gar nicht: mit Q8_0 quantisiert die CPU
+auch die Aktivierungen, an einer knappen Router-Entscheidung kippt dann ein Experte - mit der
+Wahl des Hosts auf dem Gerät genauso.
+`Qwen3MoeGgufMatchesCpu`: nach dem Band acht Decode-Schritte mit eigener Wahl und `CheckRoute`:
+384 Zeilen, keine andere Wahl als der Host, Gewichte auf CUDA bitgleich, auf Vulkan bis
+9e-8. Grün auf dem RTX-Rechner unter FPC und Delphi 13 (4325 Assertions) und Delphi 7 (2869),
+auf der Adreno X1-85 und dem M2 Pro (MoltenVK, 3723 Assertions, das Tiny-MoE wählt dort auf dem
+Gerät). Gegenprobe: vierzehn eingebaute Fehler (Route auf CUDA und Vulkan: Gleichstand an die höhere
+Id, nie normiert, auf CUDA nicht nach Id sortiert; `linear8ids`: Down liest Zeile 0, Experte
+Id + 1, auf Vulkan immer Experte 0; `moecombine` ohne Gewichte; Gerätewahl trotz `RouteTape`;
+Vulkan nie routbar) - alle scheitern. Review: Codex fand zwei Vulkan-Pipelines, die der
+Destruktor nicht freigab, und dass ein NaN-Gewicht den Maximumvergleich passiert hätte; der
+Claude-Finder, dass `GpuLinearIds` auf Vulkan `MaxLinearBytes` übersah. Behoben.
+
 **D4 erledigt (2026-10-19): Sliding Window, Cache-Semantik, NoPE.** Auf der CPU; die
 GPU-Geräte lehnen solche Modelle mit klarer Meldung ab (Backlog D4b).
 

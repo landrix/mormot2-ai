@@ -18,8 +18,8 @@ RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 > prompt cache for the next turn. Weights come from safetensors or llama.cpp GGUF files
 > (Q8_0, Q4_0, Q4_K_M). The whole forward pass runs on the CPU (NEON, AVX2), on Vulkan
 > (tested on an RTX 5090, an Adreno X1-85 and an M2 Pro through MoltenVK) and on CUDA. An
-> RTX 5090 decodes Qwen3-0.6B at about 400 tokens/s (CUDA) and Qwen3-30B-A3B at about 44
-> (Vulkan; CUDA 41). Sliding-window attention and layers without rotary positions run on
+> RTX 5090 decodes Qwen3-0.6B at about 400 tokens/s (CUDA) and Qwen3-30B-A3B at about 97
+> (CUDA; Vulkan 90), choosing its experts on the GPU. Sliding-window attention and layers without rotary positions run on
 > the CPU (SmolLM3, so far without a chat template). Three test suites - about 6300 assertions on Windows x64, fewer
 > where a feature is missing - green on every platform in the table below.
 
@@ -45,10 +45,10 @@ Qwen3-30B-A3B and Qwen2.5 included) and of the M2 Pro again on 2026-10-19:
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
 | Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2364 ⁶ |
-| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 723 | 4281 |
-| Windows x64 (i9-14900K) | Delphi 13 | 1257 | 726 | 4281 |
-| Windows x86 | **Delphi 7** | 1253 | 714 | 2848 ⁴ |
-| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 716 | 2942 ⁵ |
+| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 723 | 4325 |
+| Windows x64 (i9-14900K) | Delphi 13 | 1257 | 726 | 4325 |
+| Windows x86 | **Delphi 7** | 1253 | 714 | 2869 ⁴ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 716 | 3723 ⁵ |
 | Windows ARM64 (Snapdragon X) | FPC 3.3.1 ¹ | 1257 | 714 ² | 2728 ¹ |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 725 | 2486 ³ |
 
@@ -69,7 +69,7 @@ on the AVX2 path.
 tests skip in a 32-bit process (2.4 GB of FP32 weights, 18.6 GB of GGUF); the tiny
 models, the tokenizers and the chat templates run.
 ⁵ With all models except Qwen3-30B-A3B (the tiny MoE model runs), NEON dot-product
-kernels, and the Vulkan suite on the M2 Pro GPU through MoltenVK (`LAI_REQUIRE_VULKAN=1`); counted before Qwen2.5 was added. The BGE-M3
+kernels, and the Vulkan suite on the M2 Pro GPU through MoltenVK (`LAI_REQUIRE_VULKAN=1`). The BGE-M3
 corpus gate passed there in an earlier run (nDCG@10 0.9004, the same as on the
 Snapdragon); it is not part of this count.
 ⁶ FPC 3.2.4 with all models; under FPC 3.2.2 the native client tests ran on their own
@@ -205,12 +205,13 @@ And on an Intel i9-14900K (Windows 11, FPC 3.2.2, 22 threads, AVX2), 2026-10-16:
 | | prefill | decode |
 |---|---|---|
 | CPU (22 threads, AVX2) | 85 tokens/s | 16 tokens/s |
-| RTX 5090, CUDA | 383 tokens/s | 41 tokens/s |
-| RTX 5090, Vulkan | 489 tokens/s (642 at 2000 tokens) | 43-44 tokens/s |
+| RTX 5090, CUDA | 383 tokens/s | 97 tokens/s |
+| RTX 5090, Vulkan | 489 tokens/s (642 at 2000 tokens) | 90 tokens/s |
 
-The host still picks the experts of each layer, so a MoE layer waits for the device once
-on Vulkan and three times on CUDA - that is why Vulkan leads here. Moving the choice onto
-the device is the next step for decoding speed (backlog D3c).
+A decode step chooses the experts on the device (a route kernel, the k chosen experts in
+one matrix product per projection): one CUDA graph or one Vulkan batch per token. With the
+choice on the host, as before 2026-10-19, the same build decodes 39 (CUDA) and 43 (Vulkan)
+tokens/s. A prefill still chooses on the host.
 
 FP32 keeps greedy output token-identical to `transformers`; Q8_0 passes its own gate but
 can flip a close decision - with it, Qwen3-0.6B answers the weather question of the
@@ -574,7 +575,7 @@ provider or runtime, not only against tests.
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
 | Native embeddings (`mormot.ai.embed.native`) | **stable** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; 90-minute soak test passed (79,628 texts, every vector bit-identical to the first pass); the recommended provider of the consuming backend |
 | Decoder (`mormot.ai.infer.decoder`, `.model.qwen3`, `.tokenizer.bpe`, `.chat`) and its client (`mormot.ai.llm.native`) | **works** | Qwen3, Qwen3-MoE and Qwen2.5, SmolLM3 without a chat template; sliding windows with a cache that keeps twice the window and restore points the prompt cache respects, layers without rotary positions (NoPE), each checked bit for bit against a full cache; tokenizer: 2416 cases identical to Hugging Face, fuzzed against its pre-tokenizer; chat templates identical to `transformers` (the same 21 conversations for Qwen3 and Qwen2.5); greedy output token-identical in FP32 (Qwen3-0.6B 7 prompts, Qwen2.5-0.5B 6, tiny MoE models); behind `ILlmClient` with streaming, tool calls and reasoning, agent loop tested; FP32, Q8_0, Q4_0, Q4_K_M; greedy or sampled (temperature, top-k, top-p, min-p, seed); prompt cache for the next turn. Not yet: Q5_0 (Qwen's own Q4_K_M file of Qwen2.5-0.5B is refused with that name), sliding windows and NoPE on the GPU (refused there) |
-| GPU backends (`mormot.ai.infer.vulkan`, `.cuda`, `.model.qwen3.vulkan`, `.model.qwen3.cuda`) | **works** | the whole forward pass, experts included, checked against the CPU on every run (logits cosine, argmax, for MoE the expert choice separately); Vulkan on an RTX 5090, an Adreno X1-85 and an M2 Pro (MoltenVK), CUDA on the RTX 5090 - mixture of experts with Qwen3-30B-A3B on the RTX 5090, on the other GPUs with the tiny MoE model; flash attention, F16 KV cache, a decode step as one CUDA graph (dense models) |
+| GPU backends (`mormot.ai.infer.vulkan`, `.cuda`, `.model.qwen3.vulkan`, `.model.qwen3.cuda`) | **works** | the whole forward pass, experts included, checked against the CPU on every run (logits cosine, argmax, for MoE the expert choice separately); Vulkan on an RTX 5090, an Adreno X1-85 and an M2 Pro (MoltenVK), CUDA on the RTX 5090 - mixture of experts with Qwen3-30B-A3B on the RTX 5090, on the other GPUs with the tiny MoE model; flash attention, F16 KV cache, the experts of a decode step chosen on the device, a decode step as one CUDA graph |
 | Load governor (`mormot.ai.governor`) | **works** | tested on a fake clock and a fake sysfs tree; the temperature path needs a Linux CPU sensor, which WSL2 does not expose - not yet seen on real sensor hardware |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
 | Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
@@ -632,8 +633,9 @@ Next, in this order:
    comparison check computation and expert choice separately; Qwen2 / Qwen2.5 with QKV
    bias and its own chat template (D1b); sliding-window attention with a compact cache,
    valid restore points for the prompt cache and layers without rotary positions, SmolLM3
-   as the reference family (D4, CPU). Next: the expert choice on the device (D3c), Q5_0
-   weights (B16), gpt-oss-20b (D5) with windows on the GPU (D4b); then Gemma. Plan and order:
+   as the reference family (D4, CPU); the expert choice of a decode step on the GPU (D3c,
+   Qwen3-30B-A3B from 39 to 97 tokens/s on CUDA). Next: Q5_0 weights (B16), gpt-oss-20b
+   (D5) with windows on the GPU (D4b); then Gemma. Plan and order:
    [docs/backlog.md](docs/backlog.md) (German).
 4. **After that, on demand** — a reranker, Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 

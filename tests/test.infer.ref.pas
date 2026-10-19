@@ -139,6 +139,12 @@ function InferL2Norm(aValues: PSingleArray; aCount: PtrInt): double;
 function FindInferRefDir(const aDataset: RawUtf8): TFileName;
 
 
+/// TDecoderModel.Route written out, the choice then sorted by id as the route
+// kernels of the devices write it (slice D3c) - checked against the model's
+// Route in TTestInferCuda.RouteMatchesHost
+procedure RouteRef(aLogits: PSingleArray; aExperts, aK: PtrInt; aNorm: boolean;
+  aIds: PIntegerArray; aW: PSingleArray);
+
 implementation
 
 const
@@ -418,5 +424,57 @@ begin
     dir := ExtractFileDir(dir);
   end;
 end;
+
+procedure RouteRef(aLogits: PSingleArray; aExperts, aK: PtrInt; aNorm: boolean;
+  aIds: PIntegerArray; aW: PSingleArray);
+var
+  i, j, t, best, id: PtrInt;
+  m, sum, picked: double;
+  taken: boolean;
+  v: single;
+begin
+  m := aLogits^[0];
+  for i := 1 to aExperts - 1 do
+    if aLogits^[i] > m then
+      m := aLogits^[i];
+  sum := 0;
+  for i := 0 to aExperts - 1 do
+    sum := sum + Exp(aLogits^[i] - m);
+  picked := 0;
+  for j := 0 to aK - 1 do
+  begin
+    best := -1;
+    for i := 0 to aExperts - 1 do
+    begin
+      taken := false;
+      for t := 0 to j - 1 do
+        if aIds^[t] = i then
+          taken := true;
+      if not taken and ((best < 0) or (aLogits^[i] > aLogits^[best])) then
+        best := i;
+    end;
+    aIds^[j] := best;
+    aW^[j] := Exp(aLogits^[best] - m) / sum;
+    picked := picked + aW^[j];
+  end;
+  if aNorm then
+    for j := 0 to aK - 1 do
+      aW^[j] := aW^[j] / picked;
+  for j := 1 to aK - 1 do
+  begin
+    id := aIds^[j];
+    v := aW^[j];
+    t := j;
+    while (t > 0) and (aIds^[t - 1] > id) do
+    begin
+      aIds^[t] := aIds^[t - 1];
+      aW^[t] := aW^[t - 1];
+      dec(t);
+    end;
+    aIds^[t] := id;
+    aW^[t] := v;
+  end;
+end;
+
 
 end.

@@ -14,6 +14,8 @@
 //     backlog B3); otherwise TInferCpuFastBackend in its float mode
 //   - LAI_KV_F32=1: vulkan and cuda keep the KV cache in floats instead of
 //     half floats (TQwen3Vulkan.KvF16, TQwen3Cuda.KvF16)
+//   - LAI_ROUTE_HOST=1: a model with experts chooses them on the host in
+//     every decode step too (RouteOnDevice false), for comparison
 //   e.g.   llm-bench vendor/models/qwen3-0.6b 200 32
 program llm.bench;
 
@@ -386,7 +388,10 @@ begin
           backend := gpu;
           dev := TQwen3Vulkan.Create(model, gpu);
           TQwen3Vulkan(dev).KvF16 := GetEnvironmentVariable('LAI_KV_F32') <> '1';
-          ConsoleWrite('KV cache in half floats: %', [TQwen3Vulkan(dev).KvF16]);
+          TQwen3Vulkan(dev).RouteOnDevice := GetEnvironmentVariable('LAI_ROUTE_HOST') <> '1';
+          ConsoleWrite('KV cache in half floats: %, experts chosen on the device: %',
+            [TQwen3Vulkan(dev).KvF16, TQwen3Vulkan(dev).RouteOnDevice and
+             TQwen3Vulkan(dev).DeviceRoutable]);
         end
         else
         begin
@@ -394,7 +399,10 @@ begin
           backend := cu;
           dev := TQwen3Cuda.Create(model, cu);
           TQwen3Cuda(dev).KvF16 := GetEnvironmentVariable('LAI_KV_F32') <> '1';
-          ConsoleWrite('KV cache in half floats: %', [TQwen3Cuda(dev).KvF16]);
+          TQwen3Cuda(dev).RouteOnDevice := GetEnvironmentVariable('LAI_ROUTE_HOST') <> '1';
+          ConsoleWrite('KV cache in half floats: %, experts chosen on the device: %',
+            [TQwen3Cuda(dev).KvF16, TQwen3Cuda(dev).RouteOnDevice and
+             TQwen3Cuda(dev).DeviceRoutable]);
         end;
         QueryPerformanceMicroSeconds(t1);
         if gpu <> nil then
