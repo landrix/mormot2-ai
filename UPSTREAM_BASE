@@ -41,6 +41,22 @@ relevant, then bump the commit below.
     git -C <clone> diff <pinned-sha>..<new-sha> -- mormot2-pgvector # what changed
     # port relevant changes, then update Commit/Date above in the same commit.
 
+## Adopted test data: flydev-fr/mormot2-qwen-tts
+
+The reference dataset tests/data/infer-ref/qwen3-tts-lm (embeddings in, logits
+out, for the two Qwen3 stacks of Qwen3-TTS) and its two generators
+(tools/infer-ref/qwen3-tts/, unchanged from tools/tts/) - the regression data
+for the embeddings-input forward (docs/backlog.md B14, point 3).
+
+  Project: flydev-fr/mormot2-qwen-tts
+  URL:     https://github.com/flydev-fr/mormot2-qwen-tts
+  Commit:  8f5a84692bb00c2829b7e910cad91e93c6175104
+  Date:    2026-10-18   ("docs: add README, LICENSE and NOTICE")
+  License: MPL 1.1 / GPL 2.0 / LGPL 2.1 (follows mORMot), test data included.
+  Blob:    tensors.bin sha256 6579df8f3fe256c98c9a3cced8c7b093108f1a1c66a4396179832d8528c6d95f
+  Model:   Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice @ 85e237c12c027371202489a0ec509ded67b5e4b5
+           (Apache-2.0; downloaded by the user, not part of this repository)
+
 ## Authoritative specifications we build against
 
   MCP protocol: 2026-07-28 ONLY (greenfield — no legacy versions, no negotiation;

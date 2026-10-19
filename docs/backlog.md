@@ -642,6 +642,36 @@ Synopse-Forum (Thread „mormot2-ai“, Beitrag #31,
    den der Pool hält. *Test:* der Index liegt immer in 0 bis Workers und ist innerhalb eines
    Laufs je Thread eindeutig; Messung vorher/nachher mit einem allokierenden Job.
 
-**Reihenfolge:** 3 zuerst (größter Nutzen, berührt die Phase-D-Schnittstellen), dann 1, 2 und
-5 (klein, unabhängig), 4 nur Doku und Entscheidung. Rückmeldung an flydev im Forum, wenn
-etwas davon gepusht ist.
+6. **Gewichts-Cache der GPU-Backends liefert nach Freigabe veraltete Daten** (gemeldet von
+   flydev im Forum, Beitrag #34). `TInferVulkanBackend.Weight` und ebenso
+   `TInferCudaBackend.Weight` suchen nur nach Adresse, Typ und Größe; werden Gewichte
+   freigegeben und neue an derselben Adresse angelegt, kommt der alte Gerätepuffer zurück.
+   Der Unit-Kopf nennt das als Vertrag (Gewichte nicht freigeben, solange das Backend lebt,
+   sonst `ClearWeights`), sein TTS-Projekt hat genau diesen Umweg dokumentiert. Das ist eine
+   Falle, sobald mehrere Modelle oder wechselnde Gewichte (TTS: Talker, Predictor, Decoder)
+   ein Backend teilen. *Vorhaben:* ein Weg, gezielt zu vergessen, ohne alles zu leeren -
+   z. B. `ForgetWeights(aFrom, aTo: pointer)` für einen Adressbereich, gerufen vom
+   Besitzer der Gewichte beim Freigeben (`TDecoderModel`, Loader-Puffer), und
+   `ForgetWeight(aData)`; dazu prüfen, ob ein Modell das Backend selbst benachrichtigen kann
+   (Modell kennt sein Gerät über `TDecoderDevice`). Für Vulkan und CUDA gleich. *Test:*
+   Gewicht hochladen, Host-Speicher freigeben, neu an derselben Adresse anlegen (erzwingen:
+   derselbe Puffer mit neuem Inhalt), nach `ForgetWeights` die neuen Werte; Gegenprobe ohne
+   den Aufruf liefert die alten.
+
+**Referenzdaten für Punkt 3 (übernommen 2026-10-19):** flydev hat sie geliefert:
+`tests/data/infer-ref/qwen3-tts-lm` (Embeddings rein, Logits raus, für Talker und
+Code-Predictor von Qwen3-TTS-12Hz-0.6B-CustomVoice, PyTorch float32), Erzeuger unverändert
+unter `tools/infer-ref/qwen3-tts/`, Herkunft in `UPSTREAM_BASE` und `NOTICE`. Der Test für
+den Einstieg mit Embeddings lädt das Modell (Revision im Manifest, Hashes von
+`config.json` und `model.safetensors` prüfen; ohne Modell überspringen wie die 30B-Tests),
+schneidet die Stapel nach den Präfixen des Manifests heraus und vergleicht Zustände je
+Layer und Logits. Beide Stapel sind gewöhnliche Qwen3-Decoder; die multimodale RoPE des
+Talkers fällt bei gleichen Positionen auf die normale zurück. Sein Code ist öffentlich:
+<https://github.com/flydev-fr/mormot2-qwen-tts> (TTS-Engine auf mormot2-ai als Submodul) -
+dort zeigt `src/tts/mormot.ai.tts.qwen.lm.vulkan.pas`, welche Teile von `TQwen3Vulkan` er
+nachbauen musste; nach Punkt 3 sollte das entfallen.
+
+**Reihenfolge:** 3 zuerst (größter Nutzen, berührt die Phase-D-Schnittstellen), zusammen mit 6
+(derselbe Anwendungsfall: mehrere Stapel auf einem Gerät), dann 1, 2 und 5 (klein,
+unabhängig), 4 nur Doku und Entscheidung. Rückmeldung an flydev im Forum, wenn etwas davon
+gepusht ist.

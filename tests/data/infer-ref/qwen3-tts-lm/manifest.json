@@ -1,0 +1,450 @@
+{
+ "dataset": "qwen3-tts-lm",
+ "note": "Two Qwen3 stacks of Qwen3-TTS-12Hz-0.6B-CustomVoice fed with embedding rows instead of token ids, one sequence from position 0, no padding. PyTorch in float32 (BF16 weights upcast exactly), eager attention, CPU. Both are plain Qwen3 decoders (per-head q_norm / k_norm, SwiGLU, no bias); the multimodal RoPE of the talker (interleaved, sections [24, 20, 20]) reduces to the plain rotate_half RoPE, its three positions being equal.",
+ "model": {
+  "id": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+  "revision": "85e237c12c027371202489a0ec509ded67b5e4b5",
+  "files": {
+   "config.json": "81aca2b6fac304944d8acf345272d8a9a727d5fc2e2e66b222ab4729340c7455",
+   "model.safetensors": "bc3c7e785eb961179c25450d1acff03f839e0002f2f3a5aeb67b5735c0fa2adb"
+  }
+ },
+ "stacks": {
+  "talker": {
+   "prefix": "talker.model.",
+   "head": "talker.codec_head.weight",
+   "layers": 28,
+   "hidden_size": 1024,
+   "heads": 16,
+   "kv_heads": 8,
+   "head_dim": 128,
+   "intermediate_size": 3072,
+   "rms_norm_eps": 1e-06,
+   "rope_theta": 1000000,
+   "vocab_size": 3072
+  },
+  "predictor": {
+   "prefix": "talker.code_predictor.model.",
+   "head": "talker.code_predictor.lm_head.{g}.weight, g = 0..14",
+   "layers": 5,
+   "hidden_size": 1024,
+   "heads": 16,
+   "kv_heads": 8,
+   "head_dim": 128,
+   "intermediate_size": 3072,
+   "rms_norm_eps": 1e-06,
+   "rope_theta": 1000000,
+   "vocab_size": 2048
+  }
+ },
+ "source": {
+  "text": "Cible en vue, deux hostiles en local.",
+  "speaker": "vivian",
+  "language": "French",
+  "prompt_ids": [
+   151644,
+   77091,
+   198,
+   34,
+   1238,
+   662,
+   47134,
+   11,
+   25552,
+   3468,
+   3658,
+   662,
+   2205,
+   13,
+   151645,
+   198,
+   151644,
+   77091,
+   198
+  ]
+ },
+ "environment": {
+  "created_utc": "2026-10-18T16:15:11Z",
+  "torch": "2.9.1+rocm7.2.1",
+  "device": "cpu",
+  "dtype": "float32",
+  "attn_implementation": "eager",
+  "generator": "tools/qwen_ref.py, then tools/make_lm_reference.py"
+ },
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 2814016,
+  "sha256": "6579df8f3fe256c98c9a3cced8c7b093108f1a1c66a4396179832d8528c6d95f",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "talker.embed",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 0,
+   "bytes": 90112,
+   "sha256": "f32ee867048d37586cde3c98f8a6e36b32ff721eaf58b9d87bdaef548a9e1c40",
+   "note": "input rows (positions 0..21): sums of text projections and codec embeddings, the prefill of one sentence"
+  },
+  {
+   "name": "talker.layer00",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 90112,
+   "bytes": 90112,
+   "sha256": "3e8849a34892d0906befce0642c98365fd18f5f387d82806b17e53105f8faef9"
+  },
+  {
+   "name": "talker.layer01",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 180224,
+   "bytes": 90112,
+   "sha256": "e4bc940915fe2349337e29b3b9aaa203fe25f6491631265ea752981cd0eb8f9f"
+  },
+  {
+   "name": "talker.layer02",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 270336,
+   "bytes": 90112,
+   "sha256": "1abef9ccb19c494ab977e6fd8fff9dfb9b5ae298ed7ddaf1242170f97f4ede7a"
+  },
+  {
+   "name": "talker.layer03",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 360448,
+   "bytes": 90112,
+   "sha256": "f4fd7b1fb11a34f4ddfa62e23c923f5824ad8802ae32a52a535c1b42ed66370b"
+  },
+  {
+   "name": "talker.layer04",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 450560,
+   "bytes": 90112,
+   "sha256": "6ea4a91703379e9f86de83e15580c9e8bd50c494bda63710cbdfefdff9fe2ed0"
+  },
+  {
+   "name": "talker.layer05",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 540672,
+   "bytes": 90112,
+   "sha256": "0674d40b32a4668253ff6460c110b33431f8ab9692ec7d72c145252bd304073e"
+  },
+  {
+   "name": "talker.layer06",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 630784,
+   "bytes": 90112,
+   "sha256": "a5fe5345d1362d53940087534660c0b8035b2f91fcc20eb3a65ab0d004ef2046"
+  },
+  {
+   "name": "talker.layer07",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 720896,
+   "bytes": 90112,
+   "sha256": "6eb3854f4bd0c251a71eb0d843277494498ef767db1083c63526a7cffbb95691"
+  },
+  {
+   "name": "talker.layer08",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 811008,
+   "bytes": 90112,
+   "sha256": "a4d36a6daa2f4578fdab467e5113767444b2ba41b0505170444759de9d727000"
+  },
+  {
+   "name": "talker.layer09",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 901120,
+   "bytes": 90112,
+   "sha256": "9b42fa60f070c4258c6e00331fee0b93bac7684dfcb5d9e483e5849c689807b3"
+  },
+  {
+   "name": "talker.layer10",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 991232,
+   "bytes": 90112,
+   "sha256": "d1d4b5922678aaabeb44a96f87f883dbd955806e8f251e6e355ec63340df86d0"
+  },
+  {
+   "name": "talker.layer11",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1081344,
+   "bytes": 90112,
+   "sha256": "0c80247301b685646df8ff6f048db488c93c02b0fc70b7ee18d40a40b2ee0f5a"
+  },
+  {
+   "name": "talker.layer12",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1171456,
+   "bytes": 90112,
+   "sha256": "04c350a27cc53371d458531bb6ec131e2c925456d0d1c9b2255d29843769e145"
+  },
+  {
+   "name": "talker.layer13",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1261568,
+   "bytes": 90112,
+   "sha256": "7318e2a6d6e475b343e38a8def8503f9daf0956e82113b7dca40dbaf06634aa4"
+  },
+  {
+   "name": "talker.layer14",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1351680,
+   "bytes": 90112,
+   "sha256": "490c6f9e25eff5cca670fd850af4e00f4dc54fd007d63ce46d3d239a60a1acfa"
+  },
+  {
+   "name": "talker.layer15",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1441792,
+   "bytes": 90112,
+   "sha256": "f10757aea71b3136873ba71198c3e213010e4d2049b4ebf9836b5a5a387ce91b"
+  },
+  {
+   "name": "talker.layer16",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1531904,
+   "bytes": 90112,
+   "sha256": "6583987eb4cf4740ee1340c50f76b95d9f6173e6f4f838b1a5627b457daf3031"
+  },
+  {
+   "name": "talker.layer17",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1622016,
+   "bytes": 90112,
+   "sha256": "e506075123f234388883c7d66b0ba8d3faadfe196ccb8d123beefa414be33c33"
+  },
+  {
+   "name": "talker.layer18",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1712128,
+   "bytes": 90112,
+   "sha256": "a94b4f3780b06f77b83dff9e6eb69474b2e60f1c88c15b520ff2f10e245f6cc7"
+  },
+  {
+   "name": "talker.layer19",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1802240,
+   "bytes": 90112,
+   "sha256": "a3f9ea44178eb4c99b3724d67234ab7f7ab15d51a811add88a649a974ae8667a"
+  },
+  {
+   "name": "talker.layer20",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1892352,
+   "bytes": 90112,
+   "sha256": "92093ad59037163277ccefd13afb9f88fc19c608a6a0a9ff6c4345ed68988085"
+  },
+  {
+   "name": "talker.layer21",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 1982464,
+   "bytes": 90112,
+   "sha256": "bffe382dc9eadfaa2d24015a3a866f975d4eec042871063aec85e12e8fb64c04"
+  },
+  {
+   "name": "talker.layer22",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 2072576,
+   "bytes": 90112,
+   "sha256": "619b1f8dd453d6308e30f5e860cbee867bbbdc4ccabb74ccd90c5f9877f15f5d"
+  },
+  {
+   "name": "talker.layer23",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 2162688,
+   "bytes": 90112,
+   "sha256": "8f6f60669b1b393b4771a349ae67c5a65f201d274c480f05e61f24d2cd8ad831"
+  },
+  {
+   "name": "talker.layer24",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 2252800,
+   "bytes": 90112,
+   "sha256": "352da7c2a223de33ffd00ca94242325af040753673972b93f04c37d3e0fc0daa"
+  },
+  {
+   "name": "talker.layer25",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 2342912,
+   "bytes": 90112,
+   "sha256": "5d1dee8b33f5b58116691e5ad9ceb17e326cc68717d3430850f0d735dc190613"
+  },
+  {
+   "name": "talker.layer26",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 2433024,
+   "bytes": 90112,
+   "sha256": "1e977b30601344125e435192f8570a188cccd0d58e9517a938597404273e0b7d"
+  },
+  {
+   "name": "talker.norm",
+   "dtype": "f32",
+   "shape": [
+    22,
+    1024
+   ],
+   "offset": 2523136,
+   "bytes": 90112,
+   "sha256": "718d607c04ef02d8c6a213e8d41ddfe0674535607e8e60ea97d8c313ac26685c",
+   "note": "output of the final RMSNorm; the raw output of layer 27 is not available (transformers replaces the last hidden state by the normed one)"
+  },
+  {
+   "name": "talker.logits_last",
+   "dtype": "f32",
+   "shape": [
+    3072
+   ],
+   "offset": 2613248,
+   "bytes": 12288,
+   "sha256": "1f706b59d2bde39615b0e0e5c74b1989dfc49a8daa8c8485187e56ed16e9d5ae",
+   "note": "talker.codec_head.weight applied to the last row of talker.norm"
+  },
+  {
+   "name": "predictor.embed",
+   "dtype": "f32",
+   "shape": [
+    16,
+    1024
+   ],
+   "offset": 2625536,
+   "bytes": 65536,
+   "sha256": "cc075558e28401090c04dcb87b49a6610275583286d31370824caf8aac53705f",
+   "note": "row 0: the talker state of frame 0 (talker.norm last row); row 1: talker.model.codec_embedding[code 0]; row g + 1 (g = 1..14): talker.code_predictor.model.codec_embedding.{g-1}[code g], widened from BF16 - codes from predictor.codes"
+  },
+  {
+   "name": "predictor.codes",
+   "dtype": "i32",
+   "shape": [
+    16
+   ],
+   "offset": 2691072,
+   "bytes": 64,
+   "sha256": "280321cc1a107aa9bad821aa4d06c59cfa4ca64f3e39d3bb9f7333c8d54f3c3c",
+   "note": "the greedy codes of frame 0 (argmax of each logits row, code 0 from the talker); the last one is not fed back"
+  },
+  {
+   "name": "predictor.logits",
+   "dtype": "f32",
+   "shape": [
+    15,
+    2048
+   ],
+   "offset": 2691136,
+   "bytes": 122880,
+   "sha256": "de17f06d056abeb029dcc994b3f1368e4b6beef410d70bb0d27462d692545c3e",
+   "note": "row g: talker.code_predictor.lm_head.{g}.weight applied to the normed state of position g + 1 - one forward of the 16 rows gives them all (causal attention)"
+  }
+ ]
+}

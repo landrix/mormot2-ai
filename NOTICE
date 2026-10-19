@@ -92,3 +92,15 @@ Qwen3  (Alibaba Cloud, Qwen team)  (MODEL INTERFACE, NOT CODE)
   only works with them. Reference data under tests/data/infer-ref/qwen3*
   holds token ids, logits and states computed with the model, no weights.
   https://huggingface.co/Qwen/Qwen3-0.6B
+
+Qwen3-TTS reference data  (flydev-fr; model by Alibaba Cloud, Qwen team)  (ADOPTED TEST DATA)
+  tests/data/infer-ref/qwen3-tts-lm and its generators tools/infer-ref/qwen3-tts/
+  are taken unchanged from flydev-fr/mormot2-qwen-tts (commit 8f5a84692bb00c2829b7e910cad91e93c6175104).
+  License: MPL 1.1 / GPL 2.0 / LGPL 2.1 (three-license, follows mORMot).
+  Copyright (c) 2026 flydev-fr and contributors.
+  https://github.com/flydev-fr/mormot2-qwen-tts
+  The values were computed with Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice (revision
+  85e237c12c027371202489a0ec509ded67b5e4b5, Apache-2.0) in PyTorch; the dataset
+  also holds 14 rows of its codec embeddings (BF16 widened to float32). The
+  model itself is not part of this repository.
+  https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
