@@ -49,10 +49,15 @@ type
     fFast, fExact: TInferCpuFastBackend;
     fHits: TIntegerDynArray;
     fFail: integer;
+    fWorkerOf: TIntegerDynArray;
+    fThreadOf: TPtrUIntDynArray;
+    fPeers: integer;
     procedure Setup; override;
     procedure CleanUp; override;
     procedure CountHit(aItem: integer);
     procedure FailOne(aItem: integer);
+    procedure MarkWorker(aItem, aWorker: integer);
+    procedure WaitForPeer(aItem, aWorker: integer);
   published
     /// every kernel of this CPU against the plain Pascal loop
     procedure KernelsMatchPascal;
@@ -80,6 +85,9 @@ type
     procedure DecoderNormAndSwiGlu;
     /// the thread pool: exactly once, bursts, exceptions
     procedure ThreadPoolRunsEveryItemOnce;
+    /// RunWorkers: every item once, its index in 0..Workers, one index one
+    // thread (the caller 0), and exceptions as with Run
+    procedure ThreadPoolWorkerIndex;
     /// two threads embedding at once through one fast backend
     procedure ConcurrentCallersAreCorrect;
     /// tiny GGUF and, if present, BGE-M3 Q8: exact mode equal to the reference,
@@ -1001,6 +1009,15 @@ begin
   InterlockedIncrement(fHits[aItem]);
 end;
 
+procedure TTestInferFast.MarkWorker(aItem, aWorker: integer);
+begin
+  if aItem = fFail then
+    EInferError.RaiseUtf8('item %', [aItem]);
+  fWorkerOf[aItem] := aWorker;
+  fThreadOf[aItem] := PtrUInt(GetCurrentThreadId);
+  InterlockedIncrement(fHits[aItem]);
+end;
+
 /// causal grouped-query attention as defined, straight from the formula: an
 // independent check of the reference branch the exact path shares
 procedure NaiveCausal(const q, keys, values: TSingleDynArray; aRows, aHeads,
@@ -1415,6 +1432,126 @@ begin
       if fHits[i] <> 1 then
         inc(bad);
     CheckEqual(bad, 0, 'next job after an exception');
+  finally
+    pool.Free;
+  end;
+end;
+
+procedure TTestInferFast.WaitForPeer(aItem, aWorker: integer);
+var
+  stop: Int64;
+begin
+  // every item waits (up to 5 s) until a second item has started - on
+  // another thread, since this one waits: the pool's threads must take part,
+  // whatever the scheduler
+  MarkWorker(aItem, aWorker);
+  InterlockedIncrement(fPeers);
+  stop := GetTickCount64 + 5000;
+  while (fPeers < 2) and (GetTickCount64 < stop) do
+    SwitchToThread;
+end;
+
+procedure TTestInferFast.ThreadPoolWorkerIndex;
+var
+  pool: TInferThreadPool;
+  owner: array[0..5] of PtrUInt; // the thread of each index, over all runs
+  run, n, i, j, bad, outside: integer;
+  raised, other: boolean;
+begin
+  fFail := -1;
+  pool := TInferThreadPool.Create(5);
+  try
+    FillCharFast(owner, SizeOf(owner), 0);
+    owner[0] := PtrUInt(GetCurrentThreadId);
+    bad := 0;
+    outside := 0;
+    for run := 1 to 3000 do
+    begin
+      n := 1 + (run * 7919) mod 97;
+      SetLength(fHits, n);
+      SetLength(fWorkerOf, n);
+      SetLength(fThreadOf, n);
+      FillCharFast(pointer(fHits)^, n * SizeOf(integer), 0);
+      pool.RunWorkers(MarkWorker, n);
+      for i := 0 to n - 1 do
+        if fHits[i] <> 1 then
+          inc(bad)
+        else if (fWorkerOf[i] < 0) or (fWorkerOf[i] > pool.Workers) then
+          inc(outside)
+        else if owner[fWorkerOf[i]] = 0 then
+          owner[fWorkerOf[i]] := fThreadOf[i]
+        else if owner[fWorkerOf[i]] <> fThreadOf[i] then
+          inc(outside);
+    end;
+    CheckEqual(bad, 0, 'every item exactly once');
+    CheckEqual(outside, 0, 'index in 0..Workers, the same thread for an index');
+    for i := 0 to high(owner) do
+      if owner[i] <> 0 then
+      begin
+        for j := 0 to i - 1 do
+          if owner[j] = owner[i] then
+            inc(bad);
+      end;
+    CheckEqual(bad, 0, 'one thread, one index');
+    // the workers take part: an item waits until another thread took one
+    SetLength(fHits, 8);
+    SetLength(fWorkerOf, 8);
+    SetLength(fThreadOf, 8);
+    FillCharFast(pointer(fHits)^, 8 * SizeOf(integer), 0);
+    fPeers := 0;
+    pool.RunWorkers(WaitForPeer, 8);
+    other := false;
+    for i := 1 to 7 do
+      if fThreadOf[i] <> fThreadOf[0] then
+        other := true;
+    Check(other, 'a pool thread ran an item');
+    // an exception in one item reaches the caller; the others still ran
+    SetLength(fHits, 50);
+    SetLength(fWorkerOf, 50);
+    SetLength(fThreadOf, 50);
+    FillCharFast(pointer(fHits)^, 50 * SizeOf(integer), 0);
+    fFail := 13;
+    raised := false;
+    try
+      pool.RunWorkers(MarkWorker, 50);
+    except
+      on E: EInferError do
+        raised := PosEx('item 13', StringToUtf8(E.Message)) > 0;
+    end;
+    fFail := -1;
+    CheckUtf8(raised, 'the item exception reaches RunWorkers');
+    bad := 0;
+    for i := 0 to 49 do
+      if (i <> 13) and (fHits[i] <> 1) then
+        inc(bad);
+    CheckEqual(bad, 0, 'the other items ran once');
+    // Run after RunWorkers: the plain job again, not the one with an index
+    SetLength(fHits, 20);
+    FillCharFast(pointer(fHits)^, 20 * SizeOf(integer), 0);
+    FillCharFast(pointer(fWorkerOf)^, 20 * SizeOf(integer), $ff);
+    pool.Run(CountHit, 20);
+    bad := 0;
+    for i := 0 to 19 do
+      if (fHits[i] <> 1) or (fWorkerOf[i] <> -1) then
+        inc(bad);
+    CheckEqual(bad, 0, 'Run after RunWorkers');
+  finally
+    pool.Free;
+  end;
+  // no worker thread: every item on the caller, index 0
+  pool := TInferThreadPool.Create(0);
+  try
+    SetLength(fHits, 10);
+    SetLength(fWorkerOf, 10);
+    SetLength(fThreadOf, 10);
+    FillCharFast(pointer(fHits)^, 10 * SizeOf(integer), 0);
+    FillCharFast(pointer(fWorkerOf)^, 10 * SizeOf(integer), $ff);
+    pool.RunWorkers(MarkWorker, 10);
+    bad := 0;
+    for i := 0 to 9 do
+      if (fHits[i] <> 1) or (fWorkerOf[i] <> 0) then
+        inc(bad);
+    CheckEqual(bad, 0, 'without workers: index 0, every item once');
   finally
     pool.Free;
   end;

@@ -21,3 +21,10 @@ Here, pass `--out` explicitly:
 Model: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`, revision
 `85e237c12c027371202489a0ec509ded67b5e4b5` (Apache-2.0); hashes of `config.json` and
 `model.safetensors` are in the manifest of the dataset.
+
+The tests look for the model in `vendor/models/qwen3-tts-12hz-0.6b-customvoice/`
+(gitignored): `config.json` and `model.safetensors` for the stacks, and the tokenizer files
+`vocab.json`, `merges.txt` and `tokenizer_config.json` of the same revision for
+`VocabMergesMatchTokenizerJson` (the model ships no `tokenizer.json`; their SHA-256 hashes
+are in `tests/test.infer.bpe.pas`). Without them the tests say SKIP, with
+`LAI_REQUIRE_MODEL=1` they fail.

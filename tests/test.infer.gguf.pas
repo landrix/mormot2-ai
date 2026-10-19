@@ -56,6 +56,8 @@ type
   published
     /// FP16 rounding like ggml_fp32_to_fp16, and every half round-trips
     procedure HalfFloatLikeGgml;
+    /// InferRowToF32 widens BF16 and F16 rows bit-exactly, specials included
+    procedure RowToF32Widens;
     /// activation rows quantize to the very bytes ggml-cpu produces
     procedure QuantizeLikeGgml;
     /// the Q8_0 Linear against ggml_vec_dot_q8_0_q8_0, and dequantization
@@ -317,6 +319,43 @@ begin
   CheckEqual(PCardinal(@s)^, $33800000, 'smallest subnormal = 2^-24');
   s := InferHalfToSingle($7bff);
   CheckEqual(PCardinal(@s)^, $477fe000, 'largest half = 65504');
+end;
+
+procedure TTestInferGguf.RowToF32Widens;
+const
+  // value, then the single it must give: zeros, normals, the smallest
+  // subnormal, the largest finite, both infinities and a NaN with payload
+  BF16: array[0..8, 0..1] of cardinal = (
+    ($0000, $00000000), ($8000, $80000000), ($3f80, $3f800000),
+    ($c040, $c0400000), ($0001, $00010000), ($7f7f, $7f7f0000),
+    ($7f80, $7f800000), ($ff80, $ff800000), ($7fc1, $7fc10000));
+  F16: array[0..8, 0..1] of cardinal = (
+    ($0000, $00000000), ($8000, $80000000), ($3c00, $3f800000),
+    ($c200, $c0400000), ($0001, $33800000), ($7bff, $477fe000),
+    ($7c00, $7f800000), ($fc00, $ff800000), ($7e01, $7fc02000));
+var
+  src: array[0..17] of word;
+  dst: array[0..9] of cardinal;
+  i: PtrInt;
+begin
+  // two rows of 9: row 0 is noise, row 1 the values; dst[9] must stay
+  for i := 0 to 8 do
+  begin
+    src[i] := $5555;
+    src[9 + i] := BF16[i, 0];
+  end;
+  FillCharFast(dst, SizeOf(dst), $aa);
+  InferRowToF32(@src, idtBF16, 1, 9, @dst);
+  for i := 0 to 8 do
+    CheckEqual(dst[i], BF16[i, 1], 'BF16');
+  CheckEqual(dst[9], $aaaaaaaa, 'BF16 writes aCols values only');
+  for i := 0 to 8 do
+    src[9 + i] := F16[i, 0];
+  FillCharFast(dst, SizeOf(dst), $aa);
+  InferRowToF32(@src, idtF16, 1, 9, @dst);
+  for i := 0 to 8 do
+    CheckEqual(dst[i], F16[i, 1], 'F16');
+  CheckEqual(dst[9], $aaaaaaaa, 'F16 writes aCols values only');
 end;
 
 procedure TTestInferGguf.QuantizeLikeGgml;

@@ -22,8 +22,8 @@ unit mormot.ai.infer.tokenizer.bpe;
 {
   *****************************************************************************
 
-    - TBpeTokenizer: load a byte-level BPE tokenizer.json or the tokenizer of a
-      GGUF file (Qwen2 pipeline),
+    - TBpeTokenizer: load a byte-level BPE tokenizer.json, the older pair
+      vocab.json + merges.txt or the tokenizer of a GGUF file (Qwen2 pipeline),
       Normalize, Split, Encode text to ids and Decode ids to bytes
 
   *****************************************************************************
@@ -81,6 +81,20 @@ type
     // (left and right by rank) and the added tokens
     procedure Build(const aVocab, aLeft, aRight, aAddedText: TRawUtf8DynArray;
       const aAddedId: TIntegerDynArray);
+    /// the texts by id of a {"text": id} object: ids 0..n-1, each exactly once
+    function VocabTexts(aVocab: PDocVariantData): TRawUtf8DynArray;
+    /// "a b" (one space) split into a and b, raising otherwise
+    procedure SplitMerge(const aText: RawUtf8; aIndex: PtrInt;
+      out aLeft, aRight: RawUtf8);
+    /// raise unless every special token aDoc names (any "..._token" key with a
+    // string or {"content": ...}, extra_special_tokens,
+    // additional_special_tokens, model_specific_special_tokens) is an added
+    // token (see CheckToken)
+    procedure CheckSpecialTokens(aDoc: PDocVariantData; const aFile: TFileName);
+    /// raise unless aText is an added token
+    procedure CheckToken(const aText, aKey: RawUtf8; const aFile: TFileName);
+    /// true when aText is a key of vocab.json (byte-level text)
+    function InVocab(const aText: RawUtf8): boolean;
     procedure AddMerge(aLeft, aRight, aRank, aNew: integer);
     function FindMerge(aLeft, aRight: integer; out aRank, aNew: integer): boolean;
     function BytesId(p: pointer; aLen: PtrInt): integer;
@@ -98,6 +112,35 @@ type
     // - GGUF stores no normalizer: NFC is applied, as Qwen's tokenizer.json has
     // it (llama.cpp itself does not normalize)
     constructor CreateFromGguf(aGguf: TGgufFile); override;
+    /// the same tokenizer from the older pair vocab.json + merges.txt, the files
+    // of transformers' Qwen2Tokenizer; the pipeline is not in them, so the one
+    // of this class is assumed (NFC, Qwen2 Split, ByteLevel) and checked where
+    // the folder of aVocabFile tells: a tokenizer_config.json there must name
+    // Qwen2Tokenizer(Fast) and no prefix space
+    // - the added tokens come, as in transformers 5.19, from the
+    // added_tokens_decoder of that tokenizer_config.json, or without one (older
+    // folders) from an added_tokens.json beside it; a special token named in
+    // the config (or, without a decoder, in special_tokens_map.json) must be an
+    // added token - transformers would append a missing one with a new id, and
+    // would match one of the vocabulary as a whole in text, which Encode does
+    // not; every name in these files is checked, without
+    // transformers' rules of which one wins, so a folder whose files
+    // disagree may be refused although transformers loads it, but none is
+    // accepted whose ids differ; as with tokenizer.json, an added token is
+    // never matched in text (see Encode)
+    // - as transformers assigns them: the added ids must follow the
+    // vocabulary without a gap, each content new; an absent unk_token,
+    // eos_token or pad_token is Qwen2Tokenizer's default <|endoftext|>, which
+    // must then exist
+    // - refused, because transformers would then read something else or add
+    // tokens Encode does not: a tokenizer.json (use Create on it),
+    // tokenizer.model*, tiktoken.model or tekken.json beside; in the config
+    // fast_tokenizer_files, an inline vocab or merges, add_bos_token or
+    // add_eos_token true; two added tokens with the same content
+    // - merges.txt as the tokenizers library 0.23 reads it for transformers
+    // 5.19: one "a b" per line, LF or CRLF, every line starting with
+    // "#version" skipped; an empty line or one with more spaces is refused
+    constructor CreateFromVocabMerges(const aVocabFile, aMergesFile: TFileName);
     /// the NFC-normalized text (invalid UTF-8 replaced first)
     function Normalize(const aText: RawUtf8): RawUtf8;
     /// the pre-tokenized pieces of the normalized text, as UTF-8
@@ -196,7 +239,7 @@ var
   norm, pre, list, split, level, model, vocab, merges, entry, added,
   decoder: PDocVariantData;
   pair: PDocVariantData;
-  i, n, id, sp: PtrInt;
+  i: PtrInt;
   texts, a, b, addedText: TRawUtf8DynArray;
   addedId: TIntegerDynArray;
   text: RawUtf8;
@@ -231,17 +274,7 @@ begin
   if not model^.GetAsObject('vocab', vocab) or (vocab^.Count = 0) or
      not model^.GetAsArray('merges', merges) then
     EInferError.RaiseUtf8('%: BPE without vocab or merges', [self]);
-  // the vocabulary: ids 0..n-1, each exactly once
-  n := vocab^.Count;
-  SetLength(texts, n);
-  for i := 0 to n - 1 do
-  begin
-    id := VariantToIntegerDef(vocab^.Values[i], -1);
-    if (id < 0) or (id >= n) or (texts[id] <> '') then
-      EInferError.RaiseUtf8('%: vocab id % of "%" invalid or used twice',
-        [self, id, vocab^.Names[i]]);
-    texts[id] := vocab^.Names[i];
-  end;
+  texts := VocabTexts(vocab);
   // the merges: ["a", "b"] (current format) or "a b" (older files)
   SetLength(a, merges^.Count);
   SetLength(b, merges^.Count);
@@ -257,11 +290,7 @@ begin
     else
     begin
       VariantToUtf8(merges^.Values[i], text);
-      sp := PosEx(' ', text);
-      if (sp <= 1) or (sp = length(text)) or (PosEx(' ', text, sp + 1) > 0) then
-        EInferError.RaiseUtf8('%: merge % "%" is not "a b"', [self, i, text]);
-      a[i] := copy(text, 1, sp - 1);
-      b[i] := copy(text, sp + 1, maxInt);
+      SplitMerge(text, i, a[i], b[i]);
     end;
   // added tokens: absent, or an array - anything else is no file of ours
   // (GetAsArray is false for an empty array too, hence GetAsDocVariant)
@@ -289,7 +318,7 @@ var
   addedId: TIntegerDynArray;
   types: PIntegerArray;
   count: Int64;
-  i, n, sp: PtrInt;
+  i, n: PtrInt;
 begin
   inherited CreateFromGguf(aGguf);
   // llama.cpp's names of the Qwen2 pipeline: a GPT-2 byte-level BPE with the
@@ -331,14 +360,261 @@ begin
   SetLength(a, length(merges));
   SetLength(b, length(merges));
   for i := 0 to high(merges) do
-  begin
-    sp := PosEx(' ', merges[i]);
-    if (sp <= 1) or (sp = length(merges[i])) or (PosEx(' ', merges[i], sp + 1) > 0) then
-      EInferError.RaiseUtf8('%: merge % "%" is not "a b"', [self, i, merges[i]]);
-    a[i] := copy(merges[i], 1, sp - 1);
-    b[i] := copy(merges[i], sp + 1, maxInt);
-  end;
+    SplitMerge(merges[i], i, a[i], b[i]);
   Build(texts, a, b, addedText, addedId);
+end;
+
+const
+  /// the special tokens Qwen2Tokenizer sets to <|endoftext|> when none is given
+  DEFAULTED: array[0..2] of RawUtf8 = ('unk_token', 'eos_token', 'pad_token');
+  /// config keys that make transformers read another vocabulary
+  REFUSED_KEYS: array[0..2] of RawUtf8 = ('fast_tokenizer_files', 'vocab', 'merges');
+
+constructor TBpeTokenizer.CreateFromVocabMerges(const aVocabFile, aMergesFile: TFileName);
+var
+  doc, cfg, map: TDocVariantData;
+  decoder: PDocVariantData;
+  dir, fn: TFileName;
+  texts, a, b, addedText: TRawUtf8DynArray;
+  addedId: TIntegerDynArray;
+  merges, line: RawUtf8;
+  p, e, n, i: PtrInt;
+  hasConfig, hasMap, known: boolean;
+  sr: TSearchRec;
+begin
+  inherited Create(aVocabFile);
+  hasConfig := false;
+  decoder := nil;
+  if not doc.InitJsonFromFile(aVocabFile, JSON_FAST_FLOAT) or not doc.IsObject or
+     (doc.Count = 0) then
+    EInferError.RaiseUtf8('%: % is no vocabulary', [self, aVocabFile]);
+  texts := VocabTexts(@doc);
+  // the merges, one per line
+  merges := StringFromFile(aMergesFile);
+  if merges = '' then
+    EInferError.RaiseUtf8('%: cannot read %', [self, aMergesFile]);
+  n := 0;
+  p := 1;
+  while p <= length(merges) do
+  begin
+    e := PosEx(#10, merges, p);
+    if e = 0 then
+      e := length(merges) + 1;
+    line := copy(merges, p, e - p);
+    if (line <> '') and (line[length(line)] = #13) then
+      SetLength(line, length(line) - 1);
+    if copy(line, 1, 8) <> '#version' then
+    begin
+      if n = length(a) then
+      begin
+        SetLength(a, NextGrow(n));
+        SetLength(b, length(a));
+      end;
+      SplitMerge(line, n, a[n], b[n]);
+      inc(n);
+    end;
+    p := e + 1;
+  end;
+  SetLength(a, n);
+  SetLength(b, n);
+  // what the folder tells about the pipeline, and the added tokens
+  dir := ExtractFilePath(aVocabFile);
+  if FileExists(dir + 'tokenizer.json') then
+    EInferError.RaiseUtf8('%: % has a tokenizer.json, which transformers ' +
+      'reads instead - use Create on it', [self, dir]);
+  // what transformers picks without a tokenizer.json: a name containing
+  // tokenizer.model, tiktoken.model or tekken.json
+  if FindFirst(dir + '*', faAnyFile, sr) = 0 then
+  try
+    repeat
+      if (Pos('tokenizer.model', sr.Name) > 0) or (Pos('tiktoken.model', sr.Name) > 0) or
+         (Pos('tekken.json', sr.Name) > 0) then
+        EInferError.RaiseUtf8('%: % has %, which transformers may read instead',
+          [self, dir, sr.Name]);
+    until FindNext(sr) <> 0;
+  finally
+    FindClose(sr);
+  end;
+  fn := dir + 'tokenizer_config.json';
+  if FileExists(fn) then
+  begin
+    if not cfg.InitJsonFromFile(fn, JSON_FAST_FLOAT) or not cfg.IsObject then
+      EInferError.RaiseUtf8('%: cannot read %', [self, fn]);
+    hasConfig := true;
+    if (cfg.U['tokenizer_class'] <> 'Qwen2Tokenizer') and
+       (cfg.U['tokenizer_class'] <> 'Qwen2TokenizerFast') then
+      EInferError.RaiseUtf8('%: tokenizer_class "%" is not Qwen2Tokenizer',
+        [self, cfg.U['tokenizer_class']]);
+    if cfg.B['add_prefix_space'] then
+      EInferError.RaiseUtf8('%: add_prefix_space is set', [self]);
+    for i := 0 to high(REFUSED_KEYS) do
+      if cfg.GetValueIndex(REFUSED_KEYS[i]) >= 0 then
+        EInferError.RaiseUtf8('%: % is set in the config', [self, REFUSED_KEYS[i]]);
+    if cfg.B['add_bos_token'] or cfg.B['add_eos_token'] then
+      EInferError.RaiseUtf8('%: add_bos_token or add_eos_token is set', [self]);
+    if cfg.GetValueIndex('added_tokens_decoder') >= 0 then
+      if not cfg.GetAsDocVariant('added_tokens_decoder', decoder) or
+         not decoder^.IsObject then
+        EInferError.RaiseUtf8('%: added_tokens_decoder is not an object', [self]);
+    if decoder <> nil then
+    begin
+      SetLength(addedText, decoder^.Count);
+      SetLength(addedId, decoder^.Count);
+      for i := 0 to decoder^.Count - 1 do
+      begin
+        addedId[i] := Utf8ToInteger(decoder^.Names[i], -1);
+        addedText[i] := _Safe(decoder^.Values[i])^.U['content'];
+      end;
+    end;
+  end;
+  // without a decoder (older folders) the added tokens of added_tokens.json -
+  // with one, transformers reads neither it nor special_tokens_map.json
+  fn := dir + 'added_tokens.json';
+  if (decoder = nil) and FileExists(fn) then
+  begin
+    doc.Clear;
+    if not doc.InitJsonFromFile(fn, JSON_FAST_FLOAT) or not doc.IsObject then
+      EInferError.RaiseUtf8('%: cannot read %', [self, fn]);
+    SetLength(addedText, doc.Count);
+    SetLength(addedId, doc.Count);
+    for i := 0 to doc.Count - 1 do
+    begin
+      addedText[i] := doc.Names[i];
+      addedId[i] := VariantToIntegerDef(doc.Values[i], -1);
+    end;
+  end;
+  // transformers appends the added tokens in the order of their ids right
+  // after the vocabulary, whatever the ids say: only that layout keeps them
+  for i := 0 to high(addedId) do
+  begin
+    known := false;
+    for p := 0 to high(addedId) do
+      if addedId[p] = length(texts) + i then
+        known := true;
+    if not known then
+      EInferError.RaiseUtf8('%: the added ids do not follow the vocabulary ' +
+        '(% .. %) without a gap', [self, length(texts), length(texts) + high(addedId)]);
+  end;
+  for i := 1 to high(addedText) do
+    for p := 0 to i - 1 do
+      if addedText[p] = addedText[i] then
+        EInferError.RaiseUtf8('%: added token "%" is listed twice',
+          [self, addedText[i]]);
+  Build(texts, a, b, addedText, addedId);
+  for i := 0 to high(addedText) do
+    if InVocab(addedText[i]) then
+      EInferError.RaiseUtf8('%: added token "%" is in the vocabulary',
+        [self, addedText[i]]);
+  // the special tokens named must exist; without a decoder (older folders)
+  // those of special_tokens_map.json too
+  hasMap := false;
+  if hasConfig then
+    CheckSpecialTokens(@cfg, 'tokenizer_config.json');
+  fn := dir + 'special_tokens_map.json';
+  if (decoder = nil) and FileExists(fn) then
+  begin
+    if not map.InitJsonFromFile(fn, JSON_FAST_FLOAT) or not map.IsObject then
+      EInferError.RaiseUtf8('%: cannot read %', [self, fn]);
+    CheckSpecialTokens(@map, 'special_tokens_map.json');
+    hasMap := true;
+  end;
+  // Qwen2Tokenizer's default for these three, when no file names them
+  for i := 0 to high(DEFAULTED) do
+    if not (hasConfig and (cfg.GetValueIndex(DEFAULTED[i]) >= 0)) and
+       not (hasMap and (map.GetValueIndex(DEFAULTED[i]) >= 0)) then
+      CheckToken('<|endoftext|>', DEFAULTED[i], 'Qwen2Tokenizer (default)');
+end;
+
+procedure TBpeTokenizer.CheckToken(const aText, aKey: RawUtf8;
+  const aFile: TFileName);
+begin
+  if TokenId(aText) >= 0 then
+    exit;
+  if InVocab(aText) then
+    EInferError.RaiseUtf8('%: % of % is "%", a vocabulary entry: transformers ' +
+      'would match it in text', [self, aKey, aFile, aText]);
+  EInferError.RaiseUtf8('%: % of % is "%", which is no token',
+    [self, aKey, aFile, aText]);
+end;
+
+function TBpeTokenizer.InVocab(const aText: RawUtf8): boolean;
+var
+  bytes: RawByteString;
+begin
+  result := ByteLevelDecode(aText, bytes) and
+    (BytesId(pointer(bytes), length(bytes)) >= 0);
+end;
+
+procedure TBpeTokenizer.CheckSpecialTokens(aDoc: PDocVariantData;
+  const aFile: TFileName);
+
+  procedure Check(const aValue: variant; const aKey: RawUtf8);
+  var
+    text: RawUtf8;
+  begin
+    // a string or an AddedToken object {"content": ...}; null, a boolean
+    // (add_bos_token) or a number names no token
+    if _Safe(aValue)^.IsObject then
+      text := _Safe(aValue)^.U['content']
+    else if VarIsString(aValue) then
+      VariantToUtf8(aValue, text)
+    else
+      exit;
+    CheckToken(text, aKey, aFile);
+  end;
+
+  procedure CheckList(const aKey: RawUtf8);
+  var
+    list: PDocVariantData;
+    j: PtrInt;
+  begin
+    // an array of tokens or an object of named tokens
+    if aDoc^.GetAsDocVariant(aKey, list) then
+      for j := 0 to list^.Count - 1 do
+        Check(list^.Values[j], aKey);
+  end;
+
+var
+  i, n: PtrInt;
+begin
+  // bos_token .. mask_token and any model-specific "..._token" key
+  for i := 0 to aDoc^.Count - 1 do
+  begin
+    n := length(aDoc^.Names[i]);
+    if (n >= 6) and (copy(aDoc^.Names[i], n - 5, 6) = '_token') then
+      Check(aDoc^.Values[i], aDoc^.Names[i]);
+  end;
+  CheckList('extra_special_tokens');
+  CheckList('additional_special_tokens');
+  CheckList('model_specific_special_tokens');
+end;
+
+function TBpeTokenizer.VocabTexts(aVocab: PDocVariantData): TRawUtf8DynArray;
+var
+  i, n, id: PtrInt;
+begin
+  n := aVocab^.Count;
+  SetLength(result, n);
+  for i := 0 to n - 1 do
+  begin
+    id := VariantToIntegerDef(aVocab^.Values[i], -1);
+    if (id < 0) or (id >= n) or (result[id] <> '') then
+      EInferError.RaiseUtf8('%: vocab id % of "%" invalid or used twice',
+        [self, id, aVocab^.Names[i]]);
+    result[id] := aVocab^.Names[i];
+  end;
+end;
+
+procedure TBpeTokenizer.SplitMerge(const aText: RawUtf8; aIndex: PtrInt;
+  out aLeft, aRight: RawUtf8);
+var
+  sp: PtrInt;
+begin
+  sp := PosEx(' ', aText);
+  if (sp <= 1) or (sp = length(aText)) or (PosEx(' ', aText, sp + 1) > 0) then
+    EInferError.RaiseUtf8('%: merge % "%" is not "a b"', [self, aIndex, aText]);
+  aLeft := copy(aText, 1, sp - 1);
+  aRight := copy(aText, sp + 1, maxInt);
 end;
 
 procedure TBpeTokenizer.Build(const aVocab, aLeft, aRight, aAddedText: TRawUtf8DynArray;

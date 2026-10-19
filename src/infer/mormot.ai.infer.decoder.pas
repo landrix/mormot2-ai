@@ -429,6 +429,8 @@ type
     // - their positions have no id in the cache (-1): Reuse never keeps them
     // - the rows are copied before the computation: the caller may reuse
     // aEmbeds at once
+    // - a loop that feeds floats back (a speech model's talker) adds up
+    // rounding: on a GPU device, keep its KV cache in floats (KvF16 false)
     procedure ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
       aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false;
       const aOnState: TOnDecoderState = nil);
@@ -990,9 +992,7 @@ end;
 function TDecoderModel.WidenTensor(t: PInferTensor;
   const aName: RawUtf8): PSingleArray;
 var
-  i, n: PtrInt;
-  src: PWordArray;
-  dst: PCardinalArray;
+  n: PtrInt;
 begin
   // BF16 is the upper half of an F32, F16 a subset of it: widening is exact
   if t^.Count > High(PtrInt) div 4 then
@@ -1000,40 +1000,8 @@ begin
   n := length(fOwned);
   SetLength(fOwned, n + 1);
   SetLength(fOwned[n], t^.Count);
-  src := t^.Data;
-  dst := pointer(fOwned[n]);
-  if t^.DType = idtBF16 then
-    for i := 0 to t^.Count - 1 do
-      dst^[i] := cardinal(src^[i]) shl 16
-  else
-    for i := 0 to t^.Count - 1 do
-      dst^[i] := InferHalfToSingleBits(src^[i]);
+  InferRowToF32(t^.Data, t^.DType, 0, t^.Count, pointer(fOwned[n]));
   result := pointer(fOwned[n]);
-end;
-
-/// row aRow of a [rows, aCols] matrix as stored, as singles in aDest - exact
-// for every type (BF16 and F16 widened, Q8_0 and Q4_0 dequantized)
-procedure WidenRow(t: PInferTensor; aRow, aCols: PtrInt; aDest: PSingleArray);
-var
-  i: PtrInt;
-  src: PWordArray;
-begin
-  case t^.DType of
-    idtBF16:
-      begin
-        src := @PWordArray(t^.Data)^[aRow * aCols];
-        for i := 0 to aCols - 1 do
-          PCardinalArray(aDest)^[i] := cardinal(src^[i]) shl 16;
-      end;
-    idtF16:
-      begin
-        src := @PWordArray(t^.Data)^[aRow * aCols];
-        for i := 0 to aCols - 1 do
-          PCardinalArray(aDest)^[i] := InferHalfToSingleBits(src^[i]);
-      end;
-  else
-    InferRowToF32(t^.Data, t^.DType, aRow, aCols, aDest); // F32 and the block types
-  end;
 end;
 
 /// raise unless every FP16 scale of the blocks of t is finite
@@ -1150,7 +1118,7 @@ begin
   SetLength(row, aCols);
   for r := 0 to aRows - 1 do
   begin
-    WidenRow(t, r, aCols, pointer(row));
+    InferRowToF32(t^.Data, t^.DType, r, aCols, pointer(row));
     // a NaN or an infinity has no quantized form: refused, by its bits (no FPU)
     for c := 0 to aCols - 1 do
       if PCardinalArray(row)^[c] and $7f800000 = $7f800000 then
@@ -1382,7 +1350,8 @@ begin
     id := aIds^[i];
     if (id < 0) or (id >= fConfig.VocabSize) then
       EInferError.RaiseUtf8('%.Embed: token id % outside the vocabulary', [self, id]);
-    WidenRow(fEmbedSrc, id, fConfig.Hidden, @aDest^[i * fConfig.Hidden]);
+    InferRowToF32(fEmbedSrc^.Data, fEmbedSrc^.DType, id, fConfig.Hidden,
+      @aDest^[i * fConfig.Hidden]);
   end;
 end;
 
@@ -1725,7 +1694,8 @@ begin
   // embeddings: of the ids, or the rows as given
   if aIds <> nil then
     for i := 0 to n - 1 do
-      WidenRow(fEmbedSrc, aIds^[i], h, @aCtx.fX[i * h])
+      InferRowToF32(fEmbedSrc^.Data, fEmbedSrc^.DType, aIds^[i], h,
+        @aCtx.fX[i * h])
   else
     MoveFast(aEmbeds^[0], aCtx.fX[0], n * h * SizeOf(single));
   if Assigned(aOnState) then

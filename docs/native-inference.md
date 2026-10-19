@@ -1813,6 +1813,96 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B14 Punkte 1, 2, 4 und 5 erledigt (2026-10-19): BF16/F16-Zeilen, Tokenizer aus `vocab.json` + `merges.txt`, F16-KV-Cache, Puffer je Worker.**
+Die übrigen Rückmeldungen flydevs aus dem TTS-Projekt (Backlog B14).
+
+- *Punkt 1:* `InferRowToF32` verbreitert BF16 und F16, Bit für Bit über `PCardinalArray` (ein
+  NaN kommt nie in die FPU, wichtig unter Delphi 7). Der Decoder nimmt dafür jetzt
+  `InferRowToF32` statt eigener Schleifen (`WidenTensor` über den ganzen Tensor als eine Zeile,
+  `WidenRow` entfällt); dieselbe Rechnung, also nichts gekostet. Test `RowToF32Widens`: Null
+  und minus Null, Normalzahlen, kleinste Subnormale, größter endlicher Wert, beide
+  Unendlichkeiten, NaN mit Nutzlast, Zeile 1 von 2 und kein Wert über `aCols` hinaus.
+- *Punkt 2:* `TBpeTokenizer.CreateFromVocabMerges(vocab.json, merges.txt)`, die Dateien von
+  transformers' `Qwen2Tokenizer`. Das ältere Paar trägt die Pipeline nicht in sich; die
+  Klasse kann nur die von Qwen2 (NFC, Split mit der Qwen2-Regex, ByteLevel). Statt GPT-2 als
+  Vorgabe (so stand es im Vorhaben) prüft der Konstruktor deshalb, was der Ordner sagt: eine
+  `tokenizer_config.json` daneben muss `Qwen2Tokenizer(Fast)` nennen und darf kein
+  `add_prefix_space` setzen. Nachgebaut wie transformers 5.19 lädt (am Quellcode und mit
+  Versuchen geprüft):
+  - Zusatz-Tokens aus `added_tokens_decoder`, ohne ihn (ältere Ordner) aus
+    `added_tokens.json`; transformers nummeriert sie fortlaufend hinter dem Vokabular neu,
+    deshalb müssen die Ids genau so liegen, und kein Inhalt darf schon im Vokabular stehen.
+  - Jedes benannte Spezial-Token muss ein Zusatz-Token sein: ein fehlendes hinge
+    transformers mit neuer Id an, einen Eintrag des Vokabulars erkennt es im Text als Ganzes
+    (`Encode` nicht). Geprüft werden jeder Schlüssel auf `_token`,
+    `extra_special_tokens`, `additional_special_tokens`, `model_specific_special_tokens`, aus
+    der Config und (ohne Decoder) aus `special_tokens_map.json`. Fehlt einer von
+    `unk_token`, `eos_token` und `pad_token`, gilt für ihn die Vorgabe von `Qwen2Tokenizer`
+    (`<|endoftext|>`).
+    Bewusst ohne transformers' Vorrangregeln zwischen den Dateien und Listen (die
+    Review-Runden fanden darin immer neue Sonderfälle): geprüft wird alles, was gelesen wird.
+    Ein Ordner, dessen Dateien sich widersprechen, kann so abgelehnt werden, obwohl
+    transformers ihn lädt - angenommen wird keiner, dessen Ids abweichen.
+  - Abgelehnt, weil transformers dann etwas anderes liest oder Tokens anfügt, die `Encode`
+    nicht anfügt: eine `tokenizer.json` daneben (dafür ist `Create` da), eine Datei mit
+    `tokenizer.model`, `tiktoken.model` oder `tekken.json` im Namen; in der Config
+    `fast_tokenizer_files`, ein eingebettetes `vocab` oder `merges`, `add_bos_token` oder
+    `add_eos_token`; zwei Zusatz-Tokens mit demselben Inhalt (transformers zählt dann um).
+  - `merges.txt` wie der Rust-Parser von tokenizers, den transformers 5.19 nimmt: jede
+    Zeile, die mit `#version` beginnt, übersprungen; Leerzeilen, umgebende Leerzeichen und
+    mehr als ein Leerzeichen abgelehnt; LF oder CRLF.
+  Qwen3-TTS liefert genau dieses Paar ohne `tokenizer.json`: `vocab.json` ist bytegleich mit
+  der von Qwen3-0.6B, `merges.txt` gleich bis auf die fehlende Kopfzeile, dazu 7
+  Zusatz-Tokens mehr (`<tts_pad>` = 151671 usw.). transformers 5.19.0 auf dem TTS-Ordner gibt
+  für alle 2416 Fälle von `qwen3-tokens` die Referenz-Ids (bis auf die bekannten Fälle, in
+  denen es Steuer-Token-Literale im Text als Steuer-Tokens liest). Tests:
+  `VocabMergesFiles` (ohne Modell, 53 Prüfungen: jede Regel oben angenommen und abgelehnt)
+  und `VocabMergesMatchTokenizerJson` (das Paar von Qwen3-0.6B, ohne seine `tokenizer.json`
+  kopiert, = sein `tokenizer.json`: jeder Token, jeder Zusatz-Token, die Referenz-Ids; das
+  Paar von Qwen3-TTS nach SHA-256 an der Revision `85e237c`: 151676 Tokens, die
+  Qwen3-Tokens unverändert, die Referenz-Ids).
+- *Punkt 4 (Entscheidung 2026-10-19: Vorgabe bleibt F16, keine Umschaltung nach Länge):*
+  Gemessen mit `llm-bench` (Qwen3-0.6B Q8_0, RTX 5090, 64 neue Tokens, `LAI_KV_F32=1` für
+  F32):
+
+  | Kontext | CUDA F16 / F32 | Vulkan F16 / F32 |
+  |---|---|---|
+  | 200 | 403 / 392 Tokens/s (+3 %) | 362 / 355 (+2 %) |
+  | 4000 | 372 / 344 (+8 %) | 347 / 328 (+6 %) |
+  | 16000 | 235 / 178 (+32 %) | 212 / 183 (+16 %) |
+
+  Dazu der halbe Speicher. Der Fehler (Logits etwa 1e-3 statt 1e-4) schadet nicht, wo jeder
+  Schritt in einer Token-Id endet; er wächst, wo floats Schritt für Schritt zurückgespeist
+  werden (`ForwardEmbeds`-Schleifen eines Sprachmodells: Talker von Qwen3-TTS 7e-3 statt
+  3e-5, bei flydev 2,3e-2). Eine Umschaltung nach Länge hätte einen Kontext je nach Verlauf
+  verschieden rechnen lassen und spart bei kurzem Kontext ohnehin wenig. Stattdessen sagen
+  `KvF16` (Vulkan, CUDA) und `ForwardEmbeds`, was F16 bringt und kostet und wann man es
+  abschaltet.
+- *Punkt 5:* `TInferThreadPool.RunWorkers` mit `TOnInferWorkerItem = procedure(aItem,
+  aWorker)`: `aWorker` ist 0 für den aufrufenden Thread, 1..`Workers` für die des Pools,
+  ein Index ist während eines Laufs genau ein Thread. Ein Job legt `Workers + 1` Puffer vor
+  dem Lauf an und nimmt den seines Index. `Run` bleibt, wie er war (gemeinsames `Start`).
+  Gemessen auf dem RTX-Rechner (32 Threads, 20000 Items mit je 16 KB Zwischenpuffer): Delphi 13
+  67 ms mit Allokation je Item gegen 12 ms mit Puffer je Index; FPC 7 ms so oder so (sein
+  Heap arbeitet je Thread) - flydevs Befund ist also eine Delphi-Sache, die Regel steht jetzt
+  am Pool. Test `ThreadPoolWorkerIndex`: jedes Item einmal, Index in 0..`Workers`, derselbe
+  Thread für einen Index über 3000 Läufe, kein Thread mit zwei Indizes, die Worker waren
+  beteiligt, Ausnahme erreicht `RunWorkers`, `Run` danach, ohne Worker alles mit Index 0.
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 4985 Assertions) und Delphi 7 (3318),
+  auf der Adreno X1-85 (Vulkan-Suite 805; die neuen CPU-Tests nativ auf Windows ARM) und dem
+  M2 Pro (4164). Gegenprobe: 42 eingebaute Fehler über alle Runden (BF16/F16-Verschiebung und
+  Zeilenversatz, halber Tensor im Decoder, jede Regel des Tokenizers einzeln abgeschaltet,
+  Worker-Indizes vertauscht oder konstant, der Job mit Index nach `Run` behalten) - alle
+  scheitern.
+- Review: Claude-Finder und Codex fanden in fünf Runden vor allem, wie genau transformers 5.19
+  einen Ordner ohne `tokenizer.json` lädt (Vorrang der Dateien, Vorgaben von
+  `Qwen2Tokenizer`, Neunummerierung der Zusatz-Tokens, eine `tokenizer.json` daneben), dazu
+  den vom Scheduler abhängigen Pool-Test (jetzt `WaitForPeer`). Den Abschluss machte auf
+  Wunsch des Nutzers ein Fable-Reviewer ohne Codex, mit eigenen Versuchen in transformers:
+  `merges.txt` liest in 5.19 der Rust-Parser von tokenizers (jede `#version`-Zeile
+  übersprungen, Leerzeilen und Ränder abgelehnt), und ein Spezial-Token aus dem Vokabular
+  erkennt transformers im Text als Ganzes - beides übernommen, das Nachreview ohne Befund.
+
 **B14 Punkte 3 und 6 erledigt (2026-10-19): Embedding-Zeilen, Decoder-Stapel, `ForgetWeights`.**
 Anlass ist flydevs TTS-Projekt (Backlog B14): Er musste den Durchlauf von `TQwen3Vulkan` nachbauen,
 um fertige Embeddings statt Token-Ids einzuspeisen, und stieß auf veraltete Gewichte im

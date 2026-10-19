@@ -23,12 +23,17 @@
 //   snapshot from before the restart can ever match a ticket after it
 // - one Run at a time (the caller holds a lock); an exception in an item is
 //   re-raised by Run once every item is done
+// - an item should not allocate on the heap: with Delphi's memory manager the
+//   threads then wait at its lock (measured, see RunWorkers); an item that
+//   needs scratch memory takes it per worker - RunWorkers passes the index of
+//   the thread that runs it
 unit mormot.ai.infer.threads;
 
 {
   *****************************************************************************
 
-    - TInferThreadPool: run aCount independent items on all cores
+    - TInferThreadPool: run aCount independent items on all cores, with or
+      without the index of the thread that runs each
 
   *****************************************************************************
 }
@@ -49,6 +54,12 @@ type
   /// one work item of TInferThreadPool.Run
   TOnInferItem = procedure(aItem: integer) of object;
 
+  /// one work item of TInferThreadPool.RunWorkers
+  // - aWorker is 0 for the thread that called RunWorkers, 1..Workers for the
+  // pool's threads: one index is one thread during a run, so scratch memory
+  // allocated per index before the run is never shared
+  TOnInferWorkerItem = procedure(aItem, aWorker: integer) of object;
+
   TInferThreadPool = class;
 
   /// a worker of TInferThreadPool
@@ -56,9 +67,10 @@ type
   protected
     fPool: TInferThreadPool;
     fWake: TSynEvent;
+    fIndex: integer;
     procedure Execute; override;
   public
-    constructor Create(aPool: TInferThreadPool);
+    constructor Create(aPool: TInferThreadPool; aIndex: integer);
     destructor Destroy; override;
   end;
 
@@ -67,6 +79,7 @@ type
   protected
     fWorkers: array of TInferWorker;
     fJob: TOnInferItem;
+    fJobWorker: TOnInferWorkerItem; // set instead of fJob by RunWorkers
     fTicket, fBase, fCount, fDone: integer;
     // seqlock of the (Job, Base, Count) snapshot: odd while Run sets it up
     fSeq: integer;
@@ -81,7 +94,9 @@ type
     fTerminated: boolean;
     fError: RawUtf8;
     fErrorLock: TLightLock;
-    procedure Work;
+    procedure Work(aWorker: integer);
+    procedure Start(const aJob: TOnInferItem; const aJobWorker: TOnInferWorkerItem;
+      aCount: integer);
   public
     /// start aWorkers threads (the caller of Run is one more)
     constructor Create(aWorkers: integer);
@@ -90,6 +105,14 @@ type
     /// aJob(0) .. aJob(aCount - 1) on the workers and the calling thread
     // - returns when every item is done; not reentrant, one Run at a time
     procedure Run(const aJob: TOnInferItem; aCount: integer);
+    /// aJob(0, w) .. aJob(aCount - 1, w), w the index of the running thread:
+    // 0 the caller, 1..Workers the pool's threads
+    // - for items that need scratch memory: allocate Workers + 1 buffers once,
+    // before the run, and let each item use the one of its index - measured
+    // with 32 threads and 20000 items of 16 KB scratch: Delphi 13 Win64 took
+    // 67 ms allocating per item and 12 ms with a buffer per index; FPC 7 ms
+    // either way (its heap is per thread)
+    procedure RunWorkers(const aJob: TOnInferWorkerItem; aCount: integer);
     /// the worker threads, the caller of Run not counted
     function Workers: integer;
     /// the next ticket - for tests of the counter restart near 2^30
@@ -139,9 +162,10 @@ end;
 
 { TInferWorker }
 
-constructor TInferWorker.Create(aPool: TInferThreadPool);
+constructor TInferWorker.Create(aPool: TInferThreadPool; aIndex: integer);
 begin
   fPool := aPool;
+  fIndex := aIndex;
   fWake := TSynEvent.Create;
   inherited Create(false);
 end;
@@ -174,7 +198,7 @@ begin
     if fPool.fTerminated then
       break;
     seen := gen;
-    fPool.Work;
+    fPool.Work(fIndex);
   until false;
 end;
 
@@ -188,7 +212,7 @@ begin
   inherited Create;
   SetLength(fWorkers, aWorkers);
   for i := 0 to aWorkers - 1 do
-    fWorkers[i] := TInferWorker.Create(self);
+    fWorkers[i] := TInferWorker.Create(self, i + 1); // 0 is the caller
 end;
 
 destructor TInferThreadPool.Destroy;
@@ -208,7 +232,7 @@ begin
   result := length(fWorkers);
 end;
 
-procedure TInferThreadPool.Work;
+procedure TInferThreadPool.Work(aWorker: integer);
 var
   ticket, count, base, done, seq: integer;
   item: cardinal;
@@ -246,7 +270,10 @@ begin
         end;
       until LockedExc32(PCardinal(@fTicket)^, cardinal(ticket + 1), cardinal(ticket));
       try
-        fJob(item);
+        if Assigned(fJobWorker) then
+          fJobWorker(item, aWorker)
+        else
+          fJob(item);
       except
         on E: Exception do
         begin
@@ -264,6 +291,18 @@ begin
 end;
 
 procedure TInferThreadPool.Run(const aJob: TOnInferItem; aCount: integer);
+begin
+  Start(aJob, nil, aCount);
+end;
+
+procedure TInferThreadPool.RunWorkers(const aJob: TOnInferWorkerItem;
+  aCount: integer);
+begin
+  Start(nil, aJob, aCount);
+end;
+
+procedure TInferThreadPool.Start(const aJob: TOnInferItem;
+  const aJobWorker: TOnInferWorkerItem; aCount: integer);
 var
   i, spin: integer;
   err: RawUtf8;
@@ -273,7 +312,10 @@ begin
   if (aCount = 1) or (fWorkers = nil) then
   begin
     for i := 0 to aCount - 1 do
-      aJob(i);
+      if Assigned(aJobWorker) then
+        aJobWorker(i, 0)
+      else
+        aJob(i);
     exit;
   end;
   // the snapshot becomes invalid first (odd sequence): a worker entering from
@@ -298,6 +340,7 @@ begin
   // next ticket
   AtomicWrite(fCount, 0);
   fJob := aJob;
+  fJobWorker := aJobWorker;
   fError := '';
   AtomicWrite(fDone, 0);
   AtomicWrite(fBase, AtomicRead(fTicket));
@@ -306,7 +349,7 @@ begin
   InterlockedIncrement(fGeneration); // wakes the spinning workers
   for i := 0 to high(fWorkers) do
     fWorkers[i].fWake.SetEvent; // only matters for a sleeping worker
-  Work;
+  Work(0);
   // the last items finish on other threads: wait for them, not for workers
   spin := 0;
   while PlainRead(fDone) < aCount do

@@ -758,7 +758,19 @@ gepusht ist.
 eines größeren Checkpoints, z. B. Talker und Code-Predictor von Qwen3-TTS), `ForgetWeights`
 an Backend und Modell; flydevs Referenz `qwen3-tts-lm` läuft als Test (Talker-Zustände bis
 1,8e-4 gegen PyTorch, Predictor-Codes gleich). Neue Regel: ein Modell vor seinem Backend
-freigeben. *Offen:* 1, 2, 5 und die Entscheidung zu 4; die Rückmeldung an flydev (Forum).
+freigeben.
+
+*Punkte 1, 2, 4 und 5 erledigt 2026-10-19* (`native-inference.md`, Phase D): BF16 und F16 in
+`InferRowToF32` (der Decoder verbreitert jetzt darüber); `TBpeTokenizer.CreateFromVocabMerges`
+für `vocab.json` + `merges.txt` - statt GPT-2 als Vorgabe die Qwen2-Pipeline, geprüft an der
+`tokenizer_config.json` daneben, weil die Klasse nur diese kann; angenommen wird nur, was
+transformers 5.19 mit denselben Ids lädt; Qwen3-TTS gibt damit die Referenz-Ids. Zu 4
+(Nutzerentscheidung): F16 bleibt Vorgabe, keine Umschaltung nach Länge; gemessen bringt F16
+beim Decode 2-3 % bei 200 Tokens Kontext, 6-8 % bei 4000, 16-32 % bei 16000; `KvF16` und
+`ForwardEmbeds` sagen jetzt, wann man es abschaltet (zurückgespeiste floats wie beim Talker).
+Zu 5: `TInferThreadPool.RunWorkers` mit Worker-Index für Puffer je Thread; das Allokieren im
+Job kostet nur unter Delphi (32 Threads: 67 gegen 12 ms), FPCs Heap arbeitet je Thread.
+*Offen:* die Rückmeldung an flydev (Forum).
 
 ## B15 — Schneller Einstieg: Gewichtsvorgabe und Quickstart-Demo (aufgenommen 2026-10-19)
 

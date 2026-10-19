@@ -182,9 +182,10 @@ function InferHalfToSingleBits(aHalf: word): cardinal;
 function InferSingleToHalf(aValue: single): word;
 
 /// row aRow of a [rows, aCols] matrix of type aType, as F32 into aDst
-// - F32 is copied, Q8_0, Q4_0 and Q5_0 dequantized (d * q, d * (q - 8),
-// d * (q - 16): exact in single), Q4_K and Q6_K with the single steps of
-// ggml's dequantize_row_*; aCols must be a multiple of the block size
+// - F32 is copied, BF16 and F16 widened (exact, bit by bit: NaN and infinity
+// kept, never loaded into the FPU), Q8_0, Q4_0 and Q5_0 dequantized (d * q,
+// d * (q - 8), d * (q - 16): exact in single), Q4_K and Q6_K with the single
+// steps of ggml's dequantize_row_*; aCols must be a multiple of the block size
 procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
   aDst: PSingleArray);
 
@@ -400,10 +401,24 @@ var
   b5: PInferBlockQ5_0;
   d: single;
   qh: cardinal;
+  w: PWordArray;
 begin
   case aType of
     idtF32:
       MoveFast(PSingleArray(aData)^[aRow * aCols], aDst^[0], aCols * SizeOf(single));
+    idtBF16:
+      begin
+        // BF16 is the upper half of an F32
+        w := @PWordArray(aData)^[aRow * aCols];
+        for j := 0 to aCols - 1 do
+          PCardinalArray(aDst)^[j] := cardinal(w^[j]) shl 16;
+      end;
+    idtF16:
+      begin
+        w := @PWordArray(aData)^[aRow * aCols];
+        for j := 0 to aCols - 1 do
+          PCardinalArray(aDst)^[j] := InferHalfToSingleBits(w^[j]);
+      end;
     idtQ8_0:
       begin
         nb := aCols div 32;

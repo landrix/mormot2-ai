@@ -23,6 +23,7 @@ uses
   mormot.core.json,
   mormot.core.perf,
   mormot.core.test,
+  mormot.crypt.secure,
   mormot.ai.llm.types,
   mormot.ai.infer.tensor,
   mormot.ai.infer.unicode,
@@ -59,6 +60,13 @@ type
     /// the tokenizer of Qwen's GGUF file = the one of tokenizer.json: every
     // token, every added token, the reference ids; foreign tokenizers refused
     procedure GgufTokenizer;
+    /// vocab.json + merges.txt: header, CRLF and empty lines, added tokens from
+    // tokenizer_config.json or (older folders) added_tokens.json, named special
+    // tokens checked; foreign files refused (no model needed)
+    procedure VocabMergesFiles;
+    /// the pair of Qwen3-0.6B = its tokenizer.json; the pair of Qwen3-TTS (no
+    // tokenizer.json) gives the reference ids and its 33 added tokens
+    procedure VocabMergesMatchTokenizerJson;
     /// every chat case: same ids and same rendered text as transformers
     procedure ChatTemplateMatchesReference;
     /// the same cases through the Qwen2.5 template (tokenizer.json of
@@ -693,6 +701,325 @@ begin
   finally
     tok.Free;
     g.Free;
+  end;
+end;
+
+/// aFolder\aName with the content aText
+procedure WriteText(const aFolder, aName: TFileName; const aText: RawUtf8);
+begin
+  FileFromString(aText, aFolder + aName);
+end;
+
+/// TBpeTokenizer.CreateFromVocabMerges on the files of aFolder, nil and aError
+// when refused
+function LoadPair(const aFolder: TFileName; out aError: RawUtf8): TBpeTokenizer;
+begin
+  result := nil;
+  aError := '';
+  try
+    result := TBpeTokenizer.CreateFromVocabMerges(aFolder + 'vocab.json',
+      aFolder + 'merges.txt');
+  except
+    on E: EInferError do
+      aError := StringToUtf8(E.Message);
+  end;
+end;
+
+procedure TTestInferBpe.VocabMergesFiles;
+var
+  json, vocab, err: RawUtf8;
+  dir: TFileName;
+  one, two: TBpeTokenizer;
+  ids: TIntegerDynArray;
+  i: PtrInt;
+  same: boolean;
+const
+  TEXTS: array[0..3] of RawUtf8 = ('aaaa', 'abc aaa', ' xy  x', '<|im_end|>');
+  // the vocabulary and merges of MergeOrderAndRefusals, as the older pair
+  EXTRA = '"aa":256,"bc":257,"aaa":258,"xy":259';
+  MERGES = '#version: 0.2'#13#10'a a'#13#10'b c'#13#10'#version 0.2'#10'aa a'#10'x y'#13#10;
+  // the added tokens right after the 260 of the vocabulary, as transformers
+  // numbers them; <|endoftext|> is Qwen2Tokenizer's default unk/eos/pad token
+  DEC = '"added_tokens_decoder":{"260":{"content":"<|im_end|>","special":true},' +
+    '"261":{"content":"<|endoftext|>","special":true}}';
+  CONFIG = '{"tokenizer_class":"Qwen2Tokenizer","add_prefix_space":false,' + DEC + '}';
+  LEGACY = '{"tokenizer_class":"Qwen2Tokenizer","add_bos_token":false}';
+  NO_DEFAULTS = '{"tokenizer_class":"Qwen2Tokenizer","unk_token":null,' +
+    '"eos_token":null,"pad_token":null}';
+
+  function Refused(const aWhy: RawUtf8): boolean;
+  begin
+    two := LoadPair(dir, err);
+    result := (two = nil) and (PosEx(aWhy, err) > 0);
+    FreeAndNil(two);
+  end;
+
+  function Loads: boolean;
+  begin
+    two := LoadPair(dir, err);
+    result := two <> nil;
+    FreeAndNil(two);
+  end;
+
+  procedure WithConfig(const aInsert: RawUtf8);
+  begin
+    // CONFIG with aInsert after "add_prefix_space":false,
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(CONFIG,
+      '"add_prefix_space":false,', '"add_prefix_space":false,' + aInsert));
+  end;
+
+begin
+  // the reference: the same tokenizer from a tokenizer.json (its added token
+  // at 300 - a tokenizer.json keeps the ids it gives)
+  json := TinyBpeJson('{"type":"NFC"}', EXTRA, '[["a","a"],["b","c"],["aa","a"],["x","y"]]');
+  one := LoadBpe(json, err);
+  if CheckFailed(one <> nil, Utf8ToString(err)) then
+    exit;
+  dir := IncludeTrailingPathDelimiter(TemporaryFileName + '.bpe');
+  two := nil;
+  try
+    ForceDirectories(dir);
+    // vocab.json: the "vocab" object of the tokenizer.json
+    i := PosEx('"vocab":{', json);
+    vocab := copy(json, i + 8, PosEx('},"merges"', json) - i - 7);
+    WriteText(dir, 'vocab.json', vocab);
+    WriteText(dir, 'merges.txt', MERGES);
+    WriteText(dir, 'tokenizer_config.json', CONFIG);
+    two := LoadPair(dir, err);
+    if CheckFailed(two <> nil, Utf8ToString(err)) then
+      exit;
+    CheckEqual(two.MergeCount, 4, 'every #version line skipped, CRLF and LF');
+    CheckEqual(two.VocabSize, 262, 'the vocabulary and two added tokens');
+    same := true;
+    for i := 0 to 259 do
+      if two.TokenBytes(i) <> one.TokenBytes(i) then
+        same := false;
+    Check(same, 'every token the same bytes');
+    CheckEqual(two.TokenId('<|im_end|>'), 260, 'added token from the config');
+    CheckEqual(two.TokenId('<|endoftext|>'), 261, 'second added token');
+    for i := 0 to high(TEXTS) do
+    begin
+      ids := two.Encode(TEXTS[i]);
+      json := IdsText(pointer(ids), length(ids));
+      ids := one.Encode(TEXTS[i]);
+      CheckEqual(json, IdsText(pointer(ids), length(ids)), TEXTS[i]);
+    end;
+    FreeAndNil(two);
+    // with added_tokens_decoder, added_tokens.json and special_tokens_map.json
+    // are not read (transformers 5.19)
+    WriteText(dir, 'added_tokens.json', '{"<x>":262}');
+    WriteText(dir, 'special_tokens_map.json', '{"pad_token":"<|pad|>"}');
+    two := LoadPair(dir, err);
+    if not CheckFailed(two <> nil, Utf8ToString(err)) then
+      CheckEqual(two.TokenId('<x>'), -1, 'added_tokens.json beside a decoder ignored');
+    FreeAndNil(two);
+    // without it (an older folder): added_tokens.json gives the added tokens,
+    // and the special tokens of special_tokens_map.json must exist
+    WriteText(dir, 'tokenizer_config.json', LEGACY);
+    WriteText(dir, 'added_tokens.json',
+      '{"<x>":262,"<|im_end|>":260,"<|endoftext|>":261}');
+    DeleteFile(dir + 'special_tokens_map.json');
+    two := LoadPair(dir, err);
+    if not CheckFailed(two <> nil, Utf8ToString(err)) then
+    begin
+      CheckEqual(two.TokenId('<x>'), 262, 'added_tokens.json read');
+      CheckEqual(two.TokenId('<|im_end|>'), 260, 'in the order of the ids');
+    end;
+    FreeAndNil(two);
+    WriteText(dir, 'special_tokens_map.json', '{"pad_token":{"content":"<|pad|>"}}');
+    Check(Refused('special_tokens_map.json'),
+      'special_tokens_map.json checked without a decoder');
+    WriteText(dir, 'special_tokens_map.json', '{"pad_token":"<x>","unk_token":null}');
+    CheckUtf8(Loads, 'special_tokens_map.json with added tokens: %', [err]);
+    // every name is checked, also one the map would replace (stricter than
+    // transformers on folders whose files disagree)
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(LEGACY,
+      '"add_bos_token":false', '"add_bos_token":false,"pad_token":"<|nope|>"'));
+    Check(Refused('pad_token of tokenizer_config.json'),
+      'a config key the map replaces is checked too');
+    DeleteFile(dir + 'special_tokens_map.json');
+    // the default <|endoftext|> of unk/eos/pad must exist when none is named
+    WriteText(dir, 'tokenizer_config.json', LEGACY);
+    WriteText(dir, 'added_tokens.json', '{"<|im_end|>":260}');
+    Check(Refused('Qwen2Tokenizer (default)'), 'default <|endoftext|> missing refused');
+    DeleteFile(dir + 'added_tokens.json');
+    DeleteFile(dir + 'tokenizer_config.json');
+    Check(Refused('Qwen2Tokenizer (default)'), 'no config: the defaults apply');
+    WriteText(dir, 'tokenizer_config.json', NO_DEFAULTS);
+    two := LoadPair(dir, err);
+    if not CheckFailed(two <> nil, Utf8ToString(err)) then
+      CheckEqual(two.VocabSize, 260, 'defaults set to null: no added token');
+    FreeAndNil(two);
+    // the added ids must follow the vocabulary without a gap, each new
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(CONFIG, '"261"', '"262"'));
+    Check(Refused('without a gap'), 'a gap in the added ids refused');
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(CONFIG, '"260"', '"259"'));
+    Check(Refused('without a gap'), 'an added id inside the vocabulary refused');
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(CONFIG,
+      '"content":"<|im_end|>"', '"content":"aa"'));
+    Check(Refused('is in the vocabulary'), 'an added token of the vocabulary refused');
+    // a tokenizer.json beside wins in transformers: refused here
+    WriteText(dir, 'tokenizer_config.json', CONFIG);
+    WriteText(dir, 'tokenizer.json', '{}');
+    Check(Refused('use Create'), 'a tokenizer.json beside refused');
+    DeleteFile(dir + 'tokenizer.json');
+    WithConfig('"fast_tokenizer_files":["tokenizer.json"],');
+    Check(Refused('fast_tokenizer_files'), 'fast_tokenizer_files refused');
+    WithConfig('"vocab":{"z":0},');
+    Check(Refused('vocab is set'), 'an inline vocabulary refused');
+    WithConfig('"merges":[],');
+    Check(Refused('merges is set'), 'inline merges refused');
+    WithConfig('"add_eos_token":true,');
+    Check(Refused('add_eos_token'), 'add_eos_token refused');
+    WithConfig('"add_bos_token":true,');
+    Check(Refused('add_bos_token'), 'add_bos_token refused');
+    WithConfig('"_token":"<|nope|>",');
+    Check(Refused('_token of'), 'a key named _token counts');
+    WriteText(dir, 'tokenizer_config.json', CONFIG);
+    WriteText(dir, 'tiktoken.model', 'x');
+    Check(Refused('tiktoken.model'), 'a tiktoken.model beside refused');
+    DeleteFile(dir + 'tiktoken.model');
+    WriteText(dir, 'tokenizer.model.v3', 'x');
+    Check(Refused('tokenizer.model.v3'), 'a tokenizer.model.v3 beside refused');
+    DeleteFile(dir + 'tokenizer.model.v3');
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(CONFIG,
+      '"content":"<|endoftext|>"', '"content":"<|im_end|>"'));
+    Check(Refused('listed twice'), 'two added tokens with one content refused');
+    // what the folder says must be this pipeline
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(CONFIG,
+      'Qwen2Tokenizer', 'GPT2Tokenizer'));
+    Check(Refused('GPT2Tokenizer'), 'GPT-2 tokenizer refused');
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(CONFIG,
+      '"add_prefix_space":false', '"add_prefix_space":true'));
+    Check(Refused('add_prefix_space'), 'prefix space refused');
+    WriteText(dir, 'tokenizer_config.json', StringReplaceAll(CONFIG, DEC,
+      '"added_tokens_decoder":[{"content":"<|im_end|>"}]'));
+    Check(Refused('not an object'), 'added_tokens_decoder as an array refused');
+    // named special tokens must be added ones
+    WithConfig('"bos_token":null,"eos_token":"<|im_end|>","additional_special_tokens":' +
+      '[{"content":"<|im_end|>"}],"extra_special_tokens":{"x":"<|im_end|>"},');
+    CheckUtf8(Loads, 'added special tokens accepted: %', [err]);
+    WithConfig('"unk_token":"aa",');
+    Check(Refused('a vocabulary entry'), 'a special token of the vocabulary refused');
+    WithConfig('"audio_token":{"content":"xy"},');
+    Check(Refused('a vocabulary entry'), 'also as an AddedToken object');
+    WithConfig('"additional_special_tokens":["<|im_end|>","<|nope|>"],');
+    Check(Refused('"<|nope|>", which is no token'), 'a special token that is no token');
+    WithConfig('"audio_token":"<|nope|>",');
+    Check(Refused('audio_token'), 'a model-specific "..._token" key counts');
+    WithConfig('"extra_special_tokens":["<|im_end|>"],"additional_special_tokens":["<|nope|>"],');
+    Check(Refused('additional_special_tokens'),
+      'additional_special_tokens checked beside extra_special_tokens');
+    WithConfig('"extra_special_tokens":{"audio":"<|nope|>"},');
+    Check(Refused('extra_special_tokens'), 'extra_special_tokens as an object checked');
+    WithConfig('"model_specific_special_tokens":{"audio":"<|nope|>"},');
+    Check(Refused('model_specific_special_tokens'), 'model_specific_special_tokens');
+    WriteText(dir, 'tokenizer_config.json', CONFIG);
+    // broken merges
+    WriteText(dir, 'merges.txt', 'a a'#10'b  c'#10);
+    Check(Refused('is not "a b"'), 'two spaces refused');
+    WriteText(dir, 'merges.txt', 'a a'#10#10'b c'#10);
+    Check(Refused('is not "a b"'), 'an empty line refused');
+    WriteText(dir, 'merges.txt', 'a a'#10'b c '#10);
+    Check(Refused('is not "a b"'), 'a trailing space refused');
+    WriteText(dir, 'merges.txt', '#Version: 0.2'#10'a a'#10);
+    Check(Refused('outside the vocabulary'), 'the header is case-sensitive');
+    WriteText(dir, 'merges.txt', '');
+    Check(Refused('cannot read'), 'empty merges.txt refused');
+    WriteText(dir, 'merges.txt', MERGES);
+    WriteText(dir, 'vocab.json', '[1,2]');
+    Check(Refused('no vocabulary'), 'vocab.json no object');
+  finally
+    two.Free;
+    one.Free;
+    DirectoryDelete(dir);
+  end;
+end;
+
+const
+  /// Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice at 85e237c12c027371202489a0ec509ded67b5e4b5
+  TTS_TOKENIZER_FILES: array[0..2] of TFileName = (
+    'vocab.json', 'merges.txt', 'tokenizer_config.json');
+  TTS_TOKENIZER_SHA256: array[0..2] of RawUtf8 = (
+    'ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910',
+    '599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3',
+    'dc3c31c3bdaedd5016382bb3cbe07323026775ad51f5a4fb564505992ae4a670');
+
+procedure TTestInferBpe.VocabMergesMatchTokenizerJson;
+const
+  PAIR: array[0..2] of TFileName = ('vocab.json', 'merges.txt', 'tokenizer_config.json');
+var
+  dir, tmp: TFileName;
+  tok: TBpeTokenizer;
+  i, bad: PtrInt;
+  added: RawUtf8;
+begin
+  if not Ready then
+    exit;
+  dir := FindQwen3Folder('merges.txt');
+  if CheckFailed(dir <> '', 'vocab.json and merges.txt beside tokenizer.json') then
+    exit;
+  // without the tokenizer.json beside them, which CreateFromVocabMerges refuses
+  tmp := IncludeTrailingPathDelimiter(TemporaryFileName + '.pair');
+  ForceDirectories(tmp);
+  tok := nil;
+  try
+    for i := 0 to high(PAIR) do
+      CopyFile(dir + PAIR[i], tmp + PAIR[i], false);
+    tok := TBpeTokenizer.CreateFromVocabMerges(tmp + 'vocab.json', tmp + 'merges.txt');
+    CheckEqual(tok.VocabSize, fTokenizer.VocabSize, 'vocabulary size');
+    CheckEqual(tok.BpeCount, fTokenizer.BpeCount, 'BPE tokens');
+    CheckEqual(tok.MergeCount, fTokenizer.MergeCount, 'merges ("#version" skipped)');
+    bad := 0;
+    for i := 0 to fTokenizer.VocabSize - 1 do
+      if tok.TokenBytes(i) <> fTokenizer.TokenBytes(i) then
+        inc(bad);
+    CheckEqual(bad, 0, 'every token the same bytes');
+    bad := 0;
+    for i := fTokenizer.BpeCount to fTokenizer.VocabSize - 1 do
+    begin
+      added := fTokenizer.TokenBytes(i);
+      if (added <> '') and (tok.TokenId(added) <> fTokenizer.TokenId(added)) then
+        inc(bad);
+    end;
+    CheckEqual(bad, 0, 'every added token found by its content');
+    CheckIds(tok, 'vocab.json + merges.txt');
+  finally
+    tok.Free;
+    DirectoryDelete(tmp);
+  end;
+  // Qwen3-TTS ships no tokenizer.json: its pair, hash-checked
+  dir := FindVendorModel('qwen3-tts-12hz-0.6b-customvoice' + PathDelim + 'vocab.json');
+  if dir = '' then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3-tts-12hz-0.6b-customvoice/vocab.json');
+    AddConsole('SKIP Qwen3-TTS tokenizer: no vendor/models/' +
+      'qwen3-tts-12hz-0.6b-customvoice/vocab.json (tools/infer-ref/qwen3-tts)');
+    exit;
+  end;
+  dir := ExtractFilePath(dir);
+  for i := 0 to high(TTS_TOKENIZER_FILES) do
+    if CheckFailed(IdemPropNameU(HashFileSha256(dir + TTS_TOKENIZER_FILES[i]),
+         TTS_TOKENIZER_SHA256[i]), TTS_TOKENIZER_FILES[i] + ' sha256') then
+      exit;
+  tok := TBpeTokenizer.CreateFromVocabMerges(dir + 'vocab.json', dir + 'merges.txt');
+  try
+    // the vocabulary and merges of Qwen3, 7 added tokens more
+    CheckEqual(tok.BpeCount, fTokenizer.BpeCount, 'TTS: BPE tokens');
+    CheckEqual(tok.MergeCount, fTokenizer.MergeCount, 'TTS: merges (no "#version")');
+    CheckEqual(tok.VocabSize, 151676, 'TTS: with the 33 added tokens');
+    CheckEqual(tok.TokenId('<tts_pad>'), 151671, 'TTS: <tts_pad>');
+    CheckEqual(tok.TokenId('<|audio_pad|>'), 151675, 'TTS: <|audio_pad|>');
+    CheckEqual(tok.TokenId('<|im_end|>'), 151645, 'TTS: <|im_end|>');
+    bad := 0;
+    for i := 0 to fTokenizer.VocabSize - 1 do
+      if tok.TokenBytes(i) <> fTokenizer.TokenBytes(i) then
+        inc(bad);
+    CheckEqual(bad, 0, 'TTS: the Qwen3 tokens unchanged');
+    CheckIds(tok, 'Qwen3-TTS vocab.json + merges.txt');
+  finally
+    tok.Free;
   end;
 end;
 

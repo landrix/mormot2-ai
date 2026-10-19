@@ -188,6 +188,13 @@ type
     // memory, and half the bytes the attention reads per decoded token -
     // the keys and values rounded to 11 significant bits, the logits then
     // within a looser tolerance of the CPU's
+    // - what it buys grows with the context: Qwen3-0.6B Q8_0 on an RTX 5090
+    // decodes 2-3 % faster at 200 tokens, 6-8 % at 4000, 16-32 % at 16000
+    // - what it costs: logits about 1e-3 off instead of 1e-4, harmless where
+    // every step ends in a token id; set it false where floats are fed back
+    // step after step (ForwardEmbeds loops of a speech model: the error grows,
+    // measured 7e-3 on the Qwen3-TTS talker against 3e-5) and to compare
+    // with a reference
     // - a context takes it when its cache is allocated, and again on its
     // next Forward while it is empty (after Reset)
     property KvF16: boolean
