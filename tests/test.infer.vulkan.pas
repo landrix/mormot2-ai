@@ -16,12 +16,14 @@ uses
   mormot.core.os,
   mormot.core.unicode,
   mormot.core.text,
+  mormot.core.perf,
   mormot.core.test,
   mormot.ai.infer.tensor,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.vulkan,
   mormot.ai.infer.backend.vulkan,
+  mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.qwen3.vulkan,
   mormot.ai.llm.types,
@@ -52,6 +54,11 @@ type
     procedure RefusesMisuse;
     /// device memory: what goes up comes down, at an offset, also in pieces
     procedure UploadDownload;
+    /// BatchDispatchAt: a part of a buffer bound at an offset (a multiple of
+    // MinStorageAlignment) - the shader sees it from index 0, the bytes before
+    // and after stay as they were; misaligned offsets, ranges beyond the
+    // buffer and arrays of the wrong length are refused
+    procedure BindsAtOffset;
     /// a batch with Profile on reports its GPU time (where the queue has
     // timestamps); the tick period is read from the device limits at the
     // offset of this bitness
@@ -92,6 +99,16 @@ type
     // cache on the device, back to the backend with Device := nil - skipped
     // as Qwen3GgufMatchesCpu
     procedure NativeClientOnDevice;
+    /// phase D slice D3: the tiny Qwen3-MoE on the device against the CPU - a
+    // prompt longer than one chunk, decoding, ClearWeights; F32 (each expert a
+    // buffer of its own), the Q8_0 GGUF (the experts of a layer one buffer,
+    // each bound at its offset), Q8_0 quantized at load, a half-float cache
+    procedure TinyMoeMatchesCpu;
+    /// Qwen3-30B-A3B Q4_K_M on the device against the fast CPU backend,
+    // teacher-forced as Qwen3GgufMatchesCpu - only where the model was put
+    // (vendor/models/qwen3-30b-a3b-q4_k_m.gguf, 17 GB), not on a CPU
+    // implementation, not in a 32-bit process
+    procedure Qwen3MoeGgufMatchesCpu;
   end;
 
 
@@ -239,6 +256,105 @@ begin
     Check(SameBits(@src[1000], pointer(dst), 1000), 'part');
   finally
     buf.Free;
+  end;
+end;
+
+procedure TTestInferVulkan.BindsAtOffset;
+const
+  N = 1000;
+var
+  pipe: TInferVkPipeline;
+  a, b, y: TInferVkBuffer;
+  ha, hb, hy: TSingleDynArray;
+  al, off: Int64;
+  count: cardinal;
+  i, bad: PtrInt;
+  raised: boolean;
+
+  function Refused(const aOffsets, aRanges: array of Int64; aCount: integer): boolean;
+  begin
+    result := false;
+    fVk.BatchBegin;
+    try
+      if aCount = 3 then
+        fVk.BatchDispatchAt(pipe, [a, b, y], aOffsets, aRanges, @count, 1)
+      else
+        fVk.BatchDispatchAt(pipe, [a, b], aOffsets, aRanges, @count, 1);
+    except
+      on EInferVulkan do
+        result := true;
+    end;
+    fVk.BatchAbort;
+  end;
+
+begin
+  if not HasDevice then
+    exit;
+  al := fVk.MinStorageAlignment;
+  // Vulkan: a power of two, at most 256
+  CheckUtf8((al >= 1) and (al <= 256) and (al and (al - 1) = 0),
+    'minStorageBufferOffsetAlignment %', [al]);
+  off := 2 * al;
+  if off < 16 then
+    off := 16; // a few floats before the part, whatever the alignment
+  // a: junk, then the N inputs at off; y: zeros, the N outputs at off, more
+  // zeros behind
+  SetLength(ha, off div 4 + N);
+  SetLength(hb, N);
+  SetLength(hy, off div 4 + N + 8);
+  for i := 0 to high(ha) do
+    ha[i] := 1000 + i;
+  for i := 0 to N - 1 do
+    hb[i] := i * 0.5;
+  pipe := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
+  a := nil;
+  b := nil;
+  y := nil;
+  try
+    a := TInferVkBuffer.Create(fVk, length(ha) * 4, true);
+    b := TInferVkBuffer.Create(fVk, N * 4, true);
+    y := TInferVkBuffer.Create(fVk, length(hy) * 4, true);
+    fVk.Upload(a, 0, pointer(ha), length(ha) * 4);
+    fVk.Upload(b, 0, pointer(hb), N * 4);
+    fVk.Upload(y, 0, pointer(hy), length(hy) * 4);
+    count := N;
+    fVk.BatchBegin;
+    try
+      fVk.BatchDispatchAt(pipe, [a, b, y], [off, 0, off], [N * 4, 0, N * 4], @count,
+        (N + 127) div 128);
+    except
+      fVk.BatchAbort;
+      raise;
+    end;
+    fVk.BatchSubmit;
+    fVk.Download(y, 0, pointer(hy), length(hy) * 4);
+    bad := 0;
+    for i := 0 to N - 1 do
+      if hy[off div 4 + i] <> ha[off div 4 + i] + hb[i] then
+        inc(bad);
+    CheckUtf8(bad = 0, '% of % sums wrong at offset %', [bad, N, off]);
+    bad := 0;
+    for i := 0 to off div 4 - 1 do
+      if hy[i] <> 0 then
+        inc(bad);
+    for i := off div 4 + N to high(hy) do
+      if hy[i] <> 0 then
+        inc(bad);
+    CheckUtf8(bad = 0, '% floats outside the bound part written', [bad]);
+    // refused before anything is recorded
+    Check(Refused([$7FFFFFFFFFFFFF00, 0, 0], [512, 0, 0], 3),
+      'an offset whose sum with the range overflows');
+    if al > 1 then
+      Check(Refused([al div 2, 0, 0], [N * 4, 0, 0], 3), 'a misaligned offset');
+    Check(Refused([off, 0, 0], [a.Size - off + 4, 0, 0], 3), 'a range beyond the buffer');
+    Check(Refused([-al, 0, 0], [N * 4, 0, 0], 3), 'a negative offset');
+    Check(Refused([off, 0], [N * 4, 0], 2), 'two buffers for a pipeline of three');
+    Check(Refused([off, 0], [N * 4, 0, 0], 3), 'two offsets for three buffers');
+  finally
+    y.Free;
+    b.Free;
+    a.Free;
+    pipe.Free;
   end;
 end;
 
@@ -954,5 +1070,261 @@ begin
     gpu.Free;
   end;
 end;
+
+procedure TTestInferVulkan.TinyMoeMatchesCpu;
+const
+  PROMPT = 300; // more than one chunk of the device forward pass (256)
+  /// the router of the tiny model is sharp (as in TTestInferQwen3): the
+  // rounding of a half-float cache comes out of three layers at up to 4.6e-3
+  // on CUDA (measured 2026-10-17), where the dense tiny-qwen3 stays within 4e-3
+  TOL: array[boolean] of double = (1e-4, 6e-3);
+var
+  dir: TFileName;
+  gpu: TInferVulkanBackend;
+  ref: TInferCpuBackend;
+  model: TDecoderModel;
+  vk: TQwen3Vulkan;
+  c1: TQwen3Context;
+  c2: TQwen3VkContext;
+  ids: TIntegerDynArray;
+  l1, l2: TSingleDynArray;
+  i, k, v: PtrInt;
+  seed: cardinal;
+  e: double;
+  cmp: TInferCompare;
+  id: integer;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen3moe');
+  if CheckFailed(dir <> '', 'tiny-qwen3moe found') then
+    exit;
+  SetLength(ids, PROMPT);
+  seed := 11;
+  for i := 0 to PROMPT - 1 do
+  begin
+    seed := seed * 1103515245 + 12345;
+    ids[i] := 3 + (seed shr 16) mod 93;
+  end;
+  // 0: F32 (each expert a buffer of its own), 1: the Q8_0 GGUF (the experts
+  // of a layer one buffer, every expert bound at its offset: 4352 bytes, a
+  // multiple of every alignment Vulkan allows), 2: Q8_0 quantized at load
+  // (each expert its own buffer), 3: F32 with the cache in half floats
+  for k := 0 to 3 do
+  begin
+    gpu := TInferVulkanBackend.Create;
+    ref := TInferCpuBackend.Create;
+    model := nil;
+    vk := nil;
+    c1 := nil;
+    c2 := nil;
+    try
+      case k of
+        1:
+          model := NewDecoderModelFromGguf(MakePath([dir, 'gguf', 'q8_0.gguf']), ref);
+        2:
+          model := TQwen3MoeModel.Create(dir, ref, idtQ8_0);
+      else
+        model := TQwen3MoeModel.Create(dir, ref);
+      end;
+      Check(model is TQwen3MoeModel, 'a Qwen3-MoE model');
+      v := model.Config.VocabSize;
+      vk := TQwen3Vulkan.Create(model, gpu);
+      vk.KvF16 := k = 3;
+      // the Q8_0 GGUF in batches of 40 dispatches at most: a layer's experts
+      // then span several batches, as for a model of hundreds of experts
+      if k = 1 then
+        gpu.Vulkan.BatchMaxSets := 40;
+      // the GGUF experts of a layer: one buffer, each bound at its offset;
+      // from safetensors or quantized at load: a buffer per expert
+      if k = 1 then
+        CheckUtf8(vk.ExpertBuffers(0) = 1, 'GGUF experts in % buffers', [vk.ExpertBuffers(0)])
+      else
+        CheckUtf8(vk.ExpertBuffers(0) = model.Config.Experts,
+          'experts (%) in % buffers', [k, vk.ExpertBuffers(0)]);
+      Check(vk.ExpertBuffers(1) = 0, 'layer 1 is dense');
+      c1 := model.NewContext;
+      c2 := vk.NewContext;
+      SetLength(l1, PROMPT * v);
+      SetLength(l2, PROMPT * v);
+      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+      vk.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      Check(c2.Length = PROMPT, 'context length');
+      if k in [0, 3] then
+      begin
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= TOL[vk.KvF16], 'MoE F32 prompt logits (KvF16 %): relative error %',
+          [vk.KvF16, e]);
+      end
+      else
+      begin
+        // Q8_0: the CPU also quantizes the activations, the device not (as
+        // TinyQwen3MatchesCpu; the router passes the difference on)
+        cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
+        CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.998),
+          'MoE Q8_0 (%) prompt logits: %', [k, InferCompareText(cmp)]);
+      end;
+      // decoding: one token, two experts of it in a layer
+      for i := 0 to 4 do
+      begin
+        id := ids[i];
+        vk.SplitKeys := (i and 1) * 64;
+        model.Forward(c1, @id, 1, pointer(l1));
+        vk.Forward(c2, @id, 1, pointer(l2));
+        if k in [0, 3] then
+        begin
+          e := RelError(pointer(l2), pointer(l1), v);
+          CheckUtf8(e <= TOL[vk.KvF16], 'MoE F32 decode step % (KvF16 %): relative error %',
+            [i, vk.KvF16, e]);
+        end
+        else
+        begin
+          cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999),
+            'MoE Q8_0 (%) decode step %: %', [k, i, InferCompareText(cmp)]);
+        end;
+      end;
+      // the backend forgot its weights: the experts go up again
+      gpu.ClearWeights;
+      id := ids[200];
+      model.Forward(c1, @id, 1, pointer(l1));
+      vk.Forward(c2, @id, 1, pointer(l2));
+      cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+      CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999), 'MoE after ClearWeights: %',
+        [InferCompareText(cmp)]);
+    finally
+      c2.Free;
+      c1.Free;
+      vk.Free;
+      model.Free;
+      ref.Free;
+      gpu.Free;
+    end;
+  end;
+end;
+
+procedure TTestInferVulkan.Qwen3MoeGgufMatchesCpu;
+const
+  // "Wie verlege ich ein Kupferrohr?" as for Qwen3-0.6B: the same tokenizer
+  PROMPT: array[0..11] of integer = (
+    151644, 872, 198, 54, 645, 2739, 273, 10109, 12153, 3105, 63084, 30);
+  STEPS = 16;
+  /// the largest router gap at which the device may choose other experts
+  // than the CPU: a near tie of the 8th and 9th of 128 experts - measured on
+  // 2026-10-19 (RTX 5090, CUDA and Vulkan, FPC): 162 of 1344 routes chosen
+  // otherwise, at a gap of 0.052 at most (Delphi 13: 121, 0.071); a routing
+  // error gives gaps of whole units
+  ROUTE_GAP = 0.1;
+var
+  dir, gguf: TFileName;
+  i, v, agree: PtrInt;
+  tape: TDecoderRouteTape;
+  gpu: TInferVulkanBackend;
+  cpu: TInferCpuFastBackend;
+  model: TDecoderModel;
+  vk: TQwen3Vulkan;
+  c1: TQwen3Context;
+  c2: TQwen3VkContext;
+  l1, l2: TSingleDynArray;
+  cmp: TInferCompare;
+  worst: double;
+  id: integer;
+  timer: TPrecisionTimer;
+begin
+  if not HasDevice then
+    exit;
+  if fVk.DeviceType = VK_PHYSICAL_DEVICE_TYPE_CPU then
+  begin
+    AddConsole('SKIP Qwen3-30B-A3B on the device: % is a CPU implementation',
+      [fVk.DeviceName]);
+    exit;
+  end;
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3-30B-A3B on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  // a large model of its own: only where it was put (not LAI_REQUIRE_MODEL)
+  dir := FindQwen3Folder('model.safetensors');
+  gguf := '';
+  if dir <> '' then
+    gguf := ExpandFileName(IncludeTrailingPathDelimiter(dir) + '..' + PathDelim +
+      'qwen3-30b-a3b-q4_k_m.gguf');
+  if (gguf = '') or not FileExists(gguf) then
+  begin
+    AddConsole('SKIP Qwen3-30B-A3B on the device: no vendor/models/qwen3-30b-a3b-q4_k_m.gguf');
+    exit;
+  end;
+  gpu := TInferVulkanBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  model := nil;
+  vk := nil;
+  c1 := nil;
+  c2 := nil;
+  tape := nil;
+  try
+    model := NewDecoderModelFromGguf(gguf, cpu);
+    v := model.Config.VocabSize;
+    timer.Start;
+    vk := TQwen3Vulkan.Create(model, gpu);
+    AddConsole('Qwen3-30B-A3B uploaded in %', [timer.Stop]);
+    c1 := model.NewContext;
+    c2 := vk.NewContext;
+    SetLength(l1, v);
+    SetLength(l2, v);
+    // the CPU's expert choice handed to the device (TDecoderRouteTape): the
+    // logits then differ by arithmetic only; the device's own choice is
+    // compared - it may differ at a near tie of the router, never by more
+    tape := TDecoderRouteTape.Create;
+    model.RouteTape := tape;
+    tape.Mode := drmRecord;
+    model.Forward(c1, @PROMPT[0], length(PROMPT), pointer(l1));
+    tape.Mode := drmReplay;
+    vk.Forward(c2, @PROMPT[0], length(PROMPT), pointer(l2));
+    worst := 1;
+    agree := 0;
+    for i := 0 to STEPS - 1 do
+    begin
+      cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+      if cmp.Cosine < worst then
+        worst := cmp.Cosine;
+      // InferCompare leaves a NaN or an infinity out of the cosine
+      if cmp.NonFinite <> 0 then
+        worst := -1;
+      id := InferArgMax(pointer(l1), v);
+      if InferArgMax(pointer(l2), v) = id then
+        inc(agree);
+      // the CPU's token to both: the comparison stays on one path
+      tape.Mode := drmRecord;
+      model.Forward(c1, @id, 1, pointer(l1));
+      tape.Mode := drmReplay;
+      vk.Forward(c2, @id, 1, pointer(l2));
+    end;
+    AddConsole('Qwen3-30B-A3B on %: lowest logits cosine %, argmax agrees % of %; ' +
+      'the device chose otherwise % of % times, largest router gap %',
+      [fVk.DeviceName, worst, agree, STEPS, tape.Differs, tape.Routes, tape.DiffersGap]);
+    CheckUtf8(tape.Pending = 0, '% routes not replayed', [tape.Pending]);
+    CheckUtf8(worst >= 0.99, 'Qwen3-30B-A3B logits cosine %', [worst]);
+    // with the routing given, FPC agrees 16 of 16 at a cosine of 0.9995; the
+    // CPU of Delphi 13 computes otherwise (backlog B13): 15 of 16 at 0.9975
+    CheckUtf8(agree >= STEPS - 1, 'Qwen3-30B-A3B argmax agrees % of %', [agree, STEPS]);
+    // a near tie is rare: 12 pct of the routes (FPC), 9 pct (Delphi 13) -
+    // the router logits of the wrong row give 47 pct, at small gaps each
+    CheckUtf8(tape.Differs * 4 <= tape.Routes, 'Qwen3-30B-A3B: the device chose ' +
+      'otherwise % of % times', [tape.Differs, tape.Routes]);
+    CheckUtf8(tape.DiffersGap <= ROUTE_GAP, 'Qwen3-30B-A3B: the device chose ' +
+      'otherwise at a router gap of %', [tape.DiffersGap]);
+  finally
+    if model <> nil then
+      model.RouteTape := nil;
+    tape.Free;
+    c2.Free;
+    c1.Free;
+    vk.Free;
+    model.Free;
+    cpu.Free;
+    gpu.Free;
+  end;
+end;
+
 
 end.

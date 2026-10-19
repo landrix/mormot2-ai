@@ -102,6 +102,13 @@ type
     procedure RecordLinear(x: TInferVkBuffer; aRows, aIn: PtrInt;
       const w: TInferWeight; aOut: PtrInt; y: TInferVkBuffer;
       aBarrier: boolean = true; aTemp: TInferVkBuffer = nil);
+    /// record y = x * w^T (no bias) as RecordLinear, the aOut x aIn weights of
+    // aType at byte aOffset of aWeight (e.g. one expert of a buffer which holds
+    // every expert of a layer): aOffset a multiple of the device's
+    // MinStorageAlignment, the matrix within one binding (LinearPart = aOut)
+    procedure RecordLinearAt(x: TInferVkBuffer; aRows, aIn: PtrInt;
+      aType: TInferDType; aWeight: TInferVkBuffer; aOffset: Int64; aOut: PtrInt;
+      y: TInferVkBuffer; aBarrier: boolean = true);
     /// the output features of one part of an aOut x aIn matrix of aType on
     // the device: aOut when its bytes fit one binding (maxStorageBufferRange,
     // or MaxLinearBytes), else as many as do - e.g. the 165 MB head of
@@ -406,6 +413,38 @@ begin
       Int64(n) * 4, aRows);
     inc(o, n);
   end;
+end;
+
+procedure TInferVulkanBackend.RecordLinearAt(x: TInferVkBuffer; aRows,
+  aIn: PtrInt; aType: TInferDType; aWeight: TInferVkBuffer; aOffset: Int64;
+  aOut: PtrInt; y: TInferVkBuffer; aBarrier: boolean);
+var
+  push: TLinearPush;
+  gx, gy: cardinal;
+  pipe: TInferVkPipeline;
+  bytes: Int64;
+begin
+  if not GpuLinear(aType, aIn) or (aRows < 1) or (aRows > 65535) or (aOut < 1) or
+     (aWeight = nil) or (LinearPart(aType, aIn, aOut) < aOut) then
+    raise EInferVulkan.CreateUtf8('%.RecordLinearAt: % rows of % % into %',
+      [self, aRows, aIn, INFER_DTYPE_NAME[aType], aOut]);
+  bytes := Int64(aOut) * (aIn div INFER_DTYPE_BLOCK[aType]) * INFER_DTYPE_SIZE[aType];
+  if (aOffset < 0) or (aOffset > aWeight.Size) or (bytes > aWeight.Size - aOffset) then
+    raise EInferVulkan.CreateUtf8('%.RecordLinearAt: % bytes at % of a buffer of %',
+      [self, bytes, aOffset, aWeight.Size]);
+  // the shaders read whole 4-byte words: the last one may reach up to 3 bytes
+  // beyond the matrix (into the next one, or into the rounding of the buffer)
+  bytes := (bytes + 3) and not Int64(3);
+  if aOffset + bytes > aWeight.Size then
+    bytes := aWeight.Size - aOffset;
+  push.Rows := aRows;
+  push.InCount := aIn;
+  push.OutCount := aOut;
+  push.DType := LINEAR_DTYPE[aType];
+  push.HasBias := 0;
+  pipe := LinearShape(aType, aIn, aRows, aOut, gx, gy);
+  fVk.BatchDispatchAt(pipe, [aWeight, x, fNoBias, y], [aOffset, 0, 0, 0],
+    [bytes, 0, 0, 0], @push, gx, gy, 1, aBarrier);
 end;
 
 function TInferVulkanBackend.Weight(aData: pointer; aType: TInferDType;

@@ -13,6 +13,15 @@
 //   context reads every cached key and value per token, half the bytes
 // - the model's weights are uploaded once, at Create; the model and the
 //   backend must outlive the TQwen3Vulkan and its contexts
+// - a mixture of experts (dfMoe, phase D slice D3): the router logits on the
+//   device, then the batch is submitted and the host chooses the experts
+//   (TDecoderModel.Route, one wait per layer with experts) and starts the next
+//   batch with their token rows and weights; then expert by expert in id order
+//   its tokens gathered, its SwiGLU block by the Linear shaders, its output
+//   added back with the router weights (gatherrows.comp, scatteradd.comp); the
+//   experts of a layer stay one buffer when they are one tensor in the file
+//   (GGUF) and each lies at a multiple of minStorageBufferOffsetAlignment,
+//   each expert then bound at its offset (TInferVulkan.BatchDispatchAt)
 unit mormot.ai.infer.model.qwen3.vulkan;
 
 {
@@ -59,6 +68,13 @@ type
     // device scratch for up to fRows token rows
     fDevX, fDevH, fDevQ, fDevK, fDevV, fDevAttn, fDevTmp, fDevGate, fDevUp, fDevCos: TInferVkBuffer;
     fPart, fLogits: TInferVkBuffer;
+    // a layer with experts: router logits (on the device, then read back),
+    // the rows of one expert (gathered input, output), the token rows and
+    // weights of every expert in id order (written into fMoeIn, then copied)
+    fDevRoute, fRouteOut, fDevGather, fDevExpOut, fDevIdx, fDevW,
+      fMoeIn: TInferVkBuffer;
+    fRoute, fChosenW: TSingleDynArray;
+    fChosen, fStart: TIntegerDynArray;
     // the head in parts (TQwen3Vulkan.fHeadPart < VocabSize): one part's logits
     fHeadTemp: TInferVkBuffer;
     // host-visible: the inputs of a batch, and the logits it returns
@@ -82,6 +98,12 @@ type
     fVk: TInferVulkan;
     fNorm, fSwiGlu, fAttention, fMerge, fAdd, fQkRope, fAddNorm,
       fFlash: TInferVkPipeline;
+    fFill0, fGather, fScatter: TInferVkPipeline; // a mixture of experts
+    fMoe: boolean; // a layer with experts: a batch per such layer
+    // per layer with experts: the buffer and byte offset of every expert's
+    // gate, up and down
+    fExpertGate, fExpertUp, fExpertDown: array of TInferVkBufferDynArray;
+    fExpertGateAt, fExpertUpAt, fExpertDownAt: array of TInt64DynArray;
     // the same for a KV cache of half floats
     fQkRope16, fAttention16, fFlash16: TInferVkPipeline;
     // attndec.comp, for a float or a half-float cache
@@ -103,6 +125,12 @@ type
       w: PSingleArray; y: TInferVkBuffer);
     procedure RecordElementwise(aPipeline: TInferVkPipeline;
       const aBuffers: array of TInferVkBuffer; aCount: PtrInt);
+    /// the dfMoe block of layer aLayer: fDevH in, fDevTmp out - submits the
+    // batch so far and begins the next one
+    procedure RecordMoe(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
+    /// submit the batch being recorded and begin the next one when it has
+    // room for fewer than aSets dispatches (TInferVulkan.BatchRoom)
+    procedure NeedRoom(aSets: PtrInt);
   public
     /// upload every weight of aModel to the device of aBackend; raises
     // EInferError when a matrix type has no shader (F32, Q8_0, Q4_K, Q6_K do)
@@ -141,6 +169,10 @@ type
       read fUseFlash write fUseFlash;
     /// true when the device runs flash.comp (UseFlash can take it)
     function HasFlash: boolean;
+    /// how many device buffers hold the gate matrices of the experts of
+    // layer aLayer: 1 when they are one tensor bound at offsets, the number of
+    // experts when each has its own, 0 for a dense layer - for tests
+    function ExpertBuffers(aLayer: PtrInt): PtrInt;
     /// the attention of a decoded token (one row) from DecodeKeys cached keys
     // on through attndec.comp - one subgroup per work group, no shared memory,
     // 256 work groups - instead of attention.comp: by default on an Apple GPU
@@ -189,6 +221,11 @@ type
     Eps: single;
   end;
 
+  /// gatherrows.comp and scatteradd.comp
+  TRowsPush = record
+    Cols, First: cardinal;
+  end;
+
 const
   /// token rows per recorded batch at most: every dispatch dimension stays
   // below 65535 work groups (rows * Intermediate / 128 for SwiGLU)
@@ -212,6 +249,12 @@ const
   /// the shared memory of flash.comp in bytes: queries, a tile of keys or
   // values, the scores and three floats per query
   FLASH_SHARED = 32 * 32 * 16 + 16 * 32 * 16 + 32 * 16 * 4 + 3 * 32 * 4;
+  /// the dispatches of a layer (13 for attention and a dense block), and of
+  // one expert of a mixture of experts (6), with a margin: a batch with less
+  // room left is submitted first - a model of hundreds of experts fills the
+  // 4096 descriptor sets of a batch within one layer
+  LAYER_ROOM = 32;
+  EXPERT_ROOM = 8;
 
 /// a device buffer of at least aBytes, reallocated (content lost) when smaller
 procedure NeedDevice(aVk: TInferVulkan; var aBuffer: TInferVkBuffer;
@@ -246,6 +289,13 @@ begin
   FreeAndNil(fDevUp);
   FreeAndNil(fDevCos);
   FreeAndNil(fIn);
+  FreeAndNil(fDevRoute);
+  FreeAndNil(fRouteOut);
+  FreeAndNil(fDevGather);
+  FreeAndNil(fDevExpOut);
+  FreeAndNil(fDevIdx);
+  FreeAndNil(fDevW);
+  FreeAndNil(fMoeIn);
   fRows := 0;
 end;
 
@@ -271,13 +321,17 @@ end;
 { TQwen3Vulkan }
 
 constructor TQwen3Vulkan.Create(aModel: TDecoderModel; aBackend: TInferVulkanBackend);
+var
+  l: PtrInt;
 begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
     EInferError.RaiseUtf8('%.Create: no model or no backend', [self]);
-  // the layers it runs: attention and a dense SwiGLU block (Qwen3)
-  if not aModel.HasOnly(dmAttention, dfDense) then
-    EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
+  // the layers it runs: attention, and a dense SwiGLU block or experts
+  for l := 0 to high(aModel.Config.Spec) do
+    if aModel.Config.Spec[l].Mixer <> dmAttention then
+      EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
+  fMoe := not aModel.HasOnly(dmAttention, dfDense);
   // qkrope.comp keeps one normalized head in shared memory
   // and attention.comp reads it as vec4
   if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
@@ -324,6 +378,14 @@ begin
   end;
   fDecodeKeys := DECODE_KEYS;
   fAdd := TInferVkPipeline.Create(fVk, @SPV_ADD, length(SPV_ADD), 3, 4);
+  fFill0 := TInferVkPipeline.Create(fVk, @SPV_FILL0, length(SPV_FILL0), 1, 4);
+  fGather := TInferVkPipeline.Create(fVk, @SPV_GATHERROWS, length(SPV_GATHERROWS), 3,
+    SizeOf(TRowsPush));
+  fScatter := TInferVkPipeline.Create(fVk, @SPV_SCATTERADD, length(SPV_SCATTERADD),
+    4, SizeOf(TRowsPush));
+  fFill0.Name := 'fill0';
+  fGather.Name := 'gatherrows';
+  fScatter.Name := 'scatteradd';
   fQkRope := TInferVkPipeline.Create(fVk, @SPV_QKROPE, length(SPV_QKROPE), 8,
     SizeOf(TQkRopePush));
   fQkRope16 := TInferVkPipeline.Create(fVk, @SPV_QKROPE_F16,
@@ -352,6 +414,25 @@ begin
   result := fFlash <> nil;
 end;
 
+function TQwen3Vulkan.ExpertBuffers(aLayer: PtrInt): PtrInt;
+var
+  e, j: PtrInt;
+  seen: boolean;
+begin
+  result := 0;
+  if (aLayer < 0) or (aLayer >= length(fExpertGate)) then
+    exit;
+  for e := 0 to high(fExpertGate[aLayer]) do
+  begin
+    seen := false;
+    for j := 0 to e - 1 do
+      if fExpertGate[aLayer][j] = fExpertGate[aLayer][e] then
+        seen := true;
+    if not seen then
+      inc(result);
+  end;
+end;
+
 function TQwen3Vulkan.HasDecodeAttention: boolean;
 begin
   result := fDecode <> nil;
@@ -362,6 +443,9 @@ begin
   // the model no longer hands out contexts of this device
   if (fModel <> nil) and (fModel.Device = self) then
     fModel.Device := nil;
+  fScatter.Free;
+  fGather.Free;
+  fFill0.Free;
   fAddNorm.Free;
   fQkRope16.Free;
   fQkRope.Free;
@@ -403,6 +487,58 @@ var
     fBackend.UploadLinear(w, aCols, aRows);
   end;
 
+  // the experts of a layer: one buffer when they lie one after the other in
+  // host memory (a tensor of a GGUF file) at offsets the device can bind,
+  // else one buffer per expert
+  procedure Experts(const w: TInferWeightDynArray; aRows, aCols: PtrInt;
+    out aBuf: TInferVkBufferDynArray; out aAt: TInt64DynArray);
+  var
+    e: PtrInt;
+    slice, align: Int64;
+    one: boolean;
+    buf: TInferVkBuffer;
+  begin
+    SetLength(aBuf, length(w));
+    SetLength(aAt, length(w));
+    if length(w) = 0 then
+      exit;
+    slice := Int64(aRows) * (aCols div INFER_DTYPE_BLOCK[w[0].DType]) *
+      INFER_DTYPE_SIZE[w[0].DType];
+    // the shaders read the weights as 4-byte words from the bound offset
+    align := fVk.MinStorageAlignment;
+    if align < 4 then
+      align := 4;
+    one := slice mod align = 0;
+    for e := 0 to high(w) do
+    begin
+      if not fBackend.GpuLinear(w[e].DType, aCols) then
+        EInferError.RaiseUtf8('%: no shader for a % expert of % columns',
+          [self, INFER_DTYPE_NAME[w[e].DType], aCols]);
+      if fBackend.LinearPart(w[e].DType, aCols, aRows) < aRows then
+        EInferError.RaiseUtf8('%: a % x % % expert exceeds what the device binds',
+          [self, aRows, aCols, INFER_DTYPE_NAME[w[e].DType]]);
+      if (w[e].DType <> w[0].DType) or
+         (PtrUInt(w[e].Data) <> PtrUInt(w[0].Data) + PtrUInt(e) * PtrUInt(slice)) then
+        one := false;
+    end;
+    if one then
+    begin
+      buf := fBackend.DeviceWeight(w[0].Data, w[0].DType, slice * length(w));
+      for e := 0 to high(w) do
+      begin
+        aBuf[e] := buf;
+        aAt[e] := e * slice;
+      end;
+    end
+    else
+      for e := 0 to high(w) do
+      begin
+        aBuf[e] := fBackend.DeviceWeight(w[e].Data, w[e].DType, Int64(aRows) *
+          (aCols div INFER_DTYPE_BLOCK[w[e].DType]) * INFER_DTYPE_SIZE[w[e].DType]);
+        aAt[e] := 0;
+      end;
+  end;
+
 begin
   // everything up front: a batch cannot upload (and the first token would
   // otherwise carry the whole transfer)
@@ -410,6 +546,18 @@ begin
   c := fModel.Config;
   qw := c.Heads * c.HeadDim;
   kvw := c.KvHeads * c.HeadDim;
+  fExpertGate := nil;
+  fExpertUp := nil;
+  fExpertDown := nil;
+  fExpertGateAt := nil;
+  fExpertUpAt := nil;
+  fExpertDownAt := nil;
+  SetLength(fExpertGate, c.Layers);
+  SetLength(fExpertUp, c.Layers);
+  SetLength(fExpertDown, c.Layers);
+  SetLength(fExpertGateAt, c.Layers);
+  SetLength(fExpertUpAt, c.Layers);
+  SetLength(fExpertDownAt, c.Layers);
   for l := 0 to c.Layers - 1 do
   begin
     ly := @fModel.Layers[l];
@@ -417,9 +565,22 @@ begin
     Matrix(ly^.K, kvw, c.Hidden);
     Matrix(ly^.V, kvw, c.Hidden);
     Matrix(ly^.O, c.Hidden, qw);
-    Matrix(ly^.Gate, c.Intermediate, c.Hidden);
-    Matrix(ly^.Up, c.Intermediate, c.Hidden);
-    Matrix(ly^.Down, c.Hidden, c.Intermediate);
+    if c.Spec[l].Ffn = dfMoe then
+    begin
+      Matrix(ly^.Router, c.Experts, c.Hidden);
+      Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l],
+        fExpertGateAt[l]);
+      Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l],
+        fExpertUpAt[l]);
+      Experts(ly^.ExpertDown, c.Hidden, c.ExpertIntermediate, fExpertDown[l],
+        fExpertDownAt[l]);
+    end
+    else
+    begin
+      Matrix(ly^.Gate, c.Intermediate, c.Hidden);
+      Matrix(ly^.Up, c.Intermediate, c.Hidden);
+      Matrix(ly^.Down, c.Hidden, c.Intermediate);
+    end;
     Vector(ly^.InputNorm, c.Hidden);
     Vector(ly^.PostNorm, c.Hidden);
     Vector(ly^.QNorm, c.HeadDim);
@@ -454,6 +615,8 @@ begin
   // an element-wise dispatch (one invocation per value, 128 per work group)
   // has at most 65535 work groups
   widest := c.Intermediate;
+  if c.ExpertIntermediate > widest then
+    widest := c.ExpertIntermediate;
   if c.Hidden > widest then
     widest := c.Hidden;
   if Int64(c.Heads) * (c.HeadDim shr 1) > widest then
@@ -558,11 +721,28 @@ begin
     NeedDevice(fVk, aCtx.fDevAttn, Int64(aRows) * c.Heads * c.HeadDim * 4);
     NeedDevice(fVk, aCtx.fDevK, Int64(aRows) * kvw * 4);
     NeedDevice(fVk, aCtx.fDevV, Int64(aRows) * kvw * 4);
-    NeedDevice(fVk, aCtx.fDevGate, Int64(aRows) * c.Intermediate * 4);
-    NeedDevice(fVk, aCtx.fDevUp, Int64(aRows) * c.Intermediate * 4);
+    NeedDevice(fVk, aCtx.fDevGate, Int64(aRows) *
+      MaxPtrInt(c.Intermediate, c.ExpertIntermediate) * 4);
+    NeedDevice(fVk, aCtx.fDevUp, Int64(aRows) *
+      MaxPtrInt(c.Intermediate, c.ExpertIntermediate) * 4);
     NeedDevice(fVk, aCtx.fDevCos, Int64(aRows) * half * 2 * 4); // cos, then sin
     // host-visible: embeddings, then cos, then sin
     aCtx.fIn := TInferVkBuffer.Create(fVk, Int64(aRows) * (c.Hidden + 2 * half) * 4);
+    if fMoe then
+    begin
+      NeedDevice(fVk, aCtx.fDevRoute, Int64(aRows) * c.Experts * 4);
+      aCtx.fRouteOut := TInferVkBuffer.CreateReadback(fVk, Int64(aRows) * c.Experts * 4);
+      NeedDevice(fVk, aCtx.fDevGather, Int64(aRows) * c.Hidden * 4);
+      NeedDevice(fVk, aCtx.fDevExpOut, Int64(aRows) * c.Hidden * 4);
+      NeedDevice(fVk, aCtx.fDevIdx, Int64(aRows) * c.ExpertsUsed * 4);
+      NeedDevice(fVk, aCtx.fDevW, Int64(aRows) * c.ExpertsUsed * 4);
+      // host-visible: the token rows, then the weights
+      aCtx.fMoeIn := TInferVkBuffer.Create(fVk, Int64(aRows) * c.ExpertsUsed * 8);
+      SetLength(aCtx.fRoute, aRows * c.Experts);
+      SetLength(aCtx.fChosen, aRows * c.ExpertsUsed);
+      SetLength(aCtx.fChosenW, aRows * c.ExpertsUsed);
+      SetLength(aCtx.fStart, c.Experts + 1);
+    end;
     aCtx.fRows := aRows;
   end;
   if aOutRows > 0 then
@@ -596,6 +776,85 @@ var
 begin
   n := aCount;
   fVk.BatchDispatch(aPipeline, aBuffers, @n, (aCount + 127) div 128);
+end;
+
+procedure TQwen3Vulkan.NeedRoom(aSets: PtrInt);
+begin
+  if fVk.BatchRoom >= aSets then
+    exit;
+  // e.g. a head in more parts than a batch of BatchMaxSets takes
+  if aSets > fVk.BatchMaxSets then
+    EInferError.RaiseUtf8('%: % dispatches do not fit a batch of %',
+      [self, aSets, fVk.BatchMaxSets]);
+  fVk.BatchSubmit;
+  fVk.BatchBegin;
+end;
+
+procedure TQwen3Vulkan.RecordMoe(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
+var
+  ly: ^TQwen3Layer;
+  n, h, fi, k, ne, r, j, e, cnt, total: PtrInt;
+  idx: PIntegerArray;
+  w: PSingleArray;
+  push: TRowsPush;
+  count: cardinal;
+begin
+  ly := @fModel.Layers[aLayer];
+  n := aRows;
+  h := fModel.Config.Hidden;
+  fi := fModel.Config.ExpertIntermediate;
+  k := fModel.Config.ExpertsUsed;
+  ne := fModel.Config.Experts;
+  // the router logits down: the batch so far submitted and waited for
+  fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Router, ne, aCtx.fDevRoute);
+  fVk.BatchCopy(aCtx.fDevRoute, 0, aCtx.fRouteOut, 0, Int64(n) * ne * 4);
+  fVk.BatchSubmit;
+  MoveFast(aCtx.fRouteOut.Mapped^, pointer(aCtx.fRoute)^, n * ne * SizeOf(single));
+  // the choice on the host, as on the CPU
+  for r := 0 to n - 1 do
+    fModel.Route(@aCtx.fRoute[r * ne], @aCtx.fChosen[r * k], @aCtx.fChosenW[r * k]);
+  // the token rows and weights of every expert, expert by expert (no batch is
+  // pending: fMoeIn may be written)
+  idx := aCtx.fMoeIn.Mapped;
+  w := @idx^[n * k];
+  total := 0;
+  for e := 0 to ne - 1 do
+  begin
+    aCtx.fStart[e] := total;
+    for r := 0 to n - 1 do
+      for j := 0 to k - 1 do
+        if aCtx.fChosen[r * k + j] = e then
+        begin
+          idx^[total] := r;
+          w^[total] := aCtx.fChosenW[r * k + j];
+          inc(total);
+        end;
+  end;
+  aCtx.fStart[ne] := total;
+  fVk.BatchBegin;
+  fVk.BatchCopy(aCtx.fMoeIn, 0, aCtx.fDevIdx, 0, Int64(total) * 4);
+  fVk.BatchCopy(aCtx.fMoeIn, Int64(n) * k * 4, aCtx.fDevW, 0, Int64(total) * 4);
+  count := n * h;
+  fVk.BatchDispatch(fFill0, [aCtx.fDevTmp], @count, (count + 127) div 128);
+  push.Cols := h;
+  for e := 0 to ne - 1 do
+  begin
+    cnt := aCtx.fStart[e + 1] - aCtx.fStart[e];
+    if cnt = 0 then
+      continue;
+    NeedRoom(EXPERT_ROOM);
+    push.First := aCtx.fStart[e];
+    fVk.BatchDispatch(fGather, [aCtx.fDevH, aCtx.fDevIdx, aCtx.fDevGather], @push, cnt);
+    fBackend.RecordLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertGate[e].DType,
+      fExpertGate[aLayer][e], fExpertGateAt[aLayer][e], fi, aCtx.fDevGate, false);
+    fBackend.RecordLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertUp[e].DType,
+      fExpertUp[aLayer][e], fExpertUpAt[aLayer][e], fi, aCtx.fDevUp);
+    RecordElementwise(fSwiGlu, [aCtx.fDevGate, aCtx.fDevUp], cnt * fi);
+    fBackend.RecordLinearAt(aCtx.fDevGate, cnt, fi, ly^.ExpertDown[e].DType,
+      fExpertDown[aLayer][e], fExpertDownAt[aLayer][e], h, aCtx.fDevExpOut);
+    fVk.BatchDispatch(fScatter, [aCtx.fDevExpOut, aCtx.fDevIdx, aCtx.fDevW,
+      aCtx.fDevTmp], @push, cnt);
+  end;
 end;
 
 procedure TQwen3Vulkan.Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray;
@@ -713,6 +972,7 @@ begin
     RecordNorm(aCtx.fDevX, n, h, fModel.Layers[0].InputNorm, aCtx.fDevH);
     for l := 0 to c.Layers - 1 do
     begin
+      NeedRoom(LAYER_ROOM);
       ly := @fModel.Layers[l];
       // attention block: the three projections side by side (no barrier
       // between them: they only read fDevH), then per head the norms, rotary
@@ -732,10 +992,15 @@ begin
       // SwiGLU, down
       fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp, Vector(ly^.PostNorm, h),
         aCtx.fDevH], @norm, n);
-      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate, false);
-      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
-      RecordElementwise(fSwiGlu, [aCtx.fDevGate, aCtx.fDevUp], n * f);
-      fBackend.RecordLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
+      if c.Spec[l].Ffn = dfMoe then
+        RecordMoe(aCtx, l, n)
+      else
+      begin
+        fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate, false);
+        fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
+        RecordElementwise(fSwiGlu, [aCtx.fDevGate, aCtx.fDevUp], n * f);
+        fBackend.RecordLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
+      end;
       // the residual, and the input norm of the next layer
       if l < c.Layers - 1 then
         fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp,
@@ -749,6 +1014,9 @@ begin
     end;
     if outRows > 0 then
     begin
+      // the norm, then one dispatch per part of the head (the copies take no
+      // descriptor set)
+      NeedRoom((c.VocabSize + fHeadPart - 1) div fHeadPart + 4);
       if outRows = 1 then
       begin
         // the last row only: to the start of the scratch, its norm, the head

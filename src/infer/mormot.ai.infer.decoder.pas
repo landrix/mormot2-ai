@@ -34,6 +34,7 @@ unit mormot.ai.infer.decoder;
     - TDecoderContext: KV cache and scratch buffers of one sequence
     - TDecoderModel: weights validated at load, Forward over new tokens, Greedy
     - TDecoderDevice: computes a TDecoderModel elsewhere (a GPU)
+    - TDecoderRouteTape: the expert choices of one run handed to another
     - RegisterDecoderModel / NewDecoderModel: a family by its model type
 
   *****************************************************************************
@@ -131,6 +132,57 @@ type
 
   TDecoderDevice = class;
 
+  /// what TDecoderModel.Route does with its TDecoderRouteTape
+  // - drmOff: routes from the logits; drmRecord: routes from the logits and
+  // appends the choice; drmReplay: routes from the logits, compares, and hands
+  // out the next recorded choice instead
+  TDecoderRouteMode = (
+    drmOff,
+    drmRecord,
+    drmReplay);
+
+  /// the expert choices (ids and weights) of a run, recorded token by token
+  // and layer by layer, handed in the same order to another run of the same
+  // tokens - for tests: a device given the CPU's choice computes the same
+  // experts, so its logits differ by arithmetic only, not by a near tie of the
+  // router; the choice it would have made is compared (Differs, DiffersGap)
+  // - both runs must route the tokens in the same order: layer by layer, the
+  // rows of a chunk in order - so the same chunks (the CPU takes all tokens
+  // of a Forward at once, a device up to its chunk size: a short prompt)
+  // - not thread-safe: one sequence at a time on its model
+  TDecoderRouteTape = class
+  protected
+    fMode: TDecoderRouteMode;
+    fChosen: TIntegerDynArray;
+    fWeights: TSingleDynArray;
+    fCount, fPos, fRoutes, fDiffers: PtrInt; // in routed tokens
+    fDiffersGap: double;
+    procedure Put(aChosen: PIntegerArray; aWeights: PSingleArray; aUsed: PtrInt);
+    procedure Take(aLogits: PSingleArray; aChosen: PIntegerArray;
+      aWeights: PSingleArray; aExperts, aUsed: PtrInt);
+  public
+    /// forget the recorded choices and the counters
+    procedure Clear;
+    /// drmRecord before the reference run, drmReplay before the other one -
+    // a recording starts over once everything recorded was replayed
+    property Mode: TDecoderRouteMode
+      read fMode write fMode;
+    /// routed tokens recorded and not yet replayed
+    function Pending: PtrInt;
+    /// tokens replayed since Clear
+    property Routes: PtrInt
+      read fRoutes;
+    /// replayed tokens whose own choice (from the logits of the replaying
+    // run) was another set of experts than the recorded one
+    property Differs: PtrInt
+      read fDiffers;
+    /// the largest gap, among Differs, between the k-th highest router logit
+    // of the replaying run and the highest one it left out: a near tie gives
+    // a small gap, a wrong routing a large one
+    property DiffersGap: double
+      read fDiffersGap;
+  end;
+
   /// the KV cache and scratch buffers of one sequence
   // - one per concurrent sequence; may be reused for another sequence after
   // Reset, and for another model of the same shape
@@ -190,6 +242,7 @@ type
     fOwnedQ4: array of array of TInferBlockQ4_0;
     fWeights: TInferDType;
     fEmbedSrc: PInferTensor; // the embedding as stored: read per token
+    fRouteTape: TDecoderRouteTape;
     fEmbed, fHead: TInferWeight;
     fNorm: PSingleArray;
     fLayer: TDecoderLayerDynArray;
@@ -297,6 +350,8 @@ type
     /// the experts of one token from its [Experts] router logits: aChosen and
     // aWeights ([ExpertsUsed] each), highest probability first - as MoeBlock
     // routes, also for a device that routes on the host
+    // - with a RouteTape: recorded (drmRecord), or the recorded choice handed
+    // out instead (drmReplay)
     procedure Route(aLogits: PSingleArray; aChosen: PIntegerArray;
       aWeights: PSingleArray);
     /// true when every layer is of the kind aMixer and aFfn - what a device
@@ -331,6 +386,10 @@ type
     // computed there whatever Device is now
     property Device: TDecoderDevice
       read fDevice write SetDevice;
+    /// the expert choices of Route recorded or replayed (tests); nil (the
+    // default): Route only routes - not owned, one sequence at a time
+    property RouteTape: TDecoderRouteTape
+      read fRouteTape write fRouteTape;
   end;
 
   /// a decoder family, as RegisterDecoderModel takes it
@@ -1040,6 +1099,93 @@ begin
   if fConfig.NormTopK then
     for j := 0 to k - 1 do
       aWeights^[j] := aWeights^[j] / picked;
+  if fRouteTape <> nil then
+    case fRouteTape.Mode of
+      drmRecord:
+        fRouteTape.Put(aChosen, aWeights, k);
+      drmReplay:
+        fRouteTape.Take(aLogits, aChosen, aWeights, e, k);
+    end;
+end;
+
+
+{ TDecoderRouteTape }
+
+procedure TDecoderRouteTape.Clear;
+begin
+  fCount := 0;
+  fPos := 0;
+  fRoutes := 0;
+  fDiffers := 0;
+  fDiffersGap := 0;
+end;
+
+function TDecoderRouteTape.Pending: PtrInt;
+begin
+  result := fCount - fPos;
+end;
+
+procedure TDecoderRouteTape.Put(aChosen: PIntegerArray; aWeights: PSingleArray;
+  aUsed: PtrInt);
+begin
+  if fPos = fCount then
+  begin
+    // everything recorded was replayed: start over
+    fCount := 0;
+    fPos := 0;
+  end;
+  if (fCount + 1) * aUsed > length(fChosen) then
+  begin
+    SetLength(fChosen, NextGrow((fCount + 1) * aUsed));
+    SetLength(fWeights, length(fChosen));
+  end;
+  MoveFast(aChosen^[0], fChosen[fCount * aUsed], aUsed * SizeOf(integer));
+  MoveFast(aWeights^[0], fWeights[fCount * aUsed], aUsed * SizeOf(single));
+  inc(fCount);
+end;
+
+procedure TDecoderRouteTape.Take(aLogits: PSingleArray; aChosen: PIntegerArray;
+  aWeights: PSingleArray; aExperts, aUsed: PtrInt);
+var
+  i, j: PtrInt;
+  same, mine: boolean;
+  kth, best: double;
+begin
+  if fPos >= fCount then
+    EInferError.RaiseUtf8('%: no recorded choice left (% replayed)', [self, fRoutes]);
+  // the same set of experts? (both lists hold distinct ids)
+  same := true;
+  for j := 0 to aUsed - 1 do
+  begin
+    mine := false;
+    for i := 0 to aUsed - 1 do
+      if fChosen[fPos * aUsed + i] = aChosen^[j] then
+        mine := true;
+    if not mine then
+      same := false;
+  end;
+  if not same then
+  begin
+    inc(fDiffers);
+    // the k-th highest logit of this run, and the highest one it left out
+    kth := aLogits^[aChosen^[aUsed - 1]];
+    best := -1E38;
+    for i := 0 to aExperts - 1 do
+    begin
+      mine := false;
+      for j := 0 to aUsed - 1 do
+        if aChosen^[j] = i then
+          mine := true;
+      if not mine and (aLogits^[i] > best) then
+        best := aLogits^[i];
+    end;
+    if kth - best > fDiffersGap then
+      fDiffersGap := kth - best;
+  end;
+  MoveFast(fChosen[fPos * aUsed], aChosen^[0], aUsed * SizeOf(integer));
+  MoveFast(fWeights[fPos * aUsed], aWeights^[0], aUsed * SizeOf(single));
+  inc(fPos);
+  inc(fRoutes);
 end;
 
 procedure TDecoderModel.MoeBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;

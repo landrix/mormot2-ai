@@ -696,6 +696,7 @@ type
     fDeviceName: RawUtf8;
     fDeviceType, fVendorId: integer;
     fMaxStorageRange, fMaxInvocations, fMaxGroupSizeX, fMaxSharedMemory: cardinal;
+    fMinStorageAlign: TVkDeviceSize;
     fApiVersion, fSubgroupSize, fSubgroupStages, fSubgroupOperations: cardinal;
     fPortability: boolean;
     // a Run whose work may still be pending on the device (its wait failed):
@@ -706,7 +707,7 @@ type
     // the descriptor sets of a batch: one per dispatch, the pool reset at
     // BatchBegin; fBatching while a batch is being recorded
     fBatchPool: TVkHandle;
-    fBatchSets: integer;
+    fBatchSets, fBatchMax: integer;
     fBatching: boolean;
     // the command buffers of a batch: fCmd is fCmds[fCmdIndex]; BatchFlush
     // submits the current one without a fence (fFlushed) and goes on in the next
@@ -753,13 +754,16 @@ type
       aX, aY, aZ: cardinal);
     procedure DoCopy(aUp: boolean; aBuffer: TInferVkBuffer;
       aOffset: TVkDeviceSize; aHost: PByte; aBytes: TVkDeviceSize);
+    // aOffsets, aRanges: nil binds every buffer whole, else per buffer a byte
+    // offset and range (a range of 0: the whole buffer)
     procedure Bind(aPipeline: TInferVkPipeline; aSet: TVkHandle;
-      const aBuffers: array of TInferVkBuffer);
+      const aBuffers: array of TInferVkBuffer; aOffsets, aRanges: PInt64Array);
     procedure Barrier;
+    procedure SetBatchMax(aValue: integer);
     procedure DoBatchBegin;
     procedure DoBatchDispatch(aPipeline: TInferVkPipeline;
-      const aBuffers: array of TInferVkBuffer; aPush: pointer;
-      aX, aY, aZ: cardinal; aBarrier: boolean);
+      const aBuffers: array of TInferVkBuffer; aOffsets, aRanges: PInt64Array;
+      aPush: pointer; aX, aY, aZ: cardinal; aBarrier: boolean);
   public
     /// load the loader, create an instance and a device; raises EInferVulkan
     // when any step fails (no loader, no device, no compute queue)
@@ -791,6 +795,14 @@ type
     procedure BatchDispatch(aPipeline: TInferVkPipeline;
       const aBuffers: array of TInferVkBuffer; aPush: pointer;
       aX: cardinal; aY: cardinal = 1; aZ: cardinal = 1; aBarrier: boolean = true);
+    /// BatchDispatch binding a part of each buffer: aRanges[i] bytes from
+    // aOffsets[i] (a multiple of MinStorageAlignment, the range at most
+    // MaxStorageRange), or the whole buffer when aRanges[i] = 0 - e.g. one
+    // expert of a buffer which holds all experts of a layer
+    procedure BatchDispatchAt(aPipeline: TInferVkPipeline;
+      const aBuffers: array of TInferVkBuffer; const aOffsets, aRanges: array of Int64;
+      aPush: pointer; aX: cardinal; aY: cardinal = 1; aZ: cardinal = 1;
+      aBarrier: boolean = true);
     /// record a copy of aBytes from aSrc at aSrcOffset to aDst at aDstOffset
     procedure BatchCopy(aSrc: TInferVkBuffer; aSrcOffset: TVkDeviceSize;
       aDst: TInferVkBuffer; aDstOffset: TVkDeviceSize; aBytes: TVkDeviceSize);
@@ -810,6 +822,15 @@ type
     procedure BatchSubmit;
     /// leave a batch without submitting it (after an exception while recording)
     procedure BatchAbort;
+    /// how many more dispatches the batch being recorded takes (BatchMaxSets
+    // less those recorded): a caller with an unknown number of dispatches
+    // ahead submits and begins a new batch when this runs low
+    function BatchRoom: integer;
+    /// the dispatches of one batch at most: VK_BATCH_SETS (4096, the size of
+    // the descriptor pool) by default - lower, at least 16, for tests of
+    // callers which split their batches by BatchRoom (TQwen3Vulkan needs room
+    // for a layer, and for its head: the norm and every part of it)
+    property BatchMaxSets: integer read fBatchMax write SetBatchMax;
     property Api: TInferVkApi read fApi;
     property Device: TVkDispatch read fDevice;
     /// VkPhysicalDeviceProperties.deviceName, deviceType, vendorID
@@ -818,6 +839,9 @@ type
     property VendorId: integer read fVendorId;
     /// VkPhysicalDeviceLimits.maxStorageBufferRange: Run binds no larger buffer
     property MaxStorageRange: cardinal read fMaxStorageRange;
+    /// VkPhysicalDeviceLimits.minStorageBufferOffsetAlignment: the offsets of
+    // BatchDispatchAt are multiples of it (at least 1)
+    property MinStorageAlignment: TVkDeviceSize read fMinStorageAlign;
     /// VkPhysicalDeviceLimits.maxComputeWorkGroupInvocations (at least 128)
     property MaxInvocations: cardinal read fMaxInvocations;
     /// VkPhysicalDeviceLimits.maxComputeWorkGroupSize[0] (at least 128)
@@ -869,6 +893,9 @@ implementation
 const
   /// the command buffers of a batch: BatchFlush submits up to VK_BATCH_CMDS - 1
   VK_BATCH_CMDS = 8;
+  /// descriptor sets of one batch: a forward pass of a 64-layer model needs
+  // about a thousand (BatchMaxSets)
+  VK_BATCH_SETS = 4096;
 
 var
   // TInferVulkan.Available: 0 = not tried yet, 1 = yes, 2 = no
@@ -1018,6 +1045,7 @@ var
   fpu: TDriverFpu;
 begin
   inherited Create;
+  fBatchMax := VK_BATCH_SETS;
   fpu := DriverFpuEnter;
   try
     Open;
@@ -1210,6 +1238,10 @@ begin
   fMaxInvocations := PCardinal(@props[296 + 232])^;
   fMaxGroupSizeX := PCardinal(@props[296 + 236])^;
   fMaxSharedMemory := PCardinal(@props[296 + 216])^;
+  // behind minMemoryMapAlignment (a size_t) too, a VkDeviceSize
+  fMinStorageAlign := PInt64(@props[296 + {$ifdef CPU64} 328 {$else} 320 {$endif}])^;
+  if fMinStorageAlign < 1 then
+    fMinStorageAlign := 1;
   // nanoseconds per tick; behind minMemoryMapAlignment, a size_t: the offset
   // differs between 32 and 64 bits (vulkan_core.h)
   fTimestampPeriod := PSingle(@props[296 + {$ifdef CPU64} 424 {$else} 416 {$endif}])^;
@@ -1417,7 +1449,7 @@ begin
     raise EInferVulkan.Create('Vulkan.Run: an earlier Run did not finish');
   if fBatching then
     raise EInferVulkan.Create('Vulkan.Run: a batch is being recorded');
-  Bind(aPipeline, aPipeline.fSet, aBuffers);
+  Bind(aPipeline, aPipeline.fSet, aBuffers, nil, nil);
   CmdBegin;
   fApi.CmdBindPipeline(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE, aPipeline.fPipeline);
   fApi.CmdBindDescriptorSets(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1430,11 +1462,12 @@ begin
 end;
 
 procedure TInferVulkan.Bind(aPipeline: TInferVkPipeline; aSet: TVkHandle;
-  const aBuffers: array of TInferVkBuffer);
+  const aBuffers: array of TInferVkBuffer; aOffsets, aRanges: PInt64Array);
 var
   infos: array[0..VK_MAX_BINDINGS - 1] of TVkDescriptorBufferInfo;
   writes: array[0..VK_MAX_BINDINGS - 1] of TVkWriteDescriptorSet;
   i: PtrInt;
+  offset, range: TVkDeviceSize;
 begin
   if length(aBuffers) <> aPipeline.Buffers then
     raise EInferVulkan.CreateUtf8('Vulkan.Run: % buffers for a pipeline of %',
@@ -1444,12 +1477,30 @@ begin
   FillCharFast(writes, SizeOf(writes), 0);
   for i := 0 to high(aBuffers) do
   begin
-    if aBuffers[i].Size > fMaxStorageRange then
-      raise EInferVulkan.CreateUtf8('Vulkan.Run: buffer % of % bytes, the device ' +
-        'binds at most %', [i, aBuffers[i].Size, fMaxStorageRange]);
+    range := 0;
+    offset := 0;
+    if aRanges <> nil then
+    begin
+      range := aRanges^[i];
+      offset := aOffsets^[i];
+    end;
+    if range = 0 then
+    begin
+      if aBuffers[i].Size > fMaxStorageRange then
+        raise EInferVulkan.CreateUtf8('Vulkan.Run: buffer % of % bytes, the device ' +
+          'binds at most %', [i, aBuffers[i].Size, fMaxStorageRange]);
+      offset := 0;
+      range := VK_WHOLE_SIZE;
+    end
+    else if (offset < 0) or (offset > aBuffers[i].Size) or (range < 0) or
+            (range > aBuffers[i].Size - offset) or (range > fMaxStorageRange) or
+            (offset mod fMinStorageAlign <> 0) then
+      raise EInferVulkan.CreateUtf8('Vulkan.Run: % bytes at % of buffer % (% bytes; ' +
+        'the device binds at most % from multiples of %)', [range, offset, i,
+        aBuffers[i].Size, fMaxStorageRange, fMinStorageAlign]);
     infos[i].buffer := aBuffers[i].Handle;
-    infos[i].offset := 0;
-    infos[i].range := VK_WHOLE_SIZE;
+    infos[i].offset := offset;
+    infos[i].range := range;
     writes[i].sType := VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[i].dstSet := aSet;
     writes[i].dstBinding := i;
@@ -1612,11 +1663,6 @@ begin
     dec(aBytes, n);
   end;
 end;
-
-const
-  /// descriptor sets of one batch: a forward pass of a 64-layer model needs
-  // about a thousand
-  VK_BATCH_SETS = 4096;
 
 procedure TInferVulkan.Barrier;
 var
@@ -1808,24 +1854,43 @@ var
 begin
   fpu := DriverFpuEnter;
   try
-    DoBatchDispatch(aPipeline, aBuffers, aPush, aX, aY, aZ, aBarrier);
+    DoBatchDispatch(aPipeline, aBuffers, nil, nil, aPush, aX, aY, aZ, aBarrier);
+  finally
+    DriverFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferVulkan.BatchDispatchAt(aPipeline: TInferVkPipeline;
+  const aBuffers: array of TInferVkBuffer; const aOffsets, aRanges: array of Int64;
+  aPush: pointer; aX, aY, aZ: cardinal; aBarrier: boolean);
+var
+  fpu: TDriverFpu;
+begin
+  if (length(aBuffers) = 0) or (length(aOffsets) <> length(aBuffers)) or
+     (length(aRanges) <> length(aBuffers)) then
+    raise EInferVulkan.CreateUtf8('Vulkan.BatchDispatchAt: % buffers, % offsets, ' +
+      '% ranges', [length(aBuffers), length(aOffsets), length(aRanges)]);
+  fpu := DriverFpuEnter;
+  try
+    DoBatchDispatch(aPipeline, aBuffers, @aOffsets[0], @aRanges[0], aPush, aX, aY, aZ,
+      aBarrier);
   finally
     DriverFpuLeave(fpu);
   end;
 end;
 
 procedure TInferVulkan.DoBatchDispatch(aPipeline: TInferVkPipeline;
-  const aBuffers: array of TInferVkBuffer; aPush: pointer; aX, aY, aZ: cardinal;
-  aBarrier: boolean);
+  const aBuffers: array of TInferVkBuffer; aOffsets, aRanges: PInt64Array;
+  aPush: pointer; aX, aY, aZ: cardinal; aBarrier: boolean);
 var
   ainfo: TVkDescriptorSetAllocateInfo;
   dset: TVkHandle;
 begin
   if not fBatching then
     raise EInferVulkan.Create('Vulkan.BatchDispatch: no BatchBegin');
-  if fBatchSets >= VK_BATCH_SETS then
+  if fBatchSets >= fBatchMax then
     raise EInferVulkan.CreateUtf8('Vulkan.BatchDispatch: more than % dispatches',
-      [VK_BATCH_SETS]);
+      [fBatchMax]);
   FillCharFast(ainfo, SizeOf(ainfo), 0);
   ainfo.sType := VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
   ainfo.descriptorPool := fBatchPool;
@@ -1835,7 +1900,7 @@ begin
   Check(fApi.AllocateDescriptorSets(fDevice, @ainfo, @dset),
     'vkAllocateDescriptorSets');
   inc(fBatchSets);
-  Bind(aPipeline, dset, aBuffers);
+  Bind(aPipeline, dset, aBuffers, aOffsets, aRanges);
   fApi.CmdBindPipeline(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE, aPipeline.fPipeline);
   fApi.CmdBindDescriptorSets(fCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
     aPipeline.fLayout, 0, 1, @dset, 0, nil);
@@ -1972,6 +2037,20 @@ begin
   finally
     DriverFpuLeave(fpu);
   end;
+end;
+
+function TInferVulkan.BatchRoom: integer;
+begin
+  result := fBatchMax - fBatchSets;
+end;
+
+procedure TInferVulkan.SetBatchMax(aValue: integer);
+begin
+  if aValue < 16 then
+    aValue := 16
+  else if aValue > VK_BATCH_SETS then
+    aValue := VK_BATCH_SETS;
+  fBatchMax := aValue;
 end;
 
 procedure TInferVulkan.BatchAbort;

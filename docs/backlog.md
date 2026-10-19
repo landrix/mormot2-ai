@@ -218,9 +218,16 @@ Graph mit wechselnden Experten-IDs. Gate: CPU und GPU gleich bei wechselnder Aus
 leeren Gruppen; Prefill/Decode und Speicherspitze gemessen auf RTX und M2 Pro (Tiny).
 *D3a erledigt 2026-10-17: CUDA* (`native-inference.md`, Phase D) - erst korrekt, die Wahl
 noch auf dem Host: Qwen3-30B-A3B auf der RTX 5090 Decode 33 bis 35, Prefill 384 bis 494
-Tokens/s. *Offen:* D3b Vulkan (Bindungen mit Versatz für die Experten, drei Shader, ein
-Warten je MoE-Layer); danach die Wahl auf dem Gerät (Route-Kernel, Linear mit Experten-Ids,
-Graph) für das Decode-Tempo.
+Tokens/s.
+*D3b erledigt 2026-10-19: Vulkan* (`native-inference.md`, Phase D) - Bindungen mit Versatz
+(`BatchDispatchAt`), `fill0`/`gatherrows`/`scatteradd.comp`, ein Warten je MoE-Layer, Batch
+geteilt, wenn die Deskriptor-Sets knapp werden: Qwen3-30B-A3B auf der RTX 5090 Decode 43 bis
+44, Prefill 489 bis 642 Tokens/s (schneller als CUDA mit 41 und 383).
+Die Expertenwahl im Vergleichstest ist vorgegeben (`TDecoderRouteTape`, umgesetzt wie unten
+beschrieben; unter Delphi 13 bleibt eine Abweichung aus der CPU-Rechnung, B13).
+*Offen:* die Wahl auf dem Gerät
+(Route-Kernel, Linear mit Experten-Ids, auf CUDA wieder ein Graph) für das Decode-Tempo;
+Lauf auf dem M2 Pro (MoltenVK, Tiny-Modell).
 *Mit D3b (entschieden 2026-10-17): Expertenwahl im Vergleichstest vorgeben.* Heute misst
 `Qwen3MoeGgufMatchesCpu` Rechengenauigkeit und Routing in einem Kosinus: unter Delphi 13 kippt
 bei einer knappen Router-Entscheidung ein Experte gegenüber der CPU, deshalb 0,98 und 14 von
@@ -581,6 +588,11 @@ treibt die 5090 an ihre Leistungsgrenze (rund 0,8 Decode-Tokens je Joule bei Vul
 Anlass: Qwen3-30B-A3B gibt auf der CPU unter Delphi 13 andere Logits als unter FPC, genug, dass
 bei knappen Router-Entscheidungen ein anderer Experte gewählt wird (Kosinus gegen CUDA 0,988
 statt 0,992, Argmax 15 statt 16 von 16; B4, D3a).
+
+**Befund 2026-10-19 (D3b):** mit vorgegebener Expertenwahl (`TDecoderRouteTape`) bleibt unter
+Delphi 13 Kosinus 0,9975 und Argmax 15 von 16 gegen die GPU, unter FPC 0,9995 und 16 von 16 -
+die Abweichung steckt also in der Rechnung selbst, nicht im Routing. Damit ist ein Vergleich je
+Layer (Vorgehen 1) mit festem Routing möglich.
 
 **Stand der Ursache (nicht gemessen):** die x64-Kernel sind es vermutlich nicht -
 `InitKernels` setzt unter FPC und Delphi 11+ dieselben AVX2-Routinen (gemeinsamer Assembler,

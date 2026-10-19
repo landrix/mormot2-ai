@@ -1,0 +1,26 @@
+// LandrixAI - dst[idx[first + r]] += w[first + r] * src[r], rows of cols
+// floats, one work group per row: the output of one expert added back to the
+// rows of its tokens with their router weights (phase D of
+// docs/native-inference.md, slice D3; scatteradd of tools/cuda/ops.cu)
+// - the tokens of one expert are distinct: no two work groups of a dispatch
+// write the same row
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufS { float src[]; };
+layout(std430, binding = 1) readonly buffer BufI { int idx[]; };
+layout(std430, binding = 2) readonly buffer BufW { float w[]; };
+layout(std430, binding = 3) buffer BufD { float dst[]; };
+
+layout(push_constant) uniform Push { uint cols; uint first; } p;
+
+void main()
+{
+  uint r = gl_WorkGroupID.x;
+  uint s = r * p.cols;
+  uint d = uint(idx[p.first + r]) * p.cols;
+  float f = w[p.first + r];
+  for (uint c = gl_LocalInvocationID.x; c < p.cols; c += 128u)
+    dst[d + c] = dst[d + c] + f * src[s + c];
+}

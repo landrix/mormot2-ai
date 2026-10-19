@@ -31,6 +31,7 @@ uses
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.sampler,
   test.infer.ref,
+  test.infer.fast,
   test.infer.bpe;
 
 type
@@ -112,6 +113,11 @@ type
     procedure TinyMoeQuantized;
     /// Qwen3-MoE settings refused
     procedure TinyMoeRefused;
+    /// TDecoderRouteTape: a run replaying the recorded choice of the same
+    // tokens gives the same bits and no differing choice; the choice of other
+    // tokens differs (with a gap) and changes the logits; nothing left to
+    // replay raises
+    procedure RouteTapeReplays;
   end;
 
 
@@ -1867,6 +1873,103 @@ begin
     c.Free;
     a.Free;
     ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.RouteTapeReplays;
+const
+  A: array[0..5] of integer = (5, 17, 33, 9, 70, 41);
+  B: array[0..5] of integer = (88, 3, 52, 61, 12, 29);
+var
+  dir: TFileName;
+  model: TDecoderModel;
+  c1, c2: TDecoderContext;
+  tape: TDecoderRouteTape;
+  l1, l2, l3: TSingleDynArray;
+  v, routes, i: PtrInt;
+  raised: boolean;
+  x, y: array[0..7] of single;
+  cx, cy: array[0..1] of integer;
+  wx, wy: array[0..1] of single;
+begin
+  dir := FindInferRefDir('tiny-qwen3moe');
+  if CheckFailed(dir <> '', 'tiny-qwen3moe found') then
+    exit;
+  model := nil;
+  c1 := nil;
+  c2 := nil;
+  tape := TDecoderRouteTape.Create;
+  try
+    model := TQwen3MoeModel.Create(dir, fCpu);
+    v := model.Config.VocabSize;
+    SetLength(l1, v);
+    SetLength(l2, v);
+    SetLength(l3, v);
+    c1 := model.NewContext;
+    c2 := model.NewContext;
+    // without a tape: A, and B for the forced choice below
+    model.Forward(c1, @A[0], length(A), pointer(l2));
+    c1.Reset;
+    model.Forward(c1, @B[0], length(B), pointer(l3));
+    c1.Reset;
+    model.RouteTape := tape;
+    tape.Mode := drmRecord;
+    model.Forward(c1, @A[0], length(A), pointer(l1));
+    Check(SameBits(pointer(l1), pointer(l2), v), 'recording leaves the logits as they were');
+    // two layers with experts, one route per token in each
+    routes := length(A) * 2;
+    CheckUtf8(tape.Pending = routes, '% routes recorded', [tape.Pending]);
+    tape.Mode := drmReplay;
+    model.Forward(c2, @A[0], length(A), pointer(l2));
+    Check(SameBits(pointer(l1), pointer(l2), v), 'the same tokens replayed: the same bits');
+    CheckUtf8((tape.Routes = routes) and (tape.Differs = 0) and (tape.Pending = 0),
+      'replayed %, differing %, pending %', [tape.Routes, tape.Differs, tape.Pending]);
+    // nothing left to replay
+    raised := false;
+    try
+      model.Forward(c2, @A[0], 1, pointer(l2));
+    except
+      on EInferError do
+        raised := true;
+    end;
+    Check(raised, 'replay with nothing recorded');
+    // Route itself: the recorded experts and weights handed out bit for bit,
+    // whatever the logits of the replaying run - here experts 0 and 1 against
+    // 7 and 6, the gap between the 2nd (6: 0.6) and the best left out (5: 0.5)
+    for i := 0 to 7 do
+    begin
+      x[i] := (7 - i) * 0.25;
+      y[i] := i * 0.1;
+    end;
+    c1.Reset;
+    tape.Clear;
+    tape.Mode := drmRecord;
+    model.Route(@x, @cx, @wx);
+    Check((cx[0] = 0) and (cx[1] = 1), 'the two highest logits of x');
+    tape.Mode := drmReplay;
+    model.Route(@y, @cy, @wy);
+    Check((cy[0] = cx[0]) and (cy[1] = cx[1]), 'the recorded experts handed out');
+    Check(SameBits(@wy, @wx, 2), 'the recorded weights handed out');
+    CheckUtf8((tape.Differs = 1) and (Abs(tape.DiffersGap - 0.1) < 1e-6),
+      'one differing choice at a gap of 0.1: %, %', [tape.Differs, tape.DiffersGap]);
+    // the choice of A forced on the tokens of B: differing choices, other logits
+    c1.Reset;
+    c2.Reset;
+    tape.Clear;
+    tape.Mode := drmRecord;
+    model.Forward(c1, @A[0], length(A), pointer(l1));
+    tape.Mode := drmReplay;
+    model.Forward(c2, @B[0], length(B), pointer(l2));
+    CheckUtf8((tape.Differs > 0) and (tape.DiffersGap > 0),
+      'other tokens: % differing choices, largest gap %', [tape.Differs, tape.DiffersGap]);
+    Check(not SameBits(pointer(l2), pointer(l3), v), 'a forced choice changes the logits');
+  finally
+    if model <> nil then
+      model.RouteTape := nil;
+    tape.Free;
+    c2.Free;
+    c1.Free;
+    model.Free;
   end;
 end;
 

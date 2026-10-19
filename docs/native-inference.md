@@ -1646,6 +1646,75 @@ und an rund 45 Kernel-Starts je MoE-Layer ohne Graph - der nächste Hebel ist di
 dem Gerät (ein Route-Kernel, Linear mit Experten-Ids aus einem Gerätepuffer, dann wieder ein
 Graph).
 
+**D3b erledigt (2026-10-19): Mixture of Experts auf Vulkan.**
+
+- `TQwen3Vulkan` nimmt Layer mit Experten. Der Router rechnet im Batch, seine Logits gehen in
+  einen lesbaren Puffer, dann wird der Batch abgeschickt und abgewartet (ein Warten je
+  MoE-Layer); der Host wählt wie auf der CPU (`TDecoderModel.Route`), schreibt Token-Zeilen und
+  Gewichte jedes Experten in einen Host-Puffer und beginnt den nächsten Batch, der sie auf das
+  Gerät kopiert. Dann Experte für Experte in Id-Reihenfolge: `gatherrows.comp`, Gate und Up
+  (`TInferVulkanBackend.RecordLinearAt`), `swiglu.comp`, Down, `scatteradd.comp`; vorher leert
+  `fill0.comp` die Ausgabe. Wo die Zeilen eines Experten beginnen, kommt als Push-Konstante
+  (`First`), nicht als Versatz einer Bindung.
+- Bindungen mit Versatz: `TInferVulkan.BatchDispatchAt` bindet einen Ausschnitt eines Puffers
+  (Versatz ein Vielfaches von `minStorageBufferOffsetAlignment`, Bereich höchstens
+  `maxStorageBufferRange`; `MinStorageAlignment` liest das Limit an Byte 296 + 328 bzw.
+  + 320 unter 32 Bit). So bleiben die Experten eines Layers ein Puffer, wenn sie im GGUF ein
+  Tensor sind und jeder Experte an einem gebundenen Versatz liegt (mindestens 4 Byte, die
+  Shader lesen Wörter) - einzelne Puffer für 18432 Experten stießen sonst an
+  `maxMemoryAllocationCount` (unter Windows oft 4096). Sonst (safetensors, Q8_0 beim Laden)
+  ein Puffer je Experte. Der Bereich muss in eine Bindung passen, der Puffer als Ganzes nicht.
+- Ein Batch hat höchstens 4096 Deskriptor-Sets, ein Experte braucht sechs: Bei Modellen mit
+  Hunderten aktiver Experten in einem Prefill-Chunk wird der Batch vor jedem Layer, jedem
+  Experten und dem Kopf geteilt, wenn der Platz knapp wird (`TInferVulkan.BatchRoom`,
+  `TQwen3Vulkan.NeedRoom`).
+
+*Tests:* `BindsAtOffset` (Ausschnitt ab Index 0, Bytes davor und dahinter unverändert;
+falsch ausgerichtet, zu lang, überlaufender Versatz und falsche Längen werden abgelehnt),
+`TinyMoeMatchesCpu` wie auf CUDA, dazu der GGUF-Fall mit höchstens 40 Dispatches je Batch
+(die Experten eines Layers über mehrere Batches) und die Prüfung, dass das GGUF einen Puffer
+je Layer nimmt (`ExpertBuffers`), `Qwen3MoeGgufMatchesCpu` (Qwen3-30B-A3B gegen die schnelle
+CPU, Token für Token und mit der Expertenwahl der CPU, siehe unten). Grün auf der RTX 5090
+(FPC, Delphi 13, Delphi 7) und der Adreno X1-85. Gegenprobe: dreizehn eingebaute Fehler
+(Shader ohne Router-Gewicht, Zeile des Blocks statt der Token-Zeile, `First` übergangen,
+Ausgabe nicht geleert, alle Experten am Versatz 0, `RecordLinearAt` ohne Versatz, `Bind` ohne
+Versatz, `Bind` ohne Prüfung der Ausrichtung, Batch nie geteilt, GGUF nie ein Puffer,
+Router-Gewichte nicht übernommen, Router-Logits der ersten Zeile für alle, Gewichte aus den
+Token-Zeilen kopiert) - alle scheitern. Review: Codex fand das Limit der Deskriptor-Sets,
+einen Überlauf in der Bereichsprüfung und einen Kopf in mehr Teilen als ein sehr kleiner Batch
+fasst (jetzt eine klare Meldung), der Claude-Finder die Ausrichtung unter 4 Byte und dass der
+Test den Ein-Puffer-Weg nicht nachwies; alles behoben.
+
+*Die Expertenwahl im Vergleich vorgegeben (`TDecoderRouteTape`).* Vorher maß der 30B-Vergleich
+Rechengenauigkeit und Routing in einem Kosinus: kippt bei einer knappen Router-Entscheidung
+ein Experte, weichen die Logits ab, ohne dass etwas falsch ist (Schwelle damals 0,98 und 14
+von 16). Jetzt zeichnet `TDecoderModel.Route` beim CPU-Lauf Experten und Gewichte jedes Tokens
+und Layers auf (`drmRecord`); beim Lauf auf dem Gerät rechnet `Route` die eigene Wahl aus den
+Logits des Geräts, vergleicht sie und gibt die aufgezeichnete weiter (`drmReplay`). Ein Lauf
+prüft so beides getrennt: die Logits nur noch die Rechnung (Kosinus mindestens 0,99, Argmax
+mindestens 15 von 16), die abweichenden Wahlen das Routing - erlaubt nur bei knappem Abstand
+zwischen k-tem und bestem ausgelassenem Router-Logit (höchstens 0,1). Gemessen auf CUDA und
+Vulkan: unter FPC Kosinus 0,9995, Argmax 16 von 16, 162 von 1344 Wahlen anders bei höchstens
+0,052; unter Delphi 13 0,9975, 15 von 16, 121 anders bei höchstens 0,071 - die übrige
+Abweichung unter Delphi kommt aus seiner CPU-Rechnung (Backlog B13), nicht aus dem Routing.
+`RouteTapeReplays` prüft das Band auf der CPU: dieselben Tokens wiedergegeben geben dieselben
+Bits; die Wahl anderer Tokens erzwungen zählt Abweichungen und ändert die Logits; ein leeres
+Band löst eine Exception aus; Route direkt gerufen gibt Experten und Gewichte der
+Aufzeichnung bitgleich aus. Weil die Router-Logits einer falschen Zeile für sich plausibel sind
+(kleiner Abstand), gilt zusätzlich: höchstens ein Viertel der Wahlen anders (gemessen 12 und
+9 %, mit diesem Fehler 47 %). Gegenprobe des Bands: sechs Fehler (eigene Wahl statt der
+aufgezeichneten weitergegeben, eigene Gewichte, Abweichungen nicht gezählt, Abstand vom
+höchsten statt vom k-ten Logit, Router-Logits der ersten Zeile auf CUDA und auf Vulkan) - alle
+scheitern; der mit den eigenen Gewichten überlebte zuerst, deshalb der direkte Test von Route.
+Review: Claude-Finder und Codex fanden ein `RouteTape := nil` auf einem nicht geladenen Modell
+im `finally` der Tests und einen Kommentar, der mehr behauptete als geprüft (jetzt: Aufzeichnen
+lässt die Logits bitgleich); behoben.
+
+*Qwen3-30B-A3B Q4_K_M auf der RTX 5090 (Vulkan):* hochgeladen in 2,3 s, Spitze 17,9 GB;
+Prefill 489 Tokens/s bei 200 Tokens Prompt, 642 bei 2000; Decode 43 bis 44 Tokens/s. CUDA im
+selben Lauf: Prefill 383, Decode 41 - Vulkan ist hier vorn, weil ein MoE-Layer auf CUDA drei
+Wartepunkte hat (Router herunter, zwei Uploads), auf Vulkan einen.
+
 ### Danach — nach Bedarf
 
 Reranker (BGE-Reranker), Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding; weitere

@@ -1470,9 +1470,16 @@ const
   PROMPT: array[0..11] of integer = (
     151644, 872, 198, 54, 645, 2739, 273, 10109, 12153, 3105, 63084, 30);
   STEPS = 16;
+  /// the largest router gap at which the device may choose other experts
+  // than the CPU: a near tie of the 8th and 9th of 128 experts - measured on
+  // 2026-10-19 (RTX 5090, CUDA and Vulkan, FPC): 162 of 1344 routes chosen
+  // otherwise, at a gap of 0.052 at most (Delphi 13: 121, 0.071); a routing
+  // error gives gaps of whole units
+  ROUTE_GAP = 0.1;
 var
   dir, gguf: TFileName;
   i, v, agree: PtrInt;
+  tape: TDecoderRouteTape;
   gpu: TInferCudaBackend;
   cpu: TInferCpuFastBackend;
   model: TDecoderModel;
@@ -1508,6 +1515,7 @@ begin
   vk := nil;
   c1 := nil;
   c2 := nil;
+  tape := nil;
   try
     model := NewDecoderModelFromGguf(gguf, cpu);
     v := model.Config.VocabSize;
@@ -1518,7 +1526,14 @@ begin
     c2 := vk.NewContext;
     SetLength(l1, v);
     SetLength(l2, v);
+    // the CPU's expert choice handed to the device (TDecoderRouteTape): the
+    // logits then differ by arithmetic only; the device's own choice is
+    // compared - it may differ at a near tie of the router, never by more
+    tape := TDecoderRouteTape.Create;
+    model.RouteTape := tape;
+    tape.Mode := drmRecord;
     model.Forward(c1, @PROMPT[0], length(PROMPT), pointer(l1));
+    tape.Mode := drmReplay;
     vk.Forward(c2, @PROMPT[0], length(PROMPT), pointer(l2));
     worst := 1;
     agree := 0;
@@ -1534,17 +1549,29 @@ begin
       if InferArgMax(pointer(l2), v) = id then
         inc(agree);
       // the CPU's token to both: the comparison stays on one path
+      tape.Mode := drmRecord;
       model.Forward(c1, @id, 1, pointer(l1));
+      tape.Mode := drmReplay;
       vk.Forward(c2, @id, 1, pointer(l2));
     end;
-    AddConsole('Qwen3-30B-A3B on %: lowest logits cosine %, argmax agrees % of %',
-      [fCu.DeviceName, worst, agree, STEPS]);
-    // the expert choice of a near tie may differ between the CPU and the
-    // device: measured lowest cosine 0.992 (FPC) and 0.988 (Delphi 13, other
-    // CPU kernels) on 2026-10-17 - the argmax agreement is the sharper test
-    CheckUtf8(worst >= 0.98, 'Qwen3-30B-A3B logits cosine %', [worst]);
-    CheckUtf8(agree >= STEPS - 2, 'Qwen3-30B-A3B argmax agrees % of %', [agree, STEPS]);
+    AddConsole('Qwen3-30B-A3B on %: lowest logits cosine %, argmax agrees % of %; ' +
+      'the device chose otherwise % of % times, largest router gap %',
+      [fCu.DeviceName, worst, agree, STEPS, tape.Differs, tape.Routes, tape.DiffersGap]);
+    CheckUtf8(tape.Pending = 0, '% routes not replayed', [tape.Pending]);
+    CheckUtf8(worst >= 0.99, 'Qwen3-30B-A3B logits cosine %', [worst]);
+    // with the routing given, FPC agrees 16 of 16 at a cosine of 0.9995; the
+    // CPU of Delphi 13 computes otherwise (backlog B13): 15 of 16 at 0.9975
+    CheckUtf8(agree >= STEPS - 1, 'Qwen3-30B-A3B argmax agrees % of %', [agree, STEPS]);
+    // a near tie is rare: 12 pct of the routes (FPC), 9 pct (Delphi 13) -
+    // the router logits of the wrong row give 47 pct, at small gaps each
+    CheckUtf8(tape.Differs * 4 <= tape.Routes, 'Qwen3-30B-A3B: the device chose ' +
+      'otherwise % of % times', [tape.Differs, tape.Routes]);
+    CheckUtf8(tape.DiffersGap <= ROUTE_GAP, 'Qwen3-30B-A3B: the device chose ' +
+      'otherwise at a router gap of %', [tape.DiffersGap]);
   finally
+    if model <> nil then
+      model.RouteTape := nil;
+    tape.Free;
     c2.Free;
     c1.Free;
     vk.Free;
