@@ -23,6 +23,7 @@ uses
   mormot.ai.infer.backend.cuda,
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.model.gptoss,
   mormot.ai.infer.model.qwen3.cuda,
   mormot.ai.llm.types,
   mormot.ai.llm,
@@ -116,6 +117,9 @@ type
     // chunks, one range and a range per key, both cache formats, decode steps
     // (a CUDA graph), a branch back behind the window
     procedure SlidingWindowMatchesCpu;
+    /// D5: gpt-oss (sinks, biases, the clamped SwiGLU) is refused until the
+    // device computes it
+    procedure GptOssRefused;
     /// D3c: the route kernel against the host's choice (TDecoderModel.Route,
     // the reference below checked against it): random logits and ties, with
     // and without renorming, 8 of 128 and 2 of 8 experts
@@ -2533,6 +2537,36 @@ begin
     dev.Free;
     model.Free;
     cpu.Free;
+    gpu.Free;
+  end;
+end;
+
+procedure TTestInferCuda.GptOssRefused;
+var
+  dir: TFileName;
+  gpu: TInferCudaBackend;
+  model: TDecoderModel;
+  why: RawUtf8;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-gpt-oss');
+  if CheckFailed(dir <> '', 'tiny-gpt-oss found') then
+    exit;
+  gpu := TInferCudaBackend.Create;
+  model := nil;
+  try
+    model := NewDecoderModel(dir, gpu);
+    why := '';
+    try
+      TQwen3Cuda.Create(model, gpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('not supported', why) > 0, 'gpt-oss on the device: %', [why]);
+  finally
+    model.Free;
     gpu.Free;
   end;
 end;

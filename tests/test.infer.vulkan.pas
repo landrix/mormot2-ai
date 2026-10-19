@@ -25,6 +25,7 @@ uses
   mormot.ai.infer.backend.vulkan,
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.model.gptoss,
   mormot.ai.infer.model.qwen3.vulkan,
   mormot.ai.llm.types,
   mormot.ai.llm,
@@ -137,6 +138,9 @@ type
     // attention shader, both cache formats, the window wrapping many times -
     // and a branch back behind the window
     procedure SlidingWindowMatchesCpu;
+    /// D5: gpt-oss (sinks, biases, the clamped SwiGLU) is refused until the
+    // device computes it
+    procedure GptOssRefused;
     /// D3c: route.comp against the host's choice (TDecoderModel.Route
     // written out, as in TTestInferCuda): random logits and ties, with and
     // without renorming
@@ -2150,6 +2154,36 @@ begin
     dev.Free;
     model.Free;
     cpu.Free;
+    gpu.Free;
+  end;
+end;
+
+procedure TTestInferVulkan.GptOssRefused;
+var
+  dir: TFileName;
+  gpu: TInferVulkanBackend;
+  model: TDecoderModel;
+  why: RawUtf8;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-gpt-oss');
+  if CheckFailed(dir <> '', 'tiny-gpt-oss found') then
+    exit;
+  gpu := TInferVulkanBackend.Create;
+  model := nil;
+  try
+    model := NewDecoderModel(dir, gpu);
+    why := '';
+    try
+      TQwen3Vulkan.Create(model, gpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('not supported', why) > 0, 'gpt-oss on the device: %', [why]);
+  finally
+    model.Free;
     gpu.Free;
   end;
 end;

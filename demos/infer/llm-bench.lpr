@@ -74,10 +74,11 @@ type
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
-      aWindow: PtrInt = 0); override;
+      aWindow: PtrInt = 0; aSinks: PSingleArray = nil); override;
     procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
       aEps: double; y: PSingleArray); override;
-    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
+      aAlpha: single = 1; aLimit: single = 0); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray); override;
     procedure Reset;
@@ -146,13 +147,13 @@ end;
 
 procedure TTimedBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
-  y: PSingleArray; aWindow: PtrInt);
+  y: PSingleArray; aWindow: PtrInt; aSinks: PSingleArray);
 var
   t0, t1: Int64;
 begin
   QueryPerformanceMicroSeconds(t0);
   fInner.CausalAttention(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
-    aWindow);
+    aWindow, aSinks);
   QueryPerformanceMicroSeconds(t1);
   inc(AttnUs, t1 - t0);
 end;
@@ -168,12 +169,13 @@ begin
   inc(NormUs, t1 - t0);
 end;
 
-procedure TTimedBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt);
+procedure TTimedBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
+  aAlpha, aLimit: single);
 var
   t0, t1: Int64;
 begin
   QueryPerformanceMicroSeconds(t0);
-  fInner.SwiGlu(gate, up, aCount);
+  fInner.SwiGlu(gate, up, aCount, aAlpha, aLimit);
   QueryPerformanceMicroSeconds(t1);
   inc(GluUs, t1 - t0);
 end;

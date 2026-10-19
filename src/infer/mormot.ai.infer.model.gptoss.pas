@@ -1,0 +1,420 @@
+/// native inference engine - gpt-oss decoder (causal language model)
+// - part of the mormot.ai.* extension (LandrixAI)
+// - licensed under a MPL/GPL/LGPL three license - see LICENSE
+// - clean-room from the published architecture (looked up in Hugging Face's
+//   modeling_gpt_oss.py and configuration_gpt_oss.py, transformers 5.19,
+//   Apache-2.0, no code taken): token embedding, then per layer pre-norm
+//   self-attention (RMSNorm, Q/K/V projections with a bias, rotary positions
+//   with YaRN, grouped-query causal attention with a learned sink logit per
+//   head, output projection with a bias) and a pre-norm mixture of experts
+//   (a router with a bias picks the top num_experts_per_tok experts by logit,
+//   a softmax over their logits weighs them; each expert a clamped SwiGLU
+//   with biases), both with a residual; a final RMSNorm and an untied head
+// - the layers alternate a sliding window (sliding_window, 128 for the
+//   published models) and full attention, as layer_types says (by default the
+//   even layers slide)
+// - the family of mormot.ai.infer.decoder: this unit reads config.json and
+//   maps the tensors; the forward pass is TDecoderModel's
+// - the experts of the transformers 5 layout: gate_up_proj [experts, hidden,
+//   2 * width] with the gate and up columns interleaved (gate even, up odd),
+//   down_proj [experts, width, hidden] - both transposed against nn.Linear:
+//   reordered into one matrix per expert at load
+// - not yet (backlog D5): the MXFP4 experts of the published checkpoints
+//   (quantization_config), GGUF, a device (Vulkan, CUDA)
+unit mormot.ai.infer.model.gptoss;
+
+{
+  *****************************************************************************
+
+    - TGptOssModel: the gpt_oss family of TDecoderModel
+
+  *****************************************************************************
+}
+
+interface
+
+{$I mormot.defines.inc}
+
+{$ifndef FPC}{$ifdef CPUX64}
+  {$EXCESSPRECISION OFF} // single expressions in single, as FPC computes them
+{$endif}{$endif}
+
+uses
+  sysutils,
+  mormot.core.base,
+  mormot.core.os,
+  mormot.core.unicode,
+  mormot.core.text,
+  mormot.core.variants,
+  mormot.ai.infer.tensor,
+  mormot.ai.infer.backend,
+  mormot.ai.infer.decoder;
+
+type
+  /// a gpt-oss causal language model (e.g. gpt-oss-20b) over a safetensors
+  // folder with its weights in BF16 or F32
+  // - config.json (model_type gpt_oss): head_dim, num_local_experts,
+  // num_experts_per_tok, intermediate_size (the width of an expert),
+  // sliding_window and layer_types, rope_parameters (transformers 5) or
+  // rope_scaling and rope_theta (transformers 4) of rope_type yarn,
+  // swiglu_limit and swiglu_alpha (default 7 and 1.702)
+  // - refused: attention_bias false, tied embeddings, a quantization_config
+  // (the MXFP4 checkpoints come with backlog D5), another rope_type
+  // - the router stays F32 when the matrices are quantized at load
+  TGptOssModel = class(TDecoderModel)
+  protected
+    procedure LoadConfig(const aConfigFile: TFileName); override;
+    procedure LoadGgufConfig; override;
+    procedure LoadWeights; override;
+    function GgufName(const aName: RawUtf8): RawUtf8; override;
+    /// the YaRN settings of config.json
+    procedure LoadRope(const aDoc: TDocVariantData);
+    /// the experts of layer aLayer from the transformers 5 tensors
+    procedure LoadExperts(aLayer: PtrInt; const aPrefix: RawUtf8);
+  public
+    /// 'gpt_oss'
+    class function ModelType: RawUtf8; override;
+    /// 'gpt-oss', as llama.cpp names it (GGUF is not read yet)
+    class function Architecture: RawUtf8; override;
+  end;
+
+
+implementation
+
+
+{ TGptOssModel }
+
+class function TGptOssModel.ModelType: RawUtf8;
+begin
+  result := 'gpt_oss';
+end;
+
+class function TGptOssModel.Architecture: RawUtf8;
+begin
+  result := 'gpt-oss';
+end;
+
+const
+  REQUIRED_KEYS: array[0..9] of RawUtf8 = (
+    'vocab_size', 'hidden_size', 'num_hidden_layers', 'num_attention_heads',
+    'num_key_value_heads', 'head_dim', 'intermediate_size', 'num_local_experts',
+    'num_experts_per_tok', 'max_position_embeddings');
+
+  /// the keys of a YaRN rope dictionary we read - any other one is refused
+  // (mscale, mscale_all_dim, partial_rotary_factor... would change the angles)
+  YARN_KEYS: array[0..8] of RawUtf8 = (
+    'rope_type', 'type', 'rope_theta', 'factor', 'beta_fast', 'beta_slow',
+    'truncate', 'original_max_position_embeddings', 'attention_factor');
+
+/// a float of aDoc, aDefault when the key is missing, null, or (aZeroDefault)
+// zero - as Python's "get(key) or default"
+function FloatOr(const aDoc: TDocVariantData; const aKey: RawUtf8;
+  aDefault: double; aZeroDefault: boolean): double;
+var
+  i: PtrInt;
+begin
+  result := aDefault;
+  i := aDoc.GetValueIndex(aKey);
+  if (i < 0) or VarIsEmptyOrNull(aDoc.Values[i]) then
+    exit;
+  if not VariantToDouble(aDoc.Values[i], result) then
+    EInferError.RaiseUtf8('TGptOssModel: % is no number', [aKey]);
+  if aZeroDefault and (result = 0) then
+    result := aDefault;
+end;
+
+procedure TGptOssModel.LoadRope(const aDoc: TDocVariantData);
+var
+  rope: PDocVariantData;
+  i, j: PtrInt;
+  k, t: RawUtf8;
+  known: boolean;
+begin
+  // transformers 5 writes rope_parameters, 4 wrote rope_scaling with
+  // rope_theta at the top level; with neither, GptOssConfig sets YaRN with a
+  // factor of 32 over 4096 positions, betas 32 / 1, truncate false
+  if not aDoc.GetAsObject('rope_parameters', rope) and
+     not aDoc.GetAsObject('rope_scaling', rope) then
+  begin
+    fConfig.RopeTheta := FloatOr(aDoc, 'rope_theta', 150000, false);
+    fConfig.RopeFactor := 32;
+    fConfig.RopeOriginal := 4096;
+    fConfig.RopeBetaFast := 32;
+    fConfig.RopeBetaSlow := 1;
+    fConfig.RopeTruncate := false;
+    fConfig.RopeAttention := 0;
+    exit;
+  end;
+  for i := 0 to rope^.Count - 1 do
+  begin
+    k := rope^.Names[i];
+    known := false;
+    for j := 0 to high(YARN_KEYS) do
+      if k = YARN_KEYS[j] then
+        known := true;
+    if not known then
+      EInferError.RaiseUtf8('%: rope setting % not supported', [self, k]);
+  end;
+  t := rope^.U['rope_type'];
+  if t = '' then
+    t := rope^.U['type'];
+  if t <> 'yarn' then
+    EInferError.RaiseUtf8('%: rope_type "%" not supported', [self, t]);
+  fConfig.RopeTheta := FloatOr(rope^, 'rope_theta',
+    FloatOr(aDoc, 'rope_theta', 150000, false), false);
+  if rope^.GetValueIndex('factor') < 0 then
+    EInferError.RaiseUtf8('%: YaRN without a factor', [self]);
+  if rope^.GetValueIndex('original_max_position_embeddings') < 0 then
+    EInferError.RaiseUtf8('%: YaRN without original_max_position_embeddings', [self]);
+  fConfig.RopeOriginal := rope^.I['original_max_position_embeddings'];
+  // a factor of null: max_position_embeddings / original, as transformers
+  // derives it; 0 or less would divide by zero - refused
+  fConfig.RopeFactor := FloatOr(rope^, 'factor', -1, false);
+  if VarIsEmptyOrNull(rope^.Value['factor']) and (fConfig.RopeOriginal > 0) then
+    fConfig.RopeFactor := fConfig.MaxPositions / fConfig.RopeOriginal;
+  if not (fConfig.RopeFactor > 0) then
+    EInferError.RaiseUtf8('%: a YaRN factor of %', [self, rope^.U['factor']]);
+  fConfig.RopeBetaFast := FloatOr(rope^, 'beta_fast', 32, true);
+  fConfig.RopeBetaSlow := FloatOr(rope^, 'beta_slow', 1, true);
+  // transformers: rope_parameters.get("truncate", True)
+  fConfig.RopeTruncate := true;
+  if rope^.GetValueIndex('truncate') >= 0 then
+    fConfig.RopeTruncate := rope^.B['truncate'];
+  // attention_factor null is no attention_factor
+  fConfig.RopeAttention := FloatOr(rope^, 'attention_factor', 0, false);
+  if (rope^.GetValueIndex('attention_factor') >= 0) and
+     not VarIsEmptyOrNull(rope^.Value['attention_factor']) and
+     not (fConfig.RopeAttention > 0) then
+    EInferError.RaiseUtf8('%: an attention_factor of %', [self, fConfig.RopeAttention]);
+end;
+
+procedure TGptOssModel.LoadConfig(const aConfigFile: TFileName);
+var
+  doc: TDocVariantData;
+  d, types: PDocVariantData;
+  i: PtrInt;
+  w: Int64;
+  t: RawUtf8;
+begin
+  d := ReadConfig(aConfigFile, doc);
+  for i := 0 to high(REQUIRED_KEYS) do
+    if d^.GetValueIndex(REQUIRED_KEYS[i]) < 0 then
+      EInferError.RaiseUtf8('%: % has no "%"', [self, aConfigFile, REQUIRED_KEYS[i]]);
+  if d^.GetValueIndex('quantization_config') >= 0 then
+    EInferError.RaiseUtf8('%: a quantization_config (MXFP4) not supported yet',
+      [self]);
+  // GptOssConfig defaults: attention_bias true, untied head
+  if (d^.GetValueIndex('attention_bias') >= 0) and not d^.B['attention_bias'] then
+    EInferError.RaiseUtf8('%: attention_bias false not supported', [self]);
+  if d^.B['tie_word_embeddings'] then
+    EInferError.RaiseUtf8('%: tied embeddings not supported', [self]);
+  fConfig.VocabSize := d^.I['vocab_size'];
+  fConfig.Hidden := d^.I['hidden_size'];
+  fConfig.Layers := d^.I['num_hidden_layers'];
+  fConfig.Heads := d^.I['num_attention_heads'];
+  // null as GptOssConfig derives it: every head its own KV head, hidden / heads
+  if VarIsEmptyOrNull(d^.Value['num_key_value_heads']) then
+    fConfig.KvHeads := fConfig.Heads
+  else
+    fConfig.KvHeads := d^.I['num_key_value_heads'];
+  if VarIsEmptyOrNull(d^.Value['head_dim']) and (fConfig.Heads > 0) then
+    fConfig.HeadDim := fConfig.Hidden div fConfig.Heads
+  else
+    fConfig.HeadDim := d^.I['head_dim'];
+  fConfig.Intermediate := d^.I['intermediate_size'];
+  fConfig.MaxPositions := d^.I['max_position_embeddings'];
+  fConfig.RmsEps := FloatOr(d^, 'rms_norm_eps', 1e-5, false);
+  fConfig.TiedEmbeddings := false;
+  fConfig.Experts := d^.I['num_local_experts'];
+  fConfig.ExpertsUsed := d^.I['num_experts_per_tok'];
+  fConfig.ExpertIntermediate := fConfig.Intermediate;
+  // a softmax over the top-k logits = the top-k probabilities renormed
+  fConfig.NormTopK := true;
+  fConfig.SwiGluLimit := FloatOr(d^, 'swiglu_limit', 7, false);
+  fConfig.SwiGluAlpha := FloatOr(d^, 'swiglu_alpha', 1.702, false);
+  if not (fConfig.SwiGluLimit > 0) then
+    EInferError.RaiseUtf8('%: a swiglu_limit of %', [self, fConfig.SwiGluLimit]);
+  LoadRope(d^);
+  // every layer a mixture of experts; the window by layer_types, by default
+  // on the even layers (GptOssConfig) - a sliding layer needs a window
+  if (fConfig.Layers > 0) and (fConfig.Layers <= 1024) then
+  begin
+    SetLength(fConfig.Spec, fConfig.Layers);
+    // GptOssConfig.sliding_window: 128 by default, null for none
+    i := d^.GetValueIndex('sliding_window');
+    if i < 0 then
+      w := 128
+    else if VarIsEmptyOrNull(d^.Values[i]) then
+      w := 0
+    else
+    begin
+      w := VariantToInt64Def(d^.Values[i], 0);
+      if (w <= 0) or (w > 1 shl 24) then
+        EInferError.RaiseUtf8('%: a sliding_window of %', [self, w]);
+    end;
+    if not d^.GetAsArray('layer_types', types) then
+      types := nil
+    else if types^.Count <> fConfig.Layers then
+      EInferError.RaiseUtf8('%: % layer types for % layers',
+        [self, types^.Count, fConfig.Layers]);
+    for i := 0 to fConfig.Layers - 1 do
+    begin
+      fConfig.Spec[i].Ffn := dfMoe;
+      if types = nil then
+      begin
+        if odd(i + 1) then
+          t := 'sliding_attention'
+        else
+          t := 'full_attention';
+      end
+      else
+        t := VariantToUtf8(types^.Values[i]);
+      if t = 'sliding_attention' then
+      begin
+        if w <= 0 then
+          EInferError.RaiseUtf8('%: layer % slides without a sliding window', [self, i]);
+        fConfig.Spec[i].Window := w;
+      end
+      else if t <> 'full_attention' then
+        EInferError.RaiseUtf8('%: layer type "%" not supported', [self, t]);
+    end;
+  end;
+  CheckConfig(aConfigFile);
+end;
+
+procedure TGptOssModel.LoadGgufConfig;
+begin
+  EInferError.RaiseUtf8('%: gpt-oss from GGUF not supported yet', [self]);
+end;
+
+function TGptOssModel.GgufName(const aName: RawUtf8): RawUtf8;
+begin
+  result := '';
+end;
+
+procedure TGptOssModel.LoadExperts(aLayer: PtrInt; const aPrefix: RawUtf8);
+var
+  l: ^TDecoderLayer;
+  h, fi, n, e, i, o: PtrInt;
+  gu, down, gub: PInferTensor;
+  row, gate, up, dn, gb, ub: TSingleDynArray;
+  b: RawUtf8;
+begin
+  l := @fLayer[aLayer];
+  h := fConfig.Hidden;
+  fi := fConfig.ExpertIntermediate;
+  n := fConfig.Experts;
+  b := aPrefix + 'mlp.experts.';
+  gu := Checked(b + 'gate_up_proj', [n, h, 2 * fi]);
+  down := Checked(b + 'down_proj', [n, fi, h]);
+  gub := Checked(b + 'gate_up_proj_bias', [n, 2 * fi]);
+  l^.ExpertDownBias := Weight(b + 'down_proj_bias', [n, h]);
+  // the gate and up biases: even and odd columns of gate_up_proj_bias; row
+  // holds a row of gate_up_proj (2 * width) or of down_proj (hidden)
+  SetLength(row, MaxPtrInt(2 * fi, h));
+  SetLength(gb, n * fi);
+  SetLength(ub, n * fi);
+  for e := 0 to n - 1 do
+  begin
+    InferRowToF32(gub^.Data, gub^.DType, e, 2 * fi, pointer(row));
+    for o := 0 to fi - 1 do
+    begin
+      gb[e * fi + o] := row[2 * o];
+      ub[e * fi + o] := row[2 * o + 1];
+    end;
+  end;
+  l^.ExpertGateBias := Own(gb);
+  l^.ExpertUpBias := Own(ub);
+  // one nn.Linear matrix per expert: gate and up [width, hidden] from the
+  // rows of gate_up_proj (one per input), down [hidden, width] from those of
+  // down_proj - transposed while read
+  SetLength(l^.ExpertGate, n);
+  SetLength(l^.ExpertUp, n);
+  SetLength(l^.ExpertDown, n);
+  for e := 0 to n - 1 do
+  begin
+    // MatrixOf takes an F32 matrix over: a new one for every expert then
+    if length(gate) <> fi * h then
+      SetLength(gate, fi * h);
+    if length(up) <> fi * h then
+      SetLength(up, fi * h);
+    if length(dn) <> h * fi then
+      SetLength(dn, h * fi);
+    for i := 0 to h - 1 do
+    begin
+      InferRowToF32(gu^.Data, gu^.DType, e * h + i, 2 * fi, pointer(row));
+      for o := 0 to fi - 1 do
+      begin
+        gate[o * h + i] := row[2 * o];
+        up[o * h + i] := row[2 * o + 1];
+      end;
+    end;
+    for i := 0 to fi - 1 do
+    begin
+      InferRowToF32(down^.Data, down^.DType, e * fi + i, h, pointer(row));
+      for o := 0 to h - 1 do
+        dn[o * fi + i] := row[o];
+    end;
+    l^.ExpertGate[e] := MatrixOf(gate, fi, h, fWeights,
+      FormatUtf8('%gate_up_proj[%].gate', [b, e]));
+    l^.ExpertUp[e] := MatrixOf(up, fi, h, fWeights,
+      FormatUtf8('%gate_up_proj[%].up', [b, e]));
+    l^.ExpertDown[e] := MatrixOf(dn, h, fi, fWeights,
+      FormatUtf8('%down_proj[%]', [b, e]));
+  end;
+end;
+
+procedure TGptOssModel.LoadWeights;
+var
+  i, used: PtrInt;
+  h, qw, kvw: Int64;
+  p: RawUtf8;
+  l: ^TDecoderLayer;
+  headType: TInferDType;
+begin
+  // with Q4_0 the head stays Q8_0, as for Qwen3
+  headType := fWeights;
+  if headType = idtQ4_0 then
+    headType := idtQ8_0;
+  h := fConfig.Hidden;
+  qw := fConfig.Heads * fConfig.HeadDim;
+  kvw := fConfig.KvHeads * fConfig.HeadDim;
+  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h]);
+  if fWeights = idtF32 then
+    fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),
+      idtF32);
+  fNorm := Weight('model.norm.weight', [h]);
+  fHead := Matrix('lm_head.weight', fConfig.VocabSize, h, headType);
+  used := 3;
+  SetLength(fLayer, fConfig.Layers);
+  for i := 0 to fConfig.Layers - 1 do
+  begin
+    p := FormatUtf8('model.layers.%.', [i]);
+    l := @fLayer[i];
+    l^.Q := Matrix(p + 'self_attn.q_proj.weight', qw, h, fWeights);
+    l^.K := Matrix(p + 'self_attn.k_proj.weight', kvw, h, fWeights);
+    l^.V := Matrix(p + 'self_attn.v_proj.weight', kvw, h, fWeights);
+    l^.O := Matrix(p + 'self_attn.o_proj.weight', h, qw, fWeights);
+    l^.QBias := Weight(p + 'self_attn.q_proj.bias', [qw]);
+    l^.KBias := Weight(p + 'self_attn.k_proj.bias', [kvw]);
+    l^.VBias := Weight(p + 'self_attn.v_proj.bias', [kvw]);
+    l^.OBias := Weight(p + 'self_attn.o_proj.bias', [h]);
+    l^.Sinks := Weight(p + 'self_attn.sinks', [fConfig.Heads]);
+    l^.InputNorm := Weight(p + 'input_layernorm.weight', [h]);
+    l^.PostNorm := Weight(p + 'post_attention_layernorm.weight', [h]);
+    l^.Router := Matrix(p + 'mlp.router.weight', fConfig.Experts, h, idtF32);
+    l^.RouterBias := Weight(p + 'mlp.router.bias', [fConfig.Experts]);
+    LoadExperts(i, p);
+    inc(used, 17);
+  end;
+  // an unknown tensor means a model we do not understand
+  if used <> TensorCount then
+    EInferError.RaiseUtf8('%: % tensors in the file, % understood',
+      [self, TensorCount, used]);
+end;
+
+
+initialization
+  RegisterDecoderModel(TGptOssModel);
+
+end.

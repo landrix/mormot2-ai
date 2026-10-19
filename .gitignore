@@ -30,3 +30,6 @@ demos/.env
 
 # Python-Bytecode der Referenzwerkzeuge (tools/infer-ref)
 __pycache__/
+
+# local work list (Codex + Claude), never committed
+BACKLOG.md

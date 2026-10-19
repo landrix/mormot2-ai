@@ -1021,7 +1021,8 @@ end;
 /// causal grouped-query attention as defined, straight from the formula: an
 // independent check of the reference branch the exact path shares
 procedure NaiveCausal(const q, keys, values: TSingleDynArray; aRows, aHeads,
-  aDim, aPast, aKvHeads: PtrInt; var y: TSingleDynArray; aWindow: PtrInt = 0);
+  aDim, aPast, aKvHeads: PtrInt; var y: TSingleDynArray; aWindow: PtrInt = 0;
+  aSinks: PSingleArray = nil);
 var
   r, h, g, j, t, total, first: PtrInt;
   w: TDoubleDynArray;
@@ -1050,12 +1051,17 @@ begin
         if w[j] > m then
           m := w[j];
       end;
+      // a sink: one more logit in the softmax, without a value
+      if (aSinks <> nil) and (aSinks^[h] > m) then
+        m := aSinks^[h];
       sum := 0;
       for j := first to total - 1 do
       begin
         w[j] := Exp(w[j] - m);
         sum := sum + w[j];
       end;
+      if aSinks <> nil then
+        sum := sum + Exp(aSinks^[h] - m);
       for t := 0 to aDim - 1 do
       begin
         acc := 0;
@@ -1081,7 +1087,7 @@ const
     (1, 1024, 300), (7, 1024, 37), (3, 1000, 20), (64, 2048, 48), (2, 64, 16));
 var
   i, total, rows, qn, kvn, nin, nout, win, unseen: PtrInt;
-  q, keys, values, y1, y2, y3, x, w, bias: TSingleDynArray;
+  q, keys, values, y1, y2, y3, x, w, bias, sinks: TSingleDynArray;
   cmp: TInferCompare;
   refused: boolean;
 begin
@@ -1175,6 +1181,70 @@ begin
     CheckUtf8(InferCompareOk(cmp), 'windowed attention float, case %, window %: %',
       [i, win, InferCompareText(cmp)]);
   end;
+  // attention sinks (gpt-oss), with and without a window: a logit per head in
+  // every softmax - the same arithmetic on every path
+  for i := 0 to high(CASES) do
+  begin
+    rows := CASES[i, 1];
+    total := CASES[i, 0] + rows;
+    win := (i and 1) * (2 + i);
+    qn := rows * CASES[i, 2] * CASES[i, 4];
+    kvn := total * CASES[i, 3] * CASES[i, 4];
+    Fill(q, qn, 1600 + i, 2);
+    Fill(keys, kvn, 1700 + i, 2);
+    Fill(values, kvn, 1800 + i, 2);
+    Fill(sinks, CASES[i, 2], 1900 + i, 3);
+    SetLength(y1, qn);
+    SetLength(y2, qn);
+    SetLength(y3, qn);
+    fRef.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y1), win, pointer(sinks));
+    fExact.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y2), win, pointer(sinks));
+    fFast.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y3), win, pointer(sinks));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), qn),
+      'attention with sinks exact, case %', [i]);
+    NaiveCausal(q, keys, values, rows, CASES[i, 2], CASES[i, 4], CASES[i, 0],
+      CASES[i, 3], y2, win, pointer(sinks));
+    cmp := InferCompare(pointer(y1), pointer(y2), qn, 1e-6, 1e-5);
+    CheckUtf8(InferCompareOk(cmp), 'attention with sinks by definition, case %: %',
+      [i, InferCompareText(cmp)]);
+    cmp := InferCompare(pointer(y3), pointer(y1), qn, 1e-5, 1e-4);
+    CheckUtf8(InferCompareOk(cmp), 'attention with sinks float, case %: %',
+      [i, InferCompareText(cmp)]);
+    // the sinks count: without them, other outputs
+    fRef.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y2), win);
+    Check(not SameBits(pointer(y1), pointer(y2), qn), 'the sinks change the output');
+  end;
+  // a sink far below every score takes nothing: the bits of no sink
+  rows := CASES[3, 1];
+  total := CASES[3, 0] + rows;
+  qn := rows * CASES[3, 2] * CASES[3, 4];
+  kvn := total * CASES[3, 3] * CASES[3, 4];
+  Fill(q, qn, 1990, 2);
+  Fill(keys, kvn, 1991, 2);
+  Fill(values, kvn, 1992, 2);
+  SetLength(sinks, CASES[3, 2]);
+  for i := 0 to high(sinks) do
+    sinks[i] := -1e30;
+  SetLength(y1, qn);
+  SetLength(y2, qn);
+  fFast.CausalAttention(pointer(q), rows, CASES[3, 2], CASES[3, 4], pointer(keys),
+    pointer(values), CASES[3, 0], CASES[3, 3], pointer(y1));
+  fFast.CausalAttention(pointer(q), rows, CASES[3, 2], CASES[3, 4], pointer(keys),
+    pointer(values), CASES[3, 0], CASES[3, 3], pointer(y2), 0, pointer(sinks));
+  Check(SameBits(pointer(y1), pointer(y2), qn), 'a sink of -1e30 takes nothing');
+  // a sink far above every score takes everything: the output vanishes
+  for i := 0 to high(sinks) do
+    sinks[i] := 80;
+  fRef.CausalAttention(pointer(q), rows, CASES[3, 2], CASES[3, 4], pointer(keys),
+    pointer(values), CASES[3, 0], CASES[3, 3], pointer(y2), 0, pointer(sinks));
+  SetLength(y3, qn);
+  FillCharFast(y3[0], qn * SizeOf(single), 0);
+  cmp := InferCompare(pointer(y2), pointer(y3), qn, 1e-20, 0);
+  CheckUtf8(InferCompareOk(cmp), 'a sink of 80 takes all: %', [InferCompareText(cmp)]);
   // a window of every key is no window: the same bits on both paths
   rows := CASES[3, 1];
   total := CASES[3, 0] + rows;
@@ -1251,7 +1321,7 @@ var
   i, r, c, k, j, rows, cols, n: PtrInt;
   x, w, y1, y2, y3, u, g1, g2, g3, want: TSingleDynArray;
   sum, a: double;
-  silu: single;
+  silu, gc, uc, alpha: single;
   cmp: TInferCompare;
 begin
   for i := 0 to high(NORMS) do
@@ -1310,6 +1380,51 @@ begin
     cmp := InferCompare(pointer(g1), pointer(want), n, 1e-6, 1e-6);
     CheckUtf8(InferCompareOk(cmp), 'swiglu by definition, %: %',
       [n, InferCompareText(cmp)]);
+  end;
+  // the clamped SwiGLU of gpt-oss (limit 7, alpha 1.702): gate above and up
+  // on both sides clamped - values of 8 reach the limit often
+  alpha := 1.702;
+  for i := 0 to high(GLUS) do
+  begin
+    n := GLUS[i];
+    Fill(g1, n, 1300 + i, 8);
+    Fill(u, n, 1400 + i, 8);
+    g2 := copy(g1);
+    g3 := copy(g1);
+    SetLength(want, n);
+    SetLength(y3, n);
+    k := 0;
+    for r := 0 to n - 1 do
+    begin
+      gc := g1[r];
+      if gc > 7 then
+        gc := 7;
+      uc := u[r];
+      if uc > 7 then
+        uc := 7;
+      if uc < -7 then
+        uc := -7;
+      if (gc <> g1[r]) or (uc <> u[r]) then
+        inc(k);
+      want[r] := (uc + 1) * gc / (1 + Exp(-1.702 * gc));
+      // float32 steps: alpha * g, the sigmoid, g * it, u + 1, the product
+      silu := gc * alpha;
+      silu := 1 / (1 + Exp(-silu));
+      silu := gc * silu;
+      uc := uc + 1;
+      y3[r] := uc * silu;
+    end;
+    fRef.SwiGlu(pointer(g1), pointer(u), n, 1.702, 7);
+    fFast.SwiGlu(pointer(g2), pointer(u), n, 1.702, 7);
+    fExact.SwiGlu(pointer(g3), pointer(u), n, 1.702, 7);
+    CheckUtf8(SameBits(pointer(g1), pointer(g2), n) and
+      SameBits(pointer(g1), pointer(g3), n), 'clamped swiglu of %', [n]);
+    CheckUtf8(SameBits(pointer(g1), pointer(y3), n),
+      'clamped swiglu in float32 steps, %', [n]);
+    cmp := InferCompare(pointer(g1), pointer(want), n, 1e-5, 1e-6);
+    CheckUtf8(InferCompareOk(cmp), 'clamped swiglu by definition, %: %',
+      [n, InferCompareText(cmp)]);
+    CheckUtf8((n < 100) or (k > n div 10), 'clamped swiglu of %: % clamped', [n, k]);
   end;
   // Rope: rows below, at and above the parallel threshold; 16 heads of 128
   for i := 0 to high(ROPES) do

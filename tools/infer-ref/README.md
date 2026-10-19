@@ -55,6 +55,24 @@ logits differ without a window (the reference really measures a window).
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d4.py tiny-smollm3
 ```
 
+## gpt-oss (phase D, D5)
+
+`make_reference_d5.py` uses the same environment and the helpers of `make_reference_d4.py`
+and loads no model: it generates `tiny-gpt-oss` - three layers (window 5, full, window 5),
+8 experts of which a token takes 3, YaRN rotary positions, attention sinks, a bias on Q,
+K, V, the output, the router and the experts, and a `swiglu_limit` of 0.8, so that the
+clamp of the SwiGLU changes about a third of the values (checked by the generator).
+transformers runs with the eager attention and the eager experts (one expert after the
+other). Besides the states and the greedy continuations it stores the rotary factors of
+positions 0..63 (`rope.*`), and those of two YaRN variants (`rope_t`: `truncate` true,
+`rope_a`: an `attention_factor` and other betas) for the settings test. The target
+`tiny-gpt-oss-narrow` writes `tiny-gpt-oss/narrow/`: experts of width 16 for a hidden width
+of 64.
+
+```bash
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d5.py
+```
+
 ## Decoder stacks (backlog B14)
 
 `make_reference_b14.py` needs only Python: it creates `tiny-qwen3/stack/` - the weights of

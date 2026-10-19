@@ -325,6 +325,24 @@ festgehaltenen Anfangstokens), YaRN, Bias in Attention und Experten, die begrenz
 SwiGLU-Variante; safetensors in Teildateien mit Index (Referenzgewichte); o200k-Tokenizer, Harmony-Chatformat und Parser (Kanäle, Tool-Aufrufe). Erst
 CPU, dann Vulkan und CUDA. Gate: Tiny-gpt-oss gegen `transformers`, Token-IDs gegen den
 Referenz-Tokenizer, Harmony-Rendering und -Parsing; gpt-oss-20b auf dem RTX-Rechner.
+In Scheiben:
+- *D5a erledigt 2026-10-19* (`native-inference.md`, Phase D): die Rechnung auf der CPU -
+  Sinks, YaRN, alle Biases, die begrenzte SwiGLU, die Experten im Layout von transformers 5;
+  `tiny-gpt-oss` gegen transformers. Die Geräte lehnen gpt-oss ab (`TDecoderModel.Extras`).
+- *D5b:* MXFP4 - der Typ (Blöcke wie ggml `block_mxfp4`: ein E8M0-Exponent, 16 Bytes
+  Nibbles, untere Hälfte die Werte 0..15), Linear Referenz und schnell (NEON/AVX2 wie ggml:
+  Aktivierungen Q8_0, int8-Tabelle der FP4-Werte mal 2, Skala 2^(e-128)); die
+  `*_blocks`/`*_scales` der veröffentlichten safetensors (Zeilen schon Ausgaben, Gate und Up
+  abwechselnd, Nibbles paarweise statt halbiert: beim Laden umgepackt), safetensors in
+  Teildateien mit `model.safetensors.index.json`; GGUF `gpt-oss` (llama.cpp, Gate und Up
+  schon getrennt, `attn_sinks`, Biases als `*.bias`). Dann gpt-oss-20b (Revision `6cee5e8…`)
+  auf der CPU des RTX-Rechners gegen transformers.
+- *D5c:* o200k-Tokenizer (`tokenizer.json`, eigener Pre-Tokenizer-Ausdruck) und das
+  Harmony-Chatformat mit Parser (Kanäle `analysis`/`commentary`/`final`, Tool-Aufrufe),
+  `RegisterNativeFamily`.
+- *D5d:* Vulkan und CUDA - Sinks in den Attention-Kernels, Bias auf O, Router- und
+  Experten-Bias, die begrenzte SwiGLU, MXFP4-Linear; dann der schmale Cache auf dem Gerät,
+  wenn er sich bei gpt-oss-20b lohnt.
 
 **D6 — Gemma 4 26B-A4B und 31B.** GELU-tanh, Norm-/Residual-Pfade, Router-Skalierung,
 Logit-Softcap, K=V, der dichte Parallelzweig neben den Experten (26B), lokale und globale

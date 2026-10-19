@@ -1814,6 +1814,82 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5a erledigt (2026-10-19): gpt-oss auf der CPU.** Die Rechnung von gpt-oss, gegen
+transformers 5.19 mit einem Tiny-Modell; die veröffentlichten Gewichte (MXFP4), GGUF, der
+o200k-Tokenizer, Harmony und die Geräte folgen (D5b bis D5e, [backlog.md](backlog.md)).
+
+- `mormot.ai.infer.model.gptoss`: `TGptOssModel` (`model_type` `gpt_oss`) liest
+  `config.json` - `rope_parameters` (transformers 5) oder `rope_scaling` mit `rope_theta`
+  oben (transformers 4, so steht es bei `openai/gpt-oss-20b`), `layer_types` (sonst gleiten
+  die geraden Layer, wie `GptOssConfig`), `sliding_window` (sonst 128), `swiglu_limit` und
+  `swiglu_alpha` (sonst 7 und 1,702; die echte Konfiguration nennt kein alpha). Ohne
+  RoPE-Angaben das YaRN von `GptOssConfig` (32 über 4096, Betas 32/1, `truncate` false);
+  `null` wie in transformers: `factor` = `max_position_embeddings` / Original,
+  `attention_factor` keiner, `head_dim` = Hidden / Köpfe, `num_key_value_heads` = Köpfe.
+  Abgelehnt: `quantization_config` (kommt mit D5b), `attention_bias` false, gebundene
+  Embeddings, ein anderer `rope_type`, ein RoPE-Schlüssel, den wir nicht lesen (`mscale`
+  ...), ein `factor` von 0 oder darunter.
+- *Experten im Layout von transformers 5:* `gate_up_proj` ist `[Experten, Hidden, 2 *
+  Breite]` mit Gate und Up abwechselnd in den Spalten, `down_proj` `[Experten, Breite,
+  Hidden]` - beide gegenüber `nn.Linear` transponiert. Beim Laden je Experte in eine
+  Gate-, Up- und Down-Matrix umsortiert (`TDecoderModel.MatrixOf`: F32 übernommen, sonst
+  zeilenweise nach Q8_0/Q4_0 quantisiert wie `Matrix`), die Biases ebenso getrennt.
+- *Decoder:* `TDecoderLayer` hat `OBias`, `Sinks`, `RouterBias` und flache
+  `ExpertGateBias`/`ExpertUpBias`/`ExpertDownBias`; `TDecoderConfig` `SwiGluLimit`/
+  `SwiGluAlpha` und die YaRN-Felder (`RopeFactor`, `RopeOriginal`, `RopeBetaFast`/`Slow`,
+  `RopeTruncate`, `RopeAttention`). `TDecoderModel.Extras` meldet, was ein Modell über
+  Attention, RMSNorm und die einfache SwiGLU hinaus braucht; `TQwen3Vulkan` und
+  `TQwen3Cuda` lehnen ein Modell mit Extras ab, bis sie es rechnen.
+- *Backend:* `CausalAttention` nimmt `aSinks` (ein Logit je Kopf geht in jedes Softmax ein,
+  ohne Wert: die Gewichte der Schlüssel summieren sich auf weniger als 1), Referenz und
+  schneller Pfad; `SwiGlu` mit `aLimit > 0` die begrenzte Variante (Gate oben, Up beidseitig
+  begrenzt, `(u + 1) * g * sigmoid(alpha * g)`, jeder Schritt in float32 gerundet). Der
+  Router wählt wie bisher per Softmax über alle Logits mit Renormierung - das ist dasselbe
+  wie das Softmax über die gewählten Logits von gpt-oss.
+- *YaRN* in `CheckConfig` (`YarnFrequencies`): die Frequenzen unter dem Korrekturbereich
+  bleiben (Extrapolation), die darüber werden durch den Faktor geteilt (Interpolation),
+  eine Rampe dazwischen; die Bereichsgrenzen in double wie in Python, jeder Tensorschritt in
+  float32. `Rotary` multipliziert cos und sin mit dem Aufmerksamkeitsfaktor (0,1 ln f + 1
+  oder `attention_factor`). Da die Geräte ihre Faktoren über `Rotary` holen, rechnen sie
+  YaRN schon mit.
+- *Fixture* `tiny-gpt-oss` aus `tools/infer-ref/make_reference_d5.py`: 3 Layer (Fenster 5,
+  voll, Fenster 5), 8 Experten, top-3, `head_dim` 24, YaRN mit `truncate` false (die Rampe
+  liegt mitten in den 12 Frequenzen), Sinks, alle Biases, `swiglu_limit` 0,8 (der Clamp
+  ändert etwa ein Drittel der Werte, vom Generator geprüft); dazu die RoPE-Faktoren der
+  Positionen 0..63 und zweier Varianten (`truncate` true; `attention_factor` mit anderen
+  Betas). Die Biases auf dem Residualpfad (`o_proj`, `down_proj`) sind klein gehalten,
+  sonst gewinnt eine Richtung und Greedy wiederholt ein Token. `tiny-gpt-oss/narrow`: 2
+  Layer mit Experten der Breite 16 bei Hidden 64 (eine Zeile von `down_proj` ist länger als
+  eine von `gate_up_proj`).
+- *Tests:* `GptOssMatchesReference` (YaRN-Faktoren, alle Zustände, Cache = voller Lauf
+  bitgleich, Prefill in zwei Stücken, Greedy über 24 Tokens), `GptOssQuantized` (F32 auf
+  dem schnellen Backend, Q8_0 exakt und float; Q8_0 gegen FP32 bis 0,49 auseinander,
+  Kosinus 0,9968 - der Clamp bei 0,8 und der Top-3-Router sind in diesem Tiny-Modell
+  scharf), `GptOssConfig` (transformers-4-Form bitgleich, die Vorgaben, beide YaRN-Varianten
+  gegen ihre Referenz, 14 Ablehnungen, ein übriger Tensor), in `test.infer.fast` Sinks auf
+  allen Pfaden gegen die Definition (ein Sink von -1e30 nimmt nichts, einer von 80 alles)
+  und die begrenzte SwiGLU bitgleich auf allen Pfaden und in float32-Schritten,
+  `GptOssRefused` auf Vulkan und CUDA.
+- Review: Claude-Finder und Codex fanden beide den zu kleinen Zeilenpuffer in
+  `LoadExperts` (eine Zeile von `down_proj` hat Hidden Werte, der Puffer fasste 2 * Breite -
+  bei Hidden > 2 * Breite ein Heap-Überlauf; behoben, `narrow` prüft es) und `factor: null`,
+  das YaRN still abschaltete; der Finder die beiden Bench-Demos, die `CausalAttention` und
+  `SwiGlu` noch mit den alten Signaturen überschrieben; Codex `attention_factor: null` und
+  im Nachreview `head_dim`/`num_key_value_heads: null`, die transformers ableitet. Das letzte
+  Nachreview ohne Befund.
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 5440 Assertions) und Delphi 7 (3665)
+  und auf dem M2 Pro (4515). Gegenprobe: 37 eingebaute Fehler (Sink nicht im Nenner auf
+  beiden Pfaden, Sinks verworfen, jede der drei Begrenzungen und das +1 der SwiGLU, jeder
+  Bias weg oder vom falschen Experten, YaRN ohne Faktor, ohne Rampenbegrenzung, ohne
+  Aufrundung, ohne Aufmerksamkeitsfaktor, Gate und Up oder ihre Biases vertauscht, Down
+  nicht transponiert, falsche Vorgaben, die Zählung der Tensoren, der kleine Puffer, die
+  Ablehnung auf den Geräten ...) - alle scheitern. Ein Test für den Vorrang des Thetas in
+  `rope_parameters` kam erst durch die Gegenprobe dazu.
+- *Falle (macOS):* FPC 3.2.4 auf aarch64-darwin übersetzt `TDocVariantData.D[name] := wert`
+  so, dass 0 gespeichert wird (Konstante wie Variable; `I[]` und `AddOrUpdateValue` mit einem
+  Variant stimmen). Unser Quellcode nutzt den Setter nicht; die Tests schreiben Fließkommawerte
+  über `SetFloat` (Variant).
+
 **D4b erledigt (2026-10-19): Sliding Window und NoPE auf Vulkan und CUDA.** Bisher lehnten
 beide Geräte solche Modelle ab (D4).
 

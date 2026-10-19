@@ -1,0 +1,670 @@
+{
+ "dataset": "tiny-gpt-oss",
+ "note": "seeded gpt-oss, 3 layers: 0 and 2 a sliding window of 5, 1 full attention; hidden 64, 4 heads / 2 KV heads, head_dim 24, 8 experts of width 64, 3 per token (softmax over the top 3 router logits), YaRN (theta 150000, factor 32, original 4096, beta 32 / 1, truncate false), attention sinks, bias on q/k/v/o, router and experts, clamped SwiGLU (limit 0.8, alpha 1.702 by default), untied head, BF16 weights. The contract is model.safetensors + config.json (transformers 5 layout: gate_up_proj [experts, hidden, 2 * width] with gate and up interleaved, down_proj [experts, width, hidden]). Per case (5, 13, 29 tokens): embed, layerNN, layer00_attn, layer00_mlp, norm, logits (all positions), greedy (24 tokens, no eos) with the top-2 margin - checked equal with the transformers cache and without. rope.cos / rope.sin: [64 positions, 12], the attention factor included; rope.inv_freq [12]; rope_t / rope_a: the same for the rope settings changed as rope_variants says",
+ "config": {
+  "vocab_size": 96,
+  "hidden_size": 64,
+  "intermediate_size": 64,
+  "num_hidden_layers": 3,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 24,
+  "num_local_experts": 8,
+  "num_experts_per_tok": 3,
+  "max_position_embeddings": 512,
+  "rms_norm_eps": 1e-05,
+  "sliding_window": 5,
+  "layer_types": [
+   "sliding_attention",
+   "full_attention",
+   "sliding_attention"
+  ],
+  "rope_parameters": {
+   "rope_type": "yarn",
+   "rope_theta": 150000.0,
+   "factor": 32.0,
+   "beta_fast": 32.0,
+   "beta_slow": 1.0,
+   "truncate": false,
+   "original_max_position_embeddings": 4096
+  },
+  "swiglu_limit": 0.8,
+  "tie_word_embeddings": false,
+  "attention_bias": true,
+  "hidden_act": "silu",
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "pad_token_id": 0,
+  "model_type": "gpt_oss",
+  "architectures": [
+   "GptOssForCausalLM"
+  ],
+  "torch_dtype": "bfloat16"
+ },
+ "safetensors_sha256": "ae8ebd04e7e58bdbb6f42f67d87343e403300b48f77316df2e22536a2753881d",
+ "environment": {
+  "created_utc": "2026-10-19T20:04:57Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": false,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "window_effect": 1.3728288412094116,
+ "attention_scaling": 1.3465735902799727,
+ "clamped_share": 0.3690667355602438,
+ "rope_variants": {
+  "rope_t": {
+   "change": {
+    "truncate": true
+   },
+   "attention_scaling": 1.3465735902799727
+  },
+  "rope_a": {
+   "change": {
+    "attention_factor": 1.25,
+    "beta_fast": 16.0,
+    "beta_slow": 2.0
+   },
+   "attention_scaling": 1.25
+  }
+ },
+ "cases": [
+  {
+   "case": 0,
+   "ids": [
+    82,
+    83,
+    13,
+    15,
+    45
+   ],
+   "tokens": 5,
+   "greedy": [
+    4,
+    4,
+    91,
+    91,
+    91,
+    91,
+    30,
+    15,
+    4,
+    30,
+    30,
+    86,
+    87,
+    87,
+    87,
+    87,
+    87,
+    86,
+    86,
+    86,
+    86,
+    86,
+    82,
+    40
+   ],
+   "min_margin": 0.03164052963256836
+  },
+  {
+   "case": 1,
+   "ids": [
+    83,
+    70,
+    37,
+    18,
+    69,
+    49,
+    86,
+    40,
+    11,
+    62,
+    88,
+    90,
+    24
+   ],
+   "tokens": 13,
+   "greedy": [
+    86,
+    86,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84,
+    84
+   ],
+   "min_margin": 0.12102031707763672
+  },
+  {
+   "case": 2,
+   "ids": [
+    79,
+    71,
+    87,
+    95,
+    21,
+    39,
+    84,
+    28,
+    42,
+    50,
+    17,
+    53,
+    59,
+    56,
+    6,
+    74,
+    37,
+    64,
+    60,
+    52,
+    82,
+    56,
+    77,
+    36,
+    67,
+    71,
+    26,
+    66,
+    94
+   ],
+   "tokens": 29,
+   "greedy": [
+    4,
+    87,
+    21,
+    48,
+    4,
+    87,
+    87,
+    86,
+    86,
+    86,
+    86,
+    86,
+    86,
+    40,
+    40,
+    86,
+    86,
+    86,
+    86,
+    86,
+    86,
+    86,
+    86,
+    40
+   ],
+   "min_margin": 0.007000446319580078
+  }
+ ],
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 121516,
+  "sha256": "de1cb38ee537ea2f58da55d33414f254d10e726f2360cfc84c8234bb8a346977",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "case0.ids",
+   "dtype": "i32",
+   "shape": [
+    5
+   ],
+   "offset": 0,
+   "bytes": 20,
+   "sha256": "407cc4085666fb2352be412cd22289082be414d2d671ea0a561d5d047edc6f76"
+  },
+  {
+   "name": "case0.embed",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 20,
+   "bytes": 1280,
+   "sha256": "d95dc951a640b6a1faccfe4898b807d85bde646c2d5b7c5456ca9b1ad90569b7"
+  },
+  {
+   "name": "case0.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 1300,
+   "bytes": 1280,
+   "sha256": "86cdbd120591aff544b9632b65229722ed4651bf3237e9d54489bf2fc3ed2b44"
+  },
+  {
+   "name": "case0.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 2580,
+   "bytes": 1280,
+   "sha256": "30cae2b09e8878ded5ae05bdd5a3ff309226bfa67557276ff8f5a3d4407d1a8f"
+  },
+  {
+   "name": "case0.layer00",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 3860,
+   "bytes": 1280,
+   "sha256": "92f3db30920a25cefab95656de80635fba633092c10dc251284491373e40057e"
+  },
+  {
+   "name": "case0.layer01",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 5140,
+   "bytes": 1280,
+   "sha256": "d968f2e8937c74d81fd89252dea5e5780cc8a3584fdc91ad17195b0247f22468"
+  },
+  {
+   "name": "case0.layer02",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 6420,
+   "bytes": 1280,
+   "sha256": "f652e3eb6160124598e786d95f62d4cdcf59f2a70d712f9b086404f1ee5e6d40"
+  },
+  {
+   "name": "case0.norm",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 7700,
+   "bytes": 1280,
+   "sha256": "fb60b9d75c8f05760ec6a7b603eb308a0e1216a545865c41f3127b1f871d67ae"
+  },
+  {
+   "name": "case0.logits",
+   "dtype": "f32",
+   "shape": [
+    5,
+    96
+   ],
+   "offset": 8980,
+   "bytes": 1920,
+   "sha256": "36199fea9e4bb6f89aa21d2f7ae667fac4e4a67886d09c39073d6074ae7399df"
+  },
+  {
+   "name": "case0.greedy",
+   "dtype": "i32",
+   "shape": [
+    24
+   ],
+   "offset": 10900,
+   "bytes": 96,
+   "sha256": "1e0b17aa9b1d7ea68f607ee90bbec06b99b7778ac50096733980c41a63dd9113"
+  },
+  {
+   "name": "case0.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    24
+   ],
+   "offset": 10996,
+   "bytes": 96,
+   "sha256": "7b6f87768e7ed8ce3152bb6a582f651abbbcbb3f74617b57b3fa3878e949e16b"
+  },
+  {
+   "name": "case1.ids",
+   "dtype": "i32",
+   "shape": [
+    13
+   ],
+   "offset": 11092,
+   "bytes": 52,
+   "sha256": "7ca37fa5fd15ae0114f11af2924bdaa6c6be752866c2a412f72a0899329a3af0"
+  },
+  {
+   "name": "case1.embed",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 11144,
+   "bytes": 3328,
+   "sha256": "eab4ab0d80ef177b0494a46855e4c96044096953c4c9f371790f1d7fb61e6336"
+  },
+  {
+   "name": "case1.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 14472,
+   "bytes": 3328,
+   "sha256": "3fcaafe991dd6e962f3323517fcf81c277709d86437d23acaaf390b523cbcc86"
+  },
+  {
+   "name": "case1.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 17800,
+   "bytes": 3328,
+   "sha256": "e0e08c77ea8fe3a8b68146c1332476c7573dc892d6155941a73a8aa38da1f0e0"
+  },
+  {
+   "name": "case1.layer00",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 21128,
+   "bytes": 3328,
+   "sha256": "64e0237e1343ef75a5cd74eb240f6969f7026f3cd03e158d5e610f9a2e53a4f3"
+  },
+  {
+   "name": "case1.layer01",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 24456,
+   "bytes": 3328,
+   "sha256": "dc44eacec937574c26f0b3267bbfe8a63bb7c8f0e286c6bca23fac0570f0aa5e"
+  },
+  {
+   "name": "case1.layer02",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 27784,
+   "bytes": 3328,
+   "sha256": "12f25ba888b1be32be613c36872b7fbc797c168f6b57ba0d79fc61759457f74e"
+  },
+  {
+   "name": "case1.norm",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 31112,
+   "bytes": 3328,
+   "sha256": "06fb2d92842fbd5ad64b68967330de52bff76b02e2180d922999629b1cff60d3"
+  },
+  {
+   "name": "case1.logits",
+   "dtype": "f32",
+   "shape": [
+    13,
+    96
+   ],
+   "offset": 34440,
+   "bytes": 4992,
+   "sha256": "636542e8b87693b8a35be1d97217bfb4a3e9076c319e0318e84634a72b97d6ef"
+  },
+  {
+   "name": "case1.greedy",
+   "dtype": "i32",
+   "shape": [
+    24
+   ],
+   "offset": 39432,
+   "bytes": 96,
+   "sha256": "a2588c16c6b46b93752e5e5603e0fa233e3d2a91136edf1beec37de770402647"
+  },
+  {
+   "name": "case1.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    24
+   ],
+   "offset": 39528,
+   "bytes": 96,
+   "sha256": "bac156d43ea820e5181fcbc9f2227f8fa4ce74268574f608f254bb737335fbb8"
+  },
+  {
+   "name": "case2.ids",
+   "dtype": "i32",
+   "shape": [
+    29
+   ],
+   "offset": 39624,
+   "bytes": 116,
+   "sha256": "299fe15c88a4ef5297e94894b8315986d8f25beaa7b5bb01335a30043dd505e0"
+  },
+  {
+   "name": "case2.embed",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 39740,
+   "bytes": 7424,
+   "sha256": "44e3e053ed1de178e36a71f5c498bedeff8788242d72c400fef1624afa305268"
+  },
+  {
+   "name": "case2.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 47164,
+   "bytes": 7424,
+   "sha256": "b647267e166d44fb7192d28f0c4b76762158df2650eb2276268113ea587955ec"
+  },
+  {
+   "name": "case2.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 54588,
+   "bytes": 7424,
+   "sha256": "863ae2469e49d30aa5819c3636944822ad6cbe856e90a92cfe1bb1468e44bea7"
+  },
+  {
+   "name": "case2.layer00",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 62012,
+   "bytes": 7424,
+   "sha256": "d3152f25b87483ce409348f51f57aa4f4948abae2a76dcd32a7a63726ff6979a"
+  },
+  {
+   "name": "case2.layer01",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 69436,
+   "bytes": 7424,
+   "sha256": "66538d6bf28da55450e9605beee432bc43f37e37cee2875d45367e76f84fc008"
+  },
+  {
+   "name": "case2.layer02",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 76860,
+   "bytes": 7424,
+   "sha256": "9dca14ca001b2d061a5abb2b50b07e052317fc2f88cd348ab2726c2c426b8018"
+  },
+  {
+   "name": "case2.norm",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 84284,
+   "bytes": 7424,
+   "sha256": "dffade824c8c7cd3e61c615998d58f4119160d07029b48cb9f92072ce601e66d"
+  },
+  {
+   "name": "case2.logits",
+   "dtype": "f32",
+   "shape": [
+    29,
+    96
+   ],
+   "offset": 91708,
+   "bytes": 11136,
+   "sha256": "f38011659b1bbd1ca0bf9814396e4feeb7407afb4425025714c6637a7a2b5c85"
+  },
+  {
+   "name": "case2.greedy",
+   "dtype": "i32",
+   "shape": [
+    24
+   ],
+   "offset": 102844,
+   "bytes": 96,
+   "sha256": "51a21c313377ad0c9a2fe800f6bb6c636b7ca651a0e892d6eacad6edd44cb206"
+  },
+  {
+   "name": "case2.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    24
+   ],
+   "offset": 102940,
+   "bytes": 96,
+   "sha256": "7a673b5030c5f6da1057d47fe5205f0931529809240d511fa05503f3e4004202"
+  },
+  {
+   "name": "rope.cos",
+   "dtype": "f32",
+   "shape": [
+    64,
+    12
+   ],
+   "offset": 103036,
+   "bytes": 3072,
+   "sha256": "564686e914a0e00ae15631e0e892182c78ff5e3d5c47dfe4e9d802c89dc5e1b7"
+  },
+  {
+   "name": "rope.sin",
+   "dtype": "f32",
+   "shape": [
+    64,
+    12
+   ],
+   "offset": 106108,
+   "bytes": 3072,
+   "sha256": "bbb1a3dd238cdc07f0ab134bf39efa5042550221ab0e5e69d496233645c5c118"
+  },
+  {
+   "name": "rope.inv_freq",
+   "dtype": "f32",
+   "shape": [
+    12
+   ],
+   "offset": 109180,
+   "bytes": 48,
+   "sha256": "7753b9866c37139eb0e96abf8f4ea52e8cfebbf7441300e1fc09a932b440915a"
+  },
+  {
+   "name": "rope_t.cos",
+   "dtype": "f32",
+   "shape": [
+    64,
+    12
+   ],
+   "offset": 109228,
+   "bytes": 3072,
+   "sha256": "fb86c20158e80829b1114fa22c2f72abc403bf102c2e829c9e4d2ecdff7ee6fa"
+  },
+  {
+   "name": "rope_t.sin",
+   "dtype": "f32",
+   "shape": [
+    64,
+    12
+   ],
+   "offset": 112300,
+   "bytes": 3072,
+   "sha256": "9f2f90236c597092c0935cc898b25421dd3a1e1df72dd72376d74f74ffad240c"
+  },
+  {
+   "name": "rope_a.cos",
+   "dtype": "f32",
+   "shape": [
+    64,
+    12
+   ],
+   "offset": 115372,
+   "bytes": 3072,
+   "sha256": "02e15ead6051103d3d865ebd9b476424e6f6e38a05ef85fa9a4110b0e5ccab93"
+  },
+  {
+   "name": "rope_a.sin",
+   "dtype": "f32",
+   "shape": [
+    64,
+    12
+   ],
+   "offset": 118444,
+   "bytes": 3072,
+   "sha256": "98c50f19adc748831cfdeb2c167a9fc46e65ea71132752d9934937abd7a872ef"
+  }
+ ]
+}

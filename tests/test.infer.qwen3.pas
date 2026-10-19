@@ -30,6 +30,7 @@ uses
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.model.gptoss,
   mormot.ai.infer.sampler,
   test.infer.ref,
   test.infer.fast,
@@ -51,7 +52,7 @@ type
       aRows, aCols: PtrInt);
     function State(const aName: RawUtf8): PSingleArray;
     /// forward <aPrefix>.ids from an empty cache and compare every kept state
-    procedure CheckStates(aModel: TQwen3Model; aRef: TInferRefSet;
+    procedure CheckStates(aModel: TDecoderModel; aRef: TInferRefSet;
       const aPrefix: RawUtf8; aAtol, aRtol: double; aAllLogits: boolean);
     /// the real model folder, '' (and SKIP or a failure) when absent
     function RealModel: TFileName;
@@ -159,6 +160,14 @@ type
     // reference): every talker state and its logits, the 15 logit rows and
     // greedy codes of the predictor - skipped without the model
     procedure Qwen3TtsStacks;
+    /// D5: tiny gpt-oss against transformers - YaRN factors, sinks, biases,
+    // clamped SwiGLU: every state, the cache, greedy continuations
+    procedure GptOssMatchesReference;
+    /// D5: gpt-oss quantized to Q8_0 at load, and on the fast backend
+    procedure GptOssQuantized;
+    /// D5: the settings of a gpt-oss config.json - defaults, the transformers
+    // 4 form, the YaRN variants, refusals
+    procedure GptOssConfig;
   end;
 
 const
@@ -223,7 +232,7 @@ begin
   result := nil;
 end;
 
-procedure TTestInferQwen3.CheckStates(aModel: TQwen3Model; aRef: TInferRefSet;
+procedure TTestInferQwen3.CheckStates(aModel: TDecoderModel; aRef: TInferRefSet;
   const aPrefix: RawUtf8; aAtol, aRtol: double; aAllLogits: boolean);
 var
   ctx: TQwen3Context;
@@ -3224,6 +3233,519 @@ begin
     ctx.Free;
     st.Free;
     model.Free;
+    ref.Free;
+  end;
+end;
+
+
+{ gpt-oss (D5) }
+
+/// aDoc.D[aName] := aValue - which FPC 3.2.4 on aarch64-darwin compiles to
+// store 0 (TDocVariantData.SetDoubleByName): through a variant instead
+procedure SetFloat(var aDoc: TDocVariantData; const aName: RawUtf8; aValue: double);
+var
+  v: variant;
+begin
+  v := aValue;
+  aDoc.AddOrUpdateValue(aName, v);
+end;
+
+/// the rotary factors of positions 0..63 of aModel against <aName>.cos and
+// <aName>.sin of aRef: within one float32 step of the reference's cosf/sinf
+function RotaryMatches(aModel: TDecoderModel; aRef: TInferRefSet;
+  const aName: RawUtf8; out aWhy: RawUtf8): boolean;
+var
+  cs, sn: TSingleDynArray;
+  half, n: PtrInt;
+  cmp, cmp2: TInferCompare;
+begin
+  half := aModel.Config.HeadDim shr 1;
+  SetLength(cs, 64 * half);
+  SetLength(sn, 64 * half);
+  aModel.Rotary(0, 64, pointer(cs), pointer(sn));
+  cmp := InferCompare(pointer(cs), aRef.F32(aName + '.cos', n), 64 * half, 4e-7, 0);
+  cmp2 := InferCompare(pointer(sn), aRef.F32(aName + '.sin', n), 64 * half, 4e-7, 0);
+  result := (n = 64 * half) and InferCompareOk(cmp) and InferCompareOk(cmp2);
+  aWhy := FormatUtf8('cos %, sin %', [InferCompareText(cmp), InferCompareText(cmp2)]);
+end;
+
+procedure TTestInferQwen3.GptOssMatchesReference;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  full, step, ctx: TDecoderContext;
+  ids: PIntegerArray;
+  n, i, k, v, vocab, diff: PtrInt;
+  all, one: TSingleDynArray;
+  prompt, mine: TIntegerDynArray;
+  same: boolean;
+  margin: double;
+  detail: RawUtf8;
+  s: TDecoderLayerSpecDynArray;
+  limit, alpha: single;
+  tmp: TFileName;
+  cfg: TDocVariantData;
+  nullv: variant;
+begin
+  dir := FindInferRefDir('tiny-gpt-oss');
+  if CheckFailed(dir <> '', 'tiny-gpt-oss found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  model := nil;
+  full := nil;
+  step := nil;
+  try
+    model := NewDecoderModel(dir, fCpu);
+    Check(model is TGptOssModel, 'gpt_oss: a TGptOssModel');
+    CheckEqual(model.Config.HeadDim, 24, 'head_dim of config.json, not 64 / 4');
+    CheckEqual(model.Config.Experts, 8, 'experts');
+    CheckEqual(model.Config.ExpertsUsed, 3, 'experts per token');
+    CheckEqual(model.Config.ExpertIntermediate, 64, 'expert width');
+    Check(model.Config.NormTopK, 'softmax over the chosen logits');
+    s := model.Config.Spec;
+    Check((s[0].Window = 5) and (s[1].Window = 0) and (s[2].Window = 5) and
+      (s[0].Ffn = dfMoe) and (s[1].Ffn = dfMoe) and (s[2].Ffn = dfMoe) and
+      not s[0].NoRope and not s[1].NoRope, 'layer kinds');
+    limit := 0.8;
+    alpha := 1.702;
+    Check(model.Config.SwiGluLimit = limit, 'swiglu_limit');
+    Check(model.Config.SwiGluAlpha = alpha, 'swiglu_alpha by default');
+    Check((model.Config.RopeFactor = 32) and (model.Config.RopeOriginal = 4096) and
+      not model.Config.RopeTruncate and (model.Config.RopeTheta = 150000), 'YaRN');
+    Check(model.Extras = [dxSinks, dxOutputBias, dxRouterBias, dxExpertBias,
+      dxSwiGluLimit], 'every extra of gpt-oss');
+    Check((model.Layers[1].Router.DType = idtF32) and
+      (model.Layers[1].ExpertGate[5].DType = idtF32), 'F32 weights');
+    // YaRN: the rotary factors, the attention factor 0.1 ln 32 + 1 included
+    CheckUtf8(RotaryMatches(model, ref, 'rope', detail), 'YaRN factors: %', [detail]);
+    // every state of 5, 13 and 29 tokens (the window of 5 slides)
+    for k := 0 to 2 do
+      CheckStates(model, ref, FormatUtf8('case%', [k]), 5e-6, 2e-5, true);
+    // one token at a time = the prefill, bit for bit; two chunks alike
+    vocab := model.Config.VocabSize;
+    ids := ref.I32('case2.ids', n);
+    full := model.NewContext;
+    step := model.NewContext;
+    SetLength(all, n * vocab);
+    SetLength(one, vocab);
+    model.Forward(full, ids, n, pointer(all), true);
+    same := true;
+    for i := 0 to n - 1 do
+    begin
+      model.Forward(step, @ids^[i], 1, pointer(one));
+      for v := 0 to vocab - 1 do
+        if PCardinal(@one[v])^ <> PCardinal(@all[i * vocab + v])^ then
+          same := false;
+    end;
+    Check(same, 'cached logits bit-identical to the full pass');
+    step.Reset;
+    model.Forward(step, ids, 7, nil);
+    model.Forward(step, @ids^[7], n - 7, pointer(one));
+    Check(CompareMem(pointer(one), @all[(n - 1) * vocab], vocab * SizeOf(single)),
+      'prefill in two chunks');
+    // greedy continuations of 24 tokens, through the sliding cache
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, 24, []);
+      finally
+        ctx.Free;
+      end;
+      diff := GreedyDiff(mine, ref, FormatUtf8('case%', [k]), margin, detail);
+      CheckUtf8(diff < 0, 'gpt-oss case% greedy differs at step % (margin %, %)',
+        [k, diff, margin, detail]);
+    end;
+    // experts of width 16 for a hidden width of 64: a row of down_proj is
+    // longer than one of gate_up_proj (the buffer of LoadExperts)
+    FreeAndNil(step);
+    FreeAndNil(full);
+    FreeAndNil(model);
+    FreeAndNil(ref);
+    dir := MakePath([dir, 'narrow'], true);
+    ref := TInferRefSet.CreateFromFolder(dir);
+    model := NewDecoderModel(dir, fCpu);
+    CheckEqual(model.Config.ExpertIntermediate, 16, 'narrow experts');
+    for k := 0 to 2 do
+      CheckStates(model, ref, FormatUtf8('case%', [k]), 5e-6, 2e-5, true);
+    // head_dim null: hidden / heads = 64 / 4, the 16 of this model
+    FreeAndNil(model);
+    tmp := MakePath([GetSystemPath(spTemp), 'lai-d5n-' + Int64ToUtf8(GetTickCount64)], true);
+    ForceDirectories(tmp);
+    try
+      cfg.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT);
+      SetVariantNull(nullv);
+      cfg.AddOrUpdateValue('head_dim', nullv);
+      FileFromString(cfg.ToJson, tmp + 'config.json');
+      CopyFile(dir + 'model.safetensors', tmp + 'model.safetensors', false);
+      model := NewDecoderModel(tmp, fCpu);
+      CheckEqual(model.Config.HeadDim, 16, 'head_dim null: hidden / heads');
+      CheckStates(model, ref, 'case2', 5e-6, 2e-5, true);
+    finally
+      FreeAndNil(model);
+      DirectoryDeleteAll(tmp);
+    end;
+  finally
+    step.Free;
+    full.Free;
+    model.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.GptOssQuantized;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  a, c, f: TDecoderModel;
+  ca, cc, cf: TDecoderContext;
+  la, lc, lf: TSingleDynArray;
+  ids: PIntegerArray;
+  n, m, k, v: PtrInt;
+  cmp: TInferCompare;
+begin
+  dir := FindInferRefDir('tiny-gpt-oss');
+  if CheckFailed(dir <> '', 'tiny-gpt-oss found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  a := nil;
+  c := nil;
+  f := nil;
+  try
+    // F32 on the fast backend: float lanes, sinks in its attention too
+    f := TGptOssModel.Create(dir, fFast);
+    // Q8_0 at load: the experts reordered, then quantized; the router F32
+    a := TGptOssModel.Create(dir, fCpu, idtQ8_0);
+    c := TGptOssModel.Create(dir, fFast, idtQ8_0);
+    Check(a.Layers[0].Router.DType = idtF32, 'router in F32');
+    Check((a.Layers[2].ExpertGate[7].DType = idtQ8_0) and
+      (a.Layers[2].ExpertDown[7].DType = idtQ8_0), 'experts in Q8_0');
+    v := a.Config.VocabSize;
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(la, n * v);
+      SetLength(lc, n * v);
+      SetLength(lf, n * v);
+      ca := a.NewContext;
+      cc := c.NewContext;
+      cf := f.NewContext;
+      try
+        a.Forward(ca, ids, n, pointer(la), true);
+        c.Forward(cc, ids, n, pointer(lc), true);
+        f.Forward(cf, ids, n, pointer(lf), true);
+      finally
+        ca.Free;
+        cc.Free;
+        cf.Free;
+      end;
+      cmp := InferCompare(pointer(lf), ref.F32(FormatUtf8('case%.logits', [k]), m),
+        n * v, 1e-4, 1e-4);
+      CheckUtf8(InferCompareOk(cmp), 'gpt-oss case % F32 fast path: %',
+        [k, InferCompareText(cmp)]);
+      cmp := InferCompare(pointer(lc), pointer(la), n * v, 2e-2, 1e-2);
+      CheckUtf8(InferCompareOk(cmp), 'gpt-oss case % Q8_0 float path: %',
+        [k, InferCompareText(cmp)]);
+      // the clamp (limit 0.8) and the top-3 router are sharp in this tiny
+      // model: Q8_0 moves a logit by up to 0.49 - measured 2026-10-19 max
+      // 0.49, cosine 0.9968 (case 1)
+      cmp := InferCompare(pointer(la), ref.F32(FormatUtf8('case%.logits', [k]), m),
+        n * v, 0.6, 0.3);
+      CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.995),
+        'gpt-oss case % Q8_0 vs FP32: %', [k, InferCompareText(cmp)]);
+      AddConsole(FormatString('gpt-oss case % Q8_0 vs FP32: %',
+        [k, InferCompareText(cmp)]));
+    end;
+  finally
+    f.Free;
+    c.Free;
+    a.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.GptOssConfig;
+var
+  dir, tmp: TFileName;
+  ref: TInferRefSet;
+  base, doc: TDocVariantData;
+  rope: PDocVariantData;
+  why, detail: RawUtf8;
+  m, b: TDecoderModel;
+  s: TDecoderLayerSpecDynArray;
+  nullv: variant;
+  la, lb: TSingleDynArray;
+  ids: PIntegerArray;
+  n: PtrInt;
+  theta, r: variant;
+
+  function Load: TDecoderModel;
+  begin
+    FileFromString(doc.ToJson, tmp + 'config.json');
+    doc.Clear;
+    doc.InitCopy(variant(base), JSON_FAST_FLOAT); // the next change from the file
+    result := NewDecoderModel(tmp, fCpu);
+  end;
+
+  function Refused: RawUtf8;
+  begin
+    result := '';
+    try
+      Load.Free;
+    except
+      on E: EInferError do
+        result := StringToUtf8(E.Message);
+    end;
+  end;
+
+  /// the logits of case 2 of aModel into aLogits
+  procedure Logits(aModel: TDecoderModel; var aLogits: TSingleDynArray);
+  var
+    ctx: TDecoderContext;
+  begin
+    SetLength(aLogits, aModel.Config.VocabSize);
+    ctx := aModel.NewContext;
+    try
+      aModel.Forward(ctx, ids, n, pointer(aLogits));
+    finally
+      ctx.Free;
+    end;
+  end;
+
+  /// the rope settings of doc (a copy of base)
+  function RopeOf: PDocVariantData;
+  begin
+    if not doc.GetAsObject('rope_parameters', result) then
+      result := nil;
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-gpt-oss');
+  if CheckFailed(dir <> '', 'tiny-gpt-oss found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  base.InitFast;
+  doc.InitFast;
+  SetVariantNull(nullv); // JSON null
+  ids := ref.I32('case2.ids', n);
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-d5-' + Int64ToUtf8(GetTickCount64)], true);
+  ForceDirectories(tmp);
+  b := nil;
+  try
+    base.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT);
+    CopyFile(dir + 'model.safetensors', tmp + 'model.safetensors', false);
+    doc.InitCopy(variant(base), JSON_FAST_FLOAT);
+    b := Load;
+    Logits(b, la);
+    // the transformers 4 form: rope_scaling, rope_theta at the top level -
+    // the very same model
+    // (copied first: adding to doc may move the object rope points into)
+    rope := RopeOf;
+    theta := rope^.Value['rope_theta'];
+    rope^.Delete('rope_theta');
+    r := variant(rope^);
+    doc.Delete('rope_parameters');
+    doc.AddValue('rope_theta', theta);
+    doc.AddValue('rope_scaling', r);
+    m := Load;
+    try
+      Logits(m, lb);
+      Check(CompareMem(pointer(la), pointer(lb), length(la) * SizeOf(single)),
+        'rope_scaling and rope_theta: the same logits');
+    finally
+      m.Free;
+    end;
+    // a theta in both places: the one of rope_parameters (transformers moves
+    // the top-level one in by setdefault)
+    SetFloat(doc, 'rope_theta', 10000);
+    m := Load;
+    try
+      Check(m.Config.RopeTheta = 150000, 'rope_theta of rope_parameters first');
+    finally
+      m.Free;
+    end;
+    // rope_parameters without a theta: the one at the top level, else
+    // GptOssConfig's 150000
+    RopeOf^.Delete('rope_theta');
+    SetFloat(doc, 'rope_theta', 10000);
+    m := Load;
+    try
+      Check(m.Config.RopeTheta = 10000, 'rope_theta at the top level');
+    finally
+      m.Free;
+    end;
+    RopeOf^.Delete('rope_theta');
+    m := Load;
+    try
+      Check(m.Config.RopeTheta = 150000, 'rope_theta 150000 by default');
+    finally
+      m.Free;
+    end;
+    // no rope settings at all: GptOssConfig's YaRN, which tiny-gpt-oss uses
+    doc.Delete('rope_parameters');
+    m := Load;
+    try
+      Check((m.Config.RopeFactor = 32) and (m.Config.RopeOriginal = 4096) and
+        not m.Config.RopeTruncate, 'YaRN by default');
+      Logits(m, lb);
+      Check(CompareMem(pointer(la), pointer(lb), length(la) * SizeOf(single)),
+        'no rope settings: the same logits');
+    finally
+      m.Free;
+    end;
+    // factor null: max_position_embeddings / original, as transformers
+    RopeOf^.AddOrUpdateValue('factor', nullv);
+    doc.I['max_position_embeddings'] := 131072;
+    m := Load;
+    try
+      Check(m.Config.RopeFactor = 32, 'factor null: 131072 / 4096');
+      Logits(m, lb);
+      Check(CompareMem(pointer(la), pointer(lb), length(la) * SizeOf(single)),
+        'factor null: the same logits');
+    finally
+      m.Free;
+    end;
+    // attention_factor null: none, derived from the factor
+    RopeOf^.AddOrUpdateValue('attention_factor', nullv);
+    m := Load;
+    try
+      Logits(m, lb);
+      Check(CompareMem(pointer(la), pointer(lb), length(la) * SizeOf(single)),
+        'attention_factor null: the same logits');
+    finally
+      m.Free;
+    end;
+    // the YaRN variants against their reference factors
+    RopeOf^.B['truncate'] := true;
+    m := Load;
+    try
+      Check(m.Config.RopeTruncate, 'truncate');
+      CheckUtf8(RotaryMatches(m, ref, 'rope_t', detail), 'YaRN truncate: %', [detail]);
+    finally
+      m.Free;
+    end;
+    // truncate missing: true, as rope_parameters.get("truncate", True)
+    RopeOf^.Delete('truncate');
+    m := Load;
+    try
+      Check(m.Config.RopeTruncate, 'truncate true by default');
+    finally
+      m.Free;
+    end;
+    rope := RopeOf;
+    SetFloat(rope^, 'attention_factor', 1.25);
+    SetFloat(rope^, 'beta_fast', 16);
+    SetFloat(rope^, 'beta_slow', 2);
+    m := Load;
+    try
+      CheckUtf8(RotaryMatches(m, ref, 'rope_a', detail), 'YaRN attention_factor: %',
+        [detail]);
+    finally
+      m.Free;
+    end;
+    // no layer_types: the even layers slide (GptOssConfig); no sliding_window
+    // either: 128
+    doc.Delete('layer_types');
+    m := Load;
+    try
+      s := m.Config.Spec;
+      Check((s[0].Window = 5) and (s[1].Window = 0) and (s[2].Window = 5),
+        'gpt-oss: the even layers slide by default');
+    finally
+      m.Free;
+    end;
+    doc.Delete('sliding_window');
+    m := Load;
+    try
+      s := m.Config.Spec;
+      Check((s[0].Window = 128) and (s[1].Window = 0) and (s[2].Window = 128),
+        'gpt-oss: sliding_window 128 by default');
+    finally
+      m.Free;
+    end;
+    // swiglu_alpha is read: another one, other logits
+    SetFloat(doc, 'swiglu_alpha', 2);
+    m := Load;
+    try
+      Check(m.Config.SwiGluAlpha = 2, 'swiglu_alpha 2');
+      Logits(m, lb);
+      Check(not CompareMem(pointer(la), pointer(lb), length(la) * SizeOf(single)),
+        'swiglu_alpha changes the logits');
+    finally
+      m.Free;
+    end;
+    doc.Delete('swiglu_limit');
+    m := Load;
+    try
+      Check(m.Config.SwiGluLimit = 7, 'swiglu_limit 7 by default');
+    finally
+      m.Free;
+    end;
+    // refused
+    doc.AddOrUpdateValue('sliding_window', nullv);
+    why := Refused;
+    CheckUtf8(PosEx('without a sliding window', why) > 0, 'sliding_window null: %', [why]);
+    doc.I['sliding_window'] := 0;
+    why := Refused;
+    CheckUtf8(PosEx('a sliding_window of 0', why) > 0, 'sliding_window 0: %', [why]);
+    doc.AddOrUpdateValue('layer_types', _JsonFast('["full_attention"]'));
+    why := Refused;
+    CheckUtf8(PosEx('layer types for', why) > 0, 'layer types of another count: %', [why]);
+    doc.AddOrUpdateValue('layer_types', _JsonFast(
+      '["full_attention","chunked_attention","sliding_attention"]'));
+    why := Refused;
+    CheckUtf8(PosEx('chunked_attention', why) > 0, 'an unknown layer type: %', [why]);
+    doc.AddOrUpdateValue('quantization_config', _JsonFast('{"quant_method":"mxfp4"}'));
+    why := Refused;
+    CheckUtf8(PosEx('quantization_config', why) > 0, 'MXFP4 checkpoint: %', [why]);
+    doc.B['attention_bias'] := false;
+    why := Refused;
+    CheckUtf8(PosEx('attention_bias', why) > 0, 'attention_bias false: %', [why]);
+    doc.B['tie_word_embeddings'] := true;
+    why := Refused;
+    CheckUtf8(PosEx('tied', why) > 0, 'tied embeddings: %', [why]);
+    SetFloat(doc, 'swiglu_limit', 0);
+    why := Refused;
+    CheckUtf8(PosEx('swiglu_limit', why) > 0, 'swiglu_limit 0: %', [why]);
+    // num_key_value_heads null: every head its own KV head - 4 here, the file
+    // has 2: refused by the shapes
+    doc.AddOrUpdateValue('num_key_value_heads', nullv);
+    why := Refused;
+    CheckUtf8(PosEx('k_proj.weight is shaped', why) > 0, 'num_key_value_heads null: %',
+      [why]);
+    doc.Delete('head_dim');
+    why := Refused;
+    CheckUtf8(PosEx('"head_dim"', why) > 0, 'no head_dim: %', [why]);
+    RopeOf^.U['rope_type'] := 'default';
+    why := Refused;
+    CheckUtf8(PosEx('rope_type "default"', why) > 0, 'plain RoPE: %', [why]);
+    SetFloat(RopeOf^, 'mscale', 1);
+    why := Refused;
+    CheckUtf8(PosEx('rope setting mscale', why) > 0, 'mscale: %', [why]);
+    RopeOf^.Delete('factor');
+    why := Refused;
+    CheckUtf8(PosEx('without a factor', why) > 0, 'no factor: %', [why]);
+    SetFloat(RopeOf^, 'factor', 0);
+    why := Refused;
+    CheckUtf8(PosEx('a YaRN factor of', why) > 0, 'a factor of 0: %', [why]);
+    SetFloat(RopeOf^, 'factor', 0.5);
+    why := Refused;
+    CheckUtf8(PosEx('invalid YaRN', why) > 0, 'a factor below 1: %', [why]);
+    RopeOf^.Delete('original_max_position_embeddings');
+    why := Refused;
+    CheckUtf8(PosEx('original_max_position_embeddings', why) > 0, 'no original: %', [why]);
+    // fewer layers than the file holds: a tensor not understood
+    doc.I['num_hidden_layers'] := 2;
+    doc.AddOrUpdateValue('layer_types', _JsonFast('["sliding_attention","full_attention"]'));
+    why := Refused;
+    CheckUtf8(PosEx('tensors in the file', why) > 0, 'a tensor left over: %', [why]);
+  finally
+    b.Free;
+    DirectoryDeleteAll(tmp);
     ref.Free;
   end;
 end;

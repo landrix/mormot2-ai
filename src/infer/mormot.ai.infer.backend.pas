@@ -96,9 +96,12 @@ type
     // - aWindow > 0: a sliding window - row r sees only the last aWindow cache
     // rows up to itself, aPast + r - aWindow + 1 .. aPast + r (the keys before
     // need not be valid)
+    // - aSinks <> nil ([aHeads]): attention sinks (gpt-oss) - a learned logit
+    // per head joins the softmax of every row and takes its share of the
+    // weight without a value: the weights of the keys sum to less than 1
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
-      aWindow: PtrInt = 0); virtual; abstract;
+      aWindow: PtrInt = 0; aSinks: PSingleArray = nil); virtual; abstract;
     /// y[rows, cols] = x / sqrt(mean(x^2) + eps) * w, per row (RMSNorm)
     // - the normalized value is rounded to single before the weight, as the
     // float32 reference does; y may be x
@@ -106,7 +109,11 @@ type
       aEps: double; y: PSingleArray); virtual; abstract;
     /// gate := silu(gate) * up elementwise (the SwiGLU of a feed-forward
     // block), silu(g) = g / (1 + exp(-g)) rounded to single before the product
-    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); virtual; abstract;
+    // - aLimit > 0: the clamped variant of gpt-oss - g := min(gate, aLimit),
+    // u := up clamped to -aLimit .. aLimit, gate := (u + 1) * g * sigmoid(aAlpha
+    // * g), every step rounded to single; aAlpha is only used then
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
+      aAlpha: single = 1; aLimit: single = 0); virtual; abstract;
     /// rotary positions in place, the halves of every head rotated together
     // (rotate_half): x[i], x[i + d/2] := x[i] c - x[i + d/2] s, x[i + d/2] c +
     // x[i] s, in double

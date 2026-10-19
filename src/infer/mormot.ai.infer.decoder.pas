@@ -18,6 +18,12 @@
 //   a mixture of experts (dfMoe: a softmax router picks the top k of the
 //   experts per token, their SwiGLU outputs are summed with the router
 //   weights, renormed or not)
+// - what gpt-oss adds (TDecoderModel.Extras): attention sinks (a learned
+//   logit per head in every softmax), a bias on the output projection, the
+//   router and the experts, the clamped SwiGLU (SwiGluLimit); and YaRN rotary
+//   positions (RopeFactor: frequencies between interpolation and extrapolation,
+//   cos and sin scaled by an attention factor), computed in Rotary for every
+//   executor
 // - a sliding-window layer keeps the keys a next token may see, not the whole
 //   sequence: its cache rows start at a base position that moves on when the
 //   buffer is full (FullCache keeps every key and only masks, the reference);
@@ -128,6 +134,20 @@ type
     ExpertIntermediate: PtrInt;
     /// the weights of the chosen experts renormed to a sum of 1
     NormTopK: boolean;
+    /// > 0: the clamped SwiGLU of gpt-oss in every feed-forward block, with
+    // SwiGluAlpha (TInferBackend.SwiGlu); 0: the plain one
+    SwiGluLimit: single;
+    SwiGluAlpha: single;
+    /// > 0: YaRN rotary positions (rope_type yarn) with this scaling factor;
+    // 0: plain RoPE (the other Rope* fields unused)
+    RopeFactor: double;
+    /// YaRN: original_max_position_embeddings, beta_fast, beta_slow, truncate
+    RopeOriginal: PtrInt;
+    RopeBetaFast, RopeBetaSlow: double;
+    RopeTruncate: boolean;
+    /// YaRN: the factor of cos and sin (attention_factor); 0 derives it from
+    // RopeFactor as transformers does (0.1 ln factor + 1)
+    RopeAttention: double;
     /// the kind of every layer ([Layers]) - a family that leaves it empty
     // gets attention and a dense block in every layer
     Spec: TDecoderLayerSpecDynArray;
@@ -141,15 +161,35 @@ type
   // and ExpertGate, ExpertUp, ExpertDown ([Experts] each) for a dfMoe one
   // - QNorm and KNorm ([HeadDim]): the RMSNorm of every Q and K head (Qwen3),
   // nil without one; QBias, KBias and VBias ([Heads or KvHeads * HeadDim]):
-  // nil without a bias (Qwen2 has one)
+  // nil without a bias (Qwen2 has one); OBias ([Hidden]) likewise (gpt-oss)
+  // - Sinks ([Heads]): the attention sinks (gpt-oss), nil without
+  // - RouterBias ([Experts]), ExpertGateBias and ExpertUpBias ([Experts *
+  // ExpertIntermediate], expert by expert) and ExpertDownBias ([Experts *
+  // Hidden]): the biases of a dfMoe layer (gpt-oss), nil without
   TDecoderLayer = record
     Q, K, V, O, Gate, Up, Down: TInferWeight;
     QNorm, KNorm, InputNorm, PostNorm: PSingleArray;
-    QBias, KBias, VBias: PSingleArray;
+    QBias, KBias, VBias, OBias: PSingleArray;
+    Sinks: PSingleArray;
     Router: TInferWeight;
+    RouterBias: PSingleArray;
     ExpertGate, ExpertUp, ExpertDown: TInferWeightDynArray;
+    ExpertGateBias, ExpertUpBias, ExpertDownBias: PSingleArray;
   end;
   TDecoderLayerDynArray = array of TDecoderLayer;
+
+  /// what a model computes beyond attention, RMSNorm and a plain SwiGLU
+  // (TDecoderModel.Extras): a device refuses a model with one it lacks
+  // - dxSinks: attention sinks; dxOutputBias: a bias on the attention output;
+  // dxRouterBias, dxExpertBias: biases of a mixture of experts; dxSwiGluLimit:
+  // the clamped SwiGLU of gpt-oss
+  TDecoderExtra = (
+    dxSinks,
+    dxOutputBias,
+    dxRouterBias,
+    dxExpertBias,
+    dxSwiGluLimit);
+  TDecoderExtras = set of TDecoderExtra;
 
   /// called with intermediate states of a Forward, for diagnosis and tests
   // - aName: 'embed' (input of layer 0), 'layerNN' (output of layer NN),
@@ -309,6 +349,7 @@ type
     fNorm: PSingleArray;
     fLayer: TDecoderLayerDynArray;
     fInvFreq: TSingleDynArray;
+    fRopeScale: single; // YaRN: the factor of cos and sin (1 without)
     procedure Init(aBackend: TInferBackend);
     /// read config.json into aDoc and return the object of the settings:
     // aDoc itself (its model_type checked against ModelType), or for a stack
@@ -331,6 +372,8 @@ type
     procedure LoadGgufConfig; virtual; abstract;
     /// bound every setting, fill an empty Spec, the inverse rotary frequencies
     procedure CheckConfig(const aSource: TFileName);
+    /// fInvFreq and fRopeScale of YaRN, from the plain frequencies
+    procedure YarnFrequencies;
     /// fEmbedSrc, fEmbed, fNorm, fHead and fLayer from the file
     procedure LoadWeights; virtual; abstract;
     /// the llama.cpp name of a Hugging Face tensor name, '' if there is none
@@ -350,6 +393,19 @@ type
       aExperts, aRows, aCols: Int64): TInferWeightDynArray;
     /// a BF16 or F16 tensor widened to F32, kept with the model
     function WidenTensor(t: PInferTensor; const aName: RawUtf8): PSingleArray;
+    /// aValues kept with the model (moved: aValues is nil afterwards)
+    function Own(var aValues: TSingleDynArray): PSingleArray;
+    /// a matrix of aType from the F32 rows of aSrc ([aRows, aCols]) - for a
+    // family that reorders a tensor first: idtF32 keeps aSrc with the model
+    // (moved, nil afterwards), Q8_0 or Q4_0 quantize it row by row as Matrix
+    // does (aSrc left as it is, for the next matrix)
+    function MatrixOf(var aSrc: TSingleDynArray; aRows, aCols: Int64;
+      aType: TInferDType; const aName: RawUtf8): TInferWeight;
+    /// row aRow of aSrc (aCols F32 values) quantized into block aFirst.. of
+    // the owned matrix aOwned of aType - raises for a NaN, an infinity or a
+    // weight beyond the range
+    procedure QuantizeRow(aSrc: PSingleArray; aCols: PtrInt; aType: TInferDType;
+      aOwned, aRow: PtrInt; const aName: RawUtf8);
     /// raise unless every FP16 scale of the blocks of aTensor is finite
     procedure CheckBlockScales(aTensor: PInferTensor; const aName: RawUtf8);
     procedure Grow(aCtx: TDecoderContext; aTokens, aNew: PtrInt);
@@ -473,6 +529,9 @@ type
     /// true when every layer is of the kind aMixer and aFfn - what a device
     // checks before it takes a model
     function HasOnly(aMixer: TDecoderMixer; aFfn: TDecoderFfn): boolean;
+    /// what the layers compute beyond attention, RMSNorm and a plain SwiGLU
+    // - a device checks it too: [] for the Qwen families
+    function Extras: TDecoderExtras;
     /// the weights of the final RMSNorm, as used
     property FinalNorm: PSingleArray
       read fNorm;
@@ -895,12 +954,100 @@ begin
        ((fConfig.Spec[i].Window <> 0) and (fConfig.Spec[i].Mixer <> dmAttention)) then
       EInferError.RaiseUtf8('%: % has a window of % in layer %',
         [self, aSource, fConfig.Spec[i].Window, i]);
+  if (fConfig.SwiGluLimit < 0) or (fConfig.SwiGluLimit > 1e6) or
+     ((fConfig.SwiGluLimit > 0) and
+      (not (fConfig.SwiGluAlpha > 0) or (fConfig.SwiGluAlpha > 1e6))) then
+    EInferError.RaiseUtf8('%: % has a SwiGLU limit of % (alpha %)',
+      [self, aSource, fConfig.SwiGluLimit, fConfig.SwiGluAlpha]);
+  if (fConfig.RopeFactor <> 0) and
+     (not (fConfig.RopeFactor >= 1) or (fConfig.RopeFactor > 1e4) or
+      (fConfig.RopeOriginal <= 0) or (fConfig.RopeOriginal > 1 shl 24) or
+      not (fConfig.RopeBetaFast > 0) or (fConfig.RopeBetaFast > 1e6) or
+      not (fConfig.RopeBetaSlow > 0) or (fConfig.RopeBetaSlow > 1e6) or
+      not (fConfig.RopeAttention >= 0) or (fConfig.RopeAttention > 1e3)) then
+    EInferError.RaiseUtf8('%: % has invalid YaRN settings (factor %)',
+      [self, aSource, fConfig.RopeFactor]);
   // inverse rotary frequencies as the reference forms them in float32:
   // 1 / theta ^ (2i / d), each step rounded to single
   SetLength(fInvFreq, fConfig.HeadDim shr 1);
   for i := 0 to high(fInvFreq) do
     fInvFreq[i] := 1 / RoundToSingle(Exp(Ln(fConfig.RopeTheta) *
       RoundToSingle((2 * i) / fConfig.HeadDim)));
+  fRopeScale := 1;
+  if fConfig.RopeFactor <> 0 then
+    YarnFrequencies;
+end;
+
+procedure TDecoderModel.YarnFrequencies;
+var
+  i, d: PtrInt;
+  lo, hi, span, pi2: double;
+  loS, spanS, ramp, keep, pos, inter, extra, f: single;
+
+  // the dimension that turns aRotations times over the original context
+  function CorrectionDim(aRotations: double): double;
+  begin
+    result := (d * Ln(fConfig.RopeOriginal / (aRotations * pi2))) /
+      (2 * Ln(fConfig.RopeTheta));
+  end;
+
+begin
+  // as _compute_yarn_parameters of transformers: the frequencies below the
+  // correction range keep their value (extrapolation), those above it are
+  // divided by the factor (interpolation), a linear ramp between - every
+  // tensor step in float32, the bounds in double as Python computes them
+  d := fConfig.HeadDim;
+  pi2 := 2 * PI;
+  lo := CorrectionDim(fConfig.RopeBetaFast);
+  hi := CorrectionDim(fConfig.RopeBetaSlow);
+  if fConfig.RopeTruncate then
+  begin
+    // math.floor / math.ceil
+    if Trunc(lo) > lo then
+      lo := Trunc(lo) - 1
+    else
+      lo := Trunc(lo);
+    if Trunc(hi) < hi then
+      hi := Trunc(hi) + 1
+    else
+      hi := Trunc(hi);
+  end;
+  if lo < 0 then
+    lo := 0;
+  if hi > d - 1 then
+    hi := d - 1;
+  if lo = hi then
+    hi := hi + 0.001; // no singularity
+  span := hi - lo;
+  loS := lo;
+  spanS := span;
+  f := fConfig.RopeFactor;
+  for i := 0 to high(fInvFreq) do
+  begin
+    // the extrapolation 1 / pos is the plain frequency, the interpolation
+    // 1 / (factor * pos)
+    pos := Exp(Ln(fConfig.RopeTheta) * RoundToSingle((2 * i) / d));
+    pos := f * pos;
+    inter := 1 / pos;
+    extra := fInvFreq[i];
+    ramp := i - loS;
+    ramp := ramp / spanS;
+    if ramp < 0 then
+      ramp := 0
+    else if ramp > 1 then
+      ramp := 1;
+    keep := 1 - ramp; // the share of the extrapolation
+    ramp := 1 - keep;
+    inter := inter * ramp;
+    extra := extra * keep;
+    fInvFreq[i] := inter + extra;
+  end;
+  if fConfig.RopeAttention > 0 then
+    fRopeScale := fConfig.RopeAttention
+  else if f <= 1 then
+    fRopeScale := 1
+  else
+    fRopeScale := 0.1 * Ln(f) + 1;
 end;
 
 function TDecoderModel.HasOnly(aMixer: TDecoderMixer; aFfn: TDecoderFfn): boolean;
@@ -912,6 +1059,27 @@ begin
     if (fConfig.Spec[i].Mixer <> aMixer) or (fConfig.Spec[i].Ffn <> aFfn) then
       exit;
   result := true;
+end;
+
+function TDecoderModel.Extras: TDecoderExtras;
+var
+  i: PtrInt;
+begin
+  result := [];
+  if fConfig.SwiGluLimit > 0 then
+    include(result, dxSwiGluLimit);
+  for i := 0 to high(fLayer) do
+  begin
+    if fLayer[i].Sinks <> nil then
+      include(result, dxSinks);
+    if fLayer[i].OBias <> nil then
+      include(result, dxOutputBias);
+    if fLayer[i].RouterBias <> nil then
+      include(result, dxRouterBias);
+    if (fLayer[i].ExpertGateBias <> nil) or (fLayer[i].ExpertUpBias <> nil) or
+       (fLayer[i].ExpertDownBias <> nil) then
+      include(result, dxExpertBias);
+  end;
 end;
 
 function TDecoderModel.Find(const aName: RawUtf8): PInferTensor;
@@ -1008,6 +1176,82 @@ begin
   result := pointer(fOwned[n]);
 end;
 
+function TDecoderModel.Own(var aValues: TSingleDynArray): PSingleArray;
+var
+  n: PtrInt;
+begin
+  n := length(fOwned);
+  SetLength(fOwned, n + 1);
+  fOwned[n] := aValues; // a reference: the values are not copied
+  aValues := nil;
+  result := pointer(fOwned[n]);
+end;
+
+function TDecoderModel.MatrixOf(var aSrc: TSingleDynArray; aRows, aCols: Int64;
+  aType: TInferDType; const aName: RawUtf8): TInferWeight;
+var
+  r, n: PtrInt;
+begin
+  if Int64(length(aSrc)) <> aRows * aCols then
+    EInferError.RaiseUtf8('%: % has % values for [%,%]',
+      [self, aName, length(aSrc), aRows, aCols]);
+  case aType of
+    idtF32:
+      result := InferWeight(Own(aSrc), idtF32);
+    idtQ8_0:
+      begin
+        n := length(fOwnedQ8);
+        SetLength(fOwnedQ8, n + 1);
+        SetLength(fOwnedQ8[n], aRows * (aCols shr 5));
+        for r := 0 to aRows - 1 do
+          QuantizeRow(@aSrc[r * aCols], aCols, aType, n, r, aName);
+        result := InferWeight(pointer(fOwnedQ8[n]), idtQ8_0);
+      end;
+    idtQ4_0:
+      begin
+        n := length(fOwnedQ4);
+        SetLength(fOwnedQ4, n + 1);
+        SetLength(fOwnedQ4[n], aRows * (aCols shr 5));
+        for r := 0 to aRows - 1 do
+          QuantizeRow(@aSrc[r * aCols], aCols, aType, n, r, aName);
+        result := InferWeight(pointer(fOwnedQ4[n]), idtQ4_0);
+      end;
+  else
+    EInferError.RaiseUtf8('%: % as % not supported', [self, aName,
+      INFER_DTYPE_NAME[aType]]);
+  end;
+end;
+
+procedure TDecoderModel.QuantizeRow(aSrc: PSingleArray; aCols: PtrInt;
+  aType: TInferDType; aOwned, aRow: PtrInt; const aName: RawUtf8);
+var
+  nb, c: PtrInt;
+  d: word;
+begin
+  nb := aCols shr 5;
+  // a NaN or an infinity has no quantized form: refused, by its bits (no FPU)
+  for c := 0 to aCols - 1 do
+    if PCardinalArray(aSrc)^[c] and $7f800000 = $7f800000 then
+      EInferError.RaiseUtf8('%: % has a NaN or infinite weight at row % column %',
+        [self, aName, aRow, c]);
+  if aType = idtQ8_0 then
+    InferQuantizeRowQ8_0Ref(aSrc, aCols, @fOwnedQ8[aOwned][aRow * nb])
+  else
+    InferQuantizeRowQ4_0(aSrc, aCols, @fOwnedQ4[aOwned][aRow * nb]);
+  // a finite weight beyond the range still gets the FP16 scale +Inf (ggml
+  // writes it too): every product with it would be Inf or NaN
+  for c := aRow * nb to aRow * nb + nb - 1 do
+  begin
+    if aType = idtQ8_0 then
+      d := fOwnedQ8[aOwned][c].d
+    else
+      d := fOwnedQ4[aOwned][c].d;
+    if d and $7fff >= $7c00 then
+      EInferError.RaiseUtf8('%: % has a weight beyond the % range in row %',
+        [self, aName, INFER_DTYPE_NAME[aType], aRow]);
+  end;
+end;
+
 /// raise unless every FP16 scale of the blocks of t is finite
 procedure CheckScales(t: PInferTensor; const aName: RawUtf8; aModel: TObject);
 var
@@ -1076,8 +1320,7 @@ function TDecoderModel.Matrix(const aName: RawUtf8; aRows, aCols: Int64;
 var
   t: PInferTensor;
   row: TSingleDynArray;
-  nb, r, n, c: PtrInt;
-  d: word;
+  nb, r, n: PtrInt;
 begin
   if fGguf <> nil then
   begin
@@ -1123,27 +1366,7 @@ begin
   for r := 0 to aRows - 1 do
   begin
     InferRowToF32(t^.Data, t^.DType, r, aCols, pointer(row));
-    // a NaN or an infinity has no quantized form: refused, by its bits (no FPU)
-    for c := 0 to aCols - 1 do
-      if PCardinalArray(row)^[c] and $7f800000 = $7f800000 then
-        EInferError.RaiseUtf8('%: % has a NaN or infinite weight at row % column %',
-          [self, aName, r, c]);
-    if aType = idtQ8_0 then
-      InferQuantizeRowQ8_0Ref(pointer(row), aCols, @fOwnedQ8[n][r * nb])
-    else
-      InferQuantizeRowQ4_0(pointer(row), aCols, @fOwnedQ4[n][r * nb]);
-    // a finite weight beyond the range still gets the FP16 scale +Inf (ggml
-    // writes it too): every product with it would be Inf or NaN
-    for c := r * nb to r * nb + nb - 1 do
-    begin
-      if aType = idtQ8_0 then
-        d := fOwnedQ8[n][c].d
-      else
-        d := fOwnedQ4[n][c].d;
-      if d and $7fff >= $7c00 then
-        EInferError.RaiseUtf8('%: % has a weight beyond the % range in row %',
-          [self, aName, INFER_DTYPE_NAME[aType], r]);
-    end;
+    QuantizeRow(pointer(row), aCols, aType, n, r, aName);
   end;
 end;
 
@@ -1330,7 +1553,7 @@ end;
 procedure TDecoderModel.Rotary(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
 var
   r, i, half: PtrInt;
-  angle: single;
+  angle, c, s: single;
 begin
   half := fConfig.HeadDim shr 1;
   for r := 0 to aRows - 1 do
@@ -1338,8 +1561,16 @@ begin
     begin
       // the angle in single, as the reference's float32 product
       angle := fInvFreq[i] * (aFirstPos + r);
-      aCos^[r * half + i] := Cos(angle);
-      aSin^[r * half + i] := Sin(angle);
+      c := Cos(angle);
+      s := Sin(angle);
+      if fRopeScale <> 1 then
+      begin
+        // YaRN: both scaled in float32, after the rounding of cos and sin
+        c := c * fRopeScale;
+        s := s * fRopeScale;
+      end;
+      aCos^[r * half + i] := c;
+      aSin^[r * half + i] := s;
     end;
 end;
 
@@ -1367,7 +1598,7 @@ begin
   fBackend.CausalAttention(pointer(aCtx.fQ), aRows, fConfig.Heads, fConfig.HeadDim,
     pointer(aCtx.fKeys[aLayer]), pointer(aCtx.fValues[aLayer]),
     aCtx.fLength - aCtx.fBase[aLayer], fConfig.KvHeads, pointer(aCtx.fAttn),
-    fConfig.Spec[aLayer].Window);
+    fConfig.Spec[aLayer].Window, fLayer[aLayer].Sinks);
 end;
 
 procedure TDecoderModel.AttentionBlock(aCtx: TDecoderContext;
@@ -1408,7 +1639,7 @@ begin
   MoveFast(pointer(aCtx.fV)^, aCtx.fValues[aLayer][(aPast - aCtx.fBase[aLayer]) * kvw],
     n * kvw * SizeOf(single));
   Attention(aCtx, aLayer, n);
-  fBackend.Linear(pointer(aCtx.fAttn), n, qw, ly^.O, h, nil, pointer(aCtx.fTmp));
+  fBackend.Linear(pointer(aCtx.fAttn), n, qw, ly^.O, h, ly^.OBias, pointer(aCtx.fTmp));
   if Assigned(aOnState) and (aLayer = 0) then
     aOnState('layer00_attn', pointer(aCtx.fTmp), n, h);
   fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
@@ -1429,7 +1660,8 @@ begin
     pointer(aCtx.fH));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Gate, f, nil, pointer(aCtx.fGate));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Up, f, nil, pointer(aCtx.fUp));
-  fBackend.SwiGlu(pointer(aCtx.fGate), pointer(aCtx.fUp), n * f);
+  fBackend.SwiGlu(pointer(aCtx.fGate), pointer(aCtx.fUp), n * f,
+    fConfig.SwiGluAlpha, fConfig.SwiGluLimit);
   fBackend.Linear(pointer(aCtx.fGate), n, f, ly^.Down, h, nil, pointer(aCtx.fTmp));
   if Assigned(aOnState) and (aLayer = 0) then
     aOnState('layer00_mlp', pointer(aCtx.fTmp), n, h);
@@ -1569,7 +1801,7 @@ var
   n, h, fi, k, e, r, j, c, cnt, i: PtrInt;
   w: single;
   ly: ^TDecoderLayer;
-  src, dst: PSingleArray;
+  src, dst, gb, ub, db: PSingleArray;
 begin
   ly := @fLayer[aLayer];
   n := aRows;
@@ -1579,8 +1811,8 @@ begin
   // pre-norm, the router: its logits, then the experts of every token
   fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, fConfig.RmsEps,
     pointer(aCtx.fH));
-  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Router, fConfig.Experts, nil,
-    pointer(aCtx.fRoute));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Router, fConfig.Experts,
+    ly^.RouterBias, pointer(aCtx.fRoute));
   for r := 0 to n - 1 do
     Route(@aCtx.fRoute[r * fConfig.Experts], @aCtx.fChosen[r * k],
       @aCtx.fChosenW[r * k]);
@@ -1601,12 +1833,22 @@ begin
         end;
     if cnt = 0 then
       continue;
-    fBackend.Linear(pointer(aCtx.fGather), cnt, h, ly^.ExpertGate[e], fi, nil,
+    gb := nil;
+    ub := nil;
+    db := nil;
+    if ly^.ExpertGateBias <> nil then
+      gb := @ly^.ExpertGateBias^[e * fi];
+    if ly^.ExpertUpBias <> nil then
+      ub := @ly^.ExpertUpBias^[e * fi];
+    if ly^.ExpertDownBias <> nil then
+      db := @ly^.ExpertDownBias^[e * h];
+    fBackend.Linear(pointer(aCtx.fGather), cnt, h, ly^.ExpertGate[e], fi, gb,
       pointer(aCtx.fGate));
-    fBackend.Linear(pointer(aCtx.fGather), cnt, h, ly^.ExpertUp[e], fi, nil,
+    fBackend.Linear(pointer(aCtx.fGather), cnt, h, ly^.ExpertUp[e], fi, ub,
       pointer(aCtx.fUp));
-    fBackend.SwiGlu(pointer(aCtx.fGate), pointer(aCtx.fUp), cnt * fi);
-    fBackend.Linear(pointer(aCtx.fGate), cnt, fi, ly^.ExpertDown[e], h, nil,
+    fBackend.SwiGlu(pointer(aCtx.fGate), pointer(aCtx.fUp), cnt * fi,
+      fConfig.SwiGluAlpha, fConfig.SwiGluLimit);
+    fBackend.Linear(pointer(aCtx.fGate), cnt, fi, ly^.ExpertDown[e], h, db,
       pointer(aCtx.fExpertOut));
     for c := 0 to cnt - 1 do
     begin

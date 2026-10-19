@@ -139,10 +139,11 @@ type
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
-      aWindow: PtrInt = 0); override;
+      aWindow: PtrInt = 0; aSinks: PSingleArray = nil); override;
     procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
       aEps: double; y: PSingleArray); override;
-    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
+      aAlpha: single = 1; aLimit: single = 0); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray); override;
   end;
@@ -153,6 +154,8 @@ type
     Rows, Heads, HeadDim, Past, KvHeads: PtrInt;
     /// the keys a row sees at most, itself included (0: all before it)
     Window: PtrInt;
+    /// a logit per head that joins every softmax (nil: none)
+    Sinks: PSingleArray;
     RowBlocks: PtrInt;
     /// true: float lanes (the fast path), false: the double reference
     Fast: boolean;
@@ -202,6 +205,7 @@ type
     fGamma, fBeta: PSingleArray;
     fEps: double;
     fCols: PtrInt;
+    fAlpha, fLimit: single; // of the running SwiGlu
     fCausal: TInferCausalJob;
     procedure CausalItem(aItem: integer);
     procedure LinearTile(aItem: integer);
@@ -231,10 +235,11 @@ type
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
-      aWindow: PtrInt = 0); override;
+      aWindow: PtrInt = 0; aSinks: PSingleArray = nil); override;
     procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
       aEps: double; y: PSingleArray); override;
-    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
+    procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
+      aAlpha: single = 1; aLimit: single = 0); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray); override;
     /// the threads computing, the calling one included
@@ -1083,6 +1088,8 @@ begin
         if s^[j] > m then
           m := s^[j];
       end;
+      if (aJob.Sinks <> nil) and (aJob.Sinks^[h] > m) then
+        m := aJob.Sinks^[h];
       sum := 0;
       for j := 0 to cnt - 1 do
       begin
@@ -1090,6 +1097,8 @@ begin
         s^[j] := a;
         sum := sum + a;
       end;
+      if aJob.Sinks <> nil then
+        sum := sum + Exp(aJob.Sinks^[h] - m); // a share without a value
       sum := 1 / sum;
       for j := 0 to cnt - 1 do
         s^[j] := s^[j] * sum;
@@ -1134,12 +1143,16 @@ begin
       if (j = first) or (acc > m) then
         m := acc;
     end;
+    if (aJob.Sinks <> nil) and (aJob.Sinks^[h] > m) then
+      m := aJob.Sinks^[h];
     sum := 0;
     for j := first to total - 1 do
     begin
       sc^[j] := Exp(sc^[j] - m);
       sum := sum + sc^[j];
     end;
+    if aJob.Sinks <> nil then
+      sum := sum + Exp(aJob.Sinks^[h] - m); // a share without a value
     for t := 0 to d - 1 do
       sums^[t] := 0;
     for j := first to total - 1 do
@@ -1158,7 +1171,7 @@ end;
 
 function CausalJob(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
   keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
-  aWindow: PtrInt; aFast: boolean): TInferCausalJob;
+  aWindow: PtrInt; aSinks: PSingleArray; aFast: boolean): TInferCausalJob;
 begin
   if (aRows <= 0) or (aHeads <= 0) or (aHeadDim <= 0) or (aPast < 0) or
      (aKvHeads <= 0) or (aHeads mod aKvHeads <> 0) or (aWindow < 0) then
@@ -1174,19 +1187,20 @@ begin
   result.Past := aPast;
   result.KvHeads := aKvHeads;
   result.Window := aWindow;
+  result.Sinks := aSinks;
   result.RowBlocks := 1;
   result.Fast := aFast;
 end;
 
 procedure TInferCpuBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
-  y: PSingleArray; aWindow: PtrInt);
+  y: PSingleArray; aWindow: PtrInt; aSinks: PSingleArray);
 var
   job: TInferCausalJob;
   h: PtrInt;
 begin
   job := CausalJob(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
-    aWindow, false);
+    aWindow, aSinks, false);
   for h := 0 to aHeads - 1 do
     CausalRows(job, h, 0, aRows - 1);
 end;
@@ -1542,12 +1556,36 @@ begin
   end;
 end;
 
-procedure TInferCpuBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt);
+procedure TInferCpuBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
+  aAlpha, aLimit: single);
 var
   i: PtrInt;
   a: double;
-  b: single;
+  b, g, u: single;
 begin
+  if aLimit > 0 then
+  begin
+    // gpt-oss: (clamp(u) + 1) * g * sigmoid(alpha * g), g clamped from above,
+    // each step rounded to single like the reference (a NaN stays a NaN)
+    for i := 0 to aCount - 1 do
+    begin
+      g := gate^[i];
+      if g > aLimit then
+        g := aLimit;
+      u := up^[i];
+      if u > aLimit then
+        u := aLimit
+      else if u < -aLimit then
+        u := -aLimit;
+      b := g * aAlpha;
+      a := b;
+      b := 1 / (1 + Exp(-a));
+      b := g * b;
+      u := u + 1;
+      gate^[i] := u * b;
+    end;
+    exit;
+  end;
   for i := 0 to aCount - 1 do
   begin
     // silu(g) * u, each step rounded to single like the reference
@@ -2124,7 +2162,7 @@ end;
 
 procedure TInferCpuFastBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
-  y: PSingleArray; aWindow: PtrInt);
+  y: PSingleArray; aWindow: PtrInt; aSinks: PSingleArray);
 var
   job: TInferCausalJob;
   h: PtrInt;
@@ -2132,7 +2170,7 @@ begin
   // split by head and row block, never inside one sum: Exact stays
   // bit-identical to the reference
   job := CausalJob(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
-    aWindow, not fExact);
+    aWindow, aSinks, not fExact);
   job.RowBlocks := (aRows + CAUSAL_ROWS - 1) div CAUSAL_ROWS;
   if fBusy.TryLock then
   try
@@ -2352,20 +2390,24 @@ var
 begin
   // the reference arithmetic on a slice: bit-identical
   first := PtrInt(aItem) * SWIGLU_ITEM;
-  inherited SwiGlu(@fX^[first], @fY^[first], MinPtrInt(SWIGLU_ITEM, fRows - first));
+  inherited SwiGlu(@fX^[first], @fY^[first], MinPtrInt(SWIGLU_ITEM, fRows - first),
+    fAlpha, fLimit);
 end;
 
-procedure TInferCpuFastBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt);
+procedure TInferCpuFastBackend.SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
+  aAlpha, aLimit: single);
 begin
   if (aCount < 2 * SWIGLU_ITEM) or not fBusy.TryLock then
   begin
-    inherited SwiGlu(gate, up, aCount);
+    inherited SwiGlu(gate, up, aCount, aAlpha, aLimit);
     exit;
   end;
   try
     fX := gate;
     fY := up;
     fRows := aCount;
+    fAlpha := aAlpha;
+    fLimit := aLimit;
     RunParallel(SwiGluRange, (aCount + SWIGLU_ITEM - 1) div SWIGLU_ITEM);
   finally
     fBusy.UnLock;

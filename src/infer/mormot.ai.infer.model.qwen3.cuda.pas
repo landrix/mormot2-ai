@@ -328,6 +328,10 @@ begin
   for l := 0 to high(aModel.Config.Spec) do
     if aModel.Config.Spec[l].Mixer <> dmAttention then
       EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
+  // no attention sinks, output, router or expert biases, nor the clamped
+  // SwiGLU of gpt-oss yet (backlog D5)
+  if aModel.Extras <> [] then
+    EInferError.RaiseUtf8('%: the layers of % not supported', [self, aModel]);
   fMoe := not aModel.HasOnly(dmAttention, dfDense);
   // qkrope keeps one normalized head in shared memory, the attention reads
   // the keys as float4
