@@ -48,10 +48,10 @@ Qwen3-30B-A3B and Qwen2.5 included) and of the M2 Pro again on 2026-10-19:
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
 | Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2364 ⁶ |
-| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 723 | 4985 |
-| Windows x64 (i9-14900K) | Delphi 13 | 1257 | 726 | 4985 |
-| Windows x86 | **Delphi 7** | 1253 | 714 | 3318 ⁴ |
-| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 716 | 4164 ⁵ |
+| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 723 | 4996 |
+| Windows x64 (i9-14900K) | Delphi 13 | 1257 | 726 | 4996 |
+| Windows x86 | **Delphi 7** | 1253 | 714 | 3325 ⁴ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 716 | 4175 ⁵ |
 | Windows ARM64 (Snapdragon X) | FPC 3.3.1 ¹ | 1257 | 714 ² | 2728 ¹ |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 725 | 2486 ³ |
 
@@ -112,6 +112,34 @@ begin
   // v: 1024 floats, L2-normalised - ready for TNativeVectorStore
 end.
 ```
+
+A chat model is as short - Qwen3, Qwen3-MoE or Qwen2.5 from a Hugging Face folder or one
+GGUF file, behind the same `ILlmClient` as the HTTP providers:
+
+```pascal
+program chat;
+
+{$I mormot.defines.inc}
+
+uses
+  {$I mormot.uses.inc}
+  mormot.core.os, mormot.ai.llm.types, mormot.ai.llm, mormot.ai.llm.native;
+
+var
+  llm: ILlmClient;
+  msgs: TLlmMessageDynArray;
+begin
+  // a Hugging Face folder (quantized to Q8_0 at load), or one GGUF file with
+  // TNativeLlmClient.CreateFromGguf; the family comes from the files
+  llm := TNativeLlmClient.Create('vendor/models/qwen3-0.6b');
+  SetLength(msgs, 1);
+  msgs[0] := LlmMessage(lrUser, 'Why is the sky blue?');
+  ConsoleWrite(llm.ChatComplete(LlmChatRequest('', msgs)).Content);
+end.
+```
+
+Streamed, and on Vulkan or CUDA: [`demos/llm/llm-quickstart.lpr`](demos/llm/llm-quickstart.lpr)
+(`llm-quickstart <folder | file.gguf> [question] [cpu | vulkan | cuda]`).
 
 **How it is checked.** Every layer is compared against a fixed Python reference
 (`tools/infer-ref/`, data under `tests/data/infer-ref/`); token ids match lembed on all
@@ -218,8 +246,10 @@ tokens/s. A prefill still chooses on the host.
 
 FP32 keeps greedy output token-identical to `transformers`; Q8_0 passes its own gate but
 can flip a close decision - with it, Qwen3-0.6B answers the weather question of the
-reference prompt itself instead of calling the tool. `TNativeLlmClient` therefore loads
-FP32 by default.
+reference prompt itself instead of calling the tool. `TNativeLlmClient` still loads a folder
+as Q8_0 by default (a quarter of the memory, about twice the decoding speed); pass
+`idtF32` for tests and comparisons. `MaxContext` caps a conversation (and with it the KV
+cache, which grows by doubling as the conversation does).
 
 Plan, phases, gates and the full record: [docs/native-inference.md](docs/native-inference.md)
 (German).
@@ -551,7 +581,8 @@ mormot2-ai/
       decoder, model.qwen3[.vulkan|.cuda], chat, sampler, pipeline.embed,
       backend[.cpu|.vulkan|.cuda], kernels (NEON, AVX2), threads, vulkan, cuda
   tests/    mcp.tests · llm.tests · infer.tests (mORMot TSynTests), data/ (reference data)
-  demos/    stdio · http · jsonrpc · streamable · llm/* · rag/* · infer/{embed,llm}-bench
+  demos/    stdio · http · jsonrpc · streamable · llm/* (llm-quickstart: a local model in
+            a few lines) · rag/* · infer/{embed,llm}-bench
   tools/    infer-ref (Python reference for the engine), vk and cuda (shader and kernel
             sources; the compiled SPIR-V / PTX is in git) - none needed to build
   docs/     native-inference.md · native-embeddings.md · specs/mcp-2026-07-28/
@@ -640,7 +671,8 @@ Next, in this order:
    valid restore points for the prompt cache and layers without rotary positions, SmolLM3
    as the reference family (D4, CPU); the expert choice of a decode step on the GPU (D3c,
    Qwen3-30B-A3B from 39 to 97 tokens/s on CUDA); Q5_0 weights, so Qwen's own Q4_K_M
-   files of small models load (B16); embedding rows instead of ids and decoder stacks, for
+   files of small models load (B16); Q8_0 as the native client's default, `MaxContext` and
+   a quickstart demo (B15); embedding rows instead of ids and decoder stacks, for
    speech, vision and audio models (B14: Qwen3-TTS's talker and code predictor, its
    `vocab.json` + `merges.txt` tokenizer, BF16 and F16 rows in `InferRowToF32`, thread-pool
    jobs with scratch buffers per thread). Next:

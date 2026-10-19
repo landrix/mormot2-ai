@@ -594,7 +594,8 @@ bestehen und die Benchmarks dokumentiert sind.
     („Das …“), statt `get_weather` aufzurufen (Referenzabstand 0,22). Ein Versuch mit
     quantisierten Gewichten und F32-Aktivierungen kippt genauso, ein F32-Kopf hilft
     nicht: Ursache ist die Rundung der Gewichte, nicht unser Code. `TNativeLlmClient`
-    lädt deshalb standardmäßig F32, Q8_0 ist eine Option.
+    lädt deshalb standardmäßig F32, Q8_0 ist eine Option. (Seit B15, 2026-10-19, ist
+    Q8_0 die Vorgabe und F32 die Wahl für Tests und Vergleiche.)
 - Gegenproben, die anschlagen: Q8-Zeilen verschoben, Attention ohne Skalierung,
   falsche KV-Kopf-Zuordnung, F32-Kachel zu kurz, Float-Attention im Exact-Modus,
   Referenzzweig mit einem Schlüssel zu wenig, Q8-Kopf gleich dem Embedding, fehlende
@@ -1812,6 +1813,35 @@ wörtlich, Assistent mit Aufrufen als Text, `<tool_response>` als Id, Parser hä
 Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und nie die
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
+
+**B15 erledigt (2026-10-19): Q8_0 als Vorgabe, `MaxContext`, Quickstart-Demo.**
+Anlass war neural-api (`LoadModel(dir)` und `ChatReply`, int8 als Vorgabe): der Einstieg soll
+bei uns genauso kurz sein.
+
+- *Vorgabe (Nutzerentscheidung):* `TNativeLlmClient.Create(Ordner)` quantisiert die Matrizen
+  jetzt beim Laden zu Q8_0 - ein Viertel des Speichers von F32, rund doppeltes Decode-Tempo.
+  Wer Token-Gleichheit mit transformers braucht (Tests, Vergleiche), übergibt `idtF32`; die
+  Client-Tests tun das jetzt ausdrücklich, `Qwen3ChatClientQ8` prüft die Vorgabe. Der Befund
+  von Phase 2 bleibt richtig: Q8_0 kann eine knappe Entscheidung kippen (die Wetterfrage).
+  GGUF-Dateien betrifft das nicht, sie laden ihre Typen wie gespeichert.
+- *Kontext:* Der KV-Cache wuchs schon immer nur mit dem Gespräch (Verdoppeln, bis
+  `MaxPositions`, auf CPU und GPU). Neu ist `TNativeLlmClient.MaxContext` (0 = die Länge des
+  Modells, 40960 bei Qwen3): ein längerer Prompt wird abgelehnt, eine längere Antwort endet
+  mit `lfrLength`; damit bleibt der Cache unter etwa dem Doppelten des Deckels. Darunter
+  nimmt `NativeDecode` ein `aMaxContext`. Tests: `DecodeOnTinyModel` (dieselben Regeln mit
+  Deckel 100, ein Deckel über `MaxPositions` erweitert nichts), `Qwen3ChatClientQ8`
+  (Deckel unter dem Prompt abgelehnt, Deckel = Prompt gibt genau ein Token).
+- *Demo:* `demos/llm/llm-quickstart.lpr` - Ordner oder GGUF-Datei, eine Frage, die Antwort
+  gestreamt, wahlweise `vulkan` oder `cuda`; dazu ein Schnipsel von zehn Zeilen im README.
+  Gelaufen auf dem RTX-Rechner unter FPC, Delphi 13 und Delphi 7 auf CPU, Vulkan und CUDA,
+  mit Ordner und GGUF, auch Qwen3-30B-A3B auf CUDA; der README-Schnipsel unter FPC in der
+  WSL. Eingetragen in `build-demo.sh` und `build-delphi-demos.ps1`.
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 4996 Assertions) und Delphi 7 (3325)
+  und auf dem M2 Pro (4175). Gegenprobe: Vorgabe zurück auf F32, Deckel übergangen, Deckel
+  über `MaxPositions` hinaus, der Client reicht `MaxContext` nicht durch - alle vier
+  scheitern. Review: Claude-Finder ohne Befund; Codex: ein späteres Senken von `MaxContext`
+  verkleinert die Kontexte im Prompt-Cache nicht - jetzt am Property beschrieben, mit
+  `Cache.Slots := 0` als Abhilfe.
 
 **B14 Punkte 1, 2, 4 und 5 erledigt (2026-10-19): BF16/F16-Zeilen, Tokenizer aus `vocab.json` + `merges.txt`, F16-KV-Cache, Puffer je Worker.**
 Die übrigen Rückmeldungen flydevs aus dem TTS-Projekt (Backlog B14).

@@ -228,7 +228,8 @@ function NativeSampling(const aRequest: TLlmChatRequest;
 /// decoding of aPrompt into aParser, which is finished afterwards
 // - every token drawn by a TInferSampler of aSampling (greedy at temperature 0)
 // - at most aMaxNew tokens, and never more than the context holds: the last
-// token is not fed back, so a prompt of P tokens leaves MaxPositions - P + 1
+// token is not fed back, so a prompt of P tokens leaves C - P + 1, C the
+// model's MaxPositions or aMaxContext when that is smaller (and above 0)
 // - raises ELlmClient for an empty prompt, one longer than the context, or
 // aMaxNew <= 0
 // - aContext: nil decodes in a context of its own; else the tokens it caches
@@ -238,7 +239,7 @@ function NativeSampling(const aRequest: TLlmChatRequest;
 // - returns how many prompt tokens came from aContext
 function NativeDecode(aModel: TDecoderModel; const aPrompt: TIntegerDynArray;
   aMaxNew: PtrInt; aParser: TNativeOutputParser; const aSampling: TInferSampling;
-  aContext: TDecoderContext = nil): PtrInt;
+  aContext: TDecoderContext = nil; aMaxContext: PtrInt = 0): PtrInt;
 
 const
   /// how many finished requests a TNativeLlmClient keeps the KV cache of
@@ -335,7 +336,7 @@ type
     fActive: integer;  // requests running
     fCache: TNativePromptCache;
     fConfig: TLlmProviderConfig;
-    fMaxTokens: integer;
+    fMaxTokens, fMaxContext: integer;
     fEnableThinking: boolean;
     fSampling: TInferSampling;
     procedure Generate(const aRequest: TLlmChatRequest; aParser: TNativeOutputParser);
@@ -347,13 +348,14 @@ type
     // - aModelName: the name in Config and in every response, the folder name
     // when ''; aBackend: nil computes on a TInferCpuFastBackend of its own,
     // else on aBackend (not owned)
-    // - aWeights: idtF32 (default) keeps the model's own decisions - Qwen3-0.6B
-    // greedy is token-identical to transformers; idtQ8_0 needs a quarter of the
-    // memory and decodes about twice as fast, but rounding the weights can flip
-    // a close decision (with Q8_0, Qwen3-0.6B answers the weather question of
-    // the reference itself instead of calling the tool)
+    // - aWeights: idtQ8_0 (default) quantizes every matrix at load - a quarter
+    // of the memory of idtF32 and about twice its decoding speed, but rounding
+    // the weights can flip a close decision (with Q8_0, Qwen3-0.6B answers the
+    // weather question of the reference itself instead of calling the tool);
+    // idtF32 keeps the model's own decisions - Qwen3-0.6B greedy is
+    // token-identical to transformers - for tests and comparisons
     constructor Create(const aFolder: TFileName; const aModelName: RawUtf8 = '';
-      aBackend: TInferBackend = nil; aWeights: TInferDType = idtF32); reintroduce;
+      aBackend: TInferBackend = nil; aWeights: TInferDType = idtQ8_0); reintroduce;
     /// one llama.cpp GGUF file: weights, settings and the tokenizer from it,
     // with the family its general.architecture names
     // (NewDecoderModelFromGguf, then the family's tokenizer CreateFromGguf)
@@ -371,6 +373,17 @@ type
     // reasoning included)
     property MaxTokens: integer
       read fMaxTokens write fMaxTokens;
+    /// the most tokens of a conversation, prompt and answer: 0 (the default)
+    // for the model's MaxPositions (40960 for Qwen3), else the smaller one
+    // - the KV cache grows with the conversation, by doubling: the cap keeps
+    // it below about twice its size (Qwen3-0.6B: 224 KB per token in floats,
+    // keys and values; half that on a GPU device with KvF16);
+    // a longer prompt raises ELlmClient, a longer answer stops with finish
+    // reason length
+    // - set it before the first request: lowering it later does not shrink the
+    // contexts the prompt cache already holds (Cache.Slots := 0 frees them)
+    property MaxContext: integer
+      read fMaxContext write fMaxContext;
     /// whether the model reasons before it answers when a request does not
     // say (Qwen3: a <think> block)
     // (default true, the model's own default)
@@ -969,25 +982,28 @@ end;
 
 function NativeDecode(aModel: TDecoderModel; const aPrompt: TIntegerDynArray;
   aMaxNew: PtrInt; aParser: TNativeOutputParser; const aSampling: TInferSampling;
-  aContext: TDecoderContext): PtrInt;
+  aContext: TDecoderContext; aMaxContext: PtrInt): PtrInt;
 var
   logits: TSingleDynArray;
   ctx: TDecoderContext;
   sampler: TInferSampler;
-  n: PtrInt;
+  n, limit: PtrInt;
   id: integer;
   stopped: boolean;
 begin
+  limit := aModel.Config.MaxPositions;
+  if (aMaxContext > 0) and (aMaxContext < limit) then
+    limit := aMaxContext;
   if aPrompt = nil then
     ELlmClient.RaiseUtf8('NativeDecode: empty prompt', []);
-  if length(aPrompt) > aModel.Config.MaxPositions then
+  if length(aPrompt) > limit then
     ELlmClient.RaiseUtf8('NativeDecode: a prompt of % tokens exceeds the ' +
-      'context of %', [length(aPrompt), aModel.Config.MaxPositions]);
+      'context of %', [length(aPrompt), limit]);
   if aMaxNew <= 0 then
     ELlmClient.RaiseUtf8('NativeDecode: % new tokens', [aMaxNew]);
   // token n is fed at position P + n - 1 only when another one follows
-  if aMaxNew > aModel.Config.MaxPositions - length(aPrompt) + 1 then
-    aMaxNew := aModel.Config.MaxPositions - length(aPrompt) + 1;
+  if aMaxNew > limit - length(aPrompt) + 1 then
+    aMaxNew := limit - length(aPrompt) + 1;
   SetLength(logits, aModel.Config.VocabSize);
   sampler := nil;
   ctx := aContext;
@@ -1286,7 +1302,8 @@ begin
   try
     ctx := fCache.Acquire(prompt);
     try
-      reused := NativeDecode(fModel, prompt, maxNew, aParser, sampling, ctx);
+      reused := NativeDecode(fModel, prompt, maxNew, aParser, sampling, ctx,
+        fMaxContext);
     except
       ctx.Free; // a failed request leaves nothing in the cache
       raise;

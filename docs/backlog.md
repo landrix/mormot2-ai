@@ -772,7 +772,7 @@ Zu 5: `TInferThreadPool.RunWorkers` mit Worker-Index für Puffer je Thread; das 
 Job kostet nur unter Delphi (32 Threads: 67 gegen 12 ms), FPCs Heap arbeitet je Thread.
 *Offen:* die Rückmeldung an flydev (Forum).
 
-## B15 — Schneller Einstieg: Gewichtsvorgabe und Quickstart-Demo (aufgenommen 2026-10-19)
+## B15 — Schneller Einstieg: Gewichtsvorgabe und Quickstart-Demo (aufgenommen 2026-10-19, erledigt 2026-10-19)
 
 Anlass: neural-api (`neuralchat`) lädt ein Modell mit `LoadModel(dir)` und antwortet mit
 `ChatReply(history)`, int8-Gewichte als Vorgabe (nur die Funktion als Anregung, kein Code).
@@ -798,6 +798,13 @@ statt das Werkzeug zu rufen) - deshalb steht F32 bisher als Vorgabe.
 **Fertig, wenn:** die Entscheidung zu 1 umgesetzt ist, das Demo unter FPC und Delphi 13 baut
 und läuft (CPU, und mit Vulkan/CUDA, wenn vorhanden), und das README den Einstieg in
 wenigen Zeilen zeigt. Weitere Ideen ohne Termin: [ideas.md](ideas.md).
+
+*Erledigt 2026-10-19* (`native-inference.md`, Phase D): Q8_0 ist die Vorgabe von
+`TNativeLlmClient.Create` (Nutzerentscheidung; `idtF32` für Tests und Vergleiche);
+`MaxContext` deckelt ein Gespräch und damit den KV-Cache, der schon vorher nur nach Bedarf
+wuchs; `demos/llm/llm-quickstart.lpr` lädt Ordner oder GGUF und streamt die Antwort, auf
+CPU, Vulkan und CUDA unter FPC, Delphi 13 und Delphi 7 gelaufen; das README zeigt den
+Einstieg in zehn Zeilen.
 
 ## B16 — Q5_0 (und Q5_1) für die K-Quant-Dateien kleiner Modelle (aufgenommen 2026-10-19, Q5_0 erledigt 2026-10-19)
 

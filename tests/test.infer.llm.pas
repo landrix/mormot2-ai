@@ -89,7 +89,7 @@ type
     procedure Qwen3ChatClient;
     /// TLlmAgent over the native client: a tool call and its answer
     procedure Qwen3AgentLoop;
-    /// the native client on Q8_0 matrices
+    /// the native client on Q8_0 matrices (its default), and MaxContext
     procedure Qwen3ChatClientQ8;
     /// TInferSampler: the distributions of temperature, top-k, top-p, min-p
     procedure SamplerDraws;
@@ -646,7 +646,7 @@ var
   prompt: TIntegerDynArray;
   raised: boolean;
 
-  function Decode(aPromptLen, aMaxNew: PtrInt): boolean;
+  function Decode(aPromptLen, aMaxNew: PtrInt; aMaxContext: PtrInt = 0): boolean;
   var
     i: PtrInt;
   begin
@@ -656,7 +656,7 @@ var
     FreeAndNil(p);
     p := TQwen3OutputParser.Create(fTokenizer);
     try
-      NativeDecode(model, prompt, aMaxNew, p, InferSamplingGreedy);
+      NativeDecode(model, prompt, aMaxNew, p, InferSamplingGreedy, nil, aMaxContext);
       result := true;
     except
       on ELlmClient do
@@ -697,6 +697,14 @@ begin
     CheckEqual(p.Count, 1, 'still gives one token');
     Check(not Decode(513, 1), 'a prompt beyond the context');
     Check(not Decode(5, 0), 'no new tokens');
+    // a smaller cap of the caller: the same rules at 100
+    Check(Decode(99, 100, 100), 'one free position under the cap');
+    CheckEqual(p.Count, 2, 'gives two tokens under the cap');
+    Check(p.Response.FinishReason = lfrLength, 'cut by the cap');
+    Check(not Decode(101, 1, 100), 'a prompt beyond the cap');
+    Check(Decode(512, 100, 1000), 'a cap above MaxPositions does not widen it');
+    CheckEqual(p.Count, 1, 'MaxPositions still holds');
+    Check(not Decode(513, 1, 1000), 'nor beyond MaxPositions');
     raised := false;
     try
       FreeAndNil(p);
@@ -946,7 +954,7 @@ begin
   ref := TInferRefSet.CreateFromFolder(refdir);
   try
     timer.Start;
-    client := TNativeLlmClient.Create(dir);
+    client := TNativeLlmClient.Create(dir, '', nil, idtF32);
     llm := client; // reference counted from here
     AddConsole(FormatString('native client loaded in %', [timer.Stop]));
     CheckEqual(llm.Config.DefaultModel, 'qwen3-0.6b', 'model name from the folder');
@@ -1028,13 +1036,14 @@ var
   req: TLlmChatRequest;
   r: TLlmChatResponse;
   msgs: TLlmMessageDynArray;
+  raised: boolean;
 begin
   dir := RealModel;
   if dir = '' then
     exit;
-  client := TNativeLlmClient.Create(dir, '', nil, idtQ8_0);
+  client := TNativeLlmClient.Create(dir); // Q8_0, the default
   llm := client;
-  Check(client.Model.Weights = idtQ8_0, 'Q8_0 matrices');
+  Check(client.Model.Weights = idtQ8_0, 'Q8_0 matrices by default');
   SetLength(msgs, 1);
   msgs[0] := LlmMessage(lrUser, 'What is the capital of France? Answer in one word.');
   req := LlmChatRequest('', msgs);
@@ -1043,6 +1052,23 @@ begin
   r := llm.ChatComplete(req);
   CheckEqual(r.Content, 'Paris', 'Q8_0 answers chat_en like FP32');
   Check(r.FinishReason = lfrStop, 'stop');
+  // MaxContext caps the conversation: the prompt alone exceeds 10 tokens
+  client.MaxContext := 10;
+  raised := false;
+  try
+    llm.ChatComplete(req);
+  except
+    on ELlmClient do
+      raised := true;
+  end;
+  Check(raised, 'a prompt beyond MaxContext refused');
+  // a cap of the prompt's length leaves one token: "Paris", then no room for
+  // <|im_end|>
+  client.MaxContext := r.Usage.PromptTokens;
+  r := llm.ChatComplete(req);
+  CheckEqual(r.Content, 'Paris', 'the one token under the cap');
+  Check(r.FinishReason = lfrLength, 'the answer cut by MaxContext');
+  CheckEqual(r.Usage.CompletionTokens, 1, 'MaxContext - prompt + 1 tokens');
 end;
 
 /// draw aDraws tokens from aLogits and count them per index
@@ -1468,7 +1494,7 @@ begin
   dir := RealModel;
   if dir = '' then
     exit;
-  client := TNativeLlmClient.Create(dir);
+  client := TNativeLlmClient.Create(dir, '', nil, idtF32);
   llm := client;
   Check((Abs(client.Sampling.Temperature - 0.6) < 1e-6) and
     (client.Sampling.TopK = 20) and (Abs(client.Sampling.TopP - 0.95) < 1e-6),
@@ -1584,7 +1610,7 @@ begin
   dir := RealModel;
   if dir = '' then
     exit;
-  client := TNativeLlmClient.Create(dir);
+  client := TNativeLlmClient.Create(dir, '', nil, idtF32);
   llm := client;
   client.EnableThinking := false;
   client.MaxTokens := 40;
@@ -1786,7 +1812,7 @@ begin
   ref := TInferRefSet.CreateFromFolder(refdir);
   try
     timer.Start;
-    client := TNativeLlmClient.Create(dir);
+    client := TNativeLlmClient.Create(dir, '', nil, idtF32);
     llm := client;
     AddConsole(FormatString('Qwen2.5-0.5B client loaded in %', [timer.Stop]));
     Check(client.Model is TQwen2Model, 'a TQwen2Model');
