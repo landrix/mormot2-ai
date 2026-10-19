@@ -42,6 +42,10 @@ interface
 
 {$I mormot.defines.inc}
 
+{$ifndef FPC}{$ifdef CPUX64}
+  {$EXCESSPRECISION OFF} // single expressions in single, as FPC computes them
+{$endif}{$endif}
+
 uses
   classes,
   sysutils,

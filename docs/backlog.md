@@ -630,7 +630,7 @@ treibt die 5090 an ihre Leistungsgrenze (rund 0,8 Decode-Tokens je Joule bei Vul
 - CPU-Temperatur und -Leistung: unter Windows ohne Sensortreiber nicht zu bekommen,
   bestätigt.
 
-## B13 — CPU-Rechnung unter Delphi und FPC angleichen (aufgenommen 2026-10-17)
+## B13 — CPU-Rechnung unter Delphi und FPC angleichen (aufgenommen 2026-10-17, erledigt 2026-10-19)
 
 Anlass: Qwen3-30B-A3B gibt auf der CPU unter Delphi 13 andere Logits als unter FPC, genug, dass
 bei knappen Router-Entscheidungen ein anderer Experte gewählt wird (Kosinus gegen CUDA 0,988
@@ -662,6 +662,13 @@ Tiny-Modell und Qwen3-30B-A3B bitgleich oder nur noch in den letzten Bits versch
 der Decode unter Delphi nicht langsamer ist (`llm-bench`). Danach die Delphi-Ausnahme in den
 Vergleichstests entfernen, falls die Vorgabe der Expertenwahl (B4, D3) sie nicht schon
 überflüssig gemacht hat.
+
+*Erledigt 2026-10-19* (`native-inference.md`, Phase D): Ursache war `{$EXCESSPRECISION}` - die
+Gewichtung der Experten im MoE-Block rechnete Delphi Win64 in `double` mit einer Rundung,
+FPC in `single` mit zwei. Alle Infer-Units setzen jetzt `{$EXCESSPRECISION OFF}` (Delphi
+x64); die CPU-Ergebnisse sind unter beiden Compilern bitgleich, bis zu den Logits von
+Qwen3-30B-A3B, und Delphi dekodiert 3-14 % schneller. Die Delphi-Ausnahme im Vergleichstest
+ist entfernt.
 
 ## B14 — Rückmeldungen aus dem TTS-Projekt von flydev (aufgenommen 2026-10-18)
 

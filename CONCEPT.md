@@ -74,6 +74,12 @@ published as a **standalone extension in its own repository**.
     `TMcpToolBase<T>` over `TMcpRecordTool`).
   - No anonymous methods, no inline variables, no array constructors.
   - No `exit(value)` (Delphi 7). mORMot uses it occasionally.
+  - Every unit of the native engine (`src/infer`, and the native vector store) sets
+    `{$ifndef FPC}{$ifdef CPUX64}{$EXCESSPRECISION OFF}{$endif}{$endif}` after
+    `{$I mormot.defines.inc}`: Delphi Win64 otherwise evaluates `single` expressions in
+    double precision and rounds once where FPC rounds every step, so the CPU results would
+    differ between the compilers (backlog B13; with it they are bit-identical, and Delphi
+    is faster).
   - No `with` (readability: every identifier shows what it belongs to). mORMot itself uses
     `with` often, more than 200 times in trunk.
   - Parameters always with `a…`. Exempt are signatures given from outside

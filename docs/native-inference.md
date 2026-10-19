@@ -1814,6 +1814,38 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B13 erledigt (2026-10-19): CPU-Rechnung unter Delphi 13 und FPC bitgleich.**
+Anlass: Qwen3-30B-A3B gab auf der CPU unter Delphi 13 andere Logits als unter FPC (gegen die
+GPU mit vorgegebener Expertenwahl Kosinus 0,9975 und Argmax 15 von 16 statt 0,9995 und 16).
+
+- *Eingegrenzt* mit einem Prüfprogramm, das unter beiden Compilern auf dem RTX-Rechner
+  (AVX2) dieselben Eingaben rechnet und jedes Ergebnis bitweise vergleicht: alle Operationen
+  der beiden CPU-Backends (Linear F32 und Q8_0, RmsNorm, SwiGLU, RoPE, Attention, Softmax),
+  das Tiny-Modell in F32 und Q8_0 und Qwen3-0.6B über alle 28 Layer waren schon bitgleich.
+  Abweichend nur der MoE-Block, ab dem MLP-Ausgang von Layer 0.
+- *Ursache:* die Gewichtung der Experten, `dst^[i] := dst^[i] + w * src^[i]` in `single`.
+  Delphi Win64 rechnet ohne `{$EXCESSPRECISION OFF}` einen `single`-Ausdruck in `double` und
+  rundet einmal, FPC rundet nach dem Produkt und nach der Summe (wie die float32-Referenz).
+  Das RTL-`Exp` im Router war es nicht.
+- *Behoben:* alle 24 Units unter `src/infer` setzen die Direktive (nur Delphi x64; Delphi 7
+  rechnet auf dem x87 und bleibt außen vor), die Regel steht in `CONCEPT.md` §1. Danach
+  bitgleich: alle Operationen, die Tiny-Modelle (dicht und MoE) und Qwen3-30B-A3B über alle
+  48 Layer bis zu den Logits, Prefill und Decode-Schritt.
+- *Tempo (Delphi 13, CPU, `llm-bench`, Mittel aus zwei Läufen):* Qwen3-0.6B Q8_0 Decode
+  68,7 -> 71,1 Tokens/s, Prefill 658 -> 720; Qwen3-30B-A3B Q4_K_M Decode 11,9 -> 13,6,
+  Prefill 62 -> 75 - die Umwandlungen nach `double` und zurück fallen weg (Anteil von `add`
+  beim Prefill von 9 auf 2 %).
+- *Tests:* die Delphi-Ausnahme in `Qwen3MoeGgufMatchesCpu` (CUDA und Vulkan) ist weg: Argmax
+  16 von 16 statt mindestens 15. Delphi 13 kommt jetzt auf dieselben Zahlen wie FPC (Kosinus
+  0,99948, 162 von 1344 Routen anders gewählt, größter Router-Abstand 0,052). Gegenprobe:
+  ohne die Direktive in `decoder.pas` scheitert der Test unter Delphi 13 auf beiden GPUs
+  (15 von 16, Kosinus 0,9975).
+- Auch `mormot.ai.vectorstore.native` setzt die Direktive (`DotRow` summiert
+  `single`-Produkte; die Tests dort halten 1e-6 ein und bleiben grün, 301 unter Delphi 13).
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 4996 Assertions) und Delphi 7 (3325).
+  FPC übersetzt die Direktive nicht, für M2 Pro und Adreno ändert sich nichts. Review:
+  Claude-Finder und Codex ohne Befund; der Finder nannte den Vektorspeicher, nachgezogen.
+
 **B15 erledigt (2026-10-19): Q8_0 als Vorgabe, `MaxContext`, Quickstart-Demo.**
 Anlass war neural-api (`LoadModel(dir)` und `ChatReply`, int8 als Vorgabe): der Einstieg soll
 bei uns genauso kurz sein.

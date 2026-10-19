@@ -670,14 +670,15 @@ Next, in this order:
    bias and its own chat template (D1b); sliding-window attention with a compact cache,
    valid restore points for the prompt cache and layers without rotary positions, SmolLM3
    as the reference family (D4, CPU); the expert choice of a decode step on the GPU (D3c,
-   Qwen3-30B-A3B from 39 to 97 tokens/s on CUDA); Q5_0 weights, so Qwen's own Q4_K_M
-   files of small models load (B16); Q8_0 as the native client's default, `MaxContext` and
-   a quickstart demo (B15); embedding rows instead of ids and decoder stacks, for
-   speech, vision and audio models (B14: Qwen3-TTS's talker and code predictor, its
-   `vocab.json` + `merges.txt` tokenizer, BF16 and F16 rows in `InferRowToF32`, thread-pool
-   jobs with scratch buffers per thread). Next:
-   gpt-oss-20b (D5) with windows on the GPU (D4b); then Gemma. Plan and order:
-   [docs/backlog.md](docs/backlog.md) (German).
+   Qwen3-30B-A3B from 39 to 97 tokens/s on CUDA); Q5_0 weights, so Qwen's own Q4_K_M files
+   of small models load (B16); Q8_0 as the native client's default, `MaxContext` and a
+   quickstart demo (B15); CPU results bit-identical under Delphi 13 and FPC, Delphi
+   decoding 3-14 % faster with it (B13); embedding rows instead of ids and decoder stacks,
+   for speech, vision and audio models (B14: Qwen3-TTS's talker and code predictor, its
+   `vocab.json` + `merges.txt` tokenizer, BF16 and F16 rows in `InferRowToF32`,
+   thread-pool jobs with scratch buffers per thread). Next: gpt-oss-20b (D5) with windows
+   on the GPU (D4b); then Gemma. Plan and order: [docs/backlog.md](docs/backlog.md)
+   (German).
 4. **After that, on demand** — a reranker, Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 
 Alongside, as a separate track: **distributed execution** - big inference jobs pulled

@@ -1569,8 +1569,8 @@ const
   /// the largest router gap at which the device may choose other experts
   // than the CPU: a near tie of the 8th and 9th of 128 experts - measured on
   // 2026-10-19 (RTX 5090, CUDA and Vulkan, FPC): 162 of 1344 routes chosen
-  // otherwise, at a gap of 0.052 at most (Delphi 13: 121, 0.071); a routing
-  // error gives gaps of whole units
+  // otherwise, at a gap of 0.052 at most (Delphi 13 the same since its CPU
+  // computes as FPC, backlog B13); a routing error gives gaps of whole units
   ROUTE_GAP = 0.1;
 var
   dir, gguf: TFileName;
@@ -1655,11 +1655,11 @@ begin
       [fCu.DeviceName, worst, agree, STEPS, tape.Differs, tape.Routes, tape.DiffersGap]);
     CheckUtf8(tape.Pending = 0, '% routes not replayed', [tape.Pending]);
     CheckUtf8(worst >= 0.99, 'Qwen3-30B-A3B logits cosine %', [worst]);
-    // with the routing given, FPC agrees 16 of 16 at a cosine of 0.9995; the
-    // CPU of Delphi 13 computes otherwise (backlog B13): 15 of 16 at 0.9975
-    CheckUtf8(agree >= STEPS - 1, 'Qwen3-30B-A3B argmax agrees % of %', [agree, STEPS]);
-    // a near tie is rare: 12 pct of the routes (FPC), 9 pct (Delphi 13) -
-    // the router logits of the wrong row give 47 pct, at small gaps each
+    // with the routing given, 16 of 16 at a cosine of 0.9995 - Delphi 13 too
+    // since its CPU computes single expressions in single (backlog B13)
+    CheckUtf8(agree = STEPS, 'Qwen3-30B-A3B argmax agrees % of %', [agree, STEPS]);
+    // a near tie is rare: 12 pct of the routes - the router logits of the
+    // wrong row give 47 pct, at small gaps each
     CheckUtf8(tape.Differs * 4 <= tape.Routes, 'Qwen3-30B-A3B: the device chose ' +
       'otherwise % of % times', [tape.Differs, tape.Routes]);
     CheckUtf8(tape.DiffersGap <= ROUTE_GAP, 'Qwen3-30B-A3B: the device chose ' +
