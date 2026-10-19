@@ -1814,6 +1814,65 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D4b erledigt (2026-10-19): Sliding Window und NoPE auf Vulkan und CUDA.** Bisher lehnten
+beide Geräte solche Modelle ab (D4).
+
+- *Fenster:* `attention.comp`, `flash.comp`, `attndec.comp` und `attention`/`attention16` in
+  `tools/cuda/ops.cu` bekommen `window` (0: keins). Jede Abfrage hatte schon ihren
+  Schlüsselbereich (`j0`/`j1`, über die Splits verteilt); er beginnt jetzt bei
+  `total - window` statt bei 0, die Splits teilen nur noch das Fenster. Schlüssel davor
+  werden nicht gelesen, nicht bloß maskiert. Die Bereiche wachsen weiter mit der Zeile, also
+  stimmen `lo`/`hi` je Block in `flash.comp` und `attention.comp` unverändert.
+- *NoPE:* `qkrope.comp` und `qkrope`/`qkrope16` bekommen `rope` (0: q und k ungedreht, wie die
+  CPU sie lässt - nicht mit den Faktoren 1 und 0 gerechnet, so stimmen auch NaN und
+  Unendlich).
+- *Cache:* auf dem Gerät hält der Cache jeder Schicht alle Zeilen (wie
+  `TDecoderContext.FullCache` auf der CPU); ein Gerätekontext kann so auf jede Länge zurück
+  (`Restorable` gilt für alle). Der schmale Cache der CPU spart nur Speicher; er kommt aufs
+  Gerät, wenn ein Modell zeigt, dass es sich lohnt (bei gpt-oss-20b, dessen halbe Layer ein
+  Fenster von 128 haben, spart er bei langem Kontext knapp die Hälfte des KV-Speichers).
+- *Eine Zeile je Block bei Fenster-Layern:* ein Block rechnet die Werte aller Schlüssel
+  `lo`..`hi` seiner Abfragen, die außerhalb des Bereichs einer Abfrage mit Gewicht 0 - und
+  0 mal einen NaN- oder unendlichen Wert ergibt NaN (Codex im Review). Ein Fenster-Layer
+  mit mehreren Zeilen läuft deshalb mit `RowBlock` 1 (alle Abfragen eines Blocks teilen
+  einen Bereich) über `attention.comp` bzw. `attention`, mit eigenen Splits; Layer ohne
+  Fenster wie bisher. Eine Maske in der Wertschleife wäre die direkte Lösung gewesen, kostet
+  aber unter Vulkan auf der RTX 5090 zu viel (Qwen3-0.6B Q8_0, Prefill 4000 Tokens 9750 ->
+  5490 Tokens/s, Decode -18 %; als Auswahl auf das Gewicht noch -32 % und -12 %, je Kachel
+  verzweigt ebenso), unter CUDA 4-10 %. Am Kausalrand eines Prompt-Chunks summieren die
+  früheren Zeilen eines Blocks die Werte späterer Zeilen weiter mit Gewicht 0, wie seit
+  Phase 4c - das träfe nur ein Modell, dessen Werte selbst schon NaN oder unendlich sind.
+  Gemessen danach unverändert: Vulkan Prefill 4000 9694 gegen 9750, Decode 345 gegen 342;
+  CUDA 10075 gegen 9950, 371 gegen 376 (Rauschen). Der Kopfblock eines Fenster-Layers ist
+  dabei der von `attention.comp` (höchstens 8 Abfragen), auch wenn der Chunk `flash.comp`
+  mit 32 rechnet - Fixture `tiny-qwen3-sliding/g16` (16 Köpfe auf einem KV-Kopf, aus
+  `make_reference_d4b.py`) prüft das; mit dem Kopfblock von `flash.comp` scheitert es.
+- `TQwen3Vulkan`/`TQwen3Cuda` nehmen Fenster und NoPE je Layer aus `Config.Spec`; die
+  Ablehnung ist weg. Push-Records und Kernel-Parameter um `Window` bzw. `Rope` ergänzt,
+  SPIR-V und PTX neu erzeugt.
+- *Tests:* `SlidingWindowMatchesCpu` auf beiden Geräten mit `tiny-qwen3-sliding` (Fenster 5)
+  und `tiny-smollm3` (Fenster 6 und NoPE-Layer): Prompt über zwei Chunks, das Fenster läuft
+  dutzendfach um, beide Cache-Formate, ein Bereich und ein Bereich je Schlüssel, Vulkan
+  dazu `flash.comp` und `attndec.comp`, CUDA die Decode-Schritte als Graph; danach zurück auf
+  3 Tokens (hinter das Fenster) und 20 andere von dort, gegen eine Neuberechnung der CPU.
+  Unter Vulkan läuft das über `CheckAttentionRanges`, jetzt für jede Familie von
+  `NewDecoderModel` und mit diesem Rücksprung auch für die bisherigen Modelle.
+  `OpsMatchCpu` (CUDA) prüft die Kernel einzeln: Fenster 3, 5, 64, 1 (nur sich selbst) und
+  eines über alle Schlüssel, in Bereichen, mit und ohne Kopf-Norm, NoPE allein und mit
+  Fenster; die Schlüssel und Werte vor dem Fenster sind NaN - gelesen, schlügen sie durch.
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 5182 Assertions) und Delphi 7 (3407),
+  auf der Adreno X1-85 (Vulkan-Suite 860, die Fenster-Tests danach noch einmal mit `g16`)
+  und dem M2 Pro (MoltenVK, 4257). Gegenprobe: 13 eingebaute Fehler - das Fenster übergangen
+  in `attention.comp`, `flash.comp`, `attndec.comp` und `ops.cu`, um eins zu weit in
+  `attention.comp`, die Drehung trotz NoPE in `qkrope.comp` (q und F16-Schlüssel) und
+  `ops.cu`, kein Fenster bzw. immer RoPE aus Pascal (Vulkan und CUDA), die gemeinsamen
+  Splits für Fenster-Layer, der Kopfblock von `flash.comp` für einen Fenster-Layer - alle
+  scheitern.
+- Review: der Claude-Finder fand einen veralteten Testnamen im D4-Abschnitt; Codex das
+  Gewicht 0 mal NaN über den gemeinsamen Schlüsselbereich eines Blocks (oben, gelöst über
+  eine Zeile je Block); im Nachreview fanden beide den zu großen Kopfblock (behoben, mit
+  `g16` als Test). Das letzte Nachreview ohne Befund.
+
 **B13 erledigt (2026-10-19): CPU-Rechnung unter Delphi 13 und FPC bitgleich.**
 Anlass: Qwen3-30B-A3B gab auf der CPU unter Delphi 13 andere Logits als unter FPC (gegen die
 GPU mit vorgegebener Expertenwahl Kosinus 0,9975 und Argmax 15 von 16 statt 0,9995 und 16).
@@ -2073,7 +2132,7 @@ Destruktor nicht freigab, und dass ein NaN-Gewicht den Maximumvergleich passiert
 Claude-Finder, dass `GpuLinearIds` auf Vulkan `MaxLinearBytes` übersah. Behoben.
 
 **D4 erledigt (2026-10-19): Sliding Window, Cache-Semantik, NoPE.** Auf der CPU; die
-GPU-Geräte lehnen solche Modelle mit klarer Meldung ab (Backlog D4b).
+GPU-Geräte lehnten solche Modelle zunächst mit klarer Meldung ab (seit D4b rechnen sie sie).
 
 - `TDecoderLayerSpec` hat `Window` (0: kein Fenster) und `NoRope`. Ein Token sieht die
   letzten `Window` Tokens samt sich selbst - Schlüssel j für Abfrage i, wenn
@@ -2124,7 +2183,7 @@ gegen die Regel -, sonst `Reuse` ab 0); nach einem Prefill von 40 schrumpft der 
 nächsten Schritt auf 12 Zeilen bei gleichen Bits; `FullCache` kann jede Länge, ist auf
 einem gefüllten Kontext gesperrt. `SlidingWindowConfig` (Ableitungen und Ablehnungen wie
 oben, jede mit ihrer Meldung), auf Vulkan und CUDA `SlidingWindowRefused` (Fenster allein,
-NoPE allein). Grün auf dem RTX-Rechner unter FPC und Delphi 13 (4281 Assertions) und
+NoPE allein; seit D4b ersetzt durch `SlidingWindowMatchesCpu`). Grün auf dem RTX-Rechner unter FPC und Delphi 13 (4281 Assertions) und
 Delphi 7 (2848), lokal auf der Adreno. Gegenprobe: sechzehn eingebaute Fehler (Float-Pfad liest
 ab Schlüssel 0, Referenzpfad ohne Fenster, Fenster um eins zu kurz, `Slide` verwirft einen
 gebrauchten Schlüssel, `Slide` verschiebt nichts, `Restorable` um eins zu großzügig,

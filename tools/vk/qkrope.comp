@@ -1,7 +1,8 @@
 // LandrixAI - the per-head part of a Qwen3 attention block in one dispatch
 // (phase 4e of docs/native-inference.md): for every token row and head,
 // RMSNorm of q (QNorm) and k (KNorm) when norm is set (Qwen3; Qwen2 has
-// none: then qn and kn are not read), rotary positions on both, and k and v
+// none: then qn and kn are not read), rotary positions on both unless rope is
+// 0 (a NoPE layer, backlog D4b: q and k pass unrotated), and k and v
 // stored into the KV cache at position past + row - what were six dispatches
 // (two norms, two RoPE, two copies); arithmetic as rmsnorm.comp and rope.comp
 // - one work group of 128 per (row, head): heads first, then the KV heads
@@ -31,6 +32,7 @@ layout(push_constant) uniform Push {
   uint rows, heads, kvHeads, headDim, past;
   float eps;
   uint norm;
+  uint rope; // 0: no rotary positions in this layer (NoPE), q and k as they are
 } p;
 
 shared float partial[128];
@@ -79,12 +81,18 @@ void main()
     // the dimensions i and i + 1 of both halves, each pair one word
     for (uint i = 2u * t; i < half_; i += 256u)
     {
-      vec2 c = vec2(cs[cbase + i], cs[cbase + i + 1u]);
-      vec2 sn = vec2(cs[sbase + i], cs[sbase + i + 1u]);
       vec2 a = vec2(normed[i], normed[i + 1u]);
       vec2 b = vec2(normed[i + half_], normed[i + half_ + 1u]);
-      kc[(dst + i) >> 1] = packHalf2x16(a * c - b * sn);
-      kc[(dst + i + half_) >> 1] = packHalf2x16(b * c + a * sn);
+      if (p.rope != 0u)
+      {
+        vec2 c = vec2(cs[cbase + i], cs[cbase + i + 1u]);
+        vec2 sn = vec2(cs[sbase + i], cs[sbase + i + 1u]);
+        vec2 a0 = a;
+        a = a0 * c - b * sn;
+        b = b * c + a0 * sn;
+      }
+      kc[(dst + i) >> 1] = packHalf2x16(a);
+      kc[(dst + i + half_) >> 1] = packHalf2x16(b);
     }
     for (uint c = 2u * t; c < d; c += 256u)
       vc[(dst + c) >> 1] = packHalf2x16(vec2(v[src + c], v[src + c + 1u]));
@@ -93,12 +101,17 @@ void main()
 #endif
   for (uint i = t; i < half_; i += 128u)
   {
-    float c = cs[cbase + i];
-    float sn = cs[sbase + i];
     float a = normed[i];
     float b = normed[i + half_];
-    float x0 = a * c - b * sn;
-    float x1 = b * c + a * sn;
+    float x0 = a;
+    float x1 = b;
+    if (p.rope != 0u)
+    {
+      float c = cs[cbase + i];
+      float sn = cs[sbase + i];
+      x0 = a * c - b * sn;
+      x1 = b * c + a * sn;
+    }
     if (isQ)
     {
       q[src + i] = x0;

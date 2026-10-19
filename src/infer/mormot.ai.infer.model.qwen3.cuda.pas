@@ -26,6 +26,11 @@
 //   sums them in id order - no wait for the host, the step stays one CUDA
 //   graph (RouteOnDevice); a prefill and a run with a RouteTape choose on the
 //   host
+// - sliding-window layers and layers without rotary positions (NoPE, backlog
+//   D4b): the attention reads only the keys of the window, qkrope leaves q and
+//   k unrotated; the cache on the device keeps every row (as
+//   TDecoderContext.FullCache on the CPU), so a context can go back to any
+//   length - the narrow cache of the CPU only saves memory
 unit mormot.ai.infer.model.qwen3.cuda;
 
 {
@@ -322,12 +327,7 @@ begin
   // the layers it runs: attention, and a dense SwiGLU block or experts
   for l := 0 to high(aModel.Config.Spec) do
     if aModel.Config.Spec[l].Mixer <> dmAttention then
-      EInferError.RaiseUtf8('%: layers of another kind not supported', [self])
-    else if aModel.Config.Spec[l].Window <> 0 then
-      EInferError.RaiseUtf8('%: sliding window not supported (layer %)', [self, l])
-    else if aModel.Config.Spec[l].NoRope then
-      EInferError.RaiseUtf8('%: attention without rotary positions not ' +
-        'supported (layer %)', [self, l]);
+      EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
   fMoe := not aModel.HasOnly(dmAttention, dfDense);
   // qkrope keeps one normalized head in shared memory, the attention reads
   // the keys as float4
@@ -827,12 +827,13 @@ procedure TQwen3Cuda.Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
   c: TQwen3Config;
-  n, h, f, qw, kvw, half, past, l, outRows, hb, rb, blocks, splits, most: PtrInt;
+  n, h, f, qw, kvw, half, past, l, outRows, hb, rb, blocks, splits, most,
+    wsplits: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
   pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt: TCuDevicePtr;
   rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count,
-    norm: cardinal;
+    norm, rope, window: cardinal;
   eps: single;
   capture, device: boolean;
   qkrope, attention: TCuHandle;
@@ -876,10 +877,27 @@ begin
     splits := most;
   if splits < 1 then
     splits := 1;
-  ppart := 0;
-  if splits > 1 then
+  // a layer with a sliding window: one token row per block, so all its
+  // queries share one key range - the others' rows would sum values outside
+  // their window with a weight of 0, and 0 times a NaN or infinite value is
+  // NaN
+  wsplits := splits;
+  if n > 1 then
   begin
-    NeedDevice(fCu, aCtx.fPart, Int64(c.Heads) * n * splits * (c.HeadDim + 2) * 4);
+    wsplits := 1;
+    if fSplitKeys > 0 then
+      wsplits := (past + n + fSplitKeys - 1) div fSplitKeys;
+    most := SPLIT_GROUPS div ((c.Heads div hb) * n);
+    if wsplits > most then
+      wsplits := most;
+    if wsplits < 1 then
+      wsplits := 1;
+  end;
+  ppart := 0;
+  if (splits > 1) or (wsplits > 1) then
+  begin
+    NeedDevice(fCu, aCtx.fPart, Int64(c.Heads) * n * MaxPtrInt(splits, wsplits) *
+      (c.HeadDim + 2) * 4);
     ppart := aCtx.fPart.Ptr;
   end;
   // the inputs: embeddings, then the rotary factors (cos, then sin)
@@ -927,6 +945,15 @@ begin
       fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, ly^.VBias);
       // without head norms (Qwen2) the kernel reads no qn or kn
       norm := ord(ly^.QNorm <> nil);
+      rope := ord(not c.Spec[l].NoRope);
+      window := c.Spec[l].Window;
+      nsplits := splits;
+      rblock := rb;
+      if window > 0 then
+      begin
+        nsplits := wsplits;
+        rblock := 1;
+      end;
       pqn := 0;
       pkn := 0;
       if ly^.QNorm <> nil then
@@ -937,12 +964,13 @@ begin
       pkc := aCtx.fDevKeys[l].Ptr;
       pvc := aCtx.fDevValues[l].Ptr;
       fCu.Enqueue(qkrope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
-        @heads, @kvHeads, @headDim, @ppast, @eps, @norm], c.Heads + c.KvHeads,
-        OPS_BLOCK, n);
+        @heads, @kvHeads, @headDim, @ppast, @eps, @norm, @rope],
+        c.Heads + c.KvHeads, OPS_BLOCK, n);
       fCu.Enqueue(attention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
-        @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock], c.Heads div hb,
-        OPS_BLOCK, blocks, splits);
-      if splits > 1 then
+        @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock, @window],
+        c.Heads div hb, OPS_BLOCK, (n + PtrInt(rblock) - 1) div PtrInt(rblock),
+        nsplits);
+      if nsplits > 1 then
         fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits],
           c.Heads, OPS_BLOCK, n);
       fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);

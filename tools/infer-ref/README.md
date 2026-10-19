@@ -67,6 +67,18 @@ computed: `CreateStack` must give the bits of `tiny-qwen3`.
 python tools/infer-ref/make_reference_b14.py
 ```
 
+## A wide GQA group with a window (backlog D4b)
+
+`make_reference_d4b.py` needs numpy (the environment above): it creates
+`tiny-qwen3-sliding/g16/` - the config of `tiny-qwen3-sliding` with 16 query heads on one KV
+head, random BF16 weights from a fixed seed. Nothing is computed: the Vulkan and CUDA tests
+compare the device with the CPU on it; a group of 16 is more than the 8 queries
+`attention.comp` holds, which a window layer of a `flash.comp` prefill must respect.
+
+```bash
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d4b.py
+```
+
 ## Qwen2.5 (phase D, D1b)
 
 `make_reference_qwen2.py` uses the same environment and the helpers of

@@ -137,14 +137,16 @@ extern "C" __global__ void swiglu(float* g, const float* u, unsigned int n)
 
 // per token row (grid y) and head (grid x: the heads, then the KV heads):
 // RMSNorm of q (qn) or k (kn) when norm is set (Qwen3; Qwen2 has none: qn
-// and kn are not read), rotary positions (cs: the cos of every row, then the
+// and kn are not read), rotary positions unless rope is 0 (a NoPE layer,
+// backlog D4b) (cs: the cos of every row, then the
 // sin), q in place, k and v stored into the cache at past + row
 // - headDim <= 256, even; T: the type of the cache (float or half float)
 template <typename T>
 __device__ __forceinline__ void qkropeT(float* q, const float* k,
   const float* v, const float* qn, const float* kn, const float* cs, T* kc,
   T* vc, unsigned int rows, unsigned int heads, unsigned int kvHeads,
-  unsigned int headDim, unsigned int past, float eps, unsigned int norm)
+  unsigned int headDim, unsigned int past, float eps, unsigned int norm,
+  unsigned int rope)
 {
   __shared__ float part[4];
   __shared__ float normed[256];
@@ -176,12 +178,17 @@ __device__ __forceinline__ void qkropeT(float* q, const float* k,
   unsigned long long dst = (past + (unsigned long long)r) * kvw + (unsigned long long)h * d;
   for (unsigned int i = t; i < half; i += BLOCK)
   {
-    float c = cs[cbase + i];
-    float sn = cs[sbase + i];
     float a = normed[i];
     float b = normed[i + half];
-    float x0 = a * c - b * sn;
-    float x1 = b * c + a * sn;
+    float x0 = a;
+    float x1 = b;
+    if (rope)
+    {
+      float c = cs[cbase + i];
+      float sn = cs[sbase + i];
+      x0 = a * c - b * sn;
+      x1 = b * c + a * sn;
+    }
     if (isQ)
     {
       q[src + i] = x0;
@@ -201,20 +208,21 @@ __device__ __forceinline__ void qkropeT(float* q, const float* k,
 extern "C" __global__ void qkrope(float* q, const float* k, const float* v,
   const float* qn, const float* kn, const float* cs, float* kc, float* vc,
   unsigned int rows, unsigned int heads, unsigned int kvHeads,
-  unsigned int headDim, unsigned int past, float eps, unsigned int norm)
+  unsigned int headDim, unsigned int past, float eps, unsigned int norm,
+  unsigned int rope)
 {
   qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
-    eps, norm);
+    eps, norm, rope);
 }
 
 extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
   const float* qn, const float* kn, const float* cs, unsigned short* kc,
   unsigned short* vc, unsigned int rows, unsigned int heads,
   unsigned int kvHeads, unsigned int headDim, unsigned int past, float eps,
-  unsigned int norm)
+  unsigned int norm, unsigned int rope)
 {
   qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
-    eps, norm);
+    eps, norm, rope);
 }
 
 // causal attention with grouped-query heads - the CUDA form of
@@ -234,6 +242,14 @@ extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
 // - headDim a multiple of 4 and at most 256 (the queries kept as float4, each
 //   thread owns the output dimensions t and t + 128); keys 16-byte aligned
 //   (8 for half floats); T: the type of the cache
+// - window > 0 (backlog D4b): row r sees only the keys past + r - window + 1 ..
+//   past + r; the cache holds every row, the ranges start at the window
+// - a block sums the values of all keys lo .. hi of its queries, those
+//   outside a query's range with a weight of 0 - and 0 times a NaN or infinite
+//   value is NaN: a layer with a window therefore runs one row per block
+//   (TQwen3Cuda), where every query shares one range; at the causal edge of
+//   a prompt chunk the earlier rows of a group still sum the later rows'
+//   values with a weight of 0, as since slice C5
 #define MAXQ 8
 #define NEG -3.402823466e38f
 
@@ -242,7 +258,7 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
   const T* vals, float* y, float* part, unsigned int rows,
   unsigned int heads, unsigned int headDim, unsigned int kvHeads,
   unsigned int past, unsigned int splits, unsigned int headBlock,
-  unsigned int rowBlock)
+  unsigned int rowBlock, unsigned int window)
 {
   __shared__ float4 qs[MAXQ * 64];   // the queries
   __shared__ float ps[MAXQ * 128];   // the scores, then the weights of a tile
@@ -280,8 +296,10 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
     if (i < nq)
     {
       unsigned int total = past + r0 + i / hb + 1u;
-      unsigned int chunk = (total + splits - 1u) / splits;
-      j0[i] = min(total, s * chunk);
+      // a sliding window: the keys before the last window ones are not read
+      unsigned int first = (window != 0u) && (total > window) ? total - window : 0u;
+      unsigned int chunk = (total - first + splits - 1u) / splits;
+      j0[i] = min(total, first + s * chunk);
       j1[i] = min(total, j0[i] + chunk);
       lo = min(lo, j0[i]);
       hi = max(hi, j1[i]);
@@ -413,20 +431,20 @@ extern "C" __global__ void attention(const float* q, const float* keys,
   const float* vals, float* y, float* part, unsigned int rows,
   unsigned int heads, unsigned int headDim, unsigned int kvHeads,
   unsigned int past, unsigned int splits, unsigned int headBlock,
-  unsigned int rowBlock)
+  unsigned int rowBlock, unsigned int window)
 {
   attentionT(q, keys, vals, y, part, rows, heads, headDim, kvHeads, past,
-    splits, headBlock, rowBlock);
+    splits, headBlock, rowBlock, window);
 }
 
 extern "C" __global__ void attention16(const float* q,
   const unsigned short* keys, const unsigned short* vals, float* y,
   float* part, unsigned int rows, unsigned int heads, unsigned int headDim,
   unsigned int kvHeads, unsigned int past, unsigned int splits,
-  unsigned int headBlock, unsigned int rowBlock)
+  unsigned int headBlock, unsigned int rowBlock, unsigned int window)
 {
   attentionT(q, keys, vals, y, part, rows, heads, headDim, kvHeads, past,
-    splits, headBlock, rowBlock);
+    splits, headBlock, rowBlock, window);
 }
 
 // combines the key ranges of attention (flash-decoding), the CUDA form of

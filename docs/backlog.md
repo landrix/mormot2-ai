@@ -312,6 +312,12 @@ als Schalter in `qkrope`. Erst mit einem Modell, das es braucht (gpt-oss-20b, D5
 D6) - dann gegen die CPU wie die übrigen Gerätetests. Dazu offen aus D4: SmolLM3 als
 Chat-Familie (Template mit `/think` und `/no_think`, Parser) und aus GGUF (llama.cpp legt die
 NoPE-Layer fest, das wäre gegen die Referenz zu prüfen).
+*Erledigt 2026-10-19* (`native-inference.md`, Phase D), vorgezogen vor D5: Fenster und NoPE in
+den Attention-Shadern und -Kerneln (der Schlüsselbereich jeder Zeile beginnt am Fenster) und
+in `qkrope`; der Cache auf dem Gerät hält alle Zeilen, so kann ein Gerätekontext auf jede
+Länge zurück. Gegen die CPU mit `tiny-qwen3-sliding` und `tiny-smollm3`. *Offen:* der schmale
+Cache auf dem Gerät (nur Speicher, erst wenn ein Modell es lohnt - gpt-oss-20b), SmolLM3 als
+Chat-Familie und aus GGUF.
 
 **D5 — gpt-oss-20b.** MXFP4 (erst skalar entpacken, dann direkt im Linear rechnen, nie das
 ganze Modell nach F32), Attention-Sinks (gelernter Zusatzterm im Softmax-Nenner je Kopf, keine

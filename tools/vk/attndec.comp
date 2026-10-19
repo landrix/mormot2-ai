@@ -49,6 +49,7 @@ layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
 // headBlock divides heads / kvHeads, headBlock * rowBlock <= MAXQ
 layout(push_constant) uniform Push {
   uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
+  uint window; // > 0: a row sees only its last window keys, itself included
 } p;
 
 void main()
@@ -89,8 +90,10 @@ void main()
         qv[i] = vec4(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]) * scale;
       }
       uint total = p.past + r0 + i / hb + 1u;
-      uint chunk = (total + p.splits - 1u) / p.splits;
-      j0[i] = min(total, s * chunk);
+      // a sliding window: the keys before the last window ones are not read
+      uint first = (p.window != 0u) && (total > p.window) ? total - p.window : 0u;
+      uint chunk = (total - first + p.splits - 1u) / p.splits;
+      j0[i] = min(total, first + s * chunk);
       j1[i] = min(total, j0[i] + chunk);
       lo = min(lo, j0[i]);
       hi = max(hi, j1[i]);

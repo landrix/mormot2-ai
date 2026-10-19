@@ -45,7 +45,9 @@ type
     /// false (and SKIP or a failure) without a device
     function HasDevice: boolean;
     /// AttentionRangesMatchCpu for the tiny model in tests/data/infer-ref/aName
-    procedure CheckAttentionRanges(const aName: RawUtf8);
+    // (any family of NewDecoderModel; aSub: a model in a subfolder of it), then
+    // a branch back to 3 tokens
+    procedure CheckAttentionRanges(const aName: RawUtf8; const aSub: TFileName = '');
   published
     /// y = a + b on the device: the bits of the CPU sum (an IEEE add is
     // correctly rounded on both), over a count no multiple of the work group,
@@ -130,10 +132,11 @@ type
     /// B14: ForgetWeights - new weights at the address of forgotten ones are
     // served, other ranges kept; a freed model forgets its weights
     procedure ForgetWeightsServesNew;
-    /// D4: a model with a sliding window (tiny Qwen3 with one) or with layers
-    // without rotary positions (tiny SmolLM3 without its windows) is refused
-    // by the device, not computed otherwise
-    procedure SlidingWindowRefused;
+    /// D4b: sliding windows and layers without rotary positions (tiny Qwen3
+    // with a window, tiny SmolLM3 with both) as AttentionRangesMatchCpu - every
+    // attention shader, both cache formats, the window wrapping many times -
+    // and a branch back behind the window
+    procedure SlidingWindowMatchesCpu;
     /// D3c: route.comp against the host's choice (TDecoderModel.Route
     // written out, as in TTestInferCuda): random logits and ties, with and
     // without renorming
@@ -806,7 +809,8 @@ begin
   CheckAttentionRanges('tiny-qwen3-hd256');
 end;
 
-procedure TTestInferVulkan.CheckAttentionRanges(const aName: RawUtf8);
+procedure TTestInferVulkan.CheckAttentionRanges(const aName: RawUtf8;
+  const aSub: TFileName);
 const
   PROMPT = 400; // two chunks; a row sees up to 400 keys: 4 tiles
   FIRST = 10;   // a first forward: the cache grows with them in it
@@ -817,12 +821,12 @@ var
   dir: TFileName;
   gpu: TInferVulkanBackend;
   ref: TInferCpuBackend;
-  model: TQwen3Model;
+  model: TDecoderModel;
   vk: TQwen3Vulkan;
-  c1: TQwen3Context;
+  c1, c3: TQwen3Context;
   c2: TQwen3VkContext;
   ids: TIntegerDynArray;
-  l1, l2, d1, d2: TSingleDynArray;
+  l1, l2, d1, d2, b1, b2: TSingleDynArray;
   i, k, v: PtrInt;
   seed: cardinal;
   e: double;
@@ -834,6 +838,8 @@ begin
   dir := FindInferRefDir(aName);
   if CheckFailed(dir <> '', Utf8ToString(aName + ' found')) then
     exit;
+  if aSub <> '' then
+    dir := IncludeTrailingPathDelimiter(dir + aSub);
   SetLength(ids, PROMPT);
   seed := 11;
   for i := 0 to PROMPT - 1 do
@@ -847,11 +853,13 @@ begin
   vk := nil;
   c1 := nil;
   c2 := nil;
+  c3 := nil;
   try
-    model := TQwen3Model.Create(dir, ref);
+    model := NewDecoderModel(dir, ref);
     v := model.Config.VocabSize;
     vk := TQwen3Vulkan.Create(model, gpu);
     c1 := model.NewContext;
+    c1.FullCache := true; // every row kept: Truncate(PROMPT) after decoding
     c2 := vk.NewContext;
     SetLength(l1, PROMPT * v);
     SetLength(l2, PROMPT * v);
@@ -901,8 +909,22 @@ begin
           [aName, f16, i and 1, vk.UseDecodeAttention, i, e]);
       end;
       c1.Truncate(PROMPT);
+      // back to 3 tokens (behind any window) and 20 others from there: the
+      // device cache keeps every row, so it may go back anywhere
+      c2.Truncate(3);
+      SetLength(b1, 20 * v);
+      SetLength(b2, 20 * v);
+      vk.Forward(c2, @ids[100], 20, pointer(b2), true);
+      FreeAndNil(c3);
+      c3 := model.NewContext;
+      model.Forward(c3, pointer(ids), 3, nil);
+      model.Forward(c3, @ids[100], 20, pointer(b1), true);
+      e := RelError(pointer(b2), pointer(b1), 20 * v);
+      CheckUtf8(e <= TOL[f16], '% KvF16=% branch at 3: relative error %',
+        [aName, f16, e]);
     end;
   finally
+    c3.Free;
     c2.Free;
     c1.Free;
     vk.Free;
@@ -1757,60 +1779,13 @@ end;
 
 
 
-procedure TTestInferVulkan.SlidingWindowRefused;
-var
-  dir, qdir, tmp: TFileName;
-  gpu: TInferVulkanBackend;
-  ref: TInferCpuBackend;
-  model: TDecoderModel;
-  why: RawUtf8;
-  k: PtrInt;
+procedure TTestInferVulkan.SlidingWindowMatchesCpu;
 begin
-  if not HasDevice then
-    exit;
-  dir := FindInferRefDir('tiny-smollm3');
-  qdir := FindInferRefDir('tiny-qwen3-sliding');
-  if CheckFailed((dir <> '') and (qdir <> ''), 'tiny-smollm3 and tiny-qwen3-sliding found') then
-    exit;
-  tmp := MakePath([GetSystemPath(spTemp), 'lai-d4dev-' + Int64ToUtf8(GetTickCount64)], true);
-  ForceDirectories(tmp);
-  gpu := TInferVulkanBackend.Create;
-  ref := TInferCpuBackend.Create;
-  try
-    // SmolLM3 with every layer in full attention: NoPE alone
-    CopyFile(dir + 'model.safetensors', tmp + 'model.safetensors', false);
-    FileFromString(StringReplaceAll(StringFromFile(dir + 'config.json'),
-      '"sliding_attention"', '"full_attention"'), tmp + 'config.json');
-    for k := 0 to 1 do
-    begin
-      model := nil;
-      try
-        if k = 0 then
-          model := NewDecoderModel(qdir, ref) // a window, rotary positions
-        else
-          model := NewDecoderModel(tmp, ref); // no window, NoPE layers
-        why := '';
-        try
-          TQwen3Vulkan.Create(model, gpu).Free;
-        except
-          on E: EInferError do
-            why := StringToUtf8(E.Message);
-        end;
-        if k = 0 then
-          CheckUtf8(PosEx('sliding window not supported', why) > 0,
-            'a sliding window refused: %', [why])
-        else
-          CheckUtf8(PosEx('without rotary positions not supported', why) > 0,
-            'NoPE refused: %', [why]);
-      finally
-        model.Free;
-      end;
-    end;
-  finally
-    ref.Free;
-    gpu.Free;
-    DirectoryDeleteAll(tmp);
-  end;
+  CheckAttentionRanges('tiny-qwen3-sliding'); // a window of 5 on layer 1
+  CheckAttentionRanges('tiny-smollm3');       // windows of 6 and NoPE layers
+  // 16 query heads on one KV head: a flash.comp prefill groups 16 heads, the
+  // window layer must fall back to attention.comp's 8 (make_reference_d4b.py)
+  CheckAttentionRanges('tiny-qwen3-sliding', 'g16');
 end;
 
 

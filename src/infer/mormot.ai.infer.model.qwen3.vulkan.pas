@@ -29,6 +29,11 @@
 //   gate, up and down of the k chosen experts at once, moecombine.comp sums
 //   them in id order - the token is one batch without a wait (RouteOnDevice);
 //   a prefill and a run with a RouteTape choose on the host
+// - sliding-window layers and layers without rotary positions (NoPE, backlog
+//   D4b): the attention reads only the keys of the window, qkrope leaves q and
+//   k unrotated; the cache on the device keeps every row (as
+//   TDecoderContext.FullCache on the CPU), so a context can go back to any
+//   length - the narrow cache of the CPU only saves memory
 unit mormot.ai.infer.model.qwen3.vulkan;
 
 {
@@ -280,6 +285,7 @@ type
 
   TAttentionPush = record
     Rows, Heads, HeadDim, KvHeads, Past, Splits, HeadBlock, RowBlock: cardinal;
+    Window: cardinal; // > 0: the keys of the last Window positions only
   end;
 
   TMergePush = record
@@ -290,6 +296,7 @@ type
     Rows, Heads, KvHeads, HeadDim, Past: cardinal;
     Eps: single;
     Norm: cardinal; // 1: RMSNorm of every Q and K head (QNorm, KNorm)
+    Rope: cardinal; // 0: no rotary positions (a NoPE layer)
   end;
 
   /// gatherrows.comp and scatteradd.comp
@@ -407,12 +414,7 @@ begin
   // the layers it runs: attention, and a dense SwiGLU block or experts
   for l := 0 to high(aModel.Config.Spec) do
     if aModel.Config.Spec[l].Mixer <> dmAttention then
-      EInferError.RaiseUtf8('%: layers of another kind not supported', [self])
-    else if aModel.Config.Spec[l].Window <> 0 then
-      EInferError.RaiseUtf8('%: sliding window not supported (layer %)', [self, l])
-    else if aModel.Config.Spec[l].NoRope then
-      EInferError.RaiseUtf8('%: attention without rotary positions not ' +
-        'supported (layer %)', [self, l]);
+      EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
   fMoe := not aModel.HasOnly(dmAttention, dfDense);
   // qkrope.comp keeps one normalized head in shared memory
   // and attention.comp reads it as vec4
@@ -1089,8 +1091,8 @@ procedure TQwen3Vulkan.Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray;
 var
   c: TQwen3Config;
   n, h, f, qw, kvw, half, past, l, outRows, splits, most, hb, rb, blocks,
-    queries: PtrInt;
-  attention, qkrope: TInferVkPipeline;
+    queries, wsplits, whb: PtrInt;
+  attention, qkrope, wattention, layerAtt: TInferVkPipeline;
   qn, kn: TInferVkBuffer;
   ly: ^TQwen3Layer;
   p: PSingleArray;
@@ -1159,9 +1161,36 @@ begin
   end;
   if splits < 1 then
     splits := 1;
-  if splits > 1 then
+  // a layer with a sliding window: one token row per work group, so all its
+  // queries share one key range - the others' rows would sum values outside
+  // their window with a weight of 0, and 0 times a NaN or infinite value is
+  // NaN (attention.comp, not flash.comp: a block of one row)
+  wattention := attention;
+  wsplits := splits;
+  whb := hb;
+  if n > 1 then
   begin
-    NeedDevice(fVk, aCtx.fPart, Int64(c.Heads) * n * splits * (c.HeadDim + 2) * 4);
+    wattention := fAttention;
+    if aCtx.fKvF16 then
+      wattention := fAttention16;
+    // the head block of attention.comp: at most ATTENTION_QUERIES (hb may be
+    // sized for flash.comp)
+    whb := c.Heads div c.KvHeads;
+    while (whb > ATTENTION_QUERIES) or (c.Heads div c.KvHeads mod whb <> 0) do
+      dec(whb);
+    wsplits := 1;
+    if fSplitKeys > 0 then
+      wsplits := (past + n + fSplitKeys - 1) div fSplitKeys;
+    most := SPLIT_GROUPS div ((c.Heads div whb) * n);
+    if wsplits > most then
+      wsplits := most;
+    if wsplits < 1 then
+      wsplits := 1;
+  end;
+  if (splits > 1) or (wsplits > 1) then
+  begin
+    NeedDevice(fVk, aCtx.fPart, Int64(c.Heads) * n * MaxPtrInt(splits, wsplits) *
+      (c.HeadDim + 2) * 4);
     part := aCtx.fPart;
   end
   else
@@ -1217,6 +1246,21 @@ begin
       // without head norms (Qwen2) the shader reads no qn or kn: bound to
       // the rotary factors, any buffer would do
       qk.Norm := ord(ly^.QNorm <> nil);
+      qk.Rope := ord(not c.Spec[l].NoRope);
+      att.Window := c.Spec[l].Window;
+      layerAtt := attention;
+      att.Splits := splits;
+      att.HeadBlock := hb;
+      att.RowBlock := rb;
+      merge.Splits := splits;
+      if c.Spec[l].Window > 0 then
+      begin
+        layerAtt := wattention;
+        att.Splits := wsplits;
+        att.HeadBlock := whb;
+        att.RowBlock := 1;
+        merge.Splits := wsplits;
+      end;
       if ly^.QNorm <> nil then
       begin
         qn := Vector(ly^.QNorm, c.HeadDim);
@@ -1230,9 +1274,10 @@ begin
       fVk.BatchDispatch(qkrope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV, qn, kn,
         aCtx.fDevCos, aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk,
         c.Heads + c.KvHeads, n);
-      fVk.BatchDispatch(attention, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
-        aCtx.fDevAttn, part], @att, c.Heads div hb, blocks, splits);
-      if splits > 1 then
+      fVk.BatchDispatch(layerAtt, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
+        aCtx.fDevAttn, part], @att, c.Heads div PtrInt(att.HeadBlock),
+        (n + PtrInt(att.RowBlock) - 1) div PtrInt(att.RowBlock), att.Splits);
+      if att.Splits > 1 then
         fVk.BatchDispatch(fMerge, [part, aCtx.fDevAttn], @merge, c.Heads, n);
       fBackend.RecordLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);
       // residual and the feed-forward pre-norm, gate and up side by side,

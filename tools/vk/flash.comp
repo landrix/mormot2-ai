@@ -44,6 +44,7 @@ layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
 // headBlock divides heads / kvHeads, headBlock * rowBlock <= QN
 layout(push_constant) uniform Push {
   uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
+  uint window; // > 0: a row sees only its last window keys, itself included
 } p;
 
 shared vec4 qs[QN * 32];   // the queries, 32 vec4 each
@@ -61,8 +62,11 @@ uvec2 keyRange(uint i, uint s)
   if (i >= nq)
     return uvec2(0u);
   uint total = p.past + gl_WorkGroupID.y * p.rowBlock + i / p.headBlock + 1u;
-  uint chunk = (total + p.splits - 1u) / p.splits;
-  uint j0 = min(total, s * chunk);
+  // a sliding window: the keys before the last window ones are not read;
+  // the ranges still grow with the row, so lo and hi below hold
+  uint first = (p.window != 0u) && (total > p.window) ? total - p.window : 0u;
+  uint chunk = (total - first + p.splits - 1u) / p.splits;
+  uint j0 = min(total, first + s * chunk);
   return uvec2(j0, min(total, j0 + chunk));
 }
 

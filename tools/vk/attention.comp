@@ -17,6 +17,14 @@
 // - shared memory: 16 KB, the least every device offers
 // - -DKVF16 (SPV_ATTENTION_F16): keys and values as half floats, two to a
 //   word (qkrope.comp -DKVF16), read through key4() and val()
+// - window > 0 (backlog D4b): row r sees only the keys past + r - window + 1 ..
+//   past + r; the cache holds every row, the ranges start at the window
+// - a work group sums the values of all keys lo .. hi of its queries, those
+//   outside a query's range with a weight of 0 - and 0 times a NaN or infinite
+//   value is NaN: a layer with a window therefore runs one row per work group
+//   (TQwen3Vulkan), where every query shares one range; at the causal edge of
+//   a prompt chunk the earlier rows of a group still sum the later rows'
+//   values with a weight of 0, as since phase 4c
 #version 450
 
 #define MAXQ 8
@@ -39,6 +47,7 @@ layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
 // headBlock divides heads / kvHeads, headBlock * rowBlock <= MAXQ
 layout(push_constant) uniform Push {
   uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
+  uint window; // > 0: a row sees only its last window keys, itself included
 } p;
 
 shared vec4 qs[MAXQ * 64];      // the queries
@@ -104,8 +113,10 @@ void main()
     if (i < nq)
     {
       uint total = p.past + r0 + i / hb + 1u;
-      uint chunk = (total + p.splits - 1u) / p.splits;
-      j0[i] = min(total, s * chunk);
+      // a sliding window: the keys before the last window ones are not read
+      uint first = (p.window != 0u) && (total > p.window) ? total - p.window : 0u;
+      uint chunk = (total - first + p.splits - 1u) / p.splits;
+      j0[i] = min(total, first + s * chunk);
       j1[i] = min(total, j0[i] + chunk);
       lo = min(lo, j0[i]);
       hi = max(hi, j1[i]);

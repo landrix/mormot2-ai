@@ -111,10 +111,11 @@ type
     /// B14: ForgetWeights - new weights at the address of forgotten ones are
     // served, other ranges kept; a freed model forgets its weights
     procedure ForgetWeightsServesNew;
-    /// D4: a model with a sliding window (tiny Qwen3 with one) or with layers
-    // without rotary positions (tiny SmolLM3 without its windows) is refused
-    // by the device, not computed otherwise
-    procedure SlidingWindowRefused;
+    /// D4b: sliding windows and layers without rotary positions (tiny Qwen3
+    // with a window, tiny SmolLM3 with both) against the CPU: a prompt in two
+    // chunks, one range and a range per key, both cache formats, decode steps
+    // (a CUDA graph), a branch back behind the window
+    procedure SlidingWindowMatchesCpu;
     /// D3c: the route kernel against the host's choice (TDecoderModel.Route,
     // the reference below checked against it): random logits and ties, with
     // and without renorming, 8 of 128 and 2 of 8 experts
@@ -868,12 +869,14 @@ var
   // row cut into aSplits ranges (merged by attnmerge when more than one);
   // aNorm false: no RMSNorm per head (Qwen2), qn and kn not read
   procedure AttentionCase(aRows, aHeads, aKvHeads, aHeadDim, aPast, aHeadBlock,
-    aSplits: PtrInt; aNorm: boolean = true);
+    aSplits: PtrInt; aNorm: boolean = true; aWindow: PtrInt = 0;
+    aRope: boolean = true);
   var
     q, k, v, qn, kn, cs, cosv, sinv, keys, values, y, kc, vc, qc, yc,
       part: TSingleDynArray;
     pq, pk, pv, pqn, pkn, pcs, pkc, pvc, py, ppart: TCuDevicePtr;
-    rows, heads, kvHeads, headDim, past, splits, hb, rb, norm: cardinal;
+    rows, heads, kvHeads, headDim, past, splits, hb, rb, norm, rope,
+      window: cardinal;
     eps: single;
     half, kvw, cp, r, i: PtrInt;
   begin
@@ -897,9 +900,16 @@ var
     cs := copy(cosv);
     SetLength(cs, 2 * aRows * half);
     MoveFast(pointer(sinv)^, cs[aRows * half], aRows * half * 4);
-    // the cached rows: random keys and values, the new ones written by qkrope
+    // the cached rows: random keys and values, the new ones written by qkrope;
+    // with a window, the rows no query sees are NaN - read, they would show
     Fill(keys, cp * kvw, 36, 1);
     Fill(values, cp * kvw, 37, 1);
+    if aWindow > 0 then
+      for i := 0 to (aPast - aWindow + 1) * kvw - 1 do
+      begin
+        PCardinal(@keys[i])^ := $7fc00000;
+        PCardinal(@values[i])^ := $7fc00000;
+      end;
     pq := Up(q);
     pk := Up(k);
     pv := Up(v);
@@ -918,6 +928,8 @@ var
     rb := 8 div aHeadBlock;
     eps := 1e-6;
     norm := ord(aNorm);
+    rope := ord(aRope);
+    window := aWindow;
     // every buffer up first: the two kernels then run back to back, with no
     // copy (which waits for the stream) between them
     SetLength(y, aRows * aHeads * aHeadDim);
@@ -925,9 +937,9 @@ var
     SetLength(part, aHeads * aRows * aSplits * (aHeadDim + 2));
     ppart := Up(part);
     fCu.Enqueue(kQk, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows, @heads,
-      @kvHeads, @headDim, @past, @eps, @norm], aHeads + aKvHeads, 128, aRows);
+      @kvHeads, @headDim, @past, @eps, @norm, @rope], aHeads + aKvHeads, 128, aRows);
     fCu.Enqueue(kAtt, [@pq, @pkc, @pvc, @py, @ppart, @rows, @heads, @headDim,
-      @kvHeads, @past, @splits, @hb, @rb], aHeads div aHeadBlock, 128,
+      @kvHeads, @past, @splits, @hb, @rb, @window], aHeads div aHeadBlock, 128,
       (aRows + PtrInt(rb) - 1) div PtrInt(rb), aSplits);
     if aSplits > 1 then
       fCu.Enqueue(kMerge, [@ppart, @py, @rows, @heads, @headDim, @splits],
@@ -946,20 +958,29 @@ var
       ref.RmsNorm(pointer(q), aRows * aHeads, aHeadDim, pointer(qn), eps, pointer(q));
       ref.RmsNorm(pointer(k), aRows * aKvHeads, aHeadDim, pointer(kn), eps, pointer(k));
     end;
-    ref.Rope(pointer(q), aRows, aHeads, aHeadDim, pointer(cosv), pointer(sinv));
-    ref.Rope(pointer(k), aRows, aKvHeads, aHeadDim, pointer(cosv), pointer(sinv));
+    if aRope then
+    begin
+      ref.Rope(pointer(q), aRows, aHeads, aHeadDim, pointer(cosv), pointer(sinv));
+      ref.Rope(pointer(k), aRows, aKvHeads, aHeadDim, pointer(cosv), pointer(sinv));
+    end;
     MoveFast(pointer(k)^, keys[aPast * kvw], aRows * kvw * 4);
     MoveFast(pointer(v)^, values[aPast * kvw], aRows * kvw * 4);
     Near(qc, q, 1e-5, FormatUtf8('qkrope q % rows, % heads of %',
       [aRows, aHeads, aHeadDim]));
-    Near(kc, keys, 1e-5, FormatUtf8('qkrope keys after %', [aPast]));
+    // the NaN rows before a window: not compared (NaN is never near)
+    i := 0;
+    if aWindow > 0 then
+      i := MaxPtrInt(aPast - aWindow + 1, 0) * kvw;
+    Near(copy(kc, i, length(kc) - i), copy(keys, i, length(keys) - i), 1e-5,
+      FormatUtf8('qkrope keys after %', [aPast]));
     Check(CompareMem(pointer(vc), pointer(values), length(values) * 4),
       'qkrope values copied, the rest of the cache untouched');
     ref.CausalAttention(pointer(q), aRows, aHeads, aHeadDim, pointer(keys),
-      pointer(values), aPast, aKvHeads, pointer(y));
+      pointer(values), aPast, aKvHeads, pointer(y), aWindow);
     Near(yc, y, 2e-5, FormatUtf8(
-      'attention % rows after %, % heads / % KV heads of %, % per block, % splits',
-      [aRows, aPast, aHeads, aKvHeads, aHeadDim, aHeadBlock, aSplits]));
+      'attention % rows after %, % heads / % KV heads of %, % per block, % ' +
+      'splits, window %, rope %', [aRows, aPast, aHeads, aKvHeads, aHeadDim,
+      aHeadBlock, aSplits, aWindow, aRope]));
   end;
 
 var
@@ -988,6 +1009,15 @@ begin
     AttentionCase(2, 4, 4, 256, 5, 1, 2);
     AttentionCase(9, 8, 1, 64, 130, 8, 4);   // 8 heads of one KV head
     AttentionCase(5, 14, 2, 64, 10, 7, 1, false); // no head norm (Qwen2.5-0.5B)
+    // D4b: sliding windows (the keys before them NaN) and NoPE
+    AttentionCase(7, 4, 2, 64, 0, 2, 1, true, 3);      // a prompt, window 3
+    AttentionCase(7, 4, 2, 64, 0, 1, 3, true, 3);      // in ranges
+    AttentionCase(3, 16, 8, 128, 20, 2, 1, true, 5);   // after a cached prefix
+    AttentionCase(1, 16, 8, 128, 300, 2, 5, true, 64); // decoding, 5 ranges
+    AttentionCase(1, 16, 8, 128, 300, 2, 1, true, 400); // a window over all keys
+    AttentionCase(9, 8, 1, 64, 130, 8, 4, true, 1);    // a row sees itself only
+    AttentionCase(5, 4, 2, 64, 10, 2, 1, true, 0, false); // NoPE
+    AttentionCase(5, 4, 2, 64, 10, 2, 2, false, 4, false); // NoPE, window, no norm
   finally
     for i := 0 to high(bufs) do
       bufs[i].Free;
@@ -2002,59 +2032,110 @@ end;
 
 
 
-procedure TTestInferCuda.SlidingWindowRefused;
+procedure TTestInferCuda.SlidingWindowMatchesCpu;
+const
+  NAMES: array[0..2] of RawUtf8 = ('tiny-qwen3-sliding', 'tiny-smollm3',
+    'tiny-qwen3-sliding');
+  /// the third: 16 query heads on one KV head (make_reference_d4b.py)
+  SUBS: array[0..2] of TFileName = ('', '', 'g16');
+  PROMPT = 300; // more than one chunk of the device (256)
+  TOL: array[boolean] of double = (1e-4, 4e-3);
 var
-  dir, qdir, tmp: TFileName;
+  dir: TFileName;
   gpu: TInferCudaBackend;
   ref: TInferCpuBackend;
   model: TDecoderModel;
-  why: RawUtf8;
-  k: PtrInt;
+  dev: TQwen3Cuda;
+  c1, c3: TQwen3Context;
+  c2: TQwen3CuContext;
+  ids: TIntegerDynArray;
+  l1, l2, b1, b2: TSingleDynArray;
+  m, k, i, v: PtrInt;
+  seed: cardinal;
+  e: double;
+  id: integer;
 begin
   if not HasDevice then
     exit;
-  dir := FindInferRefDir('tiny-smollm3');
-  qdir := FindInferRefDir('tiny-qwen3-sliding');
-  if CheckFailed((dir <> '') and (qdir <> ''), 'tiny-smollm3 and tiny-qwen3-sliding found') then
-    exit;
-  tmp := MakePath([GetSystemPath(spTemp), 'lai-d4dev-' + Int64ToUtf8(GetTickCount64)], true);
-  ForceDirectories(tmp);
-  gpu := TInferCudaBackend.Create;
-  ref := TInferCpuBackend.Create;
-  try
-    // SmolLM3 with every layer in full attention: NoPE alone
-    CopyFile(dir + 'model.safetensors', tmp + 'model.safetensors', false);
-    FileFromString(StringReplaceAll(StringFromFile(dir + 'config.json'),
-      '"sliding_attention"', '"full_attention"'), tmp + 'config.json');
-    for k := 0 to 1 do
-    begin
-      model := nil;
-      try
-        if k = 0 then
-          model := NewDecoderModel(qdir, ref) // a window, rotary positions
-        else
-          model := NewDecoderModel(tmp, ref); // no window, NoPE layers
-        why := '';
-        try
-          TQwen3Cuda.Create(model, gpu).Free;
-        except
-          on E: EInferError do
-            why := StringToUtf8(E.Message);
+  SetLength(ids, PROMPT);
+  seed := 13;
+  for i := 0 to PROMPT - 1 do
+  begin
+    seed := seed * 1103515245 + 12345;
+    ids[i] := 3 + (seed shr 16) mod 93;
+  end;
+  for m := 0 to high(NAMES) do
+  begin
+    dir := FindInferRefDir(NAMES[m]);
+    if CheckFailed(dir <> '', Utf8ToString(NAMES[m] + ' found')) then
+      continue;
+    if SUBS[m] <> '' then
+      dir := IncludeTrailingPathDelimiter(dir + SUBS[m]);
+    gpu := TInferCudaBackend.Create;
+    ref := TInferCpuBackend.Create;
+    model := nil;
+    dev := nil;
+    c1 := nil;
+    c2 := nil;
+    c3 := nil;
+    try
+      model := NewDecoderModel(dir, ref);
+      v := model.Config.VocabSize;
+      dev := TQwen3Cuda.Create(model, gpu);
+      c1 := model.NewContext;
+      c1.FullCache := true; // Truncate(PROMPT) after the decode steps
+      model.Forward(c1, pointer(ids), PROMPT, nil);
+      SetLength(l1, PROMPT * v);
+      SetLength(l2, PROMPT * v);
+      c3 := model.NewContext;
+      model.Forward(c3, pointer(ids), PROMPT, pointer(l1), true);
+      FreeAndNil(c3);
+      // k bit 0: one range or a range per key; bit 1: the cache in half floats
+      for k := 0 to 3 do
+      begin
+        dev.KvF16 := k >= 2;
+        dev.SplitKeys := k and 1;
+        FreeAndNil(c2);
+        c2 := dev.NewContext;
+        dev.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= TOL[k >= 2], '% KvF16=% SplitKeys=% prompt: relative error %',
+          [NAMES[m], k >= 2, k and 1, e]);
+        // decode steps (one CUDA graph each)
+        SetLength(b1, v);
+        SetLength(b2, v);
+        for i := 0 to 3 do
+        begin
+          id := ids[i];
+          model.Forward(c1, @id, 1, pointer(b1));
+          dev.Forward(c2, @id, 1, pointer(b2));
+          e := RelError(pointer(b2), pointer(b1), v);
+          CheckUtf8(e <= TOL[k >= 2], '% KvF16=% SplitKeys=% decode step %: ' +
+            'relative error %', [NAMES[m], k >= 2, k and 1, i, e]);
         end;
-        if k = 0 then
-          CheckUtf8(PosEx('sliding window not supported', why) > 0,
-            'a sliding window refused: %', [why])
-        else
-          CheckUtf8(PosEx('without rotary positions not supported', why) > 0,
-            'NoPE refused: %', [why]);
-      finally
-        model.Free;
+        c1.Truncate(PROMPT);
+        // back to 3 tokens, behind the window: the device keeps every row
+        c2.Truncate(3);
+        SetLength(b1, 20 * v);
+        SetLength(b2, 20 * v);
+        dev.Forward(c2, @ids[100], 20, pointer(b2), true);
+        c3 := model.NewContext;
+        model.Forward(c3, pointer(ids), 3, nil);
+        model.Forward(c3, @ids[100], 20, pointer(b1), true);
+        FreeAndNil(c3);
+        e := RelError(pointer(b2), pointer(b1), 20 * v);
+        CheckUtf8(e <= TOL[k >= 2], '% KvF16=% SplitKeys=% branch at 3: ' +
+          'relative error %', [NAMES[m], k >= 2, k and 1, e]);
       end;
+    finally
+      c3.Free;
+      c2.Free;
+      c1.Free;
+      dev.Free;
+      model.Free;
+      ref.Free;
+      gpu.Free;
     end;
-  finally
-    ref.Free;
-    gpu.Free;
-    DirectoryDeleteAll(tmp);
   end;
 end;
 
