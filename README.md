@@ -6,41 +6,48 @@ vector search and RAG, and it brings **its own inference engine in plain Object 
 no Python, no llama.cpp, no foreign `.so`/`.dll` at run time. mORMot2's HTTP stack, JSON,
 RTTI, SQLite and crypto are the foundation, not a dependency we tolerate.
 
-> **Status, 2026-10-15:** MCP, LLM clients, agent loop, RAG and the native vector store
+> **Status, 2026-10-19:** MCP, LLM clients, agent loop, RAG and the native vector store
 > are done and in use. The native inference engine runs BGE-M3 embeddings from the same
 > GGUF file as `lembed`, with the same quality and **1.6 to 2 times its speed on x86_64** (Linux / Windows);
 > it passes all suites, its quality gate and a 90-minute soak test on Linux x86_64 too,
-> and it is the recommended provider of the consuming backend. The Qwen3 decoder passes
-> its gate (greedy output in FP32 token-identical to `transformers`) and runs behind
-> `ILlmClient`: the agent loop calls tools with a model on this machine, at about 33
-> tokens/s in FP32 and 64 in Q8_0 on a laptop, greedy or sampled, with a prompt cache
-> for the next turn. On an NVIDIA card the whole forward pass also runs on CUDA (RTX 5090: about 400 tokens/s decoding, faster than Vulkan). Three test suites, about 4500 assertions, green on every platform in the table below.
+> and it is the recommended provider of the consuming backend. Three decoder families
+> run behind `ILlmClient` - **Qwen3**, **Qwen3-MoE** (mixture of experts, Qwen3-30B-A3B)
+> and **Qwen2.5** - with greedy output in FP32 token-identical to `transformers` (for MoE
+> on tiny reference models; the 30B model is checked against the CPU path):
+> the agent loop calls tools with a model on this machine, greedy or sampled, with a
+> prompt cache for the next turn. Weights come from safetensors or llama.cpp GGUF files
+> (Q8_0, Q4_0, Q4_K_M). The whole forward pass runs on the CPU (NEON, AVX2), on Vulkan
+> (tested on an RTX 5090, an Adreno X1-85 and an M2 Pro through MoltenVK) and on CUDA. An
+> RTX 5090 decodes Qwen3-0.6B at about 400 tokens/s (CUDA) and Qwen3-30B-A3B at about 44
+> (Vulkan; CUDA 41). Three test suites - about 5500 assertions on Windows x64, fewer
+> where a feature is missing - green on every platform in the table below.
 
 ## What it does
 
 | Area | Units | In short |
 |---|---|---|
 | **MCP server** | `mormot.ai.mcp[.server/.stdio/.tools]` | protocol revision **2026-07-28** (stateless); tools from typed records, input schema generated from RTTI; stdio, HTTP, Streamable HTTP, in-process; OAuth 2.1 resource server (opt-in) |
-| **LLM clients** | `mormot.ai.llm[.openai/.anthropic/.native/.sse/.structured]` | OpenAI wire as lingua franca (OpenAI, LiteLLM, Ollama-compatible), native Anthropic driver, a local Qwen3 on the native engine; streaming, tool calls, structured output, vision |
+| **LLM clients** | `mormot.ai.llm[.openai/.anthropic/.native/.sse/.structured]` | OpenAI wire as lingua franca (OpenAI, LiteLLM, Ollama-compatible), native Anthropic driver, local Qwen3, Qwen3-MoE and Qwen2.5 on the native engine; streaming, tool calls, structured output, vision |
 | **Agent** | `mormot.ai.agent[.mcp]` | tool-calling loop; MCP tools usable by the agent |
 | **Embeddings** | `mormot.ai.embeddings`, `.embed.{native,provider,lembed}` | one `IEmbedder` seam: the native engine, any OpenAI-compatible API, or sqlite-lembed |
 | **Vector search** | `mormot.ai.vectorstore[.native/.sqlitevec]` | native store in mORMot's SQLite: float32 rows as the truth, 1-bit RAM index with exact rescoring, SQL key filters — measured at 2 million × 1024 |
 | **RAG** | `mormot.ai.rag[.tool]` | strict, atomic ingestion; retrieval; RAG as an MCP/agent tool |
 | **Load governor** | `mormot.ai.governor` | paces bulk jobs: duty cycle, CPU temperature threshold (Linux hwmon), throughput heuristic; `TGovernedEmbedder` wraps any `IEmbedder` |
-| **Native inference** | `src/infer/mormot.ai.infer.*` | GGUF and safetensors loaders, Q8_0, SentencePiece/Unigram tokenizer, XLM-RoBERTa encoder, CPU backend with NEON and AVX2 kernels and its own thread pool |
+| **Native inference** | `src/infer/mormot.ai.infer.*` | GGUF and safetensors loaders; Q8_0, Q4_0, Q4_K, Q6_K weights; SentencePiece/Unigram and byte-level BPE tokenizers; the XLM-RoBERTa encoder (BGE-M3) and a decoder with dense and mixture-of-experts layers (Qwen3, Qwen3-MoE, Qwen2.5), chat templates, sampler, prompt cache; CPU backend with NEON and AVX2 kernels and its own thread pool; Vulkan (embedded SPIR-V) and CUDA (embedded PTX, driver API) without shipped libraries |
 
 ## Where it runs
 
 Number of assertions per suite, every one passing unless noted; each row with numbers ran
-between 2026-10-14 and 17:
+between 2026-10-14 and 17, the inference suite of the three i9-14900K rows (RTX 5090,
+Qwen3-30B-A3B and Qwen2.5 included) and of the M2 Pro again on 2026-10-19:
 
 | Platform | Compiler | MCP | LLM | Inference |
 |---|---|---|---|---|
 | Linux aarch64 (WSL2, Snapdragon X) | FPC 3.2.4 and 3.2.2 | 1257 | 727 | 2364 ⁶ |
-| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 723 | 2644 |
-| Windows x64 (i9-14900K) | Delphi 13 | 1257 | 726 | 2644 |
-| Windows x86 | **Delphi 7** | 1253 | 714 | 1751 ⁴ |
-| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 716 | 2655 ⁵ |
+| Windows x64 (i9-14900K) | FPC 3.2.2 | 1257 | 723 | 3606 |
+| Windows x64 (i9-14900K) | Delphi 13 | 1257 | 726 | 3606 |
+| Windows x86 | **Delphi 7** | 1253 | 714 | 2174 ⁴ |
+| macOS aarch64 (M2 Pro) | FPC 3.2.4 | 1257 | 716 | 2942 ⁵ |
 | Windows ARM64 (Snapdragon X) | FPC 3.3.1 ¹ | 1257 | 714 ² | 2728 ¹ |
 | Linux x86_64 (WSL2, i9-14900K) | FPC 3.2.2 | 1257 | 725 | 2486 ³ |
 
@@ -57,12 +64,13 @@ that target.
 entry. Vulkan there is llvmpipe (a CPU implementation), so the Qwen3 tests on the device
 skip. The BGE-M3 corpus gate (`LAI_INFER_GATE=1`) passed in an earlier run: nDCG@10 0.8994
 on the AVX2 path.
-⁴ Natively on an i9-14900K (2026-10-16), the Vulkan suite included. The Qwen3-0.6B tests
-skip in a 32-bit process (2.4 GB of FP32 weights); the tiny model, the tokenizer and the
-chat template run.
-⁵ With all models, NEON dot-product kernels, and the Vulkan suite on the M2 Pro GPU
-through MoltenVK (`LAI_REQUIRE_VULKAN=1`). The BGE-M3 corpus gate passed there in an
-earlier run (nDCG@10 0.9004, the same as on the Snapdragon); it is not part of this count.
+⁴ Natively on an i9-14900K, the Vulkan suite included. The Qwen3-0.6B and Qwen3-30B-A3B
+tests skip in a 32-bit process (2.4 GB of FP32 weights, 18.6 GB of GGUF); the tiny
+models, the tokenizers and the chat templates run.
+⁵ With all models except Qwen3-30B-A3B (the tiny MoE model runs), NEON dot-product
+kernels, and the Vulkan suite on the M2 Pro GPU through MoltenVK (`LAI_REQUIRE_VULKAN=1`); counted before Qwen2.5 was added. The BGE-M3
+corpus gate passed there in an earlier run (nDCG@10 0.9004, the same as on the
+Snapdragon); it is not part of this count.
 ⁶ FPC 3.2.4 with all models; under FPC 3.2.2 the native client tests ran on their own
 (without the model).
 
@@ -188,6 +196,20 @@ And on an Intel i9-14900K (Windows 11, FPC 3.2.2, 22 threads, AVX2), 2026-10-16:
 | Q4_K_M GGUF file | 455 tokens/s | 78 tokens/s | 0.5 GB |
 | Q8_0 GGUF, 1000-token prompt | 540 tokens/s | 44 tokens/s | 1.0 GB |
 | Q4_K_M GGUF, 1000-token prompt | 369 tokens/s | 47 tokens/s | 0.8 GB |
+
+**Qwen3-30B-A3B** (mixture of experts, 128 experts with 8 active per token,
+`Qwen3-30B-A3B-Q4_K_M.gguf`, 18.6 GB) on the same machine, a 200-token prompt,
+2026-10-17 to 19:
+
+| | prefill | decode |
+|---|---|---|
+| CPU (22 threads, AVX2) | 85 tokens/s | 16 tokens/s |
+| RTX 5090, CUDA | 383 tokens/s | 41 tokens/s |
+| RTX 5090, Vulkan | 489 tokens/s (642 at 2000 tokens) | 43-44 tokens/s |
+
+The host still picks the experts of each layer, so a MoE layer waits for the device once
+on Vulkan and three times on CUDA - that is why Vulkan leads here. Moving the choice onto
+the device is the next step for decoding speed (backlog D3c).
 
 FP32 keeps greedy output token-identical to `transformers`; Q8_0 passes its own gate but
 can flip a close decision - with it, Qwen3-0.6B answers the weather question of the
@@ -371,9 +393,11 @@ driver** behind the same `ILlmClient` seam:
   top-level `system`, mandatory `max_tokens`, `input_schema`/`tool_use`/`tool_result`,
   `x-api-key` + `anthropic-version`, event-typed SSE. The agent loop, RAG and structured
   output stay provider-agnostic; only the `ILlmClient` instance changes.
-- **Native** (`mormot.ai.llm.native`, `TNativeLlmClient`): Qwen3 from a model folder on
-  this machine, run by the native engine. The prompt is the model's chat template; the
-  answer is parsed token by token - a leading `<think>` block becomes `reasoning_content`
+- **Native** (`mormot.ai.llm.native`, `TNativeLlmClient`): a model from a folder
+  (safetensors) or one GGUF file on this machine, run by the native engine - Qwen3,
+  Qwen3-MoE or Qwen2.5, chosen by `model_type` or the GGUF architecture
+  (`RegisterDecoderModel`, `RegisterNativeFamily`). The prompt is the family's chat
+  template; the answer is parsed token by token - a leading `<think>` block becomes `reasoning_content`
   in `Raw` (as vLLM returns it), each `<tool_call>` a `TLlmToolCall`. `ChatComplete` and
   `ChatStream` share one decoding path. Thinking is switched per request through
   `Extra.chat_template_kwargs.enable_thinking`, as with vLLM. Sampling follows the model's
@@ -381,7 +405,8 @@ driver** behind the same `ILlmClient` seam:
   or `Extra` `top_p`, `top_k`, `min_p`, `seed`; a seed gives the same random stream on
   every compiler and CPU. Images and `ResponseFormat` are refused rather than ignored.
   On a GPU: `client.Device := TQwen3Vulkan.Create(client.Model, gpu)` (Vulkan, with a
-  `TInferVulkanBackend` as the client's backend) - the same answers, the KV cache on the card.
+  `TInferVulkanBackend` as the client's backend) or `TQwen3Cuda` - the same answers, the KV
+  cache on the card (half floats by default).
 
 **Vision:** `TLlmMessage.Images` carries attachments (`LlmImageMessage`/`LlmImageBase64`/
 `LlmImageUrl`); both wires serialise them (OpenAI `image_url` including base64 `data:` URIs,
@@ -515,11 +540,13 @@ mormot2-ai/
     mormot.ai.rag[.tool]
     mormot.ai.governor                            load governor for bulk jobs
     infer/mormot.ai.infer.*                       the native inference engine:
-      tensor, memory, loader.{gguf,safetensors}, tokenizer.ugm, model.xlmr,
-      backend[.cpu], kernels (NEON, AVX2), threads, pipeline.embed
+      tensor, memory, loader.{gguf,safetensors}, tokenizer[.ugm|.bpe], model.xlmr,
+      decoder, model.qwen3[.vulkan|.cuda], chat, sampler, pipeline.embed,
+      backend[.cpu|.vulkan|.cuda], kernels (NEON, AVX2), threads, vulkan, cuda
   tests/    mcp.tests · llm.tests · infer.tests (mORMot TSynTests), data/ (reference data)
-  demos/    stdio · http · jsonrpc · streamable · llm/* · rag/* · infer/embed-bench
-  tools/    infer-ref (Python reference for the engine, not needed to build)
+  demos/    stdio · http · jsonrpc · streamable · llm/* · rag/* · infer/{embed,llm}-bench
+  tools/    infer-ref (Python reference for the engine), vk and cuda (shader and kernel
+            sources; the compiled SPIR-V / PTX is in git) - none needed to build
   docs/     native-inference.md · native-embeddings.md · specs/mcp-2026-07-28/
   vendor/   mormot.ext.os (adopted) · models, sqlite-ext (gitignored, not in git)
   scripts/  run-fpc-{tests,llm-tests,infer-tests}.sh · build-demo.sh · fpc-env.sh
@@ -545,7 +572,8 @@ provider or runtime, not only against tests.
 | Native vector store (`mormot.ai.vectorstore.native`) | **stable** | no C extension; persisted model contract, SQL key filters, 1-bit RAM index with exact rescoring — measured at 2M × 1024 ([docs/native-embeddings.md](docs/native-embeddings.md)) |
 | RAG (ingestion, retrieval, RAG-as-tool) | **works** | ingestion is strict and atomic; the rollback test still needs the runtime |
 | Native embeddings (`mormot.ai.embed.native`) | **stable** | BGE-M3 from GGUF Q8_0; passes its quality gates on aarch64 and x86_64; AVX2 and NEON kernels; 90-minute soak test passed (79,628 texts, every vector bit-identical to the first pass); the recommended provider of the consuming backend |
-| Qwen3 decoder (`mormot.ai.infer.model.qwen3`, `.tokenizer.bpe`, `.chat`) and its client (`mormot.ai.llm.native`) | **works, slow** | tokenizer: 2416 cases identical to Hugging Face, fuzzed against its pre-tokenizer; chat template: 21 conversations identical; Qwen3-0.6B FP32: greedy output token-identical for 7 prompts; behind `ILlmClient` with streaming, tool calls and reasoning, agent loop tested; FP32 or Q8_0, SIMD and threads (33 / 64 tokens/s decoding on a laptop); greedy or sampled (temperature, top-k, top-p, min-p, seed); prompt cache for the next turn |
+| Decoder (`mormot.ai.infer.decoder`, `.model.qwen3`, `.tokenizer.bpe`, `.chat`) and its client (`mormot.ai.llm.native`) | **works** | Qwen3, Qwen3-MoE and Qwen2.5; tokenizer: 2416 cases identical to Hugging Face, fuzzed against its pre-tokenizer; chat templates identical to `transformers` (the same 21 conversations for Qwen3 and Qwen2.5); greedy output token-identical in FP32 (Qwen3-0.6B 7 prompts, Qwen2.5-0.5B 6, tiny MoE models); behind `ILlmClient` with streaming, tool calls and reasoning, agent loop tested; FP32, Q8_0, Q4_0, Q4_K_M; greedy or sampled (temperature, top-k, top-p, min-p, seed); prompt cache for the next turn. Not yet: Q5_0 (Qwen's own Q4_K_M file of Qwen2.5-0.5B is refused with that name), sliding-window attention |
+| GPU backends (`mormot.ai.infer.vulkan`, `.cuda`, `.model.qwen3.vulkan`, `.model.qwen3.cuda`) | **works** | the whole forward pass, experts included, checked against the CPU on every run (logits cosine, argmax, for MoE the expert choice separately); Vulkan on an RTX 5090, an Adreno X1-85 and an M2 Pro (MoltenVK), CUDA on the RTX 5090 - mixture of experts with Qwen3-30B-A3B on the RTX 5090, on the other GPUs with the tiny MoE model; flash attention, F16 KV cache, a decode step as one CUDA graph (dense models) |
 | Load governor (`mormot.ai.governor`) | **works** | tested on a fake clock and a fake sysfs tree; the temperature path needs a Linux CPU sensor, which WSL2 does not expose - not yet seen on real sensor hardware |
 | Embeddings via `lembed` (local GGUF) | **works, needs a native library** | shared per model name; calls are serialised (its context is not re-entrant); kept as fallback and as the oracle of the native engine |
 | Vector store `sqlite-vec` | **works, needs a native library** | superseded by the native store; real-extension test is env-gated (`SQLITE_EXT_DIR`) |
@@ -573,6 +601,8 @@ Done:
   greedy output token-identical to `transformers` for all seven reference prompts.
 - ✓ **Qwen3 behind `ILlmClient`** — `mormot.ai.llm.native`: streaming, stop tokens, tool
   calls, reasoning; the agent loop runs a tool with the local model.
+- ✓ **Qwen3-MoE and Qwen2.5** — mixture of experts (Qwen3-30B-A3B) and the Qwen2.5
+  family on the CPU, Vulkan and CUDA, both behind `ILlmClient` (see item 3 below).
 
 Next, in this order:
 1. **Quantisation and speed** — done: Q8_0 weights, SIMD and threads for the decoder
@@ -595,8 +625,15 @@ Next, in this order:
    no shipped DLLs), CUDA through the driver API as the second backend - done too:
    `TQwen3Cuda` (kernels as embedded PTX, a decode step as one CUDA graph) prefills about
    12400 and decodes about 404 tokens/s on the RTX 5090 (Q8_0; Vulkan 13700 and 358).
-3. **After that, on demand** — more architectures (Llama 3, Mistral, Gemma), a reranker,
-   Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
+3. **More decoder families (phase D)** — under way. Done: shared decoder types and two
+   registries, so a family is one unit (D1); mixture of experts on the CPU, CUDA and
+   Vulkan with Qwen3-30B-A3B (D2, D3a, D3b), and a routing tape that lets the GPU
+   comparison check computation and expert choice separately; Qwen2 / Qwen2.5 with QKV
+   bias and its own chat template (D1b). Next: sliding-window attention and cache
+   semantics (D4), the expert choice on the device (D3c), Q5_0 weights (B16); after that
+   candidates such as gpt-oss-20b and Gemma. Plan and order:
+   [docs/backlog.md](docs/backlog.md) (German).
+4. **After that, on demand** — a reranker, Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 
 Alongside, as a separate track: **distributed execution** - big inference jobs pulled
 by idle machines on the network (task parallelism with leases, not model parallelism;
