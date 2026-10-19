@@ -30,7 +30,8 @@ uses
   mormot.ai.infer.sampler,
   test.infer.ref,
   test.infer.fast,
-  test.infer.bpe;
+  test.infer.bpe,
+  test.infer.qwen3;
 
 type
   /// slice C1: driver, device, modules from PTX, memory and a kernel
@@ -101,6 +102,15 @@ type
     /// Qwen2.5-0.5B-Instruct (Q8_0 and Q4_K_M GGUF) on the device against the
     // fast CPU backend, teacher-forced - skipped without the model
     procedure Qwen25GgufMatchesCpu;
+    /// B14: embedding rows in place of ids on the device - the bits of the
+    // ids, mixed with ids over chunks, no id in the cache there
+    procedure EmbeddingRowsOnDevice;
+    /// B14: the talker and the code predictor of Qwen3-TTS fed with rows on
+    // the device against PyTorch (logits) - skipped without the model
+    procedure Qwen3TtsOnDevice;
+    /// B14: ForgetWeights - new weights at the address of forgotten ones are
+    // served, other ranges kept; a freed model forgets its weights
+    procedure ForgetWeightsServesNew;
     /// D4: a model with a sliding window (tiny Qwen3 with one) or with layers
     // without rotary positions (tiny SmolLM3 without its windows) is refused
     // by the device, not computed otherwise
@@ -2176,6 +2186,273 @@ begin
     ops.Free;
     model.Free;
     ref.Free;
+  end;
+end;
+
+
+procedure TTestInferCuda.EmbeddingRowsOnDevice;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  gpu: TInferCudaBackend;
+  cpu: TInferCpuBackend;
+  model: TQwen3Model;
+  dev: TQwen3Cuda;
+  c1, c2: TQwen3Context;
+  ids: PIntegerArray;
+  n, h, vocab, cut1, cut2, i: PtrInt;
+  rows, all, mine: TSingleDynArray;
+  long: TIntegerDynArray;
+  seed: cardinal;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  gpu := TInferCudaBackend.Create;
+  cpu := TInferCpuBackend.Create;
+  model := nil;
+  dev := nil;
+  c1 := nil;
+  c2 := nil;
+  try
+    model := TQwen3Model.Create(dir, cpu);
+    dev := TQwen3Cuda.Create(model, gpu);
+    ids := ref.I32('case2.ids', n);
+    h := model.Config.Hidden;
+    vocab := model.Config.VocabSize;
+    SetLength(all, n * vocab);
+    SetLength(mine, n * vocab);
+    SetLength(rows, n * h);
+    model.Embed(ids, n, pointer(rows));
+    c1 := dev.NewContext;
+    c2 := dev.NewContext;
+    // on one device the rows of Embed give the bits of their ids - also
+    // through TDecoderModel.ForwardEmbeds, which hands the context over
+    dev.Forward(c1, ids, n, pointer(all), true);
+    model.ForwardEmbeds(c2, pointer(rows), n, pointer(mine), true);
+    Check(CompareMem(pointer(all), pointer(mine), n * vocab * SizeOf(single)),
+      'rows on the device give the bits of their ids');
+    Check((c2.Length = n) and (c2.Id[0] = -1), 'no id where a row was fed');
+    // the same chunks with ids, and with rows in the middle
+    cut1 := 3;
+    cut2 := n - 4;
+    c1.Reset;
+    c2.Reset;
+    dev.Forward(c1, ids, cut1, @all[0], true);
+    dev.Forward(c1, @ids^[cut1], cut2 - cut1, @all[cut1 * vocab], true);
+    dev.Forward(c1, @ids^[cut2], n - cut2, @all[cut2 * vocab], true);
+    dev.Forward(c2, ids, cut1, @mine[0], true);
+    dev.ForwardEmbeds(c2, @rows[cut1 * h], cut2 - cut1, @mine[cut1 * vocab], true);
+    dev.Forward(c2, @ids^[cut2], n - cut2, @mine[cut2 * vocab], true);
+    Check(CompareMem(pointer(all), pointer(mine), n * vocab * SizeOf(single)),
+      'ids and rows mixed over chunks');
+    CheckEqual(dev.Reuse(c2, ids, n), cut1, 'Reuse stops at the first row');
+    // 300 rows in one call: two chunks of the device, the rows of the second
+    // taken from the right offset
+    SetLength(long, 300);
+    seed := 11;
+    for i := 0 to high(long) do
+    begin
+      seed := seed * 1103515245 + 12345;
+      long[i] := 3 + (seed shr 16) mod 93;
+    end;
+    n := length(long);
+    SetLength(all, n * vocab);
+    SetLength(mine, n * vocab);
+    SetLength(rows, n * h);
+    model.Embed(pointer(long), n, pointer(rows));
+    c1.Reset;
+    c2.Reset;
+    dev.Forward(c1, pointer(long), n, pointer(all), true);
+    dev.ForwardEmbeds(c2, pointer(rows), n, pointer(mine), true);
+    Check(CompareMem(pointer(all), pointer(mine), n * vocab * SizeOf(single)),
+      '300 rows over two chunks');
+  finally
+    c2.Free;
+    c1.Free;
+    dev.Free;
+    model.Free;
+    cpu.Free;
+    gpu.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferCuda.Qwen3TtsOnDevice;
+var
+  dir, refdir: TFileName;
+  ref: TInferRefSet;
+  gpu: TInferCudaBackend;
+  cpu: TInferCpuFastBackend;
+  model: TQwen3Model;
+  dev: TQwen3Cuda;
+  ctx: TQwen3Context;
+  logits: TSingleDynArray;
+  x: PSingleArray;
+  n, m, h, vocab: PtrInt;
+  cmp: TInferCompare;
+begin
+  if not HasDevice then
+    exit;
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3-TTS on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  dir := TtsFolder;
+  if dir = '' then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/%', [TTS_MODEL]);
+    AddConsole('SKIP Qwen3-TTS on the device: no vendor/models/%', [TTS_MODEL]);
+    exit;
+  end;
+  refdir := FindInferRefDir('qwen3-tts-lm');
+  if CheckFailed(refdir <> '', 'qwen3-tts-lm found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  gpu := TInferCudaBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  model := nil;
+  dev := nil;
+  ctx := nil;
+  try
+    // the talker: the last logits of its 22 rows
+    model := NewTtsTalker(dir, cpu);
+    dev := TQwen3Cuda.Create(model, gpu);
+    dev.KvF16 := false; // against float32: the cache in floats too
+    h := model.Config.Hidden;
+    x := ref.F32('talker.embed', m);
+    n := m div h;
+    SetLength(logits, model.Config.VocabSize);
+    ctx := dev.NewContext;
+    dev.ForwardEmbeds(ctx, x, n, pointer(logits));
+    FreeAndNil(ctx);
+    cmp := InferCompare(pointer(logits), ref.F32('talker.logits_last', m), m, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'talker logits on %: %', [fCu.DeviceName,
+      InferCompareText(cmp)]);
+    AddConsole(FormatString('Qwen3-TTS talker on %: %', [fCu.DeviceName, InferCompareText(cmp)]));
+    FreeAndNil(dev);
+    FreeAndNil(model);
+    // the code predictor: head 0 on row 1 is the logits of code group 0
+    model := NewTtsPredictor(dir, cpu);
+    dev := TQwen3Cuda.Create(model, gpu);
+    dev.KvF16 := false;
+    vocab := model.Config.VocabSize;
+    x := ref.F32('predictor.embed', m);
+    n := m div h;
+    SetLength(logits, n * vocab);
+    ctx := dev.NewContext;
+    dev.ForwardEmbeds(ctx, x, n, pointer(logits), true);
+    FreeAndNil(ctx);
+    cmp := InferCompare(@logits[vocab], ref.F32('predictor.logits', m), vocab, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'predictor group 0 on %: %', [fCu.DeviceName,
+      InferCompareText(cmp)]);
+    CheckEqual(InferArgMax(@logits[vocab], vocab), ref.I32('predictor.codes', m)^[1],
+      'the code of group 0');
+  finally
+    ctx.Free;
+    dev.Free;
+    model.Free;
+    cpu.Free;
+    gpu.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferCuda.ForgetWeightsServesNew;
+const
+  NIN = 64;
+  NOUT = 8;
+var
+  gpu: TInferCudaBackend;
+  cpu: TInferCpuBackend;
+  model: TQwen3Model;
+  dev: TQwen3Cuda;
+  ctx: TQwen3Context;
+  dir: TFileName;
+  x, w, w2, wb, y1, y2, yb, ydev: TSingleDynArray;
+  epoch: integer;
+  id: integer;
+begin
+  if not HasDevice then
+    exit;
+  gpu := TInferCudaBackend.Create;
+  cpu := TInferCpuBackend.Create;
+  model := nil;
+  dev := nil;
+  ctx := nil;
+  try
+    Fill(x, NIN, 91, 2);
+    Fill(w, NOUT * NIN, 92, 0.5);
+    Fill(w2, NOUT * NIN, 93, 0.5);
+    Fill(wb, NOUT * NIN, 94, 0.5);
+    SetLength(yb, NOUT);
+    SetLength(y1, NOUT);
+    SetLength(y2, NOUT);
+    SetLength(ydev, NOUT);
+    gpu.Linear(pointer(x), 1, NIN, InferWeight(pointer(w), idtF32), NOUT, nil,
+      pointer(ydev));
+    // wb cached after w: forgetting w moves it down in the cache
+    gpu.Linear(pointer(x), 1, NIN, InferWeight(pointer(wb), idtF32), NOUT, nil,
+      pointer(yb));
+    // new weights at the same address, of the same type and size: the stale
+    // copy (the trap ForgetWeights is for)
+    MoveFast(w2[0], w[0], NOUT * NIN * SizeOf(single));
+    cpu.Linear(pointer(x), 1, NIN, InferWeight(pointer(w), idtF32), NOUT, nil,
+      pointer(y2));
+    gpu.Linear(pointer(x), 1, NIN, InferWeight(pointer(w), idtF32), NOUT, nil,
+      pointer(y1));
+    Check(CompareMem(pointer(y1), pointer(ydev), NOUT * SizeOf(single)),
+      'without ForgetWeights the old copy');
+    // another range: kept, the epoch stays
+    epoch := gpu.WeightEpoch;
+    gpu.ForgetWeights(pointer(x), @x[NIN]);
+    CheckEqual(gpu.WeightEpoch, epoch, 'nothing forgotten');
+    // the range of the weights, a byte of it is enough
+    gpu.ForgetWeights(@w[NOUT * NIN - 1], @w[NOUT * NIN]);
+    Check(gpu.WeightEpoch <> epoch, 'the epoch moves on');
+    gpu.Linear(pointer(x), 1, NIN, InferWeight(pointer(w), idtF32), NOUT, nil,
+      pointer(y1));
+    CheckUtf8(RelError(pointer(y1), pointer(y2), NOUT) <= 1e-5,
+      'the new weights after ForgetWeights: %', [RelError(pointer(y1), pointer(y2), NOUT)]);
+    // wb stayed cached: changed in place, still its old copy
+    MoveFast(w2[0], wb[0], NOUT * NIN * SizeOf(single));
+    gpu.Linear(pointer(x), 1, NIN, InferWeight(pointer(wb), idtF32), NOUT, nil,
+      pointer(y1));
+    Check(CompareMem(pointer(y1), pointer(yb), NOUT * SizeOf(single)),
+      'the other weight kept');
+    // a device forgets the weights of its model when freed (the model may
+    // compute with another backend)
+    dir := FindInferRefDir('tiny-qwen3');
+    if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+      exit;
+    model := TQwen3Model.Create(dir, cpu);
+    dev := TQwen3Cuda.Create(model, gpu);
+    ctx := dev.NewContext;
+    id := 5;
+    dev.Forward(ctx, @id, 1, nil);
+    FreeAndNil(ctx);
+    epoch := gpu.WeightEpoch;
+    FreeAndNil(dev);
+    Check(gpu.WeightEpoch <> epoch, 'the device forgot the weights of its model');
+    FreeAndNil(model);
+    // a model computing with the GPU backend forgets its weights when freed
+    model := TQwen3Model.Create(dir, gpu);
+    ctx := model.NewContext;
+    model.Forward(ctx, @id, 1, nil); // its matrices through gpu.Linear
+    FreeAndNil(ctx);
+    epoch := gpu.WeightEpoch;
+    FreeAndNil(model);
+    Check(gpu.WeightEpoch <> epoch, 'the model forgot its weights');
+  finally
+    ctx.Free;
+    dev.Free;
+    model.Free;
+    cpu.Free;
+    gpu.Free;
   end;
 end;
 

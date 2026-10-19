@@ -227,52 +227,84 @@ end;
 procedure TQwen3Model.LoadConfig(const aConfigFile: TFileName);
 var
   doc: TDocVariantData;
-  rope: PDocVariantData;
-  i: PtrInt;
+  d, rope, mrope: PDocVariantData;
+  sections: PDocVariantData;
+  i, sum: PtrInt;
+  k: RawUtf8;
 begin
-  if not doc.InitJsonFromFile(aConfigFile, JSON_FAST_FLOAT) then
-    EInferError.RaiseUtf8('%: cannot read %', [self, aConfigFile]);
-  if doc.U['model_type'] <> ModelType then
-    EInferError.RaiseUtf8('%: model_type "%" is not %',
-      [self, doc.U['model_type'], ModelType]);
+  d := ReadConfig(aConfigFile, doc);
   // a missing key would read as 0: refused, also head_dim for Qwen3 (no
   // hidden / heads fallback - that is exactly the value Qwen3 does not have)
   for i := 0 to high(REQUIRED_KEYS) do
-    if doc.GetValueIndex(REQUIRED_KEYS[i]) < 0 then
+    if d^.GetValueIndex(REQUIRED_KEYS[i]) < 0 then
       EInferError.RaiseUtf8('%: % has no "%"', [self, aConfigFile, REQUIRED_KEYS[i]]);
-  if HeadNorm and (doc.GetValueIndex('head_dim') < 0) then
+  if HeadNorm and (d^.GetValueIndex('head_dim') < 0) then
     EInferError.RaiseUtf8('%: % has no "head_dim"', [self, aConfigFile]);
-  if doc.U['hidden_act'] <> 'silu' then
-    EInferError.RaiseUtf8('%: hidden_act "%" not supported', [self, doc.U['hidden_act']]);
-  if doc.B['attention_bias'] or doc.B['mlp_bias'] then
+  if d^.U['hidden_act'] <> 'silu' then
+    EInferError.RaiseUtf8('%: hidden_act "%" not supported', [self, d^.U['hidden_act']]);
+  if d^.B['attention_bias'] or d^.B['mlp_bias'] then
     EInferError.RaiseUtf8('%: attention_bias or mlp_bias not supported', [self]);
   // rope_theta at the top (transformers 4) or in rope_parameters (5), and
   // plain RoPE only: a scaling would change every angle
-  if doc.GetAsObject('rope_parameters', rope) then
+  if d^.GetAsObject('rope_parameters', rope) then
   begin
     if (rope^.U['rope_type'] <> '') and (rope^.U['rope_type'] <> 'default') then
       EInferError.RaiseUtf8('%: rope_type "%" not supported', [self, rope^.U['rope_type']]);
     fConfig.RopeTheta := rope^.D['rope_theta'];
   end
   else
-    fConfig.RopeTheta := doc.D['rope_theta'];
-  if doc.GetAsObject('rope_scaling', rope) and (rope^.Count > 0) then
-    EInferError.RaiseUtf8('%: rope_scaling not supported', [self]);
-  fConfig.VocabSize := doc.I['vocab_size'];
-  fConfig.Hidden := doc.I['hidden_size'];
-  fConfig.Layers := doc.I['num_hidden_layers'];
-  fConfig.Heads := doc.I['num_attention_heads'];
-  fConfig.KvHeads := doc.I['num_key_value_heads'];
-  if doc.GetValueIndex('head_dim') >= 0 then
-    fConfig.HeadDim := doc.I['head_dim']
+    fConfig.RopeTheta := d^.D['rope_theta'];
+  mrope := nil;
+  if d^.GetAsObject('rope_scaling', rope) and (rope^.Count > 0) then
+    // a stack (the talker of Qwen3-TTS) may name a multimodal RoPE: taken as
+    // plain RoPE - the same angles while the positions of its three sections
+    // are equal, as for one sequence fed in order (checked below)
+    if (fStackPrefix <> '') and rope^.GetAsArray('mrope_section', sections) then
+      mrope := rope
+    else
+      EInferError.RaiseUtf8('%: rope_scaling not supported', [self]);
+  fConfig.VocabSize := d^.I['vocab_size'];
+  fConfig.Hidden := d^.I['hidden_size'];
+  fConfig.Layers := d^.I['num_hidden_layers'];
+  fConfig.Heads := d^.I['num_attention_heads'];
+  fConfig.KvHeads := d^.I['num_key_value_heads'];
+  if d^.GetValueIndex('head_dim') >= 0 then
+    fConfig.HeadDim := d^.I['head_dim']
   else
     fConfig.HeadDim := HeadDimOf(self, fConfig.Hidden, fConfig.Heads);
-  fConfig.Intermediate := doc.I['intermediate_size'];
-  fConfig.MaxPositions := doc.I['max_position_embeddings'];
-  fConfig.RmsEps := doc.D['rms_norm_eps'];
-  fConfig.TiedEmbeddings := doc.B['tie_word_embeddings'];
-  LoadFfnConfig(doc, aConfigFile);
-  LoadMixerConfig(doc, aConfigFile);
+  if mrope <> nil then
+  begin
+    // the sections cover every frequency, nothing else in the object
+    sum := 0;
+    for i := 0 to sections^.Count - 1 do
+    begin
+      k := VariantToUtf8(sections^.Values[i]);
+      if Utf8ToInteger(k, 0) <= 0 then
+        EInferError.RaiseUtf8('%: an mrope_section of "%"', [self, k]);
+      inc(sum, Utf8ToInteger(k, 0));
+    end;
+    if sum <> fConfig.HeadDim shr 1 then
+      EInferError.RaiseUtf8('%: mrope_section sums to %, not % frequencies',
+        [self, sum, fConfig.HeadDim shr 1]);
+    for i := 0 to mrope^.Count - 1 do
+    begin
+      k := mrope^.Names[i];
+      if (k = 'rope_type') or (k = 'type') then
+      begin
+        if VariantToUtf8(mrope^.Values[i]) <> 'default' then
+          EInferError.RaiseUtf8('%: rope_scaling % "%" not supported',
+            [self, k, VariantToUtf8(mrope^.Values[i])]);
+      end
+      else if (k <> 'mrope_section') and (k <> 'interleaved') then
+        EInferError.RaiseUtf8('%: rope_scaling.% not supported', [self, k]);
+    end;
+  end;
+  fConfig.Intermediate := d^.I['intermediate_size'];
+  fConfig.MaxPositions := d^.I['max_position_embeddings'];
+  fConfig.RmsEps := d^.D['rms_norm_eps'];
+  fConfig.TiedEmbeddings := d^.B['tie_word_embeddings'];
+  LoadFfnConfig(d^, aConfigFile);
+  LoadMixerConfig(d^, aConfigFile);
   CheckConfig(aConfigFile);
 end;
 
@@ -480,7 +512,7 @@ end;
 
 procedure TQwen3Model.LoadWeights;
 var
-  i, used: PtrInt;
+  i, used, before: PtrInt;
   h, qw, kvw: Int64;
   p: RawUtf8;
   l: ^TDecoderLayer;
@@ -495,16 +527,27 @@ begin
   h := fConfig.Hidden;
   qw := fConfig.Heads * fConfig.HeadDim;
   kvw := fConfig.KvHeads * fConfig.HeadDim;
-  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h],
-    fGguf <> nil);
-  // read per token: its scales checked here, also when the head is untied
-  if fEmbedSrc^.DType in INFER_BLOCK_DTYPES then
-    CheckBlockScales(fEmbedSrc, 'model.embed_tokens.weight');
-  if (fGguf = nil) and (fWeights = idtF32) then
-    fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),
-      idtF32);
+  used := 1;
+  if (fStackPrefix <> '') and (fStackEmbed = '') then
+  begin
+    // a stack fed with embedding rows only: no token embedding, no tied head
+    fEmbedSrc := nil;
+    if fConfig.TiedEmbeddings then
+      EInferError.RaiseUtf8('%: a head tied to no embedding', [self]);
+  end
+  else
+  begin
+    fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h],
+      fGguf <> nil);
+    // read per token: its scales checked here, also when the head is untied
+    if fEmbedSrc^.DType in INFER_BLOCK_DTYPES then
+      CheckBlockScales(fEmbedSrc, 'model.embed_tokens.weight');
+    if (fGguf = nil) and (fWeights = idtF32) then
+      fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),
+        idtF32);
+    inc(used);
+  end;
   fNorm := Weight('model.norm.weight', [h]);
-  used := 2;
   head := Find('lm_head.weight');
   if fConfig.TiedEmbeddings then
   begin
@@ -529,6 +572,7 @@ begin
     inc(used);
   end;
   SetLength(fLayer, fConfig.Layers);
+  before := used;
   for i := 0 to fConfig.Layers - 1 do
   begin
     p := FormatUtf8('model.layers.%.', [i]);
@@ -554,8 +598,15 @@ begin
     l^.PostNorm := Weight(p + 'post_attention_layernorm.weight', [h]);
     inc(used, 6 + LoadFfn(i, p));
   end;
-  // an unknown tensor means a model we do not understand
-  if used <> TensorCount then
+  // an unknown tensor means a model we do not understand - in a stack, only
+  // its layers are its own (the file holds other models too)
+  if fStackPrefix <> '' then
+  begin
+    if used - before <> TensorCountOf(fStackPrefix + 'layers.') then
+      EInferError.RaiseUtf8('%: % tensors under %layers., % understood',
+        [self, TensorCountOf(fStackPrefix + 'layers.'), fStackPrefix, used - before]);
+  end
+  else if used <> TensorCount then
     EInferError.RaiseUtf8('%: % tensors in the file, % understood',
       [self, TensorCount, used]);
 end;

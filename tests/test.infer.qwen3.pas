@@ -23,6 +23,7 @@ uses
   mormot.core.variants,
   mormot.core.perf,
   mormot.core.test,
+  mormot.crypt.secure,
   mormot.ai.infer.tensor,
   mormot.ai.infer.loader.safetensors,
   mormot.ai.infer.backend,
@@ -130,7 +131,8 @@ type
     /// Qwen2.5-0.5B-Instruct in FP32: states, last logits, greedy identical
     procedure Qwen25MatchesReference;
     /// Qwen's own GGUF of Qwen2.5-0.5B-Instruct: Q8_0 against FP32; its
-    // Q4_K_M refused - mostly Q5_0 (hidden 896 is no multiple of 256)
+    // Q4_K_M (mostly Q5_0: hidden 896 is no multiple of 256) against Qwen's
+    // Q8_0 file and FP32
     procedure Qwen25Gguf;
     /// D4, sliding window and NoPE: tiny SmolLM3 (every combination of window
     // and rotary positions) and a tiny Qwen3 with use_sliding_window - every
@@ -144,7 +146,39 @@ type
     /// D4: the layer kinds derived from config.json as transformers does, and
     // the settings refused
     procedure SlidingWindowConfig;
+    /// B14: embedding rows in place of ids (ForwardEmbeds) - the rows of Embed
+    // give the bits of the ids, mixed with ids over chunks; no id in the cache
+    // there, so Reuse stops at the first row
+    procedure EmbeddingRows;
+    /// B14: a decoder as one stack of a larger checkpoint (CreateStack) - the
+    // settings from an object of config.json, the tensors under a prefix, its
+    // own head, no embedding; the bits of the plain model; bad stacks refused
+    procedure StackFromCheckpoint;
+    /// B14: the talker and the code predictor of Qwen3-TTS-12Hz-0.6B-CustomVoice
+    // fed with embedding rows, against PyTorch (flydev's qwen3-tts-lm
+    // reference): every talker state and its logits, the 15 logit rows and
+    // greedy codes of the predictor - skipped without the model
+    procedure Qwen3TtsStacks;
   end;
+
+const
+  /// the folder of Qwen3-TTS-12Hz-0.6B-CustomVoice under vendor/models
+  TTS_MODEL = 'qwen3-tts-12hz-0.6b-customvoice';
+
+/// the folder of Qwen3-TTS-12Hz-0.6B-CustomVoice (with a trailing delimiter),
+// '' when absent
+function TtsFolder: TFileName;
+
+/// the talker of Qwen3-TTS (28 layers, codec embedding, codec head)
+function NewTtsTalker(const aFolder: TFileName; aBackend: TInferBackend): TQwen3Model;
+
+/// the code predictor of Qwen3-TTS (5 layers, no embedding, head of group 0)
+function NewTtsPredictor(const aFolder: TFileName; aBackend: TInferBackend): TQwen3Model;
+
+/// true when config.json and model.safetensors in aFolder have the sha256 of
+// the manifest of aRef (model.files)
+function TtsFilesMatch(const aFolder: TFileName; aRef: TInferRefSet;
+  out aWhy: RawUtf8): boolean;
 
 
 implementation
@@ -2837,6 +2871,360 @@ begin
     end;
   finally
     DirectoryDeleteAll(tmp);
+  end;
+end;
+
+
+procedure TTestInferQwen3.EmbeddingRows;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  model: TQwen3Model;
+  a, b: TQwen3Context;
+  ids: PIntegerArray;
+  n, h, vocab, cut1, cut2: PtrInt;
+  rows, all, mine: TSingleDynArray;
+  raised: boolean;
+  neg: integer;
+begin
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  model := nil;
+  a := nil;
+  b := nil;
+  try
+    model := TQwen3Model.Create(dir, fCpu);
+    Check(model.HasEmbedding, 'a token embedding');
+    ids := ref.I32('case2.ids', n);
+    if CheckFailed(n >= 8, 'case2 long enough') then
+      exit;
+    h := model.Config.Hidden;
+    vocab := model.Config.VocabSize;
+    SetLength(all, n * vocab);
+    SetLength(mine, n * vocab);
+    SetLength(rows, n * h);
+    a := model.NewContext;
+    b := model.NewContext;
+    model.Forward(a, ids, n, pointer(all), true);
+    // the rows of Embed in place of the ids: the very same logits
+    model.Embed(ids, n, pointer(rows));
+    model.ForwardEmbeds(b, pointer(rows), n, pointer(mine), true);
+    Check(CompareMem(pointer(all), pointer(mine), n * vocab * SizeOf(single)),
+      'embedding rows give the bits of their ids');
+    Check((b.Length = n) and (b.Id[0] = -1) and (b.Id[n - 1] = -1),
+      'no id where a row was fed');
+    // not even a caller's own -1 matches such a position
+    neg := -1;
+    CheckEqual(b.Common(@neg, 1), 0, 'a negative id matches no row');
+    // ids, rows, ids in three chunks: the bits of one pass
+    b.Reset;
+    cut1 := 3;
+    cut2 := n - 4;
+    FillCharFast(mine[0], n * vocab * SizeOf(single), 0);
+    model.Forward(b, ids, cut1, @mine[0], true);
+    model.ForwardEmbeds(b, @rows[cut1 * h], cut2 - cut1, @mine[cut1 * vocab], true);
+    model.Forward(b, @ids^[cut2], n - cut2, @mine[cut2 * vocab], true);
+    Check(CompareMem(pointer(all), pointer(mine), n * vocab * SizeOf(single)),
+      'ids and rows mixed over chunks');
+    Check((b.Id[cut1 - 1] = ids^[cut1 - 1]) and (b.Id[cut1] = -1) and
+      (b.Id[cut2 - 1] = -1) and (b.Id[cut2] = ids^[cut2]), 'ids around the rows');
+    // the prompt cache keeps the ids before the first row only
+    CheckEqual(model.Reuse(b, ids, n), cut1, 'Reuse stops at the first row');
+    CheckEqual(b.Length, cut1, 'cache cut there');
+    raised := false;
+    try
+      model.ForwardEmbeds(b, nil, 2, nil);
+    except
+      on EInferError do
+        raised := true;
+    end;
+    Check(raised, 'no rows refused');
+  finally
+    b.Free;
+    a.Free;
+    model.Free;
+    ref.Free;
+  end;
+end;
+
+/// the message of the EInferError aModel's CreateStack raises, '' if none
+function StackRefused(const aDir: TFileName; aBackend: TInferBackend;
+  const aConfig, aPrefix, aEmbedding, aHead: RawUtf8): RawUtf8;
+begin
+  result := '';
+  try
+    TQwen3Model.CreateStack(aDir, aBackend, aConfig, aPrefix, aEmbedding, aHead).Free;
+  except
+    on E: EInferError do
+      result := StringToUtf8(E.Message);
+  end;
+end;
+
+procedure TTestInferQwen3.StackFromCheckpoint;
+var
+  dir, sdir: TFileName;
+  ref: TInferRefSet;
+  plain, stack, inner, rowsOnly: TQwen3Model;
+  ctx: TQwen3Context;
+  ids: PIntegerArray;
+  n, h, vocab: PtrInt;
+  want, mine, rows: TSingleDynArray;
+  why: RawUtf8;
+begin
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  sdir := dir + 'stack' + PathDelim;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  plain := nil;
+  stack := nil;
+  inner := nil;
+  rowsOnly := nil;
+  ctx := nil;
+  try
+    plain := TQwen3Model.Create(dir, fCpu);
+    // tiny-qwen3 under "outer.model.", its settings in an object of
+    // config.json with the multimodal RoPE of a talker, its head on its own
+    stack := TQwen3Model.CreateStack(sdir, fCpu, 'outer_config', 'outer.model.',
+      'outer.model.embed_tokens.weight', 'outer.head.weight');
+    inner := TQwen3Model.CreateStack(sdir, fCpu, 'outer_config.inner',
+      'outer.model.', 'outer.model.embed_tokens.weight', 'outer.head.weight');
+    rowsOnly := TQwen3Model.CreateStack(sdir, fCpu, 'outer_config', 'outer.model.',
+      '', 'outer.head.weight');
+    Check(not stack.Config.TiedEmbeddings and (stack.Config.Layers = 2),
+      'the settings of the object');
+    ids := ref.I32('case2.ids', n);
+    h := plain.Config.Hidden;
+    vocab := plain.Config.VocabSize;
+    SetLength(want, n * vocab);
+    SetLength(mine, n * vocab);
+    ctx := plain.NewContext;
+    plain.Forward(ctx, ids, n, pointer(want), true);
+    FreeAndNil(ctx);
+    ctx := stack.NewContext;
+    stack.Forward(ctx, ids, n, pointer(mine), true);
+    FreeAndNil(ctx);
+    Check(CompareMem(pointer(want), pointer(mine), n * vocab * SizeOf(single)),
+      'the stack gives the bits of the model');
+    ctx := inner.NewContext;
+    inner.Forward(ctx, ids, n, pointer(mine), true);
+    FreeAndNil(ctx);
+    Check(CompareMem(pointer(want), pointer(mine), n * vocab * SizeOf(single)),
+      'a dotted path to the settings');
+    // without a token embedding: rows only
+    Check(not rowsOnly.HasEmbedding, 'no embedding');
+    SetLength(rows, n * h);
+    plain.Embed(ids, n, pointer(rows));
+    ctx := rowsOnly.NewContext;
+    rowsOnly.ForwardEmbeds(ctx, pointer(rows), n, pointer(mine), true);
+    Check(CompareMem(pointer(want), pointer(mine), n * vocab * SizeOf(single)),
+      'rows through a stack without embedding');
+    why := '';
+    try
+      rowsOnly.Forward(ctx, ids, 1, nil);
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('no token embedding', why) > 0, 'ids refused: %', [why]);
+    FreeAndNil(ctx);
+    // refused: a tensor the family has not under the layers, a multimodal
+    // RoPE whose sections miss a frequency, a scaled RoPE, a missing object,
+    // a missing head, no prefix
+    why := StackRefused(sdir, fCpu, 'outer_config', 'broken.model.',
+      'broken.model.embed_tokens.weight', 'outer.head.weight');
+    CheckUtf8(PosEx('understood', why) > 0, 'unknown layer tensor: %', [why]);
+    why := StackRefused(sdir, fCpu, 'bad_mrope', 'outer.model.', '', 'outer.head.weight');
+    CheckUtf8(PosEx('mrope_section', why) > 0, 'mrope sections: %', [why]);
+    why := StackRefused(sdir, fCpu, 'zero_mrope', 'outer.model.', '', 'outer.head.weight');
+    CheckUtf8(PosEx('an mrope_section', why) > 0, 'a section not positive: %', [why]);
+    why := StackRefused(sdir, fCpu, 'scaled', 'outer.model.', '', 'outer.head.weight');
+    CheckUtf8(PosEx('rope_scaling', why) > 0, 'linear scaling: %', [why]);
+    why := StackRefused(sdir, fCpu, 'outer_config.none', 'outer.model.', '',
+      'outer.head.weight');
+    CheckUtf8(PosEx('no object', why) > 0, 'missing object: %', [why]);
+    why := StackRefused(sdir, fCpu, 'outer_config', 'outer.model.', '', 'outer.nohead.weight');
+    CheckUtf8(why <> '', 'missing head: %', [why]);
+    why := StackRefused(sdir, fCpu, 'outer_config', '', '', 'outer.head.weight');
+    CheckUtf8(PosEx('needed', why) > 0, 'no prefix: %', [why]);
+    // the folder itself is no qwen3 model
+    why := '';
+    try
+      TQwen3Model.Create(sdir, fCpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('model_type', why) > 0, 'the checkpoint is no qwen3: %', [why]);
+  finally
+    ctx.Free;
+    rowsOnly.Free;
+    inner.Free;
+    stack.Free;
+    plain.Free;
+    ref.Free;
+  end;
+end;
+
+function TtsFolder: TFileName;
+begin
+  result := FindVendorModel(TTS_MODEL + PathDelim + 'model.safetensors');
+  if result <> '' then
+    result := ExtractFilePath(result);
+end;
+
+function NewTtsTalker(const aFolder: TFileName; aBackend: TInferBackend): TQwen3Model;
+begin
+  result := TQwen3Model.CreateStack(aFolder, aBackend, 'talker_config',
+    'talker.model.', 'talker.model.codec_embedding.weight', 'talker.codec_head.weight');
+end;
+
+function NewTtsPredictor(const aFolder: TFileName; aBackend: TInferBackend): TQwen3Model;
+begin
+  result := TQwen3Model.CreateStack(aFolder, aBackend,
+    'talker_config.code_predictor_config', 'talker.code_predictor.model.', '',
+    'talker.code_predictor.lm_head.0.weight');
+end;
+
+function TtsFilesMatch(const aFolder: TFileName; aRef: TInferRefSet;
+  out aWhy: RawUtf8): boolean;
+var
+  files: PDocVariantData;
+  f: PtrInt;
+  name, want, got: RawUtf8;
+begin
+  result := false;
+  aWhy := 'no model.files in the manifest';
+  if not aRef.Manifest^.GetAsObject('model', files) or
+     not files^.GetAsObject('files', files) then
+    exit;
+  for f := 0 to files^.Count - 1 do
+  begin
+    name := files^.Names[f];
+    want := VariantToUtf8(files^.Values[f]);
+    got := HashFileSha256(aFolder + Utf8ToString(name));
+    if not IdemPropNameU(got, want) then
+    begin
+      aWhy := FormatUtf8('% has sha256 %, the manifest %', [name, got, want]);
+      exit;
+    end;
+  end;
+  result := files^.Count > 0;
+end;
+
+procedure TTestInferQwen3.Qwen3TtsStacks;
+var
+  dir, refdir: TFileName;
+  ref: TInferRefSet;
+  model: TQwen3Model;
+  st: TSafeTensorsFile;
+  ctx: TQwen3Context;
+  logits, head: TSingleDynArray;
+  x, want: PSingleArray;
+  codes: PIntegerArray;
+  n, m, g, l, h, vocab: PtrInt;
+  cmp: TInferCompare;
+  worst: double;
+  why, name: RawUtf8;
+  t: PInferTensor;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3-TTS stacks: 1.8 GB mapped and as much widened need a ' +
+    '64-bit process');
+  exit;
+  {$endif CPU32}
+  dir := TtsFolder;
+  if dir = '' then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/%', [TTS_MODEL]);
+    AddConsole('SKIP Qwen3-TTS stacks: no vendor/models/% (Hugging Face %, ' +
+      'revision in tests/data/infer-ref/qwen3-tts-lm)', [TTS_MODEL, TTS_MODEL]);
+    exit;
+  end;
+  refdir := FindInferRefDir('qwen3-tts-lm');
+  if CheckFailed(refdir <> '', 'qwen3-tts-lm found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  model := nil;
+  st := nil;
+  ctx := nil;
+  try
+    // the files of the reference: config.json and model.safetensors by hash
+    CheckUtf8(TtsFilesMatch(dir, ref, why), 'the model of the reference: %', [why]);
+    // the talker: 28 layers fed with the sums of text and codec embeddings
+    model := NewTtsTalker(dir, fFast);
+    h := model.Config.Hidden;
+    x := ref.F32('talker.embed', m);
+    n := m div h;
+    fNames := nil;
+    fStates := nil;
+    SetLength(logits, model.Config.VocabSize);
+    ctx := model.NewContext;
+    model.ForwardEmbeds(ctx, x, n, pointer(logits), false, KeepState);
+    FreeAndNil(ctx);
+    worst := 0;
+    for l := 0 to model.Config.Layers - 2 do
+    begin
+      name := FormatUtf8('layer%', [l]);
+      if l < 10 then
+        name := FormatUtf8('layer0%', [l]);
+      want := ref.F32('talker.' + name, m);
+      cmp := InferCompare(State(name), want, m, 1e-3, 1e-3);
+      CheckUtf8(InferCompareOk(cmp), 'talker layer %: %', [l, InferCompareText(cmp)]);
+      if cmp.MaxAbs > worst then
+        worst := cmp.MaxAbs;
+    end;
+    cmp := InferCompare(State('norm'), ref.F32('talker.norm', m), m, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'talker norm: %', [InferCompareText(cmp)]);
+    AddConsole(FormatString('Qwen3-TTS talker: largest state error % (27 layers), ' +
+      'norm %', [worst, InferCompareText(cmp)]));
+    cmp := InferCompare(pointer(logits), ref.F32('talker.logits_last', m), m, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'talker logits: %', [InferCompareText(cmp)]);
+    AddConsole(FormatString('Qwen3-TTS talker logits: %', [InferCompareText(cmp)]));
+    FreeAndNil(model);
+    // the code predictor: 16 rows, the logits of code group g from head g
+    // applied to the normed state of row g + 1
+    model := NewTtsPredictor(dir, fFast);
+    Check(not model.HasEmbedding, 'the predictor takes rows only');
+    vocab := model.Config.VocabSize;
+    x := ref.F32('predictor.embed', m);
+    n := m div h;
+    fNames := nil;
+    fStates := nil;
+    ctx := model.NewContext;
+    model.ForwardEmbeds(ctx, x, n, nil, false, KeepState);
+    FreeAndNil(ctx);
+    st := TSafeTensorsFile.Create(dir + 'model.safetensors');
+    want := ref.F32('predictor.logits', m);
+    codes := ref.I32('predictor.codes', m);
+    SetLength(logits, (n - 1) * vocab);
+    SetLength(head, vocab * h);
+    for g := 0 to n - 2 do
+    begin
+      t := st.Tensor(FormatUtf8('talker.code_predictor.lm_head.%.weight', [g]));
+      for l := 0 to vocab * h - 1 do // BF16 widened exactly
+        PCardinal(@head[l])^ := cardinal(PWordArray(t^.Data)^[l]) shl 16;
+      fFast.Linear(@State('norm')^[(g + 1) * h], 1, h, InferWeight(pointer(head), idtF32),
+        vocab, nil, @logits[g * vocab]);
+    end;
+    cmp := InferCompare(pointer(logits), want, (n - 1) * vocab, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'predictor logits: %', [InferCompareText(cmp)]);
+    AddConsole(FormatString('Qwen3-TTS code predictor logits (15 groups): %',
+      [InferCompareText(cmp)]));
+    // its greedy codes: code g + 1 is the highest logit of group g
+    m := 0;
+    for g := 0 to n - 2 do
+      if InferArgMax(@logits[g * vocab], vocab) = codes^[g + 1] then
+        inc(m);
+    CheckEqual(m, n - 1, 'the greedy codes of the reference');
+  finally
+    ctx.Free;
+    st.Free;
+    model.Free;
+    ref.Free;
   end;
 end;
 

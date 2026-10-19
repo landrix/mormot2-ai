@@ -28,6 +28,12 @@
 //   to Q8_0 (or Q4_0) at load, byte for byte as a GGUF writer does it; the
 //   embedding rows are then read per token; or a llama.cpp GGUF file: its
 //   blocks used in place
+// - a decoder may also be one stack of a larger checkpoint (CreateStack: its
+//   settings from an object inside config.json, its tensors under a prefix,
+//   its own embedding and head or none), and take embedding rows instead of
+//   token ids (ForwardEmbeds) - the language model of a speech, vision or
+//   audio model; a model forgets its weights on a GPU backend when it is
+//   freed (TInferBackend.ForgetWeights)
 // - arithmetic: matrix products through the backend; norms, rotary positions
 //   and attention in double, stored as single. Rotary angles follow the float32
 //   steps of the reference (inverse frequency and angle rounded to single)
@@ -207,7 +213,9 @@ type
   // Reset, and for another model of the same shape
   // - remembers the id at every cached position: a prompt that starts with
   // the same tokens keeps their keys and values (Common, then Truncate) - the
-  // cache of position i depends on the tokens 0..i only
+  // cache of position i depends on the tokens 0..i only; a position fed an
+  // embedding row (ForwardEmbeds) has no id: -1, which Common never matches,
+  // so no common prefix reaches past it
   // - a layer with a sliding window keeps the rows from Base[layer] on, enough
   // for the next token (FullCache: all of them); going back is only possible
   // to a length whose window is still there (Restorable)
@@ -262,7 +270,8 @@ type
     /// tokens in the KV cache = position of the next token
     property Length: PtrInt
       read fLength;
-    /// the token cached at aPosition (0 .. Length - 1)
+    /// the token cached at aPosition (0 .. Length - 1), -1 where an
+    // embedding row was fed (ForwardEmbeds)
     property Id[aPosition: PtrInt]: integer
       read GetId;
     /// the device that keeps the keys and values of this context (a context
@@ -286,13 +295,31 @@ type
     fOwnedQ8: array of array of TInferBlockQ8_0; // matrices quantized at load
     fOwnedQ4: array of array of TInferBlockQ4_0;
     fWeights: TInferDType;
-    fEmbedSrc: PInferTensor; // the embedding as stored: read per token
+    fEmbedSrc: PInferTensor; // the embedding as stored: read per token (nil: none)
+    // CreateStack: the object of config.json (dotted path), the prefix that
+    // replaces "model." in every tensor name, the tensors of the embedding
+    // ('' = none) and of the head
+    fStackConfig, fStackPrefix, fStackEmbed, fStackHead: RawUtf8;
     fRouteTape: TDecoderRouteTape;
     fEmbed, fHead: TInferWeight;
     fNorm: PSingleArray;
     fLayer: TDecoderLayerDynArray;
     fInvFreq: TSingleDynArray;
     procedure Init(aBackend: TInferBackend);
+    /// read config.json into aDoc and return the object of the settings:
+    // aDoc itself (its model_type checked against ModelType), or for a stack
+    // the object at its path (the model_type of a stack is not checked)
+    function ReadConfig(const aConfigFile: TFileName;
+      var aDoc: TDocVariantData): PDocVariantData;
+    /// the name in the file of a tensor of the Hugging Face layout - for a
+    // stack under its prefix, '' when the stack has no such tensor
+    function SourceName(const aName: RawUtf8): RawUtf8;
+    /// the tensors of the file whose name starts with aPrefix
+    function TensorCountOf(const aPrefix: RawUtf8): PtrInt;
+    /// Forward of aIds or of aEmbeds (the other one nil)
+    procedure ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
+      aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
+      aAllLogits: boolean; const aOnState: TOnDecoderState);
     /// fConfig from a Hugging Face config.json - raises EInferError for a
     // setting the family does not support; ends with CheckConfig
     procedure LoadConfig(const aConfigFile: TFileName); virtual; abstract;
@@ -360,8 +387,28 @@ type
     // or shape, a scale that is not finite, or a tensor not understood
     constructor CreateFromGguf(const aFileName: TFileName;
       aBackend: TInferBackend); virtual;
-    /// unmap the weights
+    /// load one decoder stack of a larger checkpoint in a Hugging Face folder
+    // (e.g. the talker of a speech model): its settings from the object at
+    // aConfigPath of <aFolder>config.json (dotted, e.g. 'talker_config' or
+    // 'talker_config.code_predictor_config'), its tensors from
+    // <aFolder>model.safetensors with aPrefix in place of "model." (e.g.
+    // 'talker.model.'), the token embedding aEmbedding ('' = none: such a
+    // model takes embedding rows only, ForwardEmbeds) and the head aHead
+    // (full tensor names, [VocabSize, Hidden] each)
+    // - the other tensors of the file are left alone; every tensor under
+    // aPrefix + 'layers.' must be understood
+    // - aWeights as Create
+    constructor CreateStack(const aFolder: TFileName; aBackend: TInferBackend;
+      const aConfigPath, aPrefix, aEmbedding, aHead: RawUtf8;
+      aWeights: TInferDType = idtF32);
+    /// unmap the weights, and forget them on the backend first
+    // (ForgetWeights) - the backend must still live
     destructor Destroy; override;
+    /// aBackend.ForgetWeights for every byte of weights this model holds (the
+    // mapped file, what was widened or quantized at load): a GPU backend
+    // drops its copies - called by Destroy for Backend, and by a device for
+    // its own backend when it is freed
+    procedure ForgetWeights(aBackend: TInferBackend);
     /// a context sized for this model (KV cache grows on demand) - on Device
     // when one is set
     function NewContext: TDecoderContext;
@@ -375,6 +422,19 @@ type
     procedure Forward(aCtx: TDecoderContext; aIds: PIntegerArray; aCount: PtrInt;
       aLogits: PSingleArray; aAllLogits: boolean = false;
       const aOnState: TOnDecoderState = nil);
+    /// Forward with aCount embedding rows aEmbeds ([aCount, Hidden] floats)
+    // in place of the embeddings of token ids - for text interleaved with
+    // image or audio rows, or a stack fed by another model; rows made by
+    // Embed give the very logits of Forward with those ids
+    // - their positions have no id in the cache (-1): Reuse never keeps them
+    // - the rows are copied before the computation: the caller may reuse
+    // aEmbeds at once
+    procedure ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false;
+      const aOnState: TOnDecoderState = nil);
+    /// true when the model has a token embedding: Forward, Embed and Greedy
+    // need one (a stack without one takes ForwardEmbeds only)
+    function HasEmbedding: boolean;
     /// keep the cached tokens of aCtx that start aIds[0..aCount-1], forget the
     // others, and return how many stayed: the rest of aIds is to be computed
     // - at most aCount - 1 stay, so a Forward of the rest has a token to give
@@ -458,6 +518,10 @@ type
     /// TDecoderModel.Forward for a context of this device (no states)
     procedure Forward(aCtx: TDecoderContext; aIds: PIntegerArray; aCount: PtrInt;
       aLogits: PSingleArray; aAllLogits: boolean = false); virtual; abstract;
+    /// TDecoderModel.ForwardEmbeds for a context of this device (no states)
+    // - raises EInferError here: a device that takes embedding rows overrides it
+    procedure ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false); virtual;
     /// TDecoderModel.Reuse for a context of this device
     function Reuse(aCtx: TDecoderContext; aIds: PIntegerArray;
       aCount: PtrInt): PtrInt; virtual; abstract;
@@ -591,7 +655,9 @@ begin
   result := 0;
   if aCount > fLength then
     aCount := fLength;
-  while (result < aCount) and (fIds[result] = aIds^[result]) do
+  // a position fed an embedding row holds -1: no id matches it, not even a
+  // negative one a caller might pass
+  while (result < aCount) and (fIds[result] >= 0) and (fIds[result] = aIds^[result]) do
     inc(result);
 end;
 
@@ -600,6 +666,15 @@ begin
   if (aPosition < 0) or (aPosition >= fLength) then
     EInferError.RaiseUtf8('%.Id[%] of % tokens', [self, aPosition, fLength]);
   result := fIds[aPosition];
+end;
+
+
+{ TDecoderDevice }
+
+procedure TDecoderDevice.ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
+  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+begin
+  EInferError.RaiseUtf8('%.ForwardEmbeds: embedding rows not supported', [self]);
 end;
 
 
@@ -657,11 +732,114 @@ begin
   fWeights := fLayer[0].Q.DType;
 end;
 
+constructor TDecoderModel.CreateStack(const aFolder: TFileName;
+  aBackend: TInferBackend; const aConfigPath, aPrefix, aEmbedding,
+  aHead: RawUtf8; aWeights: TInferDType);
+begin
+  if (aConfigPath = '') or (aPrefix = '') or (aHead = '') then
+    EInferError.RaiseUtf8('%.CreateStack: a config path, a prefix and a head ' +
+      'are needed', [self]);
+  fStackConfig := aConfigPath;
+  fStackPrefix := aPrefix;
+  fStackEmbed := aEmbedding;
+  fStackHead := aHead;
+  Create(aFolder, aBackend, aWeights);
+end;
+
 destructor TDecoderModel.Destroy;
 begin
+  // a GPU backend keeps copies by address: gone with the memory they mirror
+  ForgetWeights(fBackend);
   fFile.Free;
   fGguf.Free;
   inherited Destroy;
+end;
+
+procedure TDecoderModel.ForgetWeights(aBackend: TInferBackend);
+var
+  i: PtrInt;
+begin
+  if aBackend = nil then
+    exit;
+  if fFile <> nil then
+    InferForgetTensors(aBackend, fFile.Tensors);
+  if fGguf <> nil then
+    InferForgetTensors(aBackend, fGguf.Tensors);
+  for i := 0 to high(fOwned) do
+    InferForgetBytes(aBackend, pointer(fOwned[i]), length(fOwned[i]) * SizeOf(single));
+  for i := 0 to high(fOwnedQ8) do
+    InferForgetBytes(aBackend, pointer(fOwnedQ8[i]),
+      length(fOwnedQ8[i]) * SizeOf(TInferBlockQ8_0));
+  for i := 0 to high(fOwnedQ4) do
+    InferForgetBytes(aBackend, pointer(fOwnedQ4[i]),
+      length(fOwnedQ4[i]) * SizeOf(TInferBlockQ4_0));
+end;
+
+function TDecoderModel.ReadConfig(const aConfigFile: TFileName;
+  var aDoc: TDocVariantData): PDocVariantData;
+var
+  p: PUtf8Char;
+  part: RawUtf8;
+  sub: PDocVariantData;
+begin
+  if not aDoc.InitJsonFromFile(aConfigFile, JSON_FAST_FLOAT) then
+    EInferError.RaiseUtf8('%: cannot read %', [self, aConfigFile]);
+  result := @aDoc;
+  if fStackPrefix = '' then
+  begin
+    if aDoc.U['model_type'] <> ModelType then
+      EInferError.RaiseUtf8('%: model_type "%" is not %',
+        [self, aDoc.U['model_type'], ModelType]);
+    exit;
+  end;
+  // a stack: the object at the dotted path
+  p := pointer(fStackConfig);
+  while p <> nil do
+  begin
+    GetNextItem(p, '.', part);
+    if (part = '') or not result^.GetAsObject(part, sub) then
+      EInferError.RaiseUtf8('%: % has no object %', [self, aConfigFile, fStackConfig]);
+    result := sub;
+  end;
+end;
+
+function TDecoderModel.SourceName(const aName: RawUtf8): RawUtf8;
+begin
+  result := aName;
+  if fStackPrefix = '' then
+    exit;
+  if aName = 'lm_head.weight' then
+    result := fStackHead
+  else if aName = 'model.embed_tokens.weight' then
+    result := fStackEmbed
+  else if IdemPChar(pointer(aName), 'MODEL.') then
+    result := fStackPrefix + copy(aName, 7, MaxInt)
+  else
+    result := ''; // a stack holds no other tensor of the layout
+end;
+
+function TDecoderModel.TensorCountOf(const aPrefix: RawUtf8): PtrInt;
+var
+  i: PtrInt;
+  t: PInferTensor;
+begin
+  result := 0;
+  if fFile = nil then
+    exit;
+  t := pointer(fFile.Tensors);
+  for i := 1 to length(fFile.Tensors) do
+  begin
+    if (aPrefix = '') or
+       ((length(t^.Name) >= length(aPrefix)) and
+        CompareMem(pointer(t^.Name), pointer(aPrefix), length(aPrefix))) then
+      inc(result);
+    inc(t);
+  end;
+end;
+
+function TDecoderModel.HasEmbedding: boolean;
+begin
+  result := fEmbedSrc <> nil;
 end;
 
 procedure TDecoderModel.CheckConfig(const aSource: TFileName);
@@ -738,6 +916,12 @@ begin
     if GgufName(aName) <> '' then
       result := fGguf.FindTensor(GgufName(aName));
   end
+  else if fStackPrefix <> '' then
+  begin
+    result := nil;
+    if SourceName(aName) <> '' then
+      result := fFile.Find(SourceName(aName));
+  end
   else
     result := fFile.Find(aName);
 end;
@@ -761,8 +945,10 @@ begin
   t := Find(aName);
   if t = nil then
   begin
+    if (fGguf = nil) and (SourceName(aName) <> '') then
+      fFile.Tensor(SourceName(aName)); // raises with the file's message
     if fGguf = nil then
-      fFile.Tensor(aName); // raises with the file's message
+      EInferError.RaiseUtf8('%: no tensor % in the stack %', [self, aName, fStackPrefix]);
     EInferError.RaiseUtf8('%: no tensor % (%) in %',
       [self, GgufName(aName), aName, fGguf.FileName]);
   end;
@@ -1189,6 +1375,8 @@ procedure TDecoderModel.Embed(aIds: PIntegerArray; aCount: PtrInt; aDest: PSingl
 var
   i, id: PtrInt;
 begin
+  if fEmbedSrc = nil then
+    EInferError.RaiseUtf8('%.Embed: no token embedding (embedding rows only)', [self]);
   for i := 0 to aCount - 1 do
   begin
     id := aIds^[i];
@@ -1473,11 +1661,31 @@ end;
 procedure TDecoderModel.Forward(aCtx: TDecoderContext; aIds: PIntegerArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
   const aOnState: TOnDecoderState);
+begin
+  if (aIds = nil) and (aCount > 0) then
+    EInferError.RaiseUtf8('%.Forward: no ids', [self]);
+  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits, aOnState);
+end;
+
+procedure TDecoderModel.ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
+  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+  const aOnState: TOnDecoderState);
+begin
+  if (aEmbeds = nil) and (aCount > 0) then
+    EInferError.RaiseUtf8('%.ForwardEmbeds: no rows', [self]);
+  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits, aOnState);
+end;
+
+procedure TDecoderModel.ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
+  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
+  aAllLogits: boolean; const aOnState: TOnDecoderState);
 var
   i, l, n, h, f, qw, past, id: PtrInt;
 begin
   if aCtx = nil then
     EInferError.RaiseUtf8('%.Forward: no context', [self]);
+  if (aIds <> nil) and (fEmbedSrc = nil) then
+    EInferError.RaiseUtf8('%.Forward: no token embedding (ForwardEmbeds only)', [self]);
   if aCtx.fDevice <> nil then
   begin
     // the keys and values are on a device: computed there
@@ -1486,7 +1694,10 @@ begin
         [self, aCtx.fDevice]);
     if Assigned(aOnState) then
       EInferError.RaiseUtf8('%.Forward: no states from %', [self, aCtx.fDevice]);
-    aCtx.fDevice.Forward(aCtx, aIds, aCount, aLogits, aAllLogits);
+    if aIds <> nil then
+      aCtx.fDevice.Forward(aCtx, aIds, aCount, aLogits, aAllLogits)
+    else
+      aCtx.fDevice.ForwardEmbeds(aCtx, aEmbeds, aCount, aLogits, aAllLogits);
     exit;
   end;
   if aCount <= 0 then
@@ -1502,17 +1713,21 @@ begin
   qw := fConfig.Heads * fConfig.HeadDim;
   if n > (High(PtrInt) div SizeOf(single)) div MaxPtrInt(f, MaxPtrInt(h, qw)) then
     EInferError.RaiseUtf8('%.Forward: % tokens too many at once', [self, n]);
-  for i := 0 to n - 1 do
-  begin
-    id := aIds^[i];
-    if (id < 0) or (id >= fConfig.VocabSize) then
-      EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary', [self, id]);
-  end;
+  if aIds <> nil then
+    for i := 0 to n - 1 do
+    begin
+      id := aIds^[i];
+      if (id < 0) or (id >= fConfig.VocabSize) then
+        EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary', [self, id]);
+    end;
   Grow(aCtx, past + n, n);
   RopeFactors(aCtx, n, past);
-  // embeddings
-  for i := 0 to n - 1 do
-    WidenRow(fEmbedSrc, aIds^[i], h, @aCtx.fX[i * h]);
+  // embeddings: of the ids, or the rows as given
+  if aIds <> nil then
+    for i := 0 to n - 1 do
+      WidenRow(fEmbedSrc, aIds^[i], h, @aCtx.fX[i * h])
+  else
+    MoveFast(aEmbeds^[0], aCtx.fX[0], n * h * SizeOf(single));
   if Assigned(aOnState) then
     aOnState('embed', pointer(aCtx.fX), n, h);
   for l := 0 to fConfig.Layers - 1 do
@@ -1530,7 +1745,10 @@ begin
     if Assigned(aOnState) then
       aOnState(LayerName(l), pointer(aCtx.fX), n, h);
   end;
-  MoveFast(aIds^[0], aCtx.fIds[past], n * SizeOf(integer));
+  if aIds <> nil then
+    MoveFast(aIds^[0], aCtx.fIds[past], n * SizeOf(integer))
+  else
+    FillCharFast(aCtx.fIds[past], n * SizeOf(integer), $ff); // -1: no id
   aCtx.fLength := past + n;
   if (aLogits = nil) and not Assigned(aOnState) then
     exit;

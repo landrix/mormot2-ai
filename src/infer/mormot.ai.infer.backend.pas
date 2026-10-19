@@ -110,10 +110,26 @@ type
     // the factors of each row's position
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray); virtual; abstract;
+    /// forget what the backend keeps of every weight whose host memory
+    // overlaps aFrom .. aTo - 1: a GPU backend keeps a device copy, found
+    // again by address, type and size, so memory freed and allocated anew at
+    // the same address would be served from the stale copy
+    // - for the owner of weights, before it frees or overwrites them (a
+    // model in its destructor does it for its own); nothing to do here: the
+    // CPU reads the host memory itself
+    procedure ForgetWeights(aFrom, aTo: pointer); virtual;
   end;
 
 /// a TInferWeight from its parts
 function InferWeight(aData: pointer; aType: TInferDType): TInferWeight;
+
+/// aBackend.ForgetWeights for the memory of aTensors (the tensors of one
+// file: from the lowest to the highest byte they cover) - nothing for none
+procedure InferForgetTensors(aBackend: TInferBackend;
+  const aTensors: TInferTensorDynArray);
+
+/// aBackend.ForgetWeights for aBytes bytes at aData - nothing for nil or 0
+procedure InferForgetBytes(aBackend: TInferBackend; aData: pointer; aBytes: PtrInt);
 
 
 implementation
@@ -122,6 +138,42 @@ function InferWeight(aData: pointer; aType: TInferDType): TInferWeight;
 begin
   result.Data := aData;
   result.DType := aType;
+end;
+
+procedure InferForgetTensors(aBackend: TInferBackend;
+  const aTensors: TInferTensorDynArray);
+var
+  i: PtrInt;
+  lo, hi, a: PtrUInt;
+begin
+  if aBackend = nil then
+    exit;
+  lo := High(PtrUInt);
+  hi := 0;
+  for i := 0 to high(aTensors) do
+    if (aTensors[i].Data <> nil) and (aTensors[i].Bytes > 0) then
+    begin
+      a := PtrUInt(aTensors[i].Data);
+      if a < lo then
+        lo := a;
+      if a + PtrUInt(aTensors[i].Bytes) > hi then
+        hi := a + PtrUInt(aTensors[i].Bytes);
+    end;
+  if hi > lo then
+    aBackend.ForgetWeights(pointer(lo), pointer(hi));
+end;
+
+procedure InferForgetBytes(aBackend: TInferBackend; aData: pointer; aBytes: PtrInt);
+begin
+  if (aBackend <> nil) and (aData <> nil) and (aBytes > 0) then
+    aBackend.ForgetWeights(aData, @PAnsiChar(aData)[aBytes]);
+end;
+
+
+{ TInferBackend }
+
+procedure TInferBackend.ForgetWeights(aFrom, aTo: pointer);
+begin
 end;
 
 end.

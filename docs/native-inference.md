@@ -1813,6 +1813,57 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B14 Punkte 3 und 6 erledigt (2026-10-19): Embedding-Zeilen, Decoder-Stapel, `ForgetWeights`.**
+Anlass ist flydevs TTS-Projekt (Backlog B14): Er musste den Durchlauf von `TQwen3Vulkan` nachbauen,
+um fertige Embeddings statt Token-Ids einzuspeisen, und stieß auf veraltete Gewichte im
+GPU-Cache.
+
+- `TDecoderModel.ForwardEmbeds`: Zeilen `[n, Hidden]` statt Ids, auf CPU, Vulkan und CUDA
+  (`TDecoderDevice.ForwardEmbeds`, `Chunk` nimmt Ids oder Zeilen). Zeilen aus `Embed` geben
+  die Logits der Ids bitgleich; Ids und Zeilen lassen sich über Chunks mischen (Text mit
+  eingeschobenen Bild- oder Audiozeilen). Eine Position mit Zeile hat im Cache die Id -1:
+  `Common` trifft sie nie, `Reuse` hält dort an.
+- `TDecoderModel.CreateStack`: ein Decoder als ein Stapel eines größeren Checkpoints - die
+  Einstellungen aus einem Objekt von `config.json` (Pfad mit Punkten, z. B.
+  `talker_config.code_predictor_config`), die Tensoren unter einem Präfix statt `model.`,
+  eigenes Embedding (oder keins: dann nur `ForwardEmbeds`) und eigener Kopf; geprüft wird nur,
+  dass jeder Tensor unter `<Präfix>layers.` verstanden ist. Für einen Stapel nimmt
+  `TQwen3Model` eine multimodale RoPE (`mrope_section`, Summe = head_dim / 2, Typ default)
+  als gewöhnliche RoPE: dieselben Winkel, solange die drei Positionskomponenten gleich sind
+  (eine Folge der Reihe nach, wie beim Talker von Qwen3-TTS; Codex hat es am Quellcode von
+  Qwen3-TTS bestätigt).
+- `TInferBackend.ForgetWeights(aFrom, aTo)`: Vulkan und CUDA verwerfen jede Gerätekopie, deren
+  Host-Speicher den Bereich berührt, und erhöhen `WeightEpoch` (wer Gewichte hochgeladen hat,
+  schlägt neu nach). Ein `TDecoderModel` vergisst seine Gewichte beim Freigeben auf seinem
+  Backend, ein `TQwen3Vulkan`/`TQwen3Cuda` auf dem seinen, `TXlmrModel` ebenso. *Neue Regel:*
+  ein Modell vor seinem Backend freigeben (die Bibliothek tut es überall so).
+- Beim Test trat die Falle wirklich auf: Nach dem Freigeben des Talkers lagen die verbreiterten
+  BF16-Gewichte des Predictors an denselben Adressen mit denselben Größen - die GPU rechnete
+  mit den Gewichten des Talkers (Logits-Kosinus 0,04), bis das Gerät beim Freigeben vergaß.
+- *Tests:* `EmbeddingRows` (bitgleich, gemischt, Ids im Cache, `Reuse`, `Common` mit
+  negativer Id), `StackFromCheckpoint` (Fixture `tiny-qwen3/stack` aus
+  `make_reference_b14.py`: dieselben Bits wie das Modell, Pfad mit Punkten, ohne Embedding;
+  abgelehnt: ein unbekannter Layer-Tensor, MRoPE mit fehlender Frequenz oder einem
+  Abschnitt, der nicht positiv ist, skalierte RoPE,
+  fehlendes Objekt, fehlender Kopf, kein Präfix), `Qwen3TtsStacks` gegen flydevs Referenz
+  `qwen3-tts-lm` (PyTorch float32; Modell nach Hash aus dem Manifest): jeder Zustand des
+  Talkers bis 1,8e-4, seine Logits bis 1,3e-5, die 15 Logit-Zeilen des Code-Predictors bis
+  8,2e-5, alle Greedy-Codes gleich; auf CUDA, Vulkan (RTX 5090) und der Adreno
+  `Qwen3TtsOnDevice` (Talker-Logits bis 2,9e-5 mit KV-Cache in floats), `EmbeddingRowsOnDevice`
+  (bitgleich zu den Ids, gemischt, 300 Zeilen über zwei Chunks) und `ForgetWeightsServesNew`
+  (alte Kopie ohne den Aufruf, neue danach, andere Gewichte bleiben, Gerät und Modell vergessen
+  beim Freigeben).
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (4882 Assertions) und Delphi 7 (3215), auf
+  der Adreno X1-85 (Vulkan-Suite 805) und dem M2 Pro (MoltenVK, 4071, ohne das TTS-Modell).
+  Gegenprobe: 13 eingebaute Fehler (Ids 0 statt -1 auf CPU und CUDA, `Common` trifft negative
+  Ids, Präfix falsch abgeschnitten, Layer-Tensoren nicht gezählt, MRoPE-Summe nicht geprüft,
+  model_type auch beim Stapel geprüft, jeder Chunk ab Zeile 0 auf Vulkan und CUDA, beim
+  Zusammenschieben Puffer nicht verschoben, nur im Bereich beginnende Gewichte vergessen,
+  Gerät und Modell vergessen beim Freigeben nichts) - alle scheitern. Review: der
+  Claude-Finder nannte die neue Freigabe-Reihenfolge, negative Ids in `Common` und
+  ungeprüfte MRoPE-Abschnitte (im Nachreview: dazu ein Test); Codex den fehlenden 32-Bit-Skip des TTS-Tests (3,6 GB), die
+  ungetestete Chunk-Grenze und das Zusammenschieben im Cache. Behoben.
+
 **D3c erledigt (2026-10-19): Expertenwahl auf dem Gerät beim Decode.** Ein Decode-Schritt
 (eine Token-Zeile) wählt die Experten auf CUDA und Vulkan selbst; der Host wartet nicht mehr
 je MoE-Layer. Prefill wählt weiter auf dem Host (dort zählt der Durchsatz der Experten-Blöcke,

@@ -55,6 +55,18 @@ Logits ohne Fenster abweichen (die Referenz misst wirklich ein Fenster).
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d4.py tiny-smollm3
 ```
 
+## Decoder-Stapel (Backlog B14)
+
+`make_reference_b14.py` braucht nur Python: es legt `tiny-qwen3/stack/` an - die Gewichte von
+`tiny-qwen3` unter dem Präfix `outer.model.`, einen eigenen Kopf, einen fremden Tensor, einen
+kaputten Stapel mit einem Tensor zu viel und in `config.json` die Einstellungen als Objekte
+(mit der multimodalen RoPE eines Talkers, einer fehlerhaften und einer skalierten). Gerechnet
+wird nichts: `CreateStack` muss die Bits von `tiny-qwen3` geben.
+
+```bash
+python tools/infer-ref/make_reference_b14.py
+```
+
 ## Qwen2.5 (Phase D, D1b)
 
 `make_reference_qwen2.py` nutzt dieselbe Umgebung und die Helfer von

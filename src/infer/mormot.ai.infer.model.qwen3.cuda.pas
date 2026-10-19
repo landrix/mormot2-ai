@@ -129,8 +129,12 @@ type
     function Vector(v: PSingleArray; aCount: PtrInt): TCuDevicePtr;
     function ChunkRows(aPast, aCount: PtrInt; aAllLogits: boolean): PtrInt;
     procedure Prepare(aCtx: TQwen3CuContext; aTokens, aRows, aOutRows: PtrInt);
-    procedure Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray; aCount: PtrInt;
-      aLogits: PSingleArray; aAllLogits: boolean);
+    /// aCount rows of aIds or of aEmbeds (the other one nil) in one pass
+    procedure Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray; aEmbeds: PSingleArray;
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+    /// Forward of aIds or of aEmbeds (the other one nil), chunk by chunk
+    procedure ForwardRows(aCtx: TQwen3Context; aIds: PIntegerArray; aEmbeds: PSingleArray;
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
     procedure EnqueueNorm(x: TInferCuBuffer; aRows, aCols: PtrInt;
       w: PSingleArray; y: TInferCuBuffer);
     procedure EnqueueAddNorm(x, t: TInferCuBuffer; aRows, aCols: PtrInt;
@@ -143,7 +147,8 @@ type
     procedure CheckDeviceRoute(aCtx: TQwen3CuContext);
   public
     /// upload every weight of aModel to the device of aBackend; raises
-    // EInferError when a matrix type has no kernel (F32, Q8_0, Q4_K, Q6_K do)
+    // EInferError when a matrix type has no kernel (F32, Q8_0, Q5_0, Q4_K and
+    // Q6_K have one)
     // - aModel and aBackend are not owned and must outlive this instance
     constructor Create(aModel: TDecoderModel; aBackend: TInferCudaBackend);
     destructor Destroy; override;
@@ -156,6 +161,10 @@ type
     // token's [VocabSize] or, when aAllLogits, [aCount, VocabSize]
     procedure Forward(aCtx: TQwen3Context; aIds: PIntegerArray; aCount: PtrInt;
       aLogits: PSingleArray; aAllLogits: boolean = false); override;
+    /// TQwen3Model.ForwardEmbeds on the device: aCount embedding rows
+    // ([aCount, Hidden] floats) in place of the embeddings of ids, as Forward
+    procedure ForwardEmbeds(aCtx: TQwen3Context; aEmbeds: PSingleArray;
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false); override;
     /// keep the cached tokens of aCtx that start aIds, at most aCount - 1
     function Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
       aCount: PtrInt): PtrInt; override;
@@ -350,6 +359,11 @@ begin
   // the model no longer hands out contexts of this device
   if (fModel <> nil) and (fModel.Device = self) then
     fModel.Device := nil;
+  // the copies of the model's weights on the backend: the model may compute
+  // with another backend (it forgets only there when freed), and memory it
+  // frees later may come back at the same address with other weights
+  if (fModel <> nil) and (fBackend <> nil) then
+    fModel.ForgetWeights(fBackend);
   fBasic.Free;
   fOps.Free;
   inherited Destroy;
@@ -799,7 +813,7 @@ begin
 end;
 
 procedure TQwen3Cuda.Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray;
-  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
   c: TQwen3Config;
   n, h, f, qw, kvw, half, past, l, outRows, hb, rb, blocks, splits, most: PtrInt;
@@ -859,7 +873,10 @@ begin
   end;
   // the inputs: embeddings, then the rotary factors (cos, then sin)
   p := pointer(aCtx.fIn);
-  fModel.Embed(aIds, n, p);
+  if aIds <> nil then
+    fModel.Embed(aIds, n, p)
+  else
+    MoveFast(aEmbeds^[0], p^[0], n * h * SizeOf(single));
   fModel.Rotary(past, n, @p^[n * h], @p^[n * h + n * half]);
   aCtx.fDevX.Upload(0, p, Int64(n) * h * 4);
   aCtx.fDevCos.Upload(0, @p^[n * h], Int64(n) * half * 2 * 4);
@@ -975,15 +992,20 @@ begin
     aCtx.fLogits.Download(0, aLogits, Int64(outRows) * c.VocabSize * 4)
   else
     fCu.Synchronize;
-  MoveFast(aIds^[0], aCtx.fIds[past], n * SizeOf(integer));
+  if aIds <> nil then
+    MoveFast(aIds^[0], aCtx.fIds[past], n * SizeOf(integer))
+  else
+    FillCharFast(aCtx.fIds[past], n * SizeOf(integer), $ff); // -1: no id
   aCtx.fLength := past + n;
 end;
 
-procedure TQwen3Cuda.Forward(aCtx: TQwen3Context; aIds: PIntegerArray;
-  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+procedure TQwen3Cuda.ForwardRows(aCtx: TQwen3Context; aIds: PIntegerArray;
+  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
 var
-  i, n, done, vocab: PtrInt;
+  i, n, done, vocab, h: PtrInt;
   last: boolean;
+  ids: PIntegerArray;
+  embeds: PSingleArray;
   ctx: TQwen3CuContext;
 begin
   if (aCtx = nil) or (aCtx.Device <> self) then
@@ -995,10 +1017,12 @@ begin
     EInferError.RaiseUtf8('%.Forward: % + % tokens exceed the % positions',
       [self, ctx.fLength, aCount, fModel.Config.MaxPositions]);
   vocab := fModel.Config.VocabSize;
-  for i := 0 to aCount - 1 do
-    if (aIds^[i] < 0) or (aIds^[i] >= vocab) then
-      EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary',
-        [self, aIds^[i]]);
+  h := fModel.Config.Hidden;
+  if aIds <> nil then
+    for i := 0 to aCount - 1 do
+      if (aIds^[i] < 0) or (aIds^[i] >= vocab) then
+        EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary',
+          [self, aIds^[i]]);
   fBackend.GpuLock;
   try
     // the backend forgot the weights (ClearWeights): up again
@@ -1009,17 +1033,41 @@ begin
     begin
       n := ChunkRows(ctx.fLength, aCount - done, aAllLogits and (aLogits <> nil));
       last := done + n = aCount;
-      if aAllLogits and (aLogits <> nil) then
-        Chunk(ctx, @aIds^[done], n, @aLogits^[done * vocab], true)
-      else if last then
-        Chunk(ctx, @aIds^[done], n, aLogits, false)
+      ids := nil;
+      embeds := nil;
+      if aIds <> nil then
+        ids := @aIds^[done]
       else
-        Chunk(ctx, @aIds^[done], n, nil, false);
+        embeds := @aEmbeds^[done * h];
+      if aAllLogits and (aLogits <> nil) then
+        Chunk(ctx, ids, embeds, n, @aLogits^[done * vocab], true)
+      else if last then
+        Chunk(ctx, ids, embeds, n, aLogits, false)
+      else
+        Chunk(ctx, ids, embeds, n, nil, false);
       inc(done, n);
     end;
   finally
     fBackend.GpuUnLock;
   end;
+end;
+
+procedure TQwen3Cuda.Forward(aCtx: TQwen3Context; aIds: PIntegerArray;
+  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+begin
+  if (aIds = nil) and (aCount > 0) then
+    EInferError.RaiseUtf8('%.Forward: no ids', [self]);
+  if not fModel.HasEmbedding then
+    EInferError.RaiseUtf8('%.Forward: no token embedding (ForwardEmbeds only)', [self]);
+  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits);
+end;
+
+procedure TQwen3Cuda.ForwardEmbeds(aCtx: TQwen3Context; aEmbeds: PSingleArray;
+  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+begin
+  if (aEmbeds = nil) and (aCount > 0) then
+    EInferError.RaiseUtf8('%.ForwardEmbeds: no rows', [self]);
+  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits);
 end;
 
 function TQwen3Cuda.Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;

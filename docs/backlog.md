@@ -753,6 +753,13 @@ nachbauen musste; nach Punkt 3 sollte das entfallen.
 unabhängig), 4 nur Doku und Entscheidung. Rückmeldung an flydev im Forum, wenn etwas davon
 gepusht ist.
 
+*Punkte 3 und 6 erledigt 2026-10-19* (`native-inference.md`, Phase D):
+`TDecoderModel.ForwardEmbeds` auf CPU, Vulkan und CUDA, `TDecoderModel.CreateStack` (ein Stapel
+eines größeren Checkpoints, z. B. Talker und Code-Predictor von Qwen3-TTS), `ForgetWeights`
+an Backend und Modell; flydevs Referenz `qwen3-tts-lm` läuft als Test (Talker-Zustände bis
+1,8e-4 gegen PyTorch, Predictor-Codes gleich). Neue Regel: ein Modell vor seinem Backend
+freigeben. *Offen:* 1, 2, 5 und die Entscheidung zu 4; die Rückmeldung an flydev (Forum).
+
 ## B15 — Schneller Einstieg: Gewichtsvorgabe und Quickstart-Demo (aufgenommen 2026-10-19)
 
 Anlass: neural-api (`neuralchat`) lädt ein Modell mit `LoadModel(dir)` und antwortet mit

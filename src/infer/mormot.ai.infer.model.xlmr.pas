@@ -121,7 +121,8 @@ type
     // - the file stays mapped and is reachable by the Gguf property, e.g. for
     // its tokenizer; raises EInferError like Create
     constructor CreateFromGguf(const aFileName: TFileName; aBackend: TInferBackend);
-    /// unmap the weights
+    /// unmap the weights, forgotten on the backend first
+    // (TInferBackend.ForgetWeights) - the backend must still live
     destructor Destroy; override;
     /// the longest sequence, in tokens
     function MaxTokens: PtrInt;
@@ -176,6 +177,11 @@ end;
 
 destructor TXlmrModel.Destroy;
 begin
+  // a GPU backend keeps copies of the weights by address: forgotten first
+  if fFile <> nil then
+    InferForgetTensors(fBackend, fFile.Tensors);
+  if fGguf <> nil then
+    InferForgetTensors(fBackend, fGguf.Tensors);
   fFile.Free;
   fGguf.Free;
   inherited Destroy;

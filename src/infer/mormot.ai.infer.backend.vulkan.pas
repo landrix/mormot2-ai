@@ -7,9 +7,10 @@
 //   call while the device is busy stay on the CPU
 // - weights and biases are uploaded once, on first use, and kept on the
 //   device, keyed by their address, type and size: they must neither change
-//   nor be freed while the backend lives (model weights and biases do not; a
-//   temporary bias would be served stale from its reused address) -
-//   ClearWeights forgets them
+//   nor be freed while the backend lives, unless their owner forgets them
+//   first (ForgetWeights for an address range - a TDecoderModel does it for
+//   its own in its destructor; a temporary bias would be served stale from
+//   its reused address) - ClearWeights forgets them all
 // - activations go up and results come down on every call, and each call
 //   waits for the device: a correctness step, not yet a speed-up for decoding
 //   (that needs the whole forward pass on the device, phase 4d)
@@ -85,6 +86,10 @@ type
       aOut: PtrInt; bias: PSingleArray; y: PSingleArray); override;
     /// release every weight kept on the device
     procedure ClearWeights;
+    /// release the device copy of every weight whose host memory overlaps
+    // aFrom .. aTo - 1 (see TInferBackend.ForgetWeights); WeightEpoch moves
+    // on when one went, so a holder of uploaded weights looks them up again
+    procedure ForgetWeights(aFrom, aTo: pointer); override;
     /// take the device for a sequence of batch operations (a forward pass on
     // the GPU): Linear computes on the CPU meanwhile
     procedure GpuLock;
@@ -286,6 +291,40 @@ begin
       FreeAndNil(fWeightBuffer[i]);
     fWeightCount := 0;
     inc(fWeightEpoch);
+  finally
+    fGpu.UnLock;
+  end;
+end;
+
+procedure TInferVulkanBackend.ForgetWeights(aFrom, aTo: pointer);
+var
+  i, n: PtrInt;
+begin
+  if PtrUInt(aTo) <= PtrUInt(aFrom) then
+    exit;
+  fGpu.Lock;
+  try
+    n := 0;
+    for i := 0 to fWeightCount - 1 do
+      if (PtrUInt(fWeightData[i]) < PtrUInt(aTo)) and
+         (PtrUInt(fWeightData[i]) + PtrUInt(fWeightBytes[i]) > PtrUInt(aFrom)) then
+        FreeAndNil(fWeightBuffer[i])
+      else
+      begin
+        // kept: moved down over the forgotten ones
+        fWeightData[n] := fWeightData[i];
+        fWeightType[n] := fWeightType[i];
+        fWeightBytes[n] := fWeightBytes[i];
+        fWeightBuffer[n] := fWeightBuffer[i];
+        inc(n);
+      end;
+    if n <> fWeightCount then
+    begin
+      for i := n to fWeightCount - 1 do
+        fWeightBuffer[i] := nil;
+      fWeightCount := n;
+      inc(fWeightEpoch);
+    end;
   finally
     fGpu.UnLock;
   end;
