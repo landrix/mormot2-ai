@@ -132,6 +132,18 @@ type
     /// Qwen's own GGUF of Qwen2.5-0.5B-Instruct: Q8_0 against FP32; its
     // Q4_K_M refused - mostly Q5_0 (hidden 896 is no multiple of 256)
     procedure Qwen25Gguf;
+    /// D4, sliding window and NoPE: tiny SmolLM3 (every combination of window
+    // and rotary positions) and a tiny Qwen3 with use_sliding_window - every
+    // state and greedy continuations that wrap the window
+    procedure SlidingWindowMatchesReference;
+    /// D4 gate: the sliding cache gives the bits of a full cache in every
+    // chunk size, wrapping many times, keeping twice the window; a branch
+    // after every length gives the bits of computing it again (Truncate where
+    // Restorable, Reuse from scratch where not)
+    procedure SlidingWindowCache;
+    /// D4: the layer kinds derived from config.json as transformers does, and
+    // the settings refused
+    procedure SlidingWindowConfig;
   end;
 
 
@@ -456,8 +468,14 @@ begin
     CopyFile(dir + 'model.safetensors', tmp + 'model.safetensors', false);
     Check(not LoadRefused('"x"', '"x"'), 'the copy loads');
     Check(LoadRefused('"silu"', '"gelu"'), 'other activation');
-    Check(LoadRefused('"use_sliding_window": false', '"use_sliding_window": true'),
-      'sliding window');
+    // a sliding window is read since D4 (SlidingWindowConfig); a negative
+    // size is refused
+    Check(LoadRefused('"sliding_window": null', '"sliding_window": -3') = false,
+      'a sliding_window without use_sliding_window: ignored');
+    cfg := StringReplaceAll(cfg, '"use_sliding_window": false', '"use_sliding_window": true');
+    Check(LoadRefused('"sliding_window": null', '"sliding_window": -3'),
+      'a negative sliding window');
+    cfg := StringReplaceAll(cfg, '"use_sliding_window": true', '"use_sliding_window": false');
     Check(LoadRefused('"head_dim": 32', '"head_dim": 16'), 'head_dim not the weights''');
     Check(LoadRefused('"num_key_value_heads": 2', '"num_key_value_heads": 3'),
       'heads not a multiple of the KV heads');
@@ -2256,5 +2274,468 @@ begin
   end;
 end;
 
+
+
+procedure TTestInferQwen3.SlidingWindowMatchesReference;
+const
+  NAMES: array[0..1] of RawUtf8 = ('tiny-smollm3', 'tiny-qwen3-sliding');
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  ctx: TDecoderContext;
+  ids: PIntegerArray;
+  prompt, mine: TIntegerDynArray;
+  d, k, n, diff: PtrInt;
+  margin: double;
+  detail: RawUtf8;
+  s: TDecoderLayerSpecDynArray;
+begin
+  for d := 0 to high(NAMES) do
+  begin
+    dir := FindInferRefDir(NAMES[d]);
+    if CheckFailed(dir <> '', Utf8ToString(NAMES[d] + ' found')) then
+      continue;
+    ref := TInferRefSet.CreateFromFolder(dir);
+    model := nil;
+    try
+      model := NewDecoderModel(dir, fCpu);
+      s := model.Config.Spec;
+      if d = 0 then
+      begin
+        Check(model is TSmolLM3Model, 'model_type smollm3: a TSmolLM3Model');
+        CheckEqual(model.Config.HeadDim, 16, 'head_dim = 64 / 4');
+        Check((s[0].Window = 0) and not s[0].NoRope and (s[1].Window = 6) and
+          s[1].NoRope and (s[2].Window = 6) and not s[2].NoRope and
+          (s[3].Window = 0) and s[3].NoRope, 'smollm3: the kind of every layer');
+        Check((model.Layers[0].QNorm = nil) and (model.Layers[0].QBias = nil),
+          'no head norm, no bias');
+      end
+      else
+      begin
+        Check(model.ClassType = TQwen3Model, 'model_type qwen3');
+        Check((s[0].Window = 0) and (s[1].Window = 5) and not s[0].NoRope and
+          not s[1].NoRope, 'qwen3: the window from max_window_layers');
+      end;
+      // every state of 5 (inside one window), 13 and 29 tokens - SmolLM3 has
+      // four layers, twice tiny-qwen2: its final norm differs by 4.03e-6 (5e-6 allowed)
+      for k := 0 to 2 do
+        CheckStates(TQwen3Model(model), ref, FormatUtf8('case%', [k]),
+          2.5e-6 * model.Config.Layers / 2, 2e-5, true);
+      // greedy through the sliding cache: 24 tokens wrap the window again and
+      // again
+      for k := 0 to 2 do
+      begin
+        ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+        SetLength(prompt, n);
+        MoveFast(ids^, prompt[0], n * SizeOf(integer));
+        ctx := model.NewContext;
+        try
+          mine := model.Greedy(ctx, prompt, 24, []);
+        finally
+          ctx.Free;
+        end;
+        diff := GreedyDiff(mine, ref, FormatUtf8('case%', [k]), margin, detail);
+        CheckUtf8(diff < 0, '% case% greedy differs at step % (margin %, %)',
+          [NAMES[d], k, diff, margin, detail]);
+      end;
+    finally
+      model.Free;
+      ref.Free;
+    end;
+  end;
+end;
+
+/// feed aIds[0..aCount-1] in chunks of the sizes of aChunks (cycled), the
+// logits of every position into aLogits ([aCount, vocab])
+procedure FeedChunks(aModel: TDecoderModel; aCtx: TDecoderContext;
+  aIds: PIntegerArray; aCount: PtrInt; const aChunks: array of integer;
+  var aLogits: TSingleDynArray);
+var
+  p, c, k: PtrInt;
+begin
+  SetLength(aLogits, aCount * aModel.Config.VocabSize);
+  p := 0;
+  k := 0;
+  while p < aCount do
+  begin
+    c := aChunks[k mod length(aChunks)];
+    inc(k);
+    if c > aCount - p then
+      c := aCount - p;
+    aModel.Forward(aCtx, @aIds^[p], c, @aLogits[p * aModel.Config.VocabSize], true);
+    inc(p, c);
+  end;
+end;
+
+procedure TTestInferQwen3.SlidingWindowCache;
+const
+  // chunk sizes: one by one (the window moves at every few tokens), around the
+  // window of 6, larger than it, and a mix
+  PATTERNS: array[0..6] of array[0..3] of integer = (
+    (1, 1, 1, 1), (2, 2, 2, 2), (5, 5, 5, 5), (6, 6, 6, 6), (7, 7, 7, 7),
+    (13, 13, 13, 13), (3, 11, 1, 20));
+  BRANCHED = 8;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  ctx, full: TDecoderContext;
+  backend: TInferBackend;
+  b, p, n, m, t, vocab, used, restorable, lost: PtrInt;
+  ids, more: PIntegerArray;
+  seq, branch: TIntegerDynArray;
+  want, got, one: TSingleDynArray;
+  raised: boolean;
+begin
+  dir := FindInferRefDir('tiny-smollm3');
+  if CheckFailed(dir <> '', 'tiny-smollm3 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  try
+    // 29 tokens of case 2 and its 24 greedy ones: 53 positions, the window of
+    // 6 moves on many times
+    ids := ref.I32('case2.ids', n);
+    more := ref.I32('case2.greedy', m);
+    SetLength(seq, n + m);
+    MoveFast(ids^, seq[0], n * SizeOf(integer));
+    MoveFast(more^, seq[n], m * SizeOf(integer));
+    n := length(seq);
+    ids := ref.I32('case1.ids', m);
+    SetLength(branch, BRANCHED);
+    MoveFast(ids^, branch[0], BRANCHED * SizeOf(integer));
+    for b := 0 to 1 do
+    begin
+      if b = 0 then
+        backend := fCpu
+      else
+        backend := fFast;
+      model := NewDecoderModel(dir, backend);
+      ctx := nil;
+      full := nil;
+      try
+        vocab := model.Config.VocabSize;
+        // the reference: every key kept, the window only masks
+        full := model.NewContext;
+        full.FullCache := true;
+        FeedChunks(model, full, pointer(seq), n, [n], want);
+        Check(full.CachedRows(1) >= n, 'FullCache: every row of a window layer');
+        // the sliding cache in every chunk pattern: the same bits
+        for p := 0 to high(PATTERNS) do
+        begin
+          FreeAndNil(ctx);
+          ctx := model.NewContext;
+          FeedChunks(model, ctx, pointer(seq), n, PATTERNS[p], got);
+          CheckUtf8(SameBits(pointer(got), pointer(want), n * vocab),
+            'backend %, chunks of %: the logits of the full cache', [b, PATTERNS[p][0]]);
+          CheckEqual(ctx.Length, n, 'every token cached');
+          if p = 0 then
+          begin
+            // one by one: twice the window per sliding layer, all for a full one
+            CheckUtf8((ctx.CachedRows(1) = 12) and (ctx.CachedRows(2) = 12) and
+              (ctx.CachedRows(0) >= n) and (ctx.CachedRows(3) >= n),
+              'rows kept: % % % %', [ctx.CachedRows(0), ctx.CachedRows(1),
+              ctx.CachedRows(2), ctx.CachedRows(3)]);
+            Check((ctx.CachedBase(1) >= n - 12) and (ctx.CachedBase(0) = 0),
+              'the window has moved on, the full layer not');
+          end;
+        end;
+        // the full cache fed in chunks: the same bits too
+        FreeAndNil(ctx);
+        ctx := model.NewContext;
+        ctx.FullCache := true;
+        FeedChunks(model, ctx, pointer(seq), n, PATTERNS[6], got);
+        Check(SameBits(pointer(got), pointer(want), n * vocab), 'full cache in chunks');
+        // going back: a branch after every length t of a sliding cache fed one
+        // by one, against computing prefix and branch again
+        restorable := 0;
+        lost := 0;
+        SetLength(one, BRANCHED * vocab);
+        for t := 0 to 40 do
+        begin
+          FreeAndNil(ctx);
+          ctx := model.NewContext;
+          FeedChunks(model, ctx, pointer(seq), 40, [1], got);
+          // the next token at t sees t - 5 .. t: the rows from there on must
+          // still be in both sliding layers, and only then
+          CheckUtf8(ctx.Restorable(t) = ((t = 0) or (t - 5 >= MaxPtrInt(ctx.CachedBase(1),
+            ctx.CachedBase(2)))), 'Restorable(%) with the window from %',
+            [t, ctx.CachedBase(1)]);
+          if ctx.Restorable(t) then
+          begin
+            inc(restorable);
+            ctx.Truncate(t);
+          end
+          else
+          begin
+            inc(lost);
+            raised := false;
+            try
+              ctx.Truncate(t);
+            except
+              on EInferError do
+                raised := true;
+            end;
+            Check(raised, 'Truncate to a length whose window is gone');
+            CheckEqual(ctx.Length, 40, 'a refused Truncate keeps the cache');
+            // Reuse starts again, the window cannot come back
+            used := model.Reuse(ctx, pointer(seq), t + 1);
+            CheckEqual(used, 0, 'Reuse of a prefix that cannot be restored');
+            if t > 0 then
+              model.Forward(ctx, pointer(seq), t, nil);
+          end;
+          model.Forward(ctx, pointer(branch), BRANCHED, pointer(one), true);
+          full.Reset;
+          if t > 0 then
+            model.Forward(full, pointer(seq), t, nil);
+          SetLength(got, BRANCHED * vocab);
+          model.Forward(full, pointer(branch), BRANCHED, pointer(got), true);
+          CheckUtf8(SameBits(pointer(one), pointer(got), BRANCHED * vocab),
+            'backend %: a branch after % tokens', [b, t]);
+        end;
+        CheckUtf8((restorable > 5) and (lost > 5), 'restorable % and lost % lengths',
+          [restorable, lost]);
+        // a large prefill leaves many rows, the next decode step gives them back
+        FreeAndNil(ctx);
+        ctx := model.NewContext;
+        FeedChunks(model, ctx, pointer(seq), 40, [40], got);
+        Check(ctx.CachedRows(1) >= 40, 'rows of the prefill');
+        model.Forward(ctx, @seq[40], 1, pointer(one));
+        CheckEqual(ctx.CachedRows(1), 12, 'shrunk to twice the window');
+        Check(SameBits(pointer(one), @want[40 * vocab], vocab), 'the logits after shrinking');
+        // and after a step of a whole window: twice the window as well
+        FreeAndNil(ctx);
+        ctx := model.NewContext;
+        FeedChunks(model, ctx, pointer(seq), 40, [40], got);
+        SetLength(got, 6 * vocab);
+        model.Forward(ctx, @seq[40], 6, pointer(got), true);
+        CheckEqual(ctx.CachedRows(1), 12, 'shrunk by a step of one window');
+        Check(SameBits(pointer(got), @want[40 * vocab], 6 * vocab),
+          'the logits of that step');
+        // Reuse keeps the longest prefix it can go back to
+        FreeAndNil(ctx);
+        ctx := model.NewContext;
+        FeedChunks(model, ctx, pointer(seq), 40, [1], got);
+        CheckEqual(model.Reuse(ctx, pointer(seq), n), 40, 'Reuse of the whole cache');
+        CheckEqual(ctx.Usable(pointer(seq), 2), 0, 'a short prefix is gone');
+        // a full cache can go back to every length
+        FreeAndNil(ctx);
+        ctx := model.NewContext;
+        ctx.FullCache := true;
+        FeedChunks(model, ctx, pointer(seq), 40, [1], got);
+        for t := 0 to 40 do
+          Check(ctx.Restorable(t), 'FullCache: every length restorable');
+        raised := false;
+        try
+          ctx.FullCache := false;
+        except
+          on EInferError do
+            raised := true;
+        end;
+        Check(raised, 'FullCache changed on a filled context');
+        ctx.Reset;
+        ctx.FullCache := false;
+        FeedChunks(model, ctx, pointer(seq), n, [4], got);
+        Check(SameBits(pointer(got), pointer(want), n * vocab),
+          'a reset context switched to the sliding cache');
+      finally
+        ctx.Free;
+        full.Free;
+        model.Free;
+      end;
+    end;
+  finally
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.SlidingWindowConfig;
+var
+  dir, qdir, tmp: TFileName;
+  base, doc: TDocVariantData;
+  why: RawUtf8;
+  m: TDecoderModel;
+  s: TDecoderLayerSpecDynArray;
+  nullv: variant;
+
+  procedure Start(const aFrom: TFileName);
+  begin
+    base.Clear;
+    base.InitJsonFromFile(aFrom + 'config.json', JSON_FAST_FLOAT);
+    CopyFile(aFrom + 'model.safetensors', tmp + 'model.safetensors', false);
+    doc.Clear;
+    doc.InitCopy(variant(base), JSON_FAST_FLOAT);
+  end;
+
+  function Load: TDecoderModel;
+  begin
+    FileFromString(doc.ToJson, tmp + 'config.json');
+    doc.Clear;
+    doc.InitCopy(variant(base), JSON_FAST_FLOAT); // the next change from the file
+    result := NewDecoderModel(tmp, fCpu);
+  end;
+
+  function Refused: RawUtf8;
+  begin
+    result := '';
+    try
+      Load.Free;
+    except
+      on E: EInferError do
+        result := StringToUtf8(E.Message);
+    end;
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-smollm3');
+  qdir := FindInferRefDir('tiny-qwen3-sliding');
+  if CheckFailed((dir <> '') and (qdir <> ''), 'tiny-smollm3 and tiny-qwen3-sliding found') then
+    exit;
+  base.InitFast;
+  doc.InitFast;
+  SetVariantNull(nullv); // JSON null
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-d4-' + Int64ToUtf8(GetTickCount64)], true);
+  ForceDirectories(tmp);
+  try
+    Start(dir);
+    // no layer_types, no no_rope_layers: as SmolLM3Config derives them - every
+    // second layer without RoPE (interval 2), the window on those
+    doc.Delete('layer_types');
+    doc.Delete('no_rope_layers');
+    doc.I['no_rope_layer_interval'] := 2;
+    m := Load;
+    try
+      s := m.Config.Spec;
+      Check(not s[0].NoRope and s[1].NoRope and not s[2].NoRope and s[3].NoRope and
+        (s[0].Window = 0) and (s[1].Window = 6) and (s[2].Window = 0) and
+        (s[3].Window = 6), 'smollm3: kinds from no_rope_layer_interval');
+    finally
+      m.Free;
+    end;
+    // without use_sliding_window: no window anywhere
+    doc.Delete('layer_types');
+    doc.B['use_sliding_window'] := false;
+    m := Load;
+    try
+      s := m.Config.Spec;
+      Check((s[1].Window = 0) and (s[2].Window = 0) and s[1].NoRope and s[3].NoRope,
+        'smollm3: no window without use_sliding_window');
+    finally
+      m.Free;
+    end;
+    // SmolLM3Config keeps sliding_window without use_sliding_window, and the
+    // model masks by layer_types: the explicit sliding layers keep it
+    doc.B['use_sliding_window'] := false;
+    m := Load;
+    try
+      s := m.Config.Spec;
+      Check((s[1].Window = 6) and (s[2].Window = 6) and (s[0].Window = 0),
+        'smollm3: explicit sliding layers without use_sliding_window');
+    finally
+      m.Free;
+    end;
+    doc.AddOrUpdateValue('sliding_window', nullv);
+    why := Refused;
+    CheckUtf8(PosEx('without a sliding window', why) > 0,
+      'a sliding layer type, sliding_window null: %', [why]);
+    doc.I['sliding_window'] := 1 shl 30;
+    why := Refused;
+    CheckUtf8(PosEx('a sliding_window of', why) > 0, 'a window beyond the bound: %', [why]);
+    doc.AddOrUpdateValue('layer_types', _JsonFast(
+      '["full_attention","chunked_attention","sliding_attention","full_attention"]'));
+    why := Refused;
+    CheckUtf8(PosEx('chunked_attention', why) > 0, 'an unknown layer type: %', [why]);
+    doc.AddOrUpdateValue('layer_types', _JsonFast('["full_attention"]'));
+    why := Refused;
+    CheckUtf8(PosEx('layer types for', why) > 0, 'layer types of another count: %', [why]);
+    doc.AddOrUpdateValue('no_rope_layers', _JsonFast('[1,0,1]'));
+    why := Refused;
+    CheckUtf8(PosEx('no_rope_layers for', why) > 0, 'no_rope_layers of another count: %',
+      [why]);
+    doc.AddOrUpdateValue('no_rope_layers', _JsonFast('[1,2,1,0]'));
+    why := Refused;
+    CheckUtf8(PosEx('no_rope_layers[1] = 2', why) > 0, 'no_rope_layers with a 2: %', [why]);
+    doc.Delete('no_rope_layers');
+    doc.Delete('layer_types');
+    doc.I['no_rope_layer_interval'] := 0;
+    why := Refused;
+    CheckUtf8(PosEx('no_rope_layer_interval = 0', why) > 0, 'no_rope_layer_interval 0: %',
+      [why]);
+    doc.B['mlp_bias'] := true;
+    why := Refused;
+    CheckUtf8(PosEx('mlp_bias', why) > 0, 'mlp_bias: %', [why]);
+    // SmolLM3 from GGUF: llama.cpp fixes the NoPE layers - refused
+    why := '';
+    try
+      TSmolLM3Model.CreateFromGguf(MakePath([FindInferRefDir('tiny-qwen2'), 'gguf'], true) +
+        'q8_0.gguf', fCpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('GGUF not supported', why) > 0, 'SmolLM3 from GGUF: %', [why]);
+    // Qwen3: without max_window_layers its default 28 - no window in 2 layers
+    Start(qdir);
+    doc.Delete('max_window_layers');
+    m := Load;
+    try
+      Check((m.Config.Spec[0].Window = 0) and (m.Config.Spec[1].Window = 0),
+        'qwen3: max_window_layers 28 by default');
+    finally
+      m.Free;
+    end;
+    // without a sliding_window key its default 4096, null: none
+    doc.Delete('sliding_window');
+    m := Load;
+    try
+      CheckEqual(m.Config.Spec[1].Window, 4096, 'qwen3: sliding_window 4096 by default');
+    finally
+      m.Free;
+    end;
+    doc.AddOrUpdateValue('sliding_window', nullv);
+    m := Load;
+    try
+      CheckEqual(m.Config.Spec[1].Window, 0, 'qwen3: sliding_window null');
+    finally
+      m.Free;
+    end;
+    // a sliding layer type without use_sliding_window: Qwen3Config drops the
+    // window, transformers cannot mask it - refused
+    doc.B['use_sliding_window'] := false;
+    doc.AddOrUpdateValue('layer_types', _JsonFast('["sliding_attention","full_attention"]'));
+    why := Refused;
+    CheckUtf8(PosEx('without a sliding window', why) > 0,
+      'qwen3: a sliding layer type without use_sliding_window: %', [why]);
+    doc.AddOrUpdateValue('layer_types', _JsonFast('["sliding_attention","full_attention"]'));
+    m := Load;
+    try
+      Check((m.Config.Spec[0].Window = 5) and (m.Config.Spec[1].Window = 0),
+        'qwen3: the window from layer_types');
+    finally
+      m.Free;
+    end;
+    doc.B['use_sliding_window'] := false;
+    m := Load;
+    try
+      Check((m.Config.Spec[0].Window = 0) and (m.Config.Spec[1].Window = 0),
+        'qwen3: no window without use_sliding_window');
+    finally
+      m.Free;
+    end;
+    // Qwen3-MoE: no max_window_layers, every layer slides
+    Start(FindInferRefDir('tiny-qwen3moe'));
+    doc.B['use_sliding_window'] := true;
+    doc.I['sliding_window'] := 5;
+    m := Load;
+    try
+      Check((m.Config.Spec[0].Window = 5) and (m.Config.Spec[1].Window = 5) and
+        (m.Config.Spec[2].Window = 5), 'qwen3_moe: a window on every layer');
+    finally
+      m.Free;
+    end;
+  finally
+    DirectoryDeleteAll(tmp);
+  end;
+end;
 
 end.

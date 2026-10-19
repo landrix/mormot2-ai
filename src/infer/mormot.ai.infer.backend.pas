@@ -89,9 +89,12 @@ type
     // included; new row r sees the cache rows 0 .. aPast + r
     // - head h reads KV head h div (aHeads div aKvHeads); scores scaled by
     // 1 / sqrt(aHeadDim)
+    // - aWindow > 0: a sliding window - row r sees only the last aWindow cache
+    // rows up to itself, aPast + r - aWindow + 1 .. aPast + r (the keys before
+    // need not be valid)
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray);
-      virtual; abstract;
+      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
+      aWindow: PtrInt = 0); virtual; abstract;
     /// y[rows, cols] = x / sqrt(mean(x^2) + eps) * w, per row (RMSNorm)
     // - the normalized value is rounded to single before the weight, as the
     // float32 reference does; y may be x

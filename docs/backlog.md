@@ -293,6 +293,19 @@ dann Ringpuffer mit absoluten Positionen (spart den Speicher). Chunk-Prefill dar
 Schlüssel nicht vorher überschreiben. NoPE als Layer-Eigenschaft. Prompt-Cache mit gültigen
 Rücksetzpunkten statt bloßem Kürzen. Gate: Fenstergrenze, mehrfacher Umlauf, verschiedene
 Chunk-Größen und verzweigte Prompts geben dieselben Logits wie eine Neuberechnung.
+*Erledigt 2026-10-19* (`native-inference.md`, Phase D) auf der CPU: Fenster und NoPE als
+Layer-Eigenschaft, schmaler Cache, der statt eines Ringpuffers die gebrauchten Zeilen an den
+Anfang schiebt (zusammenhängend, so liest die Attention ohne Umlauf), `Restorable` /
+`Usable` als Rücksetzpunkte, Konfiguration von Qwen3, Qwen2, Qwen3-MoE und neu SmolLM3 wie
+transformers. Gate bitgleich auf beiden CPU-Backends.
+
+**D4b — Fenster und NoPE auf Vulkan und CUDA (aufgenommen 2026-10-19).** Heute lehnen beide
+Geräte solche Modelle ab. Nötig: das Fenster in den Attention-Kerneln (erster Schlüssel je
+Zeile), der schmale Cache auf dem Gerät (Verschieben als Kopie im Batch bzw. Graph), NoPE
+als Schalter in `qkrope`. Erst mit einem Modell, das es braucht (gpt-oss-20b, D5; Gemma,
+D6) - dann gegen die CPU wie die übrigen Gerätetests. Dazu offen aus D4: SmolLM3 als
+Chat-Familie (Template mit `/think` und `/no_think`, Parser) und aus GGUF (llama.cpp legt die
+NoPE-Layer fest, das wäre gegen die Referenz zu prüfen).
 
 **D5 — gpt-oss-20b.** MXFP4 (erst skalar entpacken, dann direkt im Linear rechnen, nie das
 ganze Modell nach F32), Attention-Sinks (gelernter Zusatzterm im Softmax-Nenner je Kopf, keine

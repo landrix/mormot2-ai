@@ -40,6 +40,19 @@ wenn dessen SHA-256 nicht die des Referenzvertrags v1 ist. Aufruf:
 LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 q4 tiny-gguf lembed-tokens
 ```
 
+## Sliding Window und NoPE (Phase D, D4)
+
+`make_reference_d4.py` nutzt dieselbe Umgebung und die Helfer von `make_reference_qwen3.py`
+und lädt kein Modell: es erzeugt `tiny-smollm3` (jede Kombination aus Fenster und RoPE) und
+`tiny-qwen3-sliding` (Fenster aus `max_window_layers`). Greedy läuft ohne EOS über
+24 Tokens, mit dem Cache von transformers und ohne Cache gleich; dazu prüft es, dass die
+Logits ohne Fenster abweichen (die Referenz misst wirklich ein Fenster).
+
+```bash
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d4.py          # beide
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d4.py tiny-smollm3
+```
+
 ## Qwen2.5 (Phase D, D1b)
 
 `make_reference_qwen2.py` nutzt dieselbe Umgebung und die Helfer von

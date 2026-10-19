@@ -116,6 +116,10 @@ type
     /// Qwen2.5-0.5B-Instruct (Q8_0 GGUF) on the device against the fast CPU
     // backend, teacher-forced - skipped without the model
     procedure Qwen25GgufMatchesCpu;
+    /// D4: a model with a sliding window (tiny Qwen3 with one) or with layers
+    // without rotary positions (tiny SmolLM3 without its windows) is refused
+    // by the device, not computed otherwise
+    procedure SlidingWindowRefused;
   end;
 
 
@@ -1533,5 +1537,62 @@ begin
   end;
 end;
 
+
+
+procedure TTestInferVulkan.SlidingWindowRefused;
+var
+  dir, qdir, tmp: TFileName;
+  gpu: TInferVulkanBackend;
+  ref: TInferCpuBackend;
+  model: TDecoderModel;
+  why: RawUtf8;
+  k: PtrInt;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-smollm3');
+  qdir := FindInferRefDir('tiny-qwen3-sliding');
+  if CheckFailed((dir <> '') and (qdir <> ''), 'tiny-smollm3 and tiny-qwen3-sliding found') then
+    exit;
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-d4dev-' + Int64ToUtf8(GetTickCount64)], true);
+  ForceDirectories(tmp);
+  gpu := TInferVulkanBackend.Create;
+  ref := TInferCpuBackend.Create;
+  try
+    // SmolLM3 with every layer in full attention: NoPE alone
+    CopyFile(dir + 'model.safetensors', tmp + 'model.safetensors', false);
+    FileFromString(StringReplaceAll(StringFromFile(dir + 'config.json'),
+      '"sliding_attention"', '"full_attention"'), tmp + 'config.json');
+    for k := 0 to 1 do
+    begin
+      model := nil;
+      try
+        if k = 0 then
+          model := NewDecoderModel(qdir, ref) // a window, rotary positions
+        else
+          model := NewDecoderModel(tmp, ref); // no window, NoPE layers
+        why := '';
+        try
+          TQwen3Vulkan.Create(model, gpu).Free;
+        except
+          on E: EInferError do
+            why := StringToUtf8(E.Message);
+        end;
+        if k = 0 then
+          CheckUtf8(PosEx('sliding window not supported', why) > 0,
+            'a sliding window refused: %', [why])
+        else
+          CheckUtf8(PosEx('without rotary positions not supported', why) > 0,
+            'NoPE refused: %', [why]);
+      finally
+        model.Free;
+      end;
+    end;
+  finally
+    ref.Free;
+    gpu.Free;
+    DirectoryDeleteAll(tmp);
+  end;
+end;
 
 end.

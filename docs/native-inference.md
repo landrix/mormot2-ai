@@ -1758,6 +1758,73 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D4 erledigt (2026-10-19): Sliding Window, Cache-Semantik, NoPE.** Auf der CPU; die
+GPU-Geräte lehnen solche Modelle mit klarer Meldung ab (Backlog D4b).
+
+- `TDecoderLayerSpec` hat `Window` (0: kein Fenster) und `NoRope`. Ein Token sieht die
+  letzten `Window` Tokens samt sich selbst - Schlüssel j für Abfrage i, wenn
+  i - Window < j <= i, wie transformers maskiert. `TInferBackend.CausalAttention` hat dafür
+  `aWindow`; Schlüssel vor dem Fenster werden nicht gelesen (der Test füllt sie mit NaN).
+  `NoRope` lässt die Drehung von Q und K in dem Layer weg.
+- Der Cache eines Fenster-Layers hält nur, was das nächste Token braucht: Zeile 0 ist die
+  Position `CachedBase`, vor neuen Zeilen schiebt `Slide` die noch gebrauchten
+  (aPast - Window + 1 .. aPast - 1) an den Anfang. Der Puffer hat das Doppelte des Fensters
+  (eine Verschiebung je Window Tokens), wächst für einen großen Prefill-Chunk und schrumpft
+  beim nächsten Schritt von höchstens einem Fenster wieder auf das Doppelte. Ein Chunk
+  überschreibt so nie einen Schlüssel, den eine seiner Zeilen noch braucht.
+  `TDecoderContext.FullCache` behält alle Zeilen und maskiert nur - die Referenz.
+- Rücksetzpunkte: `Restorable(t)` gilt für 0, für die volle Länge und für jede Länge, deren
+  Fenster noch im Puffer liegt; `Truncate` lehnt andere ab, `Usable` gibt den längsten
+  gemeinsamen Anfang, zu dem der Cache zurück kann (sonst 0), `Reuse` und der Prompt-Cache
+  des Clients wählen danach - ein Gespräch, das hinter das Fenster zurückspringt, wird neu
+  gerechnet statt mit fehlenden Schlüsseln.
+- Konfiguration wie transformers 5.19: Qwen3/Qwen2 mit `use_sliding_window`
+  (`sliding_window`, sonst 4096; `null` heißt kein Fenster) auf `layer_types` oder den
+  Layern ab `max_window_layers` (sonst 28); Qwen3-MoE auf allen Layern (Qwen3MoeConfig
+  kennt keine Layer-Auswahl). Ein Layer-Typ `sliding_attention` ohne Fenster wird
+  abgelehnt, wie transformers ihn nicht maskieren kann.
+- `TSmolLM3Model` (`smollm3`, nachgeschlagen in `modeling_smollm3.py` und
+  `configuration_smollm3.py`): ohne Bias und Kopf-Norm, `head_dim` aus Hidden / Köpfe,
+  NoPE nach `no_rope_layers` (sonst jeder `no_rope_layer_interval`-te Layer), Fenster nach
+  `layer_types` (auch ohne `use_sliding_window`, wie das Modell maskiert) oder auf den
+  NoPE-Layern. Nur aus `config.json`: llama.cpp legt die NoPE-Layer für smollm3 fest, statt
+  sie zu lesen - GGUF wird abgelehnt, bis es gegen die Referenz geprüft ist. Keine
+  Chat-Familie (Template und Parser von SmolLM3 fehlen noch).
+
+*Referenz:* `tools/infer-ref/make_reference_d4.py` (ohne Modell-Download): `tiny-smollm3`
+(4 Layer: voll mit RoPE, Fenster ohne RoPE, Fenster mit RoPE, voll ohne RoPE; Fenster 6) und
+`tiny-qwen3-sliding` (Fenster 5 ab `max_window_layers` 1, ohne `layer_types` in der
+Datei). Je drei Sequenzen (5, 13, 29 Tokens) mit allen Zuständen und 24 Greedy-Tokens ohne
+EOS - das Fenster läuft mehrfach um; der Erzeuger prüft Greedy mit und ohne Cache von
+transformers gleich und dass die Logits ohne Fenster abweichen (um bis zu 1,54 bzw. 0,93).
+
+*Tests:* `DecoderOpsMatchReference` (je Attention-Fall ein anderes Fenster, zusammen 1 bis 12, Referenz
+und Float-Pfad gegen die Definition, Schlüssel außerhalb des Fensters NaN; ein Fenster über
+alle Schlüssel gibt dieselben Bits wie keins), `SlidingWindowMatchesReference` (alle
+Zustände, Greedy durch den schmalen Cache), `SlidingWindowCache` - das Gate, auf der
+Referenz und dem schnellen Backend: 53 Positionen in Chunks von 1, 2, 5, 6, 7, 13 und
+gemischt geben die Bits des vollen Caches; einzeln gefüttert hält ein Fenster-Layer 12
+Zeilen (das Doppelte), ein voller alle; nach jeder Länge 0 bis 40 eine Verzweigung von 8
+Tokens gegen die Neuberechnung bitgleich (Truncate, wo `Restorable` es erlaubt - geprüft
+gegen die Regel -, sonst `Reuse` ab 0); nach einem Prefill von 40 schrumpft der Puffer beim
+nächsten Schritt auf 12 Zeilen bei gleichen Bits; `FullCache` kann jede Länge, ist auf
+einem gefüllten Kontext gesperrt. `SlidingWindowConfig` (Ableitungen und Ablehnungen wie
+oben, jede mit ihrer Meldung), auf Vulkan und CUDA `SlidingWindowRefused` (Fenster allein,
+NoPE allein). Grün auf dem RTX-Rechner unter FPC und Delphi 13 (4281 Assertions) und
+Delphi 7 (2848), lokal auf der Adreno. Gegenprobe: sechzehn eingebaute Fehler (Float-Pfad liest
+ab Schlüssel 0, Referenzpfad ohne Fenster, Fenster um eins zu kurz, `Slide` verwirft einen
+gebrauchten Schlüssel, `Slide` verschiebt nichts, `Restorable` um eins zu großzügig,
+`Truncate` ohne Prüfung, `Reuse` nach `Common`, NoPE übergangen, Fenster nicht an die
+Attention, schmaler Cache nie benutzt, Qwen3-Fenster ab `max_window_layers` + 1,
+`no_rope_layers` verkehrt, Intervall um eins verschoben, Vulkan nimmt ein Fenster, Vulkan nimmt NoPE).
+Review: der Claude-Finder fand Abweichungen von transformers (fehlende Schlüssel mit
+Standardwerten, `null`, SmolLM3 ohne `use_sliding_window`, Qwen3-MoE auf allen Layern),
+Ablehnungstests ohne Meldung und einen Puffer, der nach einem großen Prefill nicht
+schrumpfte; Codex eine Vergrößerung, die bei Speichermangel Schlüssel und Werte
+verschieden groß ließ, eine Kontextwahl im Prompt-Cache, die das letzte Token mitzählte,
+und Geräte-Tests, die Fenster und NoPE nur zusammen prüften. Alles behoben, die Fixes
+nachgeprüft.
+
 ### Danach — nach Bedarf
 
 Reranker (BGE-Reranker), Sparse-/ColBERT-Ausgabe von BGE-M3, Qwen3-Embedding; weitere

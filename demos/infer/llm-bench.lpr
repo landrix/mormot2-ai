@@ -71,7 +71,8 @@ type
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
+      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
+      aWindow: PtrInt = 0); override;
     procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
       aEps: double; y: PSingleArray); override;
     procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
@@ -143,12 +144,13 @@ end;
 
 procedure TTimedBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
-  y: PSingleArray);
+  y: PSingleArray; aWindow: PtrInt);
 var
   t0, t1: Int64;
 begin
   QueryPerformanceMicroSeconds(t0);
-  fInner.CausalAttention(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y);
+  fInner.CausalAttention(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
+    aWindow);
   QueryPerformanceMicroSeconds(t1);
   inc(AttnUs, t1 - t0);
 end;

@@ -889,9 +889,9 @@ end;
 /// causal grouped-query attention as defined, straight from the formula: an
 // independent check of the reference branch the exact path shares
 procedure NaiveCausal(const q, keys, values: TSingleDynArray; aRows, aHeads,
-  aDim, aPast, aKvHeads: PtrInt; var y: TSingleDynArray);
+  aDim, aPast, aKvHeads: PtrInt; var y: TSingleDynArray; aWindow: PtrInt = 0);
 var
-  r, h, g, j, t, total: PtrInt;
+  r, h, g, j, t, total, first: PtrInt;
   w: TDoubleDynArray;
   m, sum, acc, a: double;
 begin
@@ -901,9 +901,12 @@ begin
     begin
       g := h * aKvHeads div aHeads; // heads per KV head, in order
       total := aPast + r + 1;
+      first := 0; // a sliding window: key j when total - aWindow <= j
+      if (aWindow > 0) and (total > aWindow) then
+        first := total - aWindow;
       SetLength(w, total);
       m := -1e300;
-      for j := 0 to total - 1 do
+      for j := first to total - 1 do
       begin
         acc := 0;
         for t := 0 to aDim - 1 do
@@ -916,7 +919,7 @@ begin
           m := w[j];
       end;
       sum := 0;
-      for j := 0 to total - 1 do
+      for j := first to total - 1 do
       begin
         w[j] := Exp(w[j] - m);
         sum := sum + w[j];
@@ -924,7 +927,7 @@ begin
       for t := 0 to aDim - 1 do
       begin
         acc := 0;
-        for j := 0 to total - 1 do
+        for j := first to total - 1 do
           acc := acc + w[j] * values[(j * aKvHeads + g) * aDim + t];
         y[(r * aHeads + h) * aDim + t] := acc / sum;
       end;
@@ -945,7 +948,7 @@ const
   SHAPES: array[0..4, 0..2] of integer = (
     (1, 1024, 300), (7, 1024, 37), (3, 1000, 20), (64, 2048, 48), (2, 64, 16));
 var
-  i, total, rows, qn, kvn, nin, nout: PtrInt;
+  i, total, rows, qn, kvn, nin, nout, win, unseen: PtrInt;
   q, keys, values, y1, y2, y3, x, w, bias: TSingleDynArray;
   cmp: TInferCompare;
   refused: boolean;
@@ -1002,6 +1005,73 @@ begin
       refused := true;
   end;
   Check(refused, 'heads no multiple of the KV heads');
+  // a sliding window: row r sees the last w keys up to itself; the keys no
+  // row sees may be anything (a sliding cache has dropped them) - NaN here
+  for i := 0 to high(CASES) do
+  begin
+    rows := CASES[i, 1];
+    total := CASES[i, 0] + rows;
+    win := 1 + (i * 7) mod 13;
+    qn := rows * CASES[i, 2] * CASES[i, 4];
+    kvn := total * CASES[i, 3] * CASES[i, 4];
+    Fill(q, qn, 600 + i, 2);
+    Fill(keys, kvn, 700 + i, 2);
+    Fill(values, kvn, 800 + i, 2);
+    unseen := (CASES[i, 0] + 1 - win) * CASES[i, 3] * CASES[i, 4];
+    for nin := 0 to unseen - 1 do
+    begin
+      PCardinal(@keys[nin])^ := $7fc00000;
+      PCardinal(@values[nin])^ := $7fc00000;
+    end;
+    SetLength(y1, qn);
+    SetLength(y2, qn);
+    SetLength(y3, qn);
+    fRef.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y1), win);
+    fExact.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y2), win);
+    fFast.CausalAttention(pointer(q), rows, CASES[i, 2], CASES[i, 4], pointer(keys),
+      pointer(values), CASES[i, 0], CASES[i, 3], pointer(y3), win);
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), qn),
+      'windowed attention exact, case %, window %', [i, win]);
+    NaiveCausal(q, keys, values, rows, CASES[i, 2], CASES[i, 4], CASES[i, 0],
+      CASES[i, 3], y2, win);
+    cmp := InferCompare(pointer(y1), pointer(y2), qn, 1e-6, 1e-5);
+    CheckUtf8(InferCompareOk(cmp), 'windowed attention by definition, case %, ' +
+      'window %: %', [i, win, InferCompareText(cmp)]);
+    cmp := InferCompare(pointer(y3), pointer(y1), qn, 1e-5, 1e-4);
+    CheckUtf8(InferCompareOk(cmp), 'windowed attention float, case %, window %: %',
+      [i, win, InferCompareText(cmp)]);
+  end;
+  // a window of every key is no window: the same bits on both paths
+  rows := CASES[3, 1];
+  total := CASES[3, 0] + rows;
+  qn := rows * CASES[3, 2] * CASES[3, 4];
+  kvn := total * CASES[3, 3] * CASES[3, 4];
+  Fill(q, qn, 900, 2);
+  Fill(keys, kvn, 901, 2);
+  Fill(values, kvn, 902, 2);
+  SetLength(y1, qn);
+  SetLength(y2, qn);
+  fRef.CausalAttention(pointer(q), rows, CASES[3, 2], CASES[3, 4], pointer(keys),
+    pointer(values), CASES[3, 0], CASES[3, 3], pointer(y1));
+  fRef.CausalAttention(pointer(q), rows, CASES[3, 2], CASES[3, 4], pointer(keys),
+    pointer(values), CASES[3, 0], CASES[3, 3], pointer(y2), total);
+  Check(SameBits(pointer(y1), pointer(y2), qn), 'a window of every key, reference');
+  fFast.CausalAttention(pointer(q), rows, CASES[3, 2], CASES[3, 4], pointer(keys),
+    pointer(values), CASES[3, 0], CASES[3, 3], pointer(y1));
+  fFast.CausalAttention(pointer(q), rows, CASES[3, 2], CASES[3, 4], pointer(keys),
+    pointer(values), CASES[3, 0], CASES[3, 3], pointer(y2), total);
+  Check(SameBits(pointer(y1), pointer(y2), qn), 'a window of every key, float');
+  refused := false;
+  try
+    fFast.CausalAttention(pointer(q), 1, 2, 32, pointer(keys), pointer(values), 0, 1,
+      pointer(y1), -1);
+  except
+    on EInferError do
+      refused := true;
+  end;
+  Check(refused, 'a negative window');
   // F32 Linear: float lanes (whole lanes of 16) or the exact loop
   for i := 0 to high(SHAPES) do
   begin

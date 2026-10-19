@@ -21,6 +21,17 @@
 //   looked up in modeling_qwen2.py): the same decoder with a bias on the Q, K
 //   and V projections and no RMSNorm per head; config.json has no head_dim
 //   (hidden_size / num_attention_heads), nor has the GGUF attention.key_length
+// - a sliding window (config.json use_sliding_window, sliding_window, and
+//   max_window_layers or layer_types, as Qwen3Config and Qwen2Config derive
+//   them) on the layers transformers gives one; GGUF files of these families
+//   carry no window, one that names attention.sliding_window is refused
+// - TSmolLM3Model: SmolLM3 (model_type smollm3, looked up in
+//   modeling_smollm3.py and configuration_smollm3.py): no bias, no head norm,
+//   no rotary positions in the layers no_rope_layers marks 0 (NoPE; by default
+//   every no_rope_layer_interval-th layer), a sliding window on the layers
+//   layer_types names (by default the NoPE layers when use_sliding_window);
+//   config.json only - llama.cpp's smollm3 GGUF hard-codes the NoPE layers and
+//   is refused until checked against it
 // - TQwen3MoeModel: Qwen3-MoE (model_type qwen3_moe, GGUF architecture
 //   qwen3moe, e.g. Qwen3-30B-A3B) - the same attention, a mixture of experts
 //   as feed-forward block (looked up in modeling_qwen3_moe.py: a softmax router,
@@ -34,6 +45,7 @@ unit mormot.ai.infer.model.qwen3;
     - TQwen3Model: the qwen3 family of TDecoderModel
     - TQwen3MoeModel: Qwen3-MoE, the experts as feed-forward block
     - TQwen2Model: Qwen2 / Qwen2.5, a bias on Q, K and V instead of the head norms
+    - TSmolLM3Model: SmolLM3, layers without rotary positions (NoPE)
     - TQwen3Config, TQwen3Context, TQwen3Device...: the decoder types under
       their former names
 
@@ -87,10 +99,21 @@ type
     // 'model.layers.N.'); returns how many tensors they took - here the dense
     // gate, up and down
     function LoadFfn(aLayer: PtrInt; const aPrefix: RawUtf8): PtrInt; virtual;
-    /// true: an RMSNorm of every Q and K head and no bias (Qwen3); false: a
-    // bias on Q, K and V and no head norm, head_dim from hidden / heads when
-    // the settings do not name it (Qwen2)
+    /// the attention settings of config.json (aDoc) per layer, before
+    // CheckConfig - here the sliding window of Qwen3Config / Qwen2Config
+    procedure LoadMixerConfig(const aDoc: TDocVariantData;
+      const aConfigFile: TFileName); virtual;
+    /// the window of every layer from layer_types, when aDoc has them: true
+    // when it had; a sliding_attention layer needs aWindow > 0
+    function LoadLayerTypes(const aDoc: TDocVariantData; aWindow: PtrInt): boolean;
+    /// fConfig.Spec sized to the layers - false while their count is invalid
+    // (left to CheckConfig)
+    function SpecSized: boolean;
+    /// true: an RMSNorm of every Q and K head (Qwen3); false: none, head_dim
+    // from hidden / heads when the settings do not name it (Qwen2, SmolLM3)
     class function HeadNorm: boolean; virtual;
+    /// true: a bias on the Q, K and V projections (Qwen2); false: none
+    class function QkvBias: boolean; virtual;
   public
     /// 'qwen3'
     class function ModelType: RawUtf8; override;
@@ -101,14 +124,35 @@ type
   /// a Qwen2 or Qwen2.5 causal language model (e.g. Qwen2.5-0.5B-Instruct)
   // - config.json (model_type qwen2) or GGUF (architecture qwen2); the Q, K and
   // V projections with a bias (q_proj.bias ... / attn_q.bias ...), no q_norm
-  // or k_norm; a sliding window (use_sliding_window) is refused
+  // or k_norm
   TQwen2Model = class(TQwen3Model)
   protected
     class function HeadNorm: boolean; override;
+    class function QkvBias: boolean; override;
   public
     /// 'qwen2'
     class function ModelType: RawUtf8; override;
     /// 'qwen2'
+    class function Architecture: RawUtf8; override;
+  end;
+
+  /// a SmolLM3 causal language model (e.g. SmolLM3-3B)
+  // - config.json (model_type smollm3): no bias (attention_bias and mlp_bias
+  // false), no head norm, head_dim hidden / heads; no_rope_layers (1: rotary
+  // positions, 0: none) or every no_rope_layer_interval-th layer without;
+  // layer_types, or by default a sliding window on the layers without rotary
+  // positions when use_sliding_window
+  // - no GGUF: llama.cpp fixes the NoPE layers instead of reading them
+  TSmolLM3Model = class(TQwen3Model)
+  protected
+    procedure LoadGgufConfig; override;
+    procedure LoadMixerConfig(const aDoc: TDocVariantData;
+      const aConfigFile: TFileName); override;
+    class function HeadNorm: boolean; override;
+  public
+    /// 'smollm3'
+    class function ModelType: RawUtf8; override;
+    /// 'smollm3'
     class function Architecture: RawUtf8; override;
   end;
 
@@ -128,6 +172,10 @@ type
       const aConfigFile: TFileName); override;
     procedure LoadGgufFfnConfig; override;
     function LoadFfn(aLayer: PtrInt; const aPrefix: RawUtf8): PtrInt; override;
+    /// Qwen3MoeConfig knows no max_window_layers nor layer_types: with
+    // use_sliding_window every layer slides
+    procedure LoadMixerConfig(const aDoc: TDocVariantData;
+      const aConfigFile: TFileName); override;
   public
     /// 'qwen3_moe'
     class function ModelType: RawUtf8; override;
@@ -156,6 +204,11 @@ begin
   result := true;
 end;
 
+class function TQwen3Model.QkvBias: boolean;
+begin
+  result := false;
+end;
+
 const
   REQUIRED_KEYS: array[0..8] of RawUtf8 = (
     'vocab_size', 'hidden_size', 'num_hidden_layers', 'num_attention_heads',
@@ -174,7 +227,7 @@ end;
 procedure TQwen3Model.LoadConfig(const aConfigFile: TFileName);
 var
   doc: TDocVariantData;
-  rope, types: PDocVariantData;
+  rope: PDocVariantData;
   i: PtrInt;
 begin
   if not doc.InitJsonFromFile(aConfigFile, JSON_FAST_FLOAT) then
@@ -191,15 +244,8 @@ begin
     EInferError.RaiseUtf8('%: % has no "head_dim"', [self, aConfigFile]);
   if doc.U['hidden_act'] <> 'silu' then
     EInferError.RaiseUtf8('%: hidden_act "%" not supported', [self, doc.U['hidden_act']]);
-  if doc.B['attention_bias'] then
-    EInferError.RaiseUtf8('%: attention_bias not supported', [self]);
-  if doc.B['use_sliding_window'] then
-    EInferError.RaiseUtf8('%: sliding window attention not supported', [self]);
-  if doc.GetAsArray('layer_types', types) then
-    for i := 0 to types^.Count - 1 do
-      if VariantToUtf8(types^.Values[i]) <> 'full_attention' then
-        EInferError.RaiseUtf8('%: layer type "%" not supported',
-          [self, VariantToUtf8(types^.Values[i])]);
+  if doc.B['attention_bias'] or doc.B['mlp_bias'] then
+    EInferError.RaiseUtf8('%: attention_bias or mlp_bias not supported', [self]);
   // rope_theta at the top (transformers 4) or in rope_parameters (5), and
   // plain RoPE only: a scaling would change every angle
   if doc.GetAsObject('rope_parameters', rope) then
@@ -226,12 +272,98 @@ begin
   fConfig.RmsEps := doc.D['rms_norm_eps'];
   fConfig.TiedEmbeddings := doc.B['tie_word_embeddings'];
   LoadFfnConfig(doc, aConfigFile);
+  LoadMixerConfig(doc, aConfigFile);
   CheckConfig(aConfigFile);
 end;
 
 procedure TQwen3Model.LoadFfnConfig(const aDoc: TDocVariantData;
   const aConfigFile: TFileName);
 begin
+end;
+
+function TQwen3Model.SpecSized: boolean;
+begin
+  result := (fConfig.Layers > 0) and (fConfig.Layers <= 1024);
+  if result and (fConfig.Spec = nil) then
+    SetLength(fConfig.Spec, fConfig.Layers);
+end;
+
+function TQwen3Model.LoadLayerTypes(const aDoc: TDocVariantData;
+  aWindow: PtrInt): boolean;
+var
+  types: PDocVariantData;
+  t: RawUtf8;
+  i: PtrInt;
+begin
+  result := aDoc.GetAsArray('layer_types', types);
+  if not result then
+    exit;
+  if types^.Count <> fConfig.Layers then
+    EInferError.RaiseUtf8('%: % layer types for % layers',
+      [self, types^.Count, fConfig.Layers]);
+  for i := 0 to types^.Count - 1 do
+  begin
+    t := VariantToUtf8(types^.Values[i]);
+    if t = 'sliding_attention' then
+    begin
+      // transformers masks it with sliding_window: there must be one
+      if aWindow <= 0 then
+        EInferError.RaiseUtf8('%: layer % slides without a sliding window', [self, i]);
+      fConfig.Spec[i].Window := aWindow;
+    end
+    else if t <> 'full_attention' then
+      EInferError.RaiseUtf8('%: layer type "%" not supported', [self, t]);
+  end;
+end;
+
+/// sliding_window as the configuration class leaves it: 0 when aGated and
+// not use_sliding_window (Qwen3Config / Qwen2Config set it to None then), or
+// when it is null; aDefault when the key is missing (the class default) -
+// raises for a size that is not positive
+function SlidingWindowOf(aSelf: TObject; const aDoc: TDocVariantData;
+  aDefault: PtrInt; aGated: boolean): PtrInt;
+var
+  i: PtrInt;
+  v: Int64;
+begin
+  result := 0;
+  if aGated and not aDoc.B['use_sliding_window'] then
+    exit;
+  i := aDoc.GetValueIndex('sliding_window');
+  if i < 0 then
+  begin
+    result := aDefault;
+    exit;
+  end;
+  if VarIsEmptyOrNull(aDoc.Values[i]) then
+    exit;
+  v := VariantToInt64Def(aDoc.Values[i], 0);
+  if (v <= 0) or (v > 1 shl 24) then
+    EInferError.RaiseUtf8('%: a sliding_window of %', [aSelf, v]);
+  result := v;
+end;
+
+procedure TQwen3Model.LoadMixerConfig(const aDoc: TDocVariantData;
+  const aConfigFile: TFileName);
+var
+  w, first, i: PtrInt;
+begin
+  if not SpecSized then
+    exit;
+  // as Qwen3Config / Qwen2Config: no window unless use_sliding_window (both
+  // default to a sliding_window of 4096 and max_window_layers of 28); then
+  // layer_types, or the layers from max_window_layers on - a sliding layer
+  // type without a window is refused (transformers cannot mask it either)
+  w := SlidingWindowOf(self, aDoc, 4096, true);
+  if LoadLayerTypes(aDoc, w) or (w = 0) then
+    exit;
+  first := 28;
+  if aDoc.GetValueIndex('max_window_layers') >= 0 then
+    first := aDoc.I['max_window_layers'];
+  if first < 0 then
+    first := 0;
+  for i := first to fConfig.Layers - 1 do
+    fConfig.Spec[i].Window := w;
 end;
 
 function TQwen3Model.GgufCount(const aKey: RawUtf8): PtrInt;
@@ -410,8 +542,8 @@ begin
       l^.QNorm := Weight(p + 'self_attn.q_norm.weight', [fConfig.HeadDim]);
       l^.KNorm := Weight(p + 'self_attn.k_norm.weight', [fConfig.HeadDim]);
       inc(used, 2);
-    end
-    else
+    end;
+    if QkvBias then
     begin
       l^.QBias := Weight(p + 'self_attn.q_proj.bias', [qw]);
       l^.KBias := Weight(p + 'self_attn.k_proj.bias', [kvw]);
@@ -458,6 +590,81 @@ end;
 class function TQwen2Model.HeadNorm: boolean;
 begin
   result := false;
+end;
+
+class function TQwen2Model.QkvBias: boolean;
+begin
+  result := true;
+end;
+
+
+{ TSmolLM3Model }
+
+class function TSmolLM3Model.ModelType: RawUtf8;
+begin
+  result := 'smollm3';
+end;
+
+class function TSmolLM3Model.Architecture: RawUtf8;
+begin
+  result := 'smollm3';
+end;
+
+class function TSmolLM3Model.HeadNorm: boolean;
+begin
+  result := false;
+end;
+
+procedure TSmolLM3Model.LoadGgufConfig;
+begin
+  EInferError.RaiseUtf8('%: SmolLM3 from GGUF not supported', [self]);
+end;
+
+procedure TSmolLM3Model.LoadMixerConfig(const aDoc: TDocVariantData;
+  const aConfigFile: TFileName);
+var
+  rope: PDocVariantData;
+  w, every, i: PtrInt;
+  v: Int64;
+begin
+  if not SpecSized then
+    exit;
+  // as SmolLM3Config: no_rope_layers (1 = rotary positions), else every
+  // no_rope_layer_interval-th layer without
+  if aDoc.GetAsArray('no_rope_layers', rope) then
+  begin
+    if rope^.Count <> fConfig.Layers then
+      EInferError.RaiseUtf8('%: % no_rope_layers for % layers',
+        [self, rope^.Count, fConfig.Layers]);
+    for i := 0 to rope^.Count - 1 do
+    begin
+      v := VariantToInt64Def(rope^.Values[i], -1);
+      if (v <> 0) and (v <> 1) then
+        EInferError.RaiseUtf8('%: no_rope_layers[%] = %', [self, i, v]);
+      fConfig.Spec[i].NoRope := v = 0;
+    end;
+  end
+  else
+  begin
+    every := 4;
+    if aDoc.GetValueIndex('no_rope_layer_interval') >= 0 then
+      every := aDoc.I['no_rope_layer_interval'];
+    if every <= 0 then
+      EInferError.RaiseUtf8('%: no_rope_layer_interval = %', [self, every]);
+    for i := 0 to fConfig.Layers - 1 do
+      fConfig.Spec[i].NoRope := (i + 1) mod every = 0;
+  end;
+  // SmolLM3Config keeps sliding_window whatever use_sliding_window says, and
+  // the model masks by layer_types: explicit layer types slide with it; else
+  // a window on the layers without rotary positions when use_sliding_window
+  if LoadLayerTypes(aDoc, SlidingWindowOf(self, aDoc, 0, false)) then
+    exit;
+  w := SlidingWindowOf(self, aDoc, 0, true);
+  if w = 0 then
+    exit;
+  for i := 0 to fConfig.Layers - 1 do
+    if fConfig.Spec[i].NoRope then
+      fConfig.Spec[i].Window := w;
 end;
 
 
@@ -513,6 +720,20 @@ begin
     if not dense then
       fConfig.Spec[i].Ffn := dfMoe;
   end;
+end;
+
+procedure TQwen3MoeModel.LoadMixerConfig(const aDoc: TDocVariantData;
+  const aConfigFile: TFileName);
+var
+  w, i: PtrInt;
+begin
+  if not SpecSized then
+    exit;
+  // as modeling_qwen3_moe.py: one mask for all layers, sliding when
+  // config.sliding_window is set (only with use_sliding_window)
+  w := SlidingWindowOf(self, aDoc, 4096, true);
+  for i := 0 to fConfig.Layers - 1 do
+    fConfig.Spec[i].Window := w;
 end;
 
 procedure TQwen3MoeModel.LoadGgufFfnConfig;
@@ -576,5 +797,6 @@ initialization
   RegisterDecoderModel(TQwen3Model);
   RegisterDecoderModel(TQwen3MoeModel);
   RegisterDecoderModel(TQwen2Model);
+  RegisterDecoderModel(TSmolLM3Model);
 
 end.

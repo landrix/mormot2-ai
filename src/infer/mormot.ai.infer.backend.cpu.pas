@@ -130,7 +130,8 @@ type
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
+      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
+      aWindow: PtrInt = 0); override;
     procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
       aEps: double; y: PSingleArray); override;
     procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
@@ -142,6 +143,8 @@ type
   TInferCausalJob = record
     Q, Keys, Values, Y: PSingleArray;
     Rows, Heads, HeadDim, Past, KvHeads: PtrInt;
+    /// the keys a row sees at most, itself included (0: all before it)
+    Window: PtrInt;
     RowBlocks: PtrInt;
     /// true: float lanes (the fast path), false: the double reference
     Fast: boolean;
@@ -219,7 +222,8 @@ type
     procedure Attention(q, k, v: PSingleArray; aSeq, aHeads, aHeadDim: PtrInt;
       aKeep: PIntegerArray; aScratch, y: PSingleArray); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray); override;
+      keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
+      aWindow: PtrInt = 0); override;
     procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
       aEps: double; y: PSingleArray); override;
     procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt); override;
@@ -958,7 +962,7 @@ const
 // with aJob.Fast and a float kernel for this CPU and head size, float lanes
 procedure CausalRows(const aJob: TInferCausalJob; h, aFirst, aLast: PtrInt);
 var
-  r, g, j, t, d, total, kvw, qw: PtrInt;
+  r, g, j, t, d, total, first, cnt, kvw, qw: PtrInt;
   scale, m, sum, acc, a: double;
   q, k, outp: PSingleArray;
   sc, sums: PDoubleArray;
@@ -987,29 +991,33 @@ begin
     for r := aFirst to aLast do
     begin
       total := aJob.Past + r + 1; // causal: up to and including this token
-      InferDotsF32(@aJob.Q^[r * qw + h * d], @aJob.Keys^[g * d],
-        kvw * SizeOf(single), total, d, s);
+      first := 0; // a sliding window: the last Window keys only
+      if (aJob.Window > 0) and (total > aJob.Window) then
+        first := total - aJob.Window;
+      cnt := total - first;
+      InferDotsF32(@aJob.Q^[r * qw + h * d], @aJob.Keys^[first * kvw + g * d],
+        kvw * SizeOf(single), cnt, d, s);
       m := s^[0] * scale;
-      for j := 0 to total - 1 do
+      for j := 0 to cnt - 1 do
       begin
         s^[j] := s^[j] * scale;
         if s^[j] > m then
           m := s^[j];
       end;
       sum := 0;
-      for j := 0 to total - 1 do
+      for j := 0 to cnt - 1 do
       begin
         a := Exp(s^[j] - m);
         s^[j] := a;
         sum := sum + a;
       end;
       sum := 1 / sum;
-      for j := 0 to total - 1 do
+      for j := 0 to cnt - 1 do
         s^[j] := s^[j] * sum;
       outp := @aJob.Y^[r * qw + h * d];
       FillCharFast(outp^, d * SizeOf(single), 0);
-      InferAxpyRowsF32(pointer(s), @aJob.Values^[g * d], kvw * SizeOf(single),
-        total, d, outp);
+      InferAxpyRowsF32(pointer(s), @aJob.Values^[first * kvw + g * d],
+        kvw * SizeOf(single), cnt, d, outp);
     end;
     exit;
   end;
@@ -1028,9 +1036,12 @@ begin
   for r := aFirst to aLast do
   begin
     total := aJob.Past + r + 1;
+    first := 0;
+    if (aJob.Window > 0) and (total > aJob.Window) then
+      first := total - aJob.Window;
     q := @aJob.Q^[r * qw + h * d];
     m := 0;
-    for j := 0 to total - 1 do
+    for j := first to total - 1 do
     begin
       k := @aJob.Keys^[j * kvw + g * d];
       acc := 0;
@@ -1041,18 +1052,18 @@ begin
       end;
       acc := acc * scale;
       sc^[j] := acc;
-      if (j = 0) or (acc > m) then
+      if (j = first) or (acc > m) then
         m := acc;
     end;
     sum := 0;
-    for j := 0 to total - 1 do
+    for j := first to total - 1 do
     begin
       sc^[j] := Exp(sc^[j] - m);
       sum := sum + sc^[j];
     end;
     for t := 0 to d - 1 do
       sums^[t] := 0;
-    for j := 0 to total - 1 do
+    for j := first to total - 1 do
     begin
       k := @aJob.Values^[j * kvw + g * d];
       acc := sc^[j];
@@ -1068,12 +1079,12 @@ end;
 
 function CausalJob(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
   keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
-  aFast: boolean): TInferCausalJob;
+  aWindow: PtrInt; aFast: boolean): TInferCausalJob;
 begin
   if (aRows <= 0) or (aHeads <= 0) or (aHeadDim <= 0) or (aPast < 0) or
-     (aKvHeads <= 0) or (aHeads mod aKvHeads <> 0) then
+     (aKvHeads <= 0) or (aHeads mod aKvHeads <> 0) or (aWindow < 0) then
     EInferError.RaiseUtf8('CausalAttention: % rows, % heads of %, % KV heads, ' +
-      'past %', [aRows, aHeads, aHeadDim, aKvHeads, aPast]);
+      'past %, window %', [aRows, aHeads, aHeadDim, aKvHeads, aPast, aWindow]);
   result.Q := q;
   result.Keys := keys;
   result.Values := values;
@@ -1083,19 +1094,20 @@ begin
   result.HeadDim := aHeadDim;
   result.Past := aPast;
   result.KvHeads := aKvHeads;
+  result.Window := aWindow;
   result.RowBlocks := 1;
   result.Fast := aFast;
 end;
 
 procedure TInferCpuBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
-  y: PSingleArray);
+  y: PSingleArray; aWindow: PtrInt);
 var
   job: TInferCausalJob;
   h: PtrInt;
 begin
   job := CausalJob(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
-    false);
+    aWindow, false);
   for h := 0 to aHeads - 1 do
     CausalRows(job, h, 0, aRows - 1);
 end;
@@ -2019,7 +2031,7 @@ end;
 
 procedure TInferCpuFastBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
-  y: PSingleArray);
+  y: PSingleArray; aWindow: PtrInt);
 var
   job: TInferCausalJob;
   h: PtrInt;
@@ -2027,7 +2039,7 @@ begin
   // split by head and row block, never inside one sum: Exact stays
   // bit-identical to the reference
   job := CausalJob(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
-    not fExact);
+    aWindow, not fExact);
   job.RowBlocks := (aRows + CAUSAL_ROWS - 1) div CAUSAL_ROWS;
   if fBusy.TryLock then
   try

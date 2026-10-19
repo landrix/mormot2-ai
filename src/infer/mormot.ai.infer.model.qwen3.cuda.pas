@@ -252,7 +252,12 @@ begin
   // the layers it runs: attention, and a dense SwiGLU block or experts
   for l := 0 to high(aModel.Config.Spec) do
     if aModel.Config.Spec[l].Mixer <> dmAttention then
-      EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
+      EInferError.RaiseUtf8('%: layers of another kind not supported', [self])
+    else if aModel.Config.Spec[l].Window <> 0 then
+      EInferError.RaiseUtf8('%: sliding window not supported (layer %)', [self, l])
+    else if aModel.Config.Spec[l].NoRope then
+      EInferError.RaiseUtf8('%: attention without rotary positions not ' +
+        'supported (layer %)', [self, l]);
   fMoe := not aModel.HasOnly(dmAttention, dfDense);
   // qkrope keeps one normalized head in shared memory, the attention reads
   // the keys as float4

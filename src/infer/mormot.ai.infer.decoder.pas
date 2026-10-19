@@ -12,10 +12,17 @@
 //   projection) and a pre-norm SwiGLU feed-forward block,
 //   both with a residual; a final RMSNorm and the language-model head (tied to
 //   the embedding or its own matrix) - TDecoderLayerSpec names the kind of
-//   every layer, so another mixer (sliding window, linear attention) docks in
-//   there; the feed-forward block is dense or a mixture of experts (dfMoe: a
-//   softmax router picks the top k of the experts per token, their SwiGLU
-//   outputs are summed with the router weights, renormed or not)
+//   every layer, so another mixer (linear attention) docks in there; an
+//   attention layer may see a sliding window of keys only (Window) and may go
+//   without rotary positions (NoRope, NoPE); the feed-forward block is dense or
+//   a mixture of experts (dfMoe: a softmax router picks the top k of the
+//   experts per token, their SwiGLU outputs are summed with the router
+//   weights, renormed or not)
+// - a sliding-window layer keeps the keys a next token may see, not the whole
+//   sequence: its cache rows start at a base position that moves on when the
+//   buffer is full (FullCache keeps every key and only masks, the reference);
+//   a cached prefix is then a valid restore point only while its window is
+//   still there (TDecoderContext.Restorable) - Reuse computes again otherwise
 // - weights: F32 is used in place (memory-mapped), BF16 widened to F32 once at
 //   load (exact: BF16 is the upper half of an F32); or every matrix quantized
 //   to Q8_0 (or Q4_0) at load, byte for byte as a GGUF writer does it; the
@@ -76,10 +83,17 @@ type
     dfMoe);
 
   /// the kind of one layer
-  // - all zero (the default of a new array) is attention and a dense block
+  // - all zero (the default of a new array) is attention over every cached
+  // token with rotary positions and a dense block
   TDecoderLayerSpec = record
     Mixer: TDecoderMixer;
     Ffn: TDecoderFfn;
+    /// a sliding window of dmAttention: a token sees the last Window tokens,
+    // itself included (key j for query i when i - Window < j <= i, as
+    // transformers masks it); 0: every token before it
+    Window: PtrInt;
+    /// no rotary positions on Q and K in this layer (NoPE)
+    NoRope: boolean;
   end;
   TDecoderLayerSpecDynArray = array of TDecoderLayerSpec;
 
@@ -194,13 +208,20 @@ type
   // - remembers the id at every cached position: a prompt that starts with
   // the same tokens keeps their keys and values (Common, then Truncate) - the
   // cache of position i depends on the tokens 0..i only
+  // - a layer with a sliding window keeps the rows from Base[layer] on, enough
+  // for the next token (FullCache: all of them); going back is only possible
+  // to a length whose window is still there (Restorable)
   TDecoderContext = class
   protected
     fDevice: TDecoderDevice; // nil: the keys and values are in the arrays below
     fLength, fCapacity: PtrInt;
     fKvWidth, fLayers: PtrInt;
     fOwner: integer; // serial of the model whose keys and values are cached
-    fKeys, fValues: array of TSingleDynArray; // per layer [capacity, kvWidth]
+    fFullCache: boolean;
+    fKeys, fValues: array of TSingleDynArray; // per layer [rows, kvWidth]
+    // per layer: the sliding window (0: none, or kept in full) and the
+    // position of row 0 of fKeys / fValues (0 without a window)
+    fWindow, fBase: array of PtrInt;
     fIds: TIntegerDynArray; // [capacity] the token at every cached position
     fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp: TSingleDynArray;
     fCos, fSin: TSingleDynArray; // [new tokens, HeadDim / 2] rotary factors
@@ -210,15 +231,34 @@ type
     fRoute, fChosenW, fGather, fExpertOut, fRowW: TSingleDynArray;
     fChosen, fRow: TIntegerDynArray;
     function GetId(aPosition: PtrInt): integer;
+    procedure SetFullCache(aValue: boolean);
   public
     /// forget the cached tokens - the buffers stay allocated
     procedure Reset;
     /// keep the first aLength cached tokens, forget the others
-    // - raises EInferError unless 0 <= aLength <= Length
+    // - raises EInferError unless 0 <= aLength <= Length and Restorable(aLength)
     procedure Truncate(aLength: PtrInt);
+    /// true when the cache can go back to its first aLength tokens: every
+    // sliding window still holds the keys position aLength sees (always for 0
+    // and Length, and without a sliding window)
+    function Restorable(aLength: PtrInt): boolean;
     /// how many of the first tokens of aIds[0..aCount-1] the cache holds:
     // the length of the common prefix
     function Common(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
+    /// the longest common prefix with aIds[0..aCount-1] that the cache can go
+    // back to (Common, then 0 unless Restorable)
+    function Usable(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
+    /// the cache rows layer aLayer holds allocated (0 before the first
+    // Forward) - a sliding window keeps about twice its size
+    function CachedRows(aLayer: PtrInt): PtrInt;
+    /// the position of the first cache row of layer aLayer (0 unless its
+    // sliding window has moved on)
+    function CachedBase(aLayer: PtrInt): PtrInt;
+    /// keep the keys of every token also in sliding-window layers, which then
+    // only mask (the reference, and every length restorable) - set it on an
+    // empty context; false by default
+    property FullCache: boolean
+      read fFullCache write SetFullCache;
     /// tokens in the KV cache = position of the next token
     property Length: PtrInt
       read fLength;
@@ -282,6 +322,9 @@ type
     /// raise unless every FP16 scale of the blocks of aTensor is finite
     procedure CheckBlockScales(aTensor: PInferTensor; const aName: RawUtf8);
     procedure Grow(aCtx: TDecoderContext; aTokens, aNew: PtrInt);
+    /// room in the rows of sliding-window layer aLayer for aRows new tokens
+    // at aPast: older keys than the window of aPast moved out first
+    procedure Slide(aCtx: TDecoderContext; aLayer, aPast, aRows: PtrInt);
     procedure RopeFactors(aCtx: TDecoderContext; aRows, aFirstPos: PtrInt);
     procedure Attention(aCtx: TDecoderContext; aLayer, aRows: PtrInt);
     /// the dmAttention mixer of layer aLayer over aRows new tokens, its output
@@ -335,7 +378,9 @@ type
     /// keep the cached tokens of aCtx that start aIds[0..aCount-1], forget the
     // others, and return how many stayed: the rest of aIds is to be computed
     // - at most aCount - 1 stay, so a Forward of the rest has a token to give
-    // logits for; none when aCtx holds a sequence of another model
+    // logits for; none when aCtx holds a sequence of another model, or when a
+    // sliding window no longer holds what the common prefix needs
+    // (TDecoderContext.Usable)
     function Reuse(aCtx: TDecoderContext; aIds: PIntegerArray; aCount: PtrInt): PtrInt;
     /// greedy continuation: the prompt is fed after aCtx's cached tokens, then
     // the highest logit is taken until one of aStop or aMaxNew tokens
@@ -464,15 +509,81 @@ end;
 { TDecoderContext }
 
 procedure TDecoderContext.Reset;
+var
+  i: PtrInt;
 begin
   fLength := 0;
+  for i := 0 to high(fBase) do
+    fBase[i] := 0;
 end;
 
 procedure TDecoderContext.Truncate(aLength: PtrInt);
 begin
   if (aLength < 0) or (aLength > fLength) then
     EInferError.RaiseUtf8('%.Truncate(%) of % tokens', [self, aLength, fLength]);
-  fLength := aLength;
+  if not Restorable(aLength) then
+    EInferError.RaiseUtf8('%.Truncate(%): a sliding window no longer holds ' +
+      'the keys of that position', [self, aLength]);
+  if aLength = 0 then
+    Reset
+  else
+    fLength := aLength;
+end;
+
+function TDecoderContext.Restorable(aLength: PtrInt): boolean;
+var
+  i, first: PtrInt;
+begin
+  result := false;
+  if (aLength < 0) or (aLength > fLength) then
+    exit;
+  result := true;
+  if aLength = 0 then
+    exit; // a new sequence: every window starts again
+  for i := 0 to high(fWindow) do
+    if fWindow[i] > 0 then
+    begin
+      // the next token at aLength sees aLength - Window + 1 .. aLength
+      first := aLength - fWindow[i] + 1;
+      if first < 0 then
+        first := 0;
+      if fBase[i] > first then
+      begin
+        result := false;
+        exit;
+      end;
+    end;
+end;
+
+function TDecoderContext.Usable(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
+begin
+  result := Common(aIds, aCount);
+  if not Restorable(result) then
+    result := 0;
+end;
+
+function TDecoderContext.CachedRows(aLayer: PtrInt): PtrInt;
+begin
+  result := 0;
+  if (fKvWidth > 0) and (aLayer >= 0) and (aLayer <= high(fKeys)) then
+    result := system.length(fKeys[aLayer]) div fKvWidth;
+end;
+
+function TDecoderContext.CachedBase(aLayer: PtrInt): PtrInt;
+begin
+  result := 0;
+  if (aLayer >= 0) and (aLayer <= high(fBase)) then
+    result := fBase[aLayer];
+end;
+
+procedure TDecoderContext.SetFullCache(aValue: boolean);
+begin
+  if aValue = fFullCache then
+    exit;
+  if fLength <> 0 then
+    EInferError.RaiseUtf8('%.FullCache on % cached tokens', [self, fLength]);
+  fFullCache := aValue;
+  fLayers := 0; // the next Forward lays the rows out again
 end;
 
 function TDecoderContext.Common(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
@@ -595,6 +706,11 @@ begin
   else if (fConfig.Experts <> 0) or (fConfig.ExpertsUsed <> 0) or
           (fConfig.ExpertIntermediate <> 0) then
     EInferError.RaiseUtf8('%: % has experts but no layer uses them', [self, aSource]);
+  for i := 0 to high(fConfig.Spec) do
+    if (fConfig.Spec[i].Window < 0) or (fConfig.Spec[i].Window > 1 shl 24) or
+       ((fConfig.Spec[i].Window <> 0) and (fConfig.Spec[i].Mixer <> dmAttention)) then
+      EInferError.RaiseUtf8('%: % has a window of % in layer %',
+        [self, aSource, fConfig.Spec[i].Window, i]);
   // inverse rotary frequencies as the reference forms them in float32:
   // 1 / theta ^ (2i / d), each step rounded to single
   SetLength(fInvFreq, fConfig.HeadDim shr 1);
@@ -908,16 +1024,44 @@ begin
         [self]);
     aCtx.fOwner := fSerial;
   end;
-  if (aCtx.fKvWidth <> kvw) or (aCtx.fLayers <> fConfig.Layers) then
+  if (aCtx.fKvWidth <> kvw) or (aCtx.fLayers <> fConfig.Layers) or
+     (length(aCtx.fWindow) <> fConfig.Layers) then
   begin
     // the shape is only taken once its arrays are there: a failed SetLength
     // leaves a context that tries again
     aCtx.fCapacity := 0;
+    aCtx.fKeys := nil; // a sliding window layer may become a full one
+    aCtx.fValues := nil;
     SetLength(aCtx.fKeys, fConfig.Layers);
     SetLength(aCtx.fValues, fConfig.Layers);
+    SetLength(aCtx.fWindow, fConfig.Layers);
+    SetLength(aCtx.fBase, fConfig.Layers);
+    for i := 0 to fConfig.Layers - 1 do
+    begin
+      aCtx.fBase[i] := 0;
+      if aCtx.fFullCache then
+        aCtx.fWindow[i] := 0 // every row kept: the window only masks
+      else
+        aCtx.fWindow[i] := fConfig.Spec[i].Window;
+    end;
     aCtx.fKvWidth := kvw;
     aCtx.fLayers := fConfig.Layers;
-  end;
+  end
+  else
+    // the same shape but another model: its windows
+    for i := 0 to fConfig.Layers - 1 do
+      if aCtx.fFullCache then
+        aCtx.fWindow[i] := 0
+      else if aCtx.fWindow[i] <> fConfig.Spec[i].Window then
+      begin
+        if aCtx.fLength <> 0 then
+          EInferError.RaiseUtf8('%.Forward: context holds other windows', [self]);
+        aCtx.fWindow[i] := fConfig.Spec[i].Window;
+        aCtx.fBase[i] := 0;
+        aCtx.fKeys[i] := nil;
+        aCtx.fValues[i] := nil;
+        aCtx.fCapacity := 0; // a full layer again: sized by the loop below
+      end;
   if aTokens > aCtx.fCapacity then
   begin
     // doubled, and a quarter beyond the tokens wanted: a prefill is followed
@@ -933,11 +1077,13 @@ begin
     if cap > (High(PtrInt) div SizeOf(single)) div kvw then
       EInferError.RaiseUtf8('%.Forward: a KV cache of % tokens is too large for ' +
         'this process', [self, cap]);
+    // a sliding window layer sizes its own rows (Slide)
     for i := 0 to fConfig.Layers - 1 do
-    begin
-      SetLength(aCtx.fKeys[i], cap * kvw);
-      SetLength(aCtx.fValues[i], cap * kvw);
-    end;
+      if aCtx.fWindow[i] = 0 then
+      begin
+        SetLength(aCtx.fKeys[i], cap * kvw);
+        SetLength(aCtx.fValues[i], cap * kvw);
+      end;
     SetLength(aCtx.fIds, cap);
     aCtx.fCapacity := cap;
   end;
@@ -963,6 +1109,57 @@ begin
       SetLength(aCtx.fChosen, aNew * fConfig.ExpertsUsed);
     if length(aCtx.fRow) < aNew then
       SetLength(aCtx.fRow, aNew);
+  end;
+end;
+
+procedure TDecoderModel.Slide(aCtx: TDecoderContext; aLayer, aPast, aRows: PtrInt);
+var
+  w, base, first, keep, need, rows, cap, kvw: PtrInt;
+begin
+  w := aCtx.fWindow[aLayer];
+  kvw := aCtx.fKvWidth;
+  base := aCtx.fBase[aLayer];
+  // both buffers: a failed SetLength may have grown only the keys
+  rows := MinPtrInt(length(aCtx.fKeys[aLayer]), length(aCtx.fValues[aLayer])) div kvw;
+  // the new rows fit behind the kept ones - unless a large prefill left far
+  // more rows than decoding needs: then they shrink back now
+  if (aPast + aRows - base <= rows) and ((rows <= 4 * w) or (aRows > w)) then
+    exit;
+  // the first new token sees aPast - w + 1 .. aPast: older keys are dropped,
+  // the newer ones moved to row 0 - the new rows never overwrite a key that
+  // one of them still needs
+  first := aPast - w + 1;
+  if first < base then
+    first := base;
+  keep := aPast - first;
+  if (first > base) and (keep > 0) then
+  begin
+    MoveFast(aCtx.fKeys[aLayer][(first - base) * kvw], aCtx.fKeys[aLayer][0],
+      keep * kvw * SizeOf(single));
+    MoveFast(aCtx.fValues[aLayer][(first - base) * kvw], aCtx.fValues[aLayer][0],
+      keep * kvw * SizeOf(single));
+  end;
+  aCtx.fBase[aLayer] := first;
+  need := keep + aRows;
+  if (need > rows) or (rows > 4 * w) then
+  begin
+    // twice the window: a decode step moves the rows once every w tokens;
+    // growing leaves a quarter more, shrinking (need <= 2w - 1) none
+    if need > rows then
+      cap := need + need shr 2
+    else
+      cap := need;
+    if cap < 2 * w then
+      cap := 2 * w;
+    if cap > fConfig.MaxPositions then
+      cap := fConfig.MaxPositions;
+    if cap < need then
+      cap := need;
+    if cap > (High(PtrInt) div SizeOf(single)) div kvw then
+      EInferError.RaiseUtf8('%.Forward: a KV cache of % tokens is too large for ' +
+        'this process', [self, cap]);
+    SetLength(aCtx.fKeys[aLayer], cap * kvw);
+    SetLength(aCtx.fValues[aLayer], cap * kvw);
   end;
 end;
 
@@ -1004,10 +1201,12 @@ end;
 procedure TDecoderModel.Attention(aCtx: TDecoderContext; aLayer, aRows: PtrInt);
 begin
   // the reference backend computes in double; a fast one splits by head and
-  // row block
+  // row block - the cache rows start at the base position of the layer, a
+  // sliding window masks the older ones (they may be gone)
   fBackend.CausalAttention(pointer(aCtx.fQ), aRows, fConfig.Heads, fConfig.HeadDim,
-    pointer(aCtx.fKeys[aLayer]), pointer(aCtx.fValues[aLayer]), aCtx.fLength,
-    fConfig.KvHeads, pointer(aCtx.fAttn));
+    pointer(aCtx.fKeys[aLayer]), pointer(aCtx.fValues[aLayer]),
+    aCtx.fLength - aCtx.fBase[aLayer], fConfig.KvHeads, pointer(aCtx.fAttn),
+    fConfig.Spec[aLayer].Window);
 end;
 
 procedure TDecoderModel.AttentionBlock(aCtx: TDecoderContext;
@@ -1034,12 +1233,19 @@ begin
     fBackend.RmsNorm(pointer(aCtx.fK), n * fConfig.KvHeads, fConfig.HeadDim,
       ly^.KNorm, fConfig.RmsEps, pointer(aCtx.fK));
   end;
-  fBackend.Rope(pointer(aCtx.fQ), n, fConfig.Heads, fConfig.HeadDim,
-    pointer(aCtx.fCos), pointer(aCtx.fSin));
-  fBackend.Rope(pointer(aCtx.fK), n, fConfig.KvHeads, fConfig.HeadDim,
-    pointer(aCtx.fCos), pointer(aCtx.fSin));
-  MoveFast(pointer(aCtx.fK)^, aCtx.fKeys[aLayer][aPast * kvw], n * kvw * SizeOf(single));
-  MoveFast(pointer(aCtx.fV)^, aCtx.fValues[aLayer][aPast * kvw], n * kvw * SizeOf(single));
+  if not fConfig.Spec[aLayer].NoRope then
+  begin
+    fBackend.Rope(pointer(aCtx.fQ), n, fConfig.Heads, fConfig.HeadDim,
+      pointer(aCtx.fCos), pointer(aCtx.fSin));
+    fBackend.Rope(pointer(aCtx.fK), n, fConfig.KvHeads, fConfig.HeadDim,
+      pointer(aCtx.fCos), pointer(aCtx.fSin));
+  end;
+  if aCtx.fWindow[aLayer] > 0 then
+    Slide(aCtx, aLayer, aPast, n);
+  MoveFast(pointer(aCtx.fK)^, aCtx.fKeys[aLayer][(aPast - aCtx.fBase[aLayer]) * kvw],
+    n * kvw * SizeOf(single));
+  MoveFast(pointer(aCtx.fV)^, aCtx.fValues[aLayer][(aPast - aCtx.fBase[aLayer]) * kvw],
+    n * kvw * SizeOf(single));
   Attention(aCtx, aLayer, n);
   fBackend.Linear(pointer(aCtx.fAttn), n, qw, ly^.O, h, nil, pointer(aCtx.fTmp));
   if Assigned(aOnState) and (aLayer = 0) then
@@ -1355,7 +1561,7 @@ begin
   end;
   result := 0;
   if (aCtx.fOwner = fSerial) and (aCount > 0) then
-    result := aCtx.Common(aIds, aCount - 1);
+    result := aCtx.Usable(aIds, aCount - 1);
   aCtx.Truncate(result);
 end;
 

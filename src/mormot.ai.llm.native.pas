@@ -1091,7 +1091,8 @@ begin
     longest := 0;
     for i := 0 to high(fIdle) do
     begin
-      common := fIdle[i].Common(pointer(aPrompt), length(aPrompt));
+      // as Reuse keeps them: the last token is always computed again
+      common := fIdle[i].Usable(pointer(aPrompt), length(aPrompt) - 1);
       if common > longest then
       begin
         longest := common;
