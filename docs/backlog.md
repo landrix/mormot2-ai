@@ -235,6 +235,24 @@ Für CUDA und Vulkan gleich; die Gegenprobe muss zeigen, dass ein falsches Routi
 (z. B. Router-Logits der falschen Zeile) in Prüfung 2 scheitert, obwohl Prüfung 1 es nicht
 sehen kann.
 
+**D1b — Qwen2.5 als Familie (aufgenommen 2026-10-19).** Anlass: neural-api zeigt einen Chat mit
+Qwen2.5-0.5B-Instruct in wenigen Zeilen (nur die Funktion als Anregung, kein Code - LGPL, keine
+Vorlage). Qwen2 ist Qwen3 ohne `q_norm`/`k_norm` je Kopf, dafür mit Bias auf Q, K und V (O ohne
+Bias); RoPE, SwiGLU, RMSNorm, GQA wie gehabt. Tokenizer (`TBpeTokenizer`, Qwen2-Regex) und
+Chat-Template (ChatML, Qwen2.5-Tool-Calling) können es schon; zu prüfen ist das
+Antwortformat ohne `<think>` und der System-Prompt, den das Template von Qwen2.5 ohne
+System-Nachricht selbst einsetzt. Nutzen: Qwen2.5 0.5B bis 72B, Qwen2.5-Coder und viele
+Fine-Tunes - die meisten kleinen, gut laufenden Modelle für CPU-Rechner.
+*Bau:* `TQwen2Model` (`qwen2` / GGUF `qwen2`) auf `TDecoderModel`; Bias als Eigenschaft im
+Layer-Spec (D1 hat ihn ausdrücklich offen gelassen) - auf CPU, Vulkan und CUDA, und so, dass
+gpt-oss (D5, Attention mit Bias) ihn wiederverwendet; Norm je Kopf abschaltbar.
+`RegisterNativeFamily` für den Client. *Gate:* Tiny-Qwen2 aus `make_reference_qwen3.py`
+(BF16, Bias ungleich null, `head_dim` ungleich Hidden/Köpfe) gegen transformers auf allen
+drei Backends; Qwen2.5-0.5B-Instruct (safetensors und GGUF Q8_0) Greedy-Tokens gleich
+transformers, ohne Modell überspringen; Client-Test mit Tool-Aufruf; Gegenproben (Bias
+vergessen, Bias auf O, Norm je Kopf doch an). Revision des Modells pinnen.
+*Einordnung:* vor D4 oder parallel dazu - klein, unabhängig von MoE.
+
 **D4 — Sliding Window und Cache-Semantik.** Erst voller KV mit Fenstermaske als Referenz,
 dann Ringpuffer mit absoluten Positionen (spart den Speicher). Chunk-Prefill darf benötigte
 Schlüssel nicht vorher überschreiben. NoPE als Layer-Eigenschaft. Prompt-Cache mit gültigen
@@ -675,3 +693,30 @@ nachbauen musste; nach Punkt 3 sollte das entfallen.
 (derselbe Anwendungsfall: mehrere Stapel auf einem Gerät), dann 1, 2 und 5 (klein,
 unabhängig), 4 nur Doku und Entscheidung. Rückmeldung an flydev im Forum, wenn etwas davon
 gepusht ist.
+
+## B15 — Schneller Einstieg: Gewichtsvorgabe und Quickstart-Demo (aufgenommen 2026-10-19)
+
+Anlass: neural-api (`neuralchat`) lädt ein Modell mit `LoadModel(dir)` und antwortet mit
+`ChatReply(history)`, int8-Gewichte als Vorgabe (nur die Funktion als Anregung, kein Code).
+Bei uns ist der Weg ähnlich kurz (`TNativeLlmClient.Create(folder)` hinter `ILlmClient`),
+aber die Vorgabe ist `idtF32`: Token für Token gleich mit transformers (Qwen3-0.6B greedy),
+dafür viermal so viel Speicher und rund halbes Decode-Tempo wie `idtQ8_0`. Q8_0 kann eine
+knappe Entscheidung kippen (Qwen3-0.6B beantwortet die Wetterfrage der Referenz dann selbst,
+statt das Werkzeug zu rufen) - deshalb steht F32 bisher als Vorgabe.
+
+**Vorhaben:**
+1. Entscheiden (Nutzer): Vorgabe bleibt F32, oder eine benannte Wahl - etwa eine Konstante
+   bzw. ein Profil „genau“ (F32, für Tests und Vergleiche) gegen „schnell“ (Q8_0 beim Laden)
+   - und welches davon `Create` ohne Angabe nimmt. Ein Wechsel der Vorgabe ändert die
+   Client-Tests (die dann F32 ausdrücklich wählen).
+2. Demo `demos/llm/llm-quickstart.lpr`: Ordner (git clone von Hugging Face) oder GGUF-Datei
+   laden, eine Frage, Antwort gestreamt - so kurz wie möglich, mit dem Schnipsel im README
+   der Bibliothek. Zeigt nebenbei, dass die Familie aus dem Ordner erkannt wird
+   (`DecoderModelClassOfFolder`).
+3. Prüfen, wie die Kontextlänge gedeckelt wird (neural-api: `CtxLen`, „hält den KV-Cache
+   klein“): ob `TNativeLlmClient` eine Obergrenze hat und der KV-Cache nur so weit wächst,
+   wie er gebraucht wird; falls nicht, eine Eigenschaft dafür.
+
+**Fertig, wenn:** die Entscheidung zu 1 umgesetzt ist, das Demo unter FPC und Delphi 13 baut
+und läuft (CPU, und mit Vulkan/CUDA, wenn vorhanden), und das README den Einstieg in
+wenigen Zeilen zeigt. Weitere Ideen ohne Termin: [ideas.md](ideas.md).
