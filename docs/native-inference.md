@@ -1814,6 +1814,59 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5e erledigt (2026-10-20): Issue #1 (flydev) - normierte Zeile vom Gerät, Stapel ohne Kopf,
+paralleles Laden.** flydev hat `mormot2-qwen-tts` auf `21aa4bb` gezogen und drei Dinge gemeldet
+(<https://github.com/landrix/mormot2-ai/issues/1>): Sein Nachbau des Vulkan-Durchlaufs brach
+mit den neuen Push-Konstanten still (falsche Codes, kein Fehler); der Talker braucht auf dem
+Gerät die normierte letzte Zeile (die Eingabe des Code-Predictors), und der Predictor nimmt je
+Schritt einen anderen seiner 15 Köpfe; `CreateStack` konvertiert auf einem Thread (Q8_0: 6,1 s
+gegen 0,56 s mit seinem Pool).
+
+- `TDecoderModel.ForwardEmbeds(..., aNormed)` (und `TDecoderDevice.ForwardEmbeds`,
+  `TQwen3Vulkan`, `TQwen3Cuda`): `aNormed <> nil` bekommt die letzte Zeile nach der finalen
+  RMSNorm (`[Hidden]`) - genau das, was der Kopf multipliziert. Mit den Logits der letzten
+  Zeile, mit denen jeder Zeile (dann wird jede Zeile normiert und die letzte gelesen) oder ohne
+  Logits; auf dem Gerät nur im letzten Chunk, auf Vulkan im selben Rücklesepuffer hinter den
+  Logits, auf CUDA ein Download aus dem Normpuffer (ein Decode-Schritt bleibt CUDA-Graph; ein
+  Wechsel zwischen mit und ohne Zeile baut den Graph einmal neu). Damit braucht flydev den
+  nachgebauten Vulkan-Durchlauf nicht mehr.
+- `CreateStack(..., aHead = '')`: ein Stapel ohne Kopf (`HasHead` false) - keine Logits, nur
+  die normierte Zeile; eine Anfrage mit Logits wird abgelehnt, bevor sich der Cache ändert
+  (CPU und Gerät). Ein solcher Stapel lädt keinen Kopf, auch keinen gebundenen; das Gerät lädt
+  keinen hoch. `aEmbedding` und `aHead` dürfen beide leer sein (der Predictor von Qwen3-TTS).
+- `TInferBackend.RunItems(aJob, aCount)`: unabhängige Einträge auf den Threads des Backends,
+  wenn es einen freien Pool hat (`TInferCpuFastBackend` und damit Vulkan und CUDA), sonst der
+  Reihe nach. Das Laden nutzt es: Q8_0 und Q4_0 quantisieren Zeile für Zeile auf dem Pool, und
+  jede Zeile Block für Block über 32 floats auf dem Stack (kein Zeilenpuffer, kein Heap in den
+  Threads - flydevs Hinweis); BF16 und F16 werden in Stücken von 4096 Werten verbreitert. Die
+  Bytes sind dieselben wie auf einem Thread (Q8_0 und Q4_0 quantisieren jeden Block für sich);
+  ein NaN wird weiter mit Name, Zeile und Spalte abgelehnt, vom Pool als `EInferError` mit
+  derselben Meldung.
+- *Gemessen* (Talker und Predictor von Qwen3-TTS-12Hz-0.6B, BF16-Checkpoint, zweimal geladen):
+  auf dem RTX-Rechner (i9, 22 Threads) Q8_0 5,3-6,4 s vorher, 0,37-0,38 s nachher; F32
+  0,65-1,2 s vorher, 0,38-0,43 s nachher. Auf der Snapdragon X unter WSL (8 Threads, Modell im
+  Linux-Dateisystem) Q8_0 10-16 s vorher, 2,8-5,9 s nachher.
+- *Tests:* `StackFromCheckpoint` (die normierte Zeile ist bitgleich der Zustand `norm` der
+  letzten Zeile, mit und ohne Logits, die Logits unverändert; ein Stapel ohne Kopf gibt
+  dieselben Bits, lehnt Logits ab, der Cache bleibt), `LoadOnAllCores` (F32, Q8_0 und Q4_0 aus
+  safetensors und F16 aus GGUF auf dem Pool Byte für Byte wie auf einem Thread; ein NaN in der
+  letzten Zeile vom Pool abgelehnt, mit Zeile und Spalte), auf Vulkan und CUDA
+  `NormedRowOnDevice` (mit den letzten Logits, mit allen, ohne, zwei Einzelschritte, über zwei
+  Chunks, Stapel ohne Kopf, gegen die CPU) und in `Qwen3TtsOnDevice` die normierte Zeile des
+  Talkers gegen PyTorch und der Predictor ohne Kopf Schritt für Schritt, seine 15 Köpfe auf der
+  CPU angewandt, gegen flydevs Referenz (alle Greedy-Codes gleich).
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (6776 Assertions) und Delphi 7 (4305), unter
+  WSL mit Lavapipe (5083) und auf dem M2 Pro (MoltenVK, 5129; LLM-Suite 730). Gegenprobe: 15
+  eingebaute Fehler (`RunItems` nie auf dem Pool, falscher Block- und Stück-Offset, Rest zu kurz,
+  falscher Quelltyp, die erste statt der letzten Zeile auf der CPU, die Norm ohne Logits
+  übersprungen, Logits ohne Kopf durchgelassen, auf Vulkan und CUDA Zeile 0 bei allen Logits,
+  die Norm ohne Logits übersprungen und die Zeile an den ersten statt den letzten Chunk, auf
+  Vulkan vom Anfang des Rücklesepuffers gelesen) - alle scheitern. Review: Codex ohne Befund;
+  der Claude-Finder bemerkte, dass `LoadOnAllCores` auf einem Kern scheiterte und nicht zeigte,
+  dass der Pool wirklich rechnet (jetzt: Überspringen, 64 Einträge zu 1 ms, die auf anderen
+  Threads laufen müssen), Codex im Nachreview, dass ein nie ausgeführter Eintrag als fremder
+  Thread zählte (jetzt: jeder Eintrag muss laufen). Behoben.
+
 **D5d2 erledigt (2026-10-20): gpt-oss auf Vulkan.** `TQwen3Vulkan` nimmt gpt-oss an wie
 `TQwen3Cuda` seit D5d1.
 

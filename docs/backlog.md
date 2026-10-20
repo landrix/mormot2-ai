@@ -886,3 +886,17 @@ verschobene `qh`-Wort falsch; gelesen wird das eine Byte. *Offen, nur bei Bedarf
   mit `matvec8`.
 - **Auspacken mit NEON/AVX2** wie `InferQ4Unpack`: Prefill auf der CPU 4 % langsamer als
   Q8_0 (891 / 931 Tokens/s).
+
+## B17 — Issue #1 (flydev): normierte Zeile vom Gerät, Stapel ohne Kopf, paralleles Laden (aufgenommen und erledigt 2026-10-20)
+
+Anlass: <https://github.com/landrix/mormot2-ai/issues/1>. flydev hat `mormot2-qwen-tts` auf
+`21aa4bb` gezogen (1228 Tests grün) und meldet: sein Nachbau des Vulkan-Durchlaufs brach mit den
+neuen Push-Konstanten still; auf dem Gerät fehlt die normierte letzte Zeile des Talkers (die
+Eingabe des Code-Predictors, der je Schritt einen anderen seiner 15 Köpfe nimmt), dazu
+`CreateStack` ohne Kopf; `CreateStack` konvertiert auf einem Thread (Q8_0 6,1 s gegen 0,56 s).
+
+*Erledigt 2026-10-20* (D5e, `native-inference.md`, Phase D): `ForwardEmbeds(..., aNormed)` auf
+CPU, Vulkan und CUDA; `CreateStack` mit `aHead = ''` (`HasHead`, Logits abgelehnt);
+`TInferBackend.RunItems`, über den das Laden konvertiert (Q8_0 beider Stapel auf dem
+RTX-Rechner 0,37 s statt 5,3-6,4 s, Byte für Byte gleich). *Rückmeldung an flydev* im Issue,
+sobald gepusht.

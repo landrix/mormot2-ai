@@ -536,7 +536,7 @@ begin
   begin
     // a stack fed with embedding rows only: no token embedding, no tied head
     fEmbedSrc := nil;
-    if fConfig.TiedEmbeddings then
+    if fConfig.TiedEmbeddings and (fStackHead <> '') then
       EInferError.RaiseUtf8('%: a head tied to no embedding', [self]);
   end
   else
@@ -553,7 +553,9 @@ begin
   end;
   fNorm := Weight('model.norm.weight', [h]);
   head := Find('lm_head.weight');
-  if fConfig.TiedEmbeddings then
+  if (fStackPrefix <> '') and (fStackHead = '') then
+    // a stack without a head (CreateStack): no logits, the normed state only
+  else if fConfig.TiedEmbeddings then
   begin
     // a tied head may still be stored: only when it is the very same matrix
     if head <> nil then

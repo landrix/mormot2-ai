@@ -17,6 +17,7 @@ uses
   mormot.core.perf,
   mormot.core.test,
   mormot.ai.infer.tensor,
+  mormot.ai.infer.loader.safetensors,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.cuda,
@@ -108,7 +109,13 @@ type
     procedure EmbeddingRowsOnDevice;
     /// B14: the talker and the code predictor of Qwen3-TTS fed with rows on
     // the device against PyTorch (logits) - skipped without the model
+    // - D5e: the normed last row of the talker, and the predictor as a stack
+    // without a head, step by step, its 15 heads applied to the normed rows
     procedure Qwen3TtsOnDevice;
+    /// D5e: the normed last row of ForwardEmbeds (aNormed) on the device - with
+    // the last logits, with every row's, without logits, single steps, over
+    // two chunks, and from a stack without a head - against the CPU
+    procedure NormedRowOnDevice;
     /// B14: ForgetWeights - new weights at the address of forgotten ones are
     // served, other ranges kept; a freed model forgets its weights
     procedure ForgetWeightsServesNew;
@@ -2466,6 +2473,132 @@ begin
   end;
 end;
 
+procedure TTestInferCuda.NormedRowOnDevice;
+var
+  dir, sdir: TFileName;
+  ref: TInferRefSet;
+  gpu: TInferCudaBackend;
+  cpu: TInferCpuBackend;
+  model, headless: TQwen3Model;
+  dev, devh: TQwen3Cuda;
+  c, ch, cc: TQwen3Context;
+  ids: PIntegerArray;
+  n, h, vocab, i, step: PtrInt;
+  rows, last, all, normed, normed2, want: TSingleDynArray;
+  long: TIntegerDynArray;
+  seed: cardinal;
+  cmp: TInferCompare;
+  why: RawUtf8;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  sdir := dir + 'stack' + PathDelim;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  gpu := TInferCudaBackend.Create;
+  cpu := TInferCpuBackend.Create;
+  model := nil;
+  headless := nil;
+  dev := nil;
+  devh := nil;
+  c := nil;
+  ch := nil;
+  cc := nil;
+  try
+    model := TQwen3Model.Create(dir, cpu);
+    headless := TQwen3Model.CreateStack(sdir, cpu, 'outer_config', 'outer.model.',
+      '', '');
+    dev := TQwen3Cuda.Create(model, gpu);
+    devh := TQwen3Cuda.Create(headless, gpu);
+    dev.KvF16 := false; // against the CPU: the cache in floats
+    devh.KvF16 := false;
+    ids := ref.I32('case2.ids', n);
+    h := model.Config.Hidden;
+    vocab := model.Config.VocabSize;
+    SetLength(rows, n * h);
+    SetLength(last, vocab);
+    SetLength(all, n * vocab);
+    SetLength(normed, h);
+    SetLength(normed2, h);
+    SetLength(want, h);
+    model.Embed(ids, n, pointer(rows));
+    // the CPU: the normed last row
+    cc := model.NewContext;
+    model.ForwardEmbeds(cc, pointer(rows), n, nil, false, nil, pointer(want));
+    // with the logits of the last row: that row normed alone
+    c := dev.NewContext;
+    dev.ForwardEmbeds(c, pointer(rows), n, pointer(last), false, pointer(normed));
+    cmp := InferCompare(pointer(normed), pointer(want), h, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'with the last logits: %', [InferCompareText(cmp)]);
+    // with the logits of every row: all rows normed, the last one read
+    c.Reset;
+    dev.ForwardEmbeds(c, pointer(rows), n, pointer(all), true, pointer(normed2));
+    cmp := InferCompare(pointer(normed2), pointer(want), h, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'with every row''s logits: %', [InferCompareText(cmp)]);
+    cmp := InferCompare(@all[(n - 1) * vocab], pointer(last), vocab, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'the logits beside it: %', [InferCompareText(cmp)]);
+    // without logits: the bits of the first call
+    c.Reset;
+    FillCharFast(normed2[0], h * SizeOf(single), 0);
+    dev.ForwardEmbeds(c, pointer(rows), n, nil, false, pointer(normed2));
+    Check(CompareMem(pointer(normed), pointer(normed2), h * SizeOf(single)),
+      'without logits');
+    // single rows after it (a decode step, twice the same work)
+    for step := 0 to 1 do
+    begin
+      dev.ForwardEmbeds(c, @rows[step * h], 1, nil, false, pointer(normed2));
+      model.ForwardEmbeds(cc, @rows[step * h], 1, nil, false, nil, pointer(want));
+      cmp := InferCompare(pointer(normed2), pointer(want), h, 1e-3, 1e-3);
+      CheckUtf8(InferCompareOk(cmp), 'single step %: %', [step, InferCompareText(cmp)]);
+    end;
+    // a stack without a head, through TDecoderModel.ForwardEmbeds
+    ch := devh.NewContext;
+    FillCharFast(normed2[0], h * SizeOf(single), 0);
+    headless.ForwardEmbeds(ch, pointer(rows), n, nil, false, nil, pointer(normed2));
+    Check(CompareMem(pointer(normed), pointer(normed2), h * SizeOf(single)),
+      'a stack without a head');
+    why := '';
+    try
+      devh.ForwardEmbeds(ch, pointer(rows), 1, pointer(last));
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('no head', why) > 0, 'logits refused: %', [why]);
+    CheckEqual(ch.Length, n, 'the cache unchanged by the refused call');
+    // 300 rows over two chunks: the last row of the second
+    SetLength(long, 300);
+    seed := 13;
+    for i := 0 to high(long) do
+    begin
+      seed := seed * 1103515245 + 12345;
+      long[i] := 3 + (seed shr 16) mod 93;
+    end;
+    n := length(long);
+    SetLength(rows, n * h);
+    model.Embed(pointer(long), n, pointer(rows));
+    c.Reset;
+    cc.Reset;
+    dev.ForwardEmbeds(c, pointer(rows), n, nil, false, pointer(normed));
+    model.ForwardEmbeds(cc, pointer(rows), n, nil, false, nil, pointer(want));
+    cmp := InferCompare(pointer(normed), pointer(want), h, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), '300 rows over two chunks: %', [InferCompareText(cmp)]);
+  finally
+    cc.Free;
+    ch.Free;
+    c.Free;
+    devh.Free;
+    dev.Free;
+    headless.Free;
+    model.Free;
+    cpu.Free;
+    gpu.Free;
+    ref.Free;
+  end;
+end;
+
 procedure TTestInferCuda.Qwen3TtsOnDevice;
 var
   dir, refdir: TFileName;
@@ -2475,10 +2608,13 @@ var
   model: TQwen3Model;
   dev: TQwen3Cuda;
   ctx: TQwen3Context;
-  logits: TSingleDynArray;
+  logits, normed, head: TSingleDynArray;
   x: PSingleArray;
-  n, m, h, vocab: PtrInt;
+  n, m, h, vocab, g, l: PtrInt;
   cmp: TInferCompare;
+  st: TSafeTensorsFile;
+  t: PInferTensor;
+  codes: PIntegerArray;
 begin
   if not HasDevice then
     exit;
@@ -2503,6 +2639,7 @@ begin
   model := nil;
   dev := nil;
   ctx := nil;
+  st := nil;
   try
     // the talker: the last logits of its 22 rows
     model := NewTtsTalker(dir, cpu);
@@ -2512,9 +2649,14 @@ begin
     x := ref.F32('talker.embed', m);
     n := m div h;
     SetLength(logits, model.Config.VocabSize);
+    SetLength(normed, h);
     ctx := dev.NewContext;
-    dev.ForwardEmbeds(ctx, x, n, pointer(logits));
+    dev.ForwardEmbeds(ctx, x, n, pointer(logits), false, pointer(normed));
     FreeAndNil(ctx);
+    // the normed last row: the input of the code predictor
+    cmp := InferCompare(pointer(normed), @ref.F32('talker.norm', m)^[(n - 1) * h], h,
+      1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'talker normed row on %: %', [fCu.DeviceName, InferCompareText(cmp)]);
     cmp := InferCompare(pointer(logits), ref.F32('talker.logits_last', m), m, 1e-3, 1e-3);
     CheckUtf8(InferCompareOk(cmp), 'talker logits on %: %', [fCu.DeviceName,
       InferCompareText(cmp)]);
@@ -2537,7 +2679,45 @@ begin
       InferCompareText(cmp)]);
     CheckEqual(InferArgMax(@logits[vocab], vocab), ref.I32('predictor.codes', m)^[1],
       'the code of group 0');
+    FreeAndNil(dev);
+    FreeAndNil(model);
+    // the predictor without a head, as a speech model runs it: two rows, then
+    // one per step, head g applied by the caller to the normed row g + 1
+    model := TQwen3Model.CreateStack(dir, cpu, 'talker_config.code_predictor_config',
+      'talker.code_predictor.model.', '', '');
+    dev := TQwen3Cuda.Create(model, gpu);
+    dev.KvF16 := false;
+    st := TSafeTensorsFile.Create(dir + 'model.safetensors');
+    SetLength(head, vocab * h);
+    SetLength(logits, (n - 1) * vocab);
+    ctx := dev.NewContext;
+    for g := 0 to n - 2 do
+    begin
+      if g = 0 then
+        dev.ForwardEmbeds(ctx, x, 2, nil, false, pointer(normed))
+      else
+        dev.ForwardEmbeds(ctx, @x^[(g + 1) * h], 1, nil, false, pointer(normed));
+      t := st.Tensor(FormatUtf8('talker.code_predictor.lm_head.%.weight', [g]));
+      for l := 0 to vocab * h - 1 do // BF16 widened exactly
+        PCardinal(@head[l])^ := cardinal(PWordArray(t^.Data)^[l]) shl 16;
+      cpu.Linear(pointer(normed), 1, h, InferWeight(pointer(head), idtF32), vocab, nil,
+        @logits[g * vocab]);
+    end;
+    FreeAndNil(ctx);
+    cmp := InferCompare(pointer(logits), ref.F32('predictor.logits', m), (n - 1) * vocab,
+      1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'predictor steps without a head on %: %',
+      [fCu.DeviceName, InferCompareText(cmp)]);
+    AddConsole(FormatString('Qwen3-TTS predictor steps without a head on %: %',
+      [fCu.DeviceName, InferCompareText(cmp)]));
+    codes := ref.I32('predictor.codes', m);
+    m := 0;
+    for g := 0 to n - 2 do
+      if InferArgMax(@logits[g * vocab], vocab) = codes^[g + 1] then
+        inc(m);
+    CheckEqual(m, n - 1, 'the greedy codes of the reference, step by step');
   finally
+    st.Free;
     ctx.Free;
     dev.Free;
     model.Free;

@@ -44,6 +44,7 @@ type
     fFast: TInferCpuFastBackend;
     fNames: TRawUtf8DynArray;
     fStates: array of TSingleDynArray;
+    fItemThread: array of TThreadID; // the thread of each item of ThreadItem
     procedure Setup; override;
     procedure CheckArgMaxRandom;
     procedure CleanUp; override;
@@ -52,6 +53,8 @@ type
     // reference itself was less than 1 sure)
     procedure CheckGptOss20b(aModel: TDecoderModel; aRef: TInferRefSet;
       const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double);
+    /// one item of RunItems in LoadOnAllCores: 1 ms, its thread noted
+    procedure ThreadItem(aItem: integer);
     /// TOnQwen3State: copy every state, the model reuses its buffers
     procedure KeepState(const aName: RawUtf8; aValues: PSingleArray;
       aRows, aCols: PtrInt);
@@ -112,6 +115,10 @@ type
     /// the tiny Qwen3 from GGUF files: settings, matrices byte for byte like
     // ours, logits, F16 and an untied head, damaged files refused
     procedure TinyGguf;
+    /// D5e: the weights converted at load on the threads of the fast backend
+    // (Backend.RunItems) - byte for byte those of one thread, in F32, Q8_0 and
+    // Q4_0 and from an F16 GGUF; a NaN still refused by name
+    procedure LoadOnAllCores;
     /// Qwen's own Q8_0 GGUF of Qwen3-0.6B: every matrix our bytes, the Q8_0 gate
     procedure Qwen3Gguf;
     /// a Q4_K_M GGUF of Qwen3-0.6B (Q4_K and Q6_K matrices) against FP32
@@ -159,6 +166,8 @@ type
     /// B14: a decoder as one stack of a larger checkpoint (CreateStack) - the
     // settings from an object of config.json, the tensors under a prefix, its
     // own head, no embedding; the bits of the plain model; bad stacks refused
+    // - D5e: no head either - the normed last row (aNormed) only, logits
+    // refused before the cache changes
     procedure StackFromCheckpoint;
     /// B14: the talker and the code predictor of Qwen3-TTS-12Hz-0.6B-CustomVoice
     // fed with embedding rows, against PyTorch (flydev's qwen3-tts-lm
@@ -1435,6 +1444,107 @@ begin
     g.Free;
     exact.Free;
     ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.ThreadItem(aItem: integer);
+begin
+  fItemThread[aItem] := GetCurrentThreadId;
+  SleepHiRes(1);
+end;
+
+procedure TTestInferQwen3.LoadOnAllCores;
+var
+  dir, gdir, tmp: TFileName;
+  one, all: TQwen3Model;
+  w: TInferDType;
+  detail, why: RawUtf8;
+  st, bad: RawByteString;
+  hdr: variant;
+  pos, i: PtrInt;
+  others, missed: boolean;
+begin
+  dir := FindInferRefDir('tiny-qwen3');
+  gdir := FindInferRefDir('tiny-qwen3-gguf');
+  if CheckFailed((dir <> '') and (gdir <> ''), 'tiny-qwen3 and its GGUF found') then
+    exit;
+  if fFast.Threads < 2 then
+  begin
+    AddConsole('SKIP load on all cores: one thread only');
+    exit;
+  end;
+  // RunItems of the fast backend runs on its pool: 64 items of 1 ms cannot
+  // all stay on the calling thread; an entry 0 was not run
+  SetLength(fItemThread, 64);
+  FillCharFast(fItemThread[0], length(fItemThread) * SizeOf(fItemThread[0]), 0);
+  fFast.RunItems(ThreadItem, length(fItemThread));
+  others := false;
+  missed := false;
+  for i := 0 to high(fItemThread) do
+    if fItemThread[i] = 0 then
+      missed := true
+    else if fItemThread[i] <> GetCurrentThreadId then
+      others := true;
+  Check(not missed and others, 'every item run, some on the pool');
+  // the base class: in order, on this thread
+  FillCharFast(fItemThread[0], length(fItemThread) * SizeOf(fItemThread[0]), 0);
+  fCpu.RunItems(ThreadItem, length(fItemThread));
+  others := false;
+  for i := 0 to high(fItemThread) do
+    if fItemThread[i] <> GetCurrentThreadId then
+      others := true;
+  Check(not others, 'RunItems of the reference backend on this thread');
+  one := nil;
+  all := nil;
+  tmp := '';
+  try
+    // BF16 widened (embedding rows of 4096 values per item and a rest),
+    // Q8_0 and Q4_0 quantized row by row on the pool
+    for w := low(w) to high(w) do
+      if w in [idtF32, idtQ8_0, idtQ4_0] then
+      begin
+        one := TQwen3Model.Create(dir, fCpu, w);
+        all := TQwen3Model.Create(dir, fFast, w);
+        CheckUtf8(SameMatrices(one, all, detail), '% on all cores: %',
+          [INFER_DTYPE_NAME[w], detail]);
+        FreeAndNil(all);
+        FreeAndNil(one);
+      end;
+    // F16 matrices of a GGUF file widened on the pool
+    one := TQwen3Model.CreateFromGguf(gdir + 'untied-f16.gguf', fCpu);
+    all := TQwen3Model.CreateFromGguf(gdir + 'untied-f16.gguf', fFast);
+    CheckUtf8(SameMatrices(one, all, detail), 'F16 GGUF on all cores: %', [detail]);
+    FreeAndNil(all);
+    FreeAndNil(one);
+    // a NaN in the last row of a matrix: refused by name from the pool too
+    tmp := MakePath([GetSystemPath(spTemp), 'lai-cores-' +
+      Int64ToUtf8(GetTickCount64)], true);
+    ForceDirectories(tmp);
+    CopyFile(dir + 'config.json', tmp + 'config.json', false);
+    st := StringFromFile(dir + 'model.safetensors');
+    hdr := _JsonFast(copy(st, 9, PInteger(st)^));
+    pos := 8 + PInteger(st)^ + _Safe(hdr)^.O['model.layers.1.mlp.up_proj.weight']^.
+      A['data_offsets']^.Values[1] - 2;
+    FastSetRawByteString(bad, pointer(st), length(st));
+    PWord(@PByteArray(bad)^[pos])^ := $7fc0; // BF16 quiet NaN
+    FileFromString(bad, tmp + 'model.safetensors');
+    why := '';
+    try
+      TQwen3Model.Create(tmp, fFast, idtQ8_0).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('model.layers.1.mlp.up_proj.weight has a NaN or infinite weight ' +
+      'at row 159 column 63', why) > 0, 'a NaN refused on the pool: %', [why]);
+  finally
+    all.Free;
+    one.Free;
+    if tmp <> '' then
+    begin
+      DirectoryDeleteAll(tmp);
+      RemoveDir(tmp);
+    end;
   end;
 end;
 
@@ -2993,11 +3103,11 @@ procedure TTestInferQwen3.StackFromCheckpoint;
 var
   dir, sdir: TFileName;
   ref: TInferRefSet;
-  plain, stack, inner, rowsOnly: TQwen3Model;
+  plain, stack, inner, rowsOnly, headless: TQwen3Model;
   ctx: TQwen3Context;
   ids: PIntegerArray;
   n, h, vocab: PtrInt;
-  want, mine, rows: TSingleDynArray;
+  want, mine, rows, normed, normed2: TSingleDynArray;
   why: RawUtf8;
 begin
   dir := FindInferRefDir('tiny-qwen3');
@@ -3009,6 +3119,7 @@ begin
   stack := nil;
   inner := nil;
   rowsOnly := nil;
+  headless := nil;
   ctx := nil;
   try
     plain := TQwen3Model.Create(dir, fCpu);
@@ -3057,6 +3168,46 @@ begin
     end;
     CheckUtf8(PosEx('no token embedding', why) > 0, 'ids refused: %', [why]);
     FreeAndNil(ctx);
+    // the normed last row: the 'norm' state of that row, with the logits
+    // or without them
+    SetLength(normed, h);
+    SetLength(normed2, h);
+    fNames := nil;
+    fStates := nil;
+    ctx := rowsOnly.NewContext;
+    rowsOnly.ForwardEmbeds(ctx, pointer(rows), n, pointer(mine), false, KeepState,
+      pointer(normed));
+    FreeAndNil(ctx);
+    Check(CompareMem(pointer(normed), @State('norm')^[(n - 1) * h], h * SizeOf(single)),
+      'aNormed is the normed last row');
+    Check(CompareMem(pointer(mine), @want[(n - 1) * vocab], vocab * SizeOf(single)),
+      'the logits unchanged by aNormed');
+    ctx := rowsOnly.NewContext;
+    rowsOnly.ForwardEmbeds(ctx, pointer(rows), n, nil, false, nil, pointer(normed2));
+    FreeAndNil(ctx);
+    Check(CompareMem(pointer(normed), pointer(normed2), h * SizeOf(single)),
+      'aNormed without logits');
+    // no head either: the normed row only, logits refused before the cache
+    // changes
+    headless := TQwen3Model.CreateStack(sdir, fCpu, 'outer_config', 'outer.model.',
+      '', '');
+    Check(rowsOnly.HasHead and not headless.HasHead and not headless.HasEmbedding,
+      'a stack without a head');
+    ctx := headless.NewContext;
+    FillCharFast(normed2[0], h * SizeOf(single), 0);
+    headless.ForwardEmbeds(ctx, pointer(rows), n, nil, false, nil, pointer(normed2));
+    Check(CompareMem(pointer(normed), pointer(normed2), h * SizeOf(single)),
+      'the normed row without a head');
+    why := '';
+    try
+      headless.ForwardEmbeds(ctx, pointer(rows), 1, pointer(mine));
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('no head', why) > 0, 'logits refused: %', [why]);
+    CheckEqual(ctx.Length, n, 'the cache unchanged by the refused call');
+    FreeAndNil(ctx);
     // refused: a tensor the family has not under the layers, a multimodal
     // RoPE whose sections miss a frequency, a scaled RoPE, a missing object,
     // a missing head, no prefix
@@ -3087,6 +3238,7 @@ begin
     CheckUtf8(PosEx('model_type', why) > 0, 'the checkpoint is no qwen3: %', [why]);
   finally
     ctx.Free;
+    headless.Free;
     rowsOnly.Free;
     inner.Free;
     stack.Free;

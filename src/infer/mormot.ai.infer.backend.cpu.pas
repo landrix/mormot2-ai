@@ -248,6 +248,8 @@ type
       aAlpha: single = 1; aLimit: single = 0); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray); override;
+    /// the items on the pool, unless it is busy with another caller
+    procedure RunItems(const aJob: TOnInferItem; aCount: integer); override;
     /// the threads computing, the calling one included
     property Threads: integer
       read fThreads;
@@ -1716,6 +1718,19 @@ begin
       aJob(i)
   else
     fPool.Run(aJob, aCount);
+end;
+
+procedure TInferCpuFastBackend.RunItems(const aJob: TOnInferItem;
+  aCount: integer);
+begin
+  if (aCount > 1) and (fPool <> nil) and fBusy.TryLock then
+  try
+    fPool.Run(aJob, aCount);
+  finally
+    fBusy.UnLock;
+  end
+  else
+    inherited RunItems(aJob, aCount);
 end;
 
 procedure LinearQuantizeRow(const aJob: TInferLinearJob; aRow: PtrInt);

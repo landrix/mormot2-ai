@@ -142,12 +142,15 @@ type
     function Vector(v: PSingleArray; aCount: PtrInt): TCuDevicePtr;
     function ChunkRows(aPast, aCount: PtrInt; aAllLogits: boolean): PtrInt;
     procedure Prepare(aCtx: TQwen3CuContext; aTokens, aRows, aOutRows: PtrInt);
-    /// aCount rows of aIds or of aEmbeds (the other one nil) in one pass
+    /// aCount rows of aIds or of aEmbeds (the other one nil) in one pass;
+    // aNormed <> nil receives the normed last row
     procedure Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray; aEmbeds: PSingleArray;
-      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+      aNormed: PSingleArray);
     /// Forward of aIds or of aEmbeds (the other one nil), chunk by chunk
     procedure ForwardRows(aCtx: TQwen3Context; aIds: PIntegerArray; aEmbeds: PSingleArray;
-      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+      aNormed: PSingleArray);
     procedure EnqueueNorm(x: TInferCuBuffer; aRows, aCols: PtrInt;
       w: PSingleArray; y: TInferCuBuffer);
     procedure EnqueueAddNorm(x, t: TInferCuBuffer; aRows, aCols: PtrInt;
@@ -175,9 +178,11 @@ type
     procedure Forward(aCtx: TQwen3Context; aIds: PIntegerArray; aCount: PtrInt;
       aLogits: PSingleArray; aAllLogits: boolean = false); override;
     /// TQwen3Model.ForwardEmbeds on the device: aCount embedding rows
-    // ([aCount, Hidden] floats) in place of the embeddings of ids, as Forward
+    // ([aCount, Hidden] floats) in place of the embeddings of ids, as Forward;
+    // aNormed <> nil receives the last row after the final norm ([Hidden])
     procedure ForwardEmbeds(aCtx: TQwen3Context; aEmbeds: PSingleArray;
-      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false); override;
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false;
+      aNormed: PSingleArray = nil); override;
     /// keep the cached tokens of aCtx that start aIds, at most aCount - 1
     function Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
       aCount: PtrInt): PtrInt; override;
@@ -520,7 +525,8 @@ begin
       Vector(ly^.ExpertDownBias, c.Experts * c.Hidden);
   end;
   Vector(fModel.FinalNorm, c.Hidden);
-  Matrix(fModel.Head, c.VocabSize, c.Hidden);
+  if fModel.HasHead then // a stack without one: the normed state only
+    Matrix(fModel.Head, c.VocabSize, c.Hidden);
   fEpoch := fBackend.WeightEpoch;
 end;
 
@@ -880,11 +886,12 @@ begin
 end;
 
 procedure TQwen3Cuda.Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray;
-  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+  aNormed: PSingleArray);
 var
   c: TQwen3Config;
   n, h, f, qw, kvw, half, past, l, outRows, hb, rb, blocks, splits, most,
-    wsplits: PtrInt;
+    wsplits, last: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
   pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt, psk: TCuDevicePtr;
@@ -1069,18 +1076,23 @@ begin
           (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
       end;
     end;
-    if outRows > 0 then
+    last := 0;
+    if (outRows > 0) or (aNormed <> nil) then
     begin
-      if outRows = 1 then
+      if outRows <= 1 then
       begin
         // the last row only: to the start of the scratch, its norm, the head
         aCtx.fDevX.CopyTo(Int64(n - 1) * h * 4, aCtx.fDevTmp, 0, Int64(h) * 4);
         EnqueueNorm(aCtx.fDevTmp, 1, h, fModel.FinalNorm, aCtx.fDevH);
       end
       else
+      begin
         EnqueueNorm(aCtx.fDevX, n, h, fModel.FinalNorm, aCtx.fDevH);
-      fBackend.EnqueueLinear(aCtx.fDevH, outRows, h, fModel.Head, c.VocabSize,
-        aCtx.fLogits);
+        last := n - 1;
+      end;
+      if outRows > 0 then
+        fBackend.EnqueueLinear(aCtx.fDevH, outRows, h, fModel.Head, c.VocabSize,
+          aCtx.fLogits);
     end;
     if capture then
       fCu.CaptureEnd(aCtx.fGraph);
@@ -1090,8 +1102,10 @@ begin
   end;
   // waits for every kernel before it (one stream)
   if outRows > 0 then
-    aCtx.fLogits.Download(0, aLogits, Int64(outRows) * c.VocabSize * 4)
-  else
+    aCtx.fLogits.Download(0, aLogits, Int64(outRows) * c.VocabSize * 4);
+  if aNormed <> nil then
+    aCtx.fDevH.Download(Int64(last) * h * 4, aNormed, Int64(h) * 4);
+  if (outRows = 0) and (aNormed = nil) then
     fCu.Synchronize;
   if aIds <> nil then
     MoveFast(aIds^[0], aCtx.fIds[past], n * SizeOf(integer))
@@ -1101,12 +1115,13 @@ begin
 end;
 
 procedure TQwen3Cuda.ForwardRows(aCtx: TQwen3Context; aIds: PIntegerArray;
-  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+  aNormed: PSingleArray);
 var
   i, n, done, vocab, h: PtrInt;
   last: boolean;
   ids: PIntegerArray;
-  embeds: PSingleArray;
+  embeds, normed: PSingleArray;
   ctx: TQwen3CuContext;
 begin
   if (aCtx = nil) or (aCtx.Device <> self) then
@@ -1117,6 +1132,9 @@ begin
   if aCount > fModel.Config.MaxPositions - ctx.fLength then
     EInferError.RaiseUtf8('%.Forward: % + % tokens exceed the % positions',
       [self, ctx.fLength, aCount, fModel.Config.MaxPositions]);
+  if (aLogits <> nil) and not fModel.HasHead then
+    EInferError.RaiseUtf8('%.Forward: no head for logits (the normed state only)',
+      [self]);
   vocab := fModel.Config.VocabSize;
   h := fModel.Config.Hidden;
   if aIds <> nil then
@@ -1140,12 +1158,15 @@ begin
         ids := @aIds^[done]
       else
         embeds := @aEmbeds^[done * h];
+      normed := nil;
+      if last then
+        normed := aNormed;
       if aAllLogits and (aLogits <> nil) then
-        Chunk(ctx, ids, embeds, n, @aLogits^[done * vocab], true)
+        Chunk(ctx, ids, embeds, n, @aLogits^[done * vocab], true, normed)
       else if last then
-        Chunk(ctx, ids, embeds, n, aLogits, false)
+        Chunk(ctx, ids, embeds, n, aLogits, false, normed)
       else
-        Chunk(ctx, ids, embeds, n, nil, false);
+        Chunk(ctx, ids, embeds, n, nil, false, nil);
       inc(done, n);
     end;
   finally
@@ -1160,15 +1181,15 @@ begin
     EInferError.RaiseUtf8('%.Forward: no ids', [self]);
   if not fModel.HasEmbedding then
     EInferError.RaiseUtf8('%.Forward: no token embedding (ForwardEmbeds only)', [self]);
-  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits);
+  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits, nil);
 end;
 
 procedure TQwen3Cuda.ForwardEmbeds(aCtx: TQwen3Context; aEmbeds: PSingleArray;
-  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean; aNormed: PSingleArray);
 begin
   if (aEmbeds = nil) and (aCount > 0) then
     EInferError.RaiseUtf8('%.ForwardEmbeds: no rows', [self]);
-  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits);
+  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits, aNormed);
 end;
 
 function TQwen3Cuda.Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;

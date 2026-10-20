@@ -153,13 +153,19 @@ type
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TInferVkBuffer;
     function ChunkRows(aCount: PtrInt; aAllLogits: boolean): PtrInt;
-    procedure Prepare(aCtx: TQwen3VkContext; aTokens, aRows, aOutRows: PtrInt);
-    /// aCount rows of aIds or of aEmbeds (the other one nil) in one pass
+    /// the buffers of a chunk: aOutRows rows of logits, aNormed the normed
+    // last row read back too
+    procedure Prepare(aCtx: TQwen3VkContext; aTokens, aRows, aOutRows: PtrInt;
+      aNormed: boolean);
+    /// aCount rows of aIds or of aEmbeds (the other one nil) in one pass;
+    // aNormed <> nil receives the normed last row
     procedure Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray; aEmbeds: PSingleArray;
-      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+      aNormed: PSingleArray);
     /// Forward of aIds or of aEmbeds (the other one nil), chunk by chunk
     procedure ForwardRows(aCtx: TQwen3Context; aIds: PIntegerArray; aEmbeds: PSingleArray;
-      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+      aNormed: PSingleArray);
     procedure RecordNorm(x: TInferVkBuffer; aRows, aCols: PtrInt;
       w: PSingleArray; y: TInferVkBuffer);
     procedure RecordElementwise(aPipeline: TInferVkPipeline;
@@ -200,9 +206,11 @@ type
     procedure Forward(aCtx: TQwen3Context; aIds: PIntegerArray; aCount: PtrInt;
       aLogits: PSingleArray; aAllLogits: boolean = false); override;
     /// TQwen3Model.ForwardEmbeds on the device: aCount embedding rows
-    // ([aCount, Hidden] floats) in place of the embeddings of ids, as Forward
+    // ([aCount, Hidden] floats) in place of the embeddings of ids, as Forward;
+    // aNormed <> nil receives the last row after the final norm ([Hidden])
     procedure ForwardEmbeds(aCtx: TQwen3Context; aEmbeds: PSingleArray;
-      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false); override;
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false;
+      aNormed: PSingleArray = nil); override;
     /// keep the cached tokens of aCtx that start aIds, at most aCount - 1
     function Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
       aCount: PtrInt): PtrInt; override;
@@ -762,7 +770,10 @@ begin
   end;
   Vector(fModel.FinalNorm, c.Hidden);
   // the head: 165 MB in Qwen3-0.6B Q8_0, more than some GPUs bind at once
-  fHeadPart := Matrix(fModel.Head, c.VocabSize, c.Hidden, true);
+  // (a stack without one: the normed state only)
+  fHeadPart := c.VocabSize;
+  if fModel.HasHead then
+    fHeadPart := Matrix(fModel.Head, c.VocabSize, c.Hidden, true);
   fEpoch := fBackend.WeightEpoch;
 end;
 
@@ -807,10 +818,11 @@ begin
 end;
 
 procedure TQwen3Vulkan.Prepare(aCtx: TQwen3VkContext; aTokens, aRows,
-  aOutRows: PtrInt);
+  aOutRows: PtrInt; aNormed: boolean);
 var
   c: TQwen3Config;
   cap, kvw, l, half, es: PtrInt;
+  back: Int64;
   keys, values: TInferVkBufferDynArray;
 begin
   c := fModel.Config;
@@ -933,11 +945,15 @@ begin
     NeedDevice(fVk, aCtx.fLogits, Int64(aOutRows) * c.VocabSize * 4);
     if fHeadPart < c.VocabSize then
       NeedDevice(fVk, aCtx.fHeadTemp, Int64(aOutRows) * fHeadPart * 4);
-    if (aCtx.fOut = nil) or (aCtx.fOut.Size < Int64(aOutRows) * c.VocabSize * 4) then
-    begin
-      FreeAndNil(aCtx.fOut);
-      aCtx.fOut := TInferVkBuffer.CreateReadback(fVk, Int64(aOutRows) * c.VocabSize * 4);
-    end;
+  end;
+  // read back: the logits, then the normed row
+  back := Int64(aOutRows) * c.VocabSize * 4;
+  if aNormed then
+    inc(back, Int64(c.Hidden) * 4);
+  if (back > 0) and ((aCtx.fOut = nil) or (aCtx.fOut.Size < back)) then
+  begin
+    FreeAndNil(aCtx.fOut);
+    aCtx.fOut := TInferVkBuffer.CreateReadback(fVk, back);
   end;
 end;
 
@@ -1160,11 +1176,12 @@ begin
 end;
 
 procedure TQwen3Vulkan.Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray;
-  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+  aNormed: PSingleArray);
 var
   c: TQwen3Config;
   n, h, f, qw, kvw, half, past, l, outRows, splits, most, hb, rb, blocks,
-    queries, wsplits, whb: PtrInt;
+    queries, wsplits, whb, last: PtrInt;
   attention, qkrope, wattention, layerAtt: TInferVkPipeline;
   qn, kn: TInferVkBuffer;
   ly: ^TQwen3Layer;
@@ -1190,7 +1207,7 @@ begin
       outRows := n
     else
       outRows := 1;
-  Prepare(aCtx, past + n, n, outRows);
+  Prepare(aCtx, past + n, n, outRows, aNormed <> nil);
   // the attention work groups: hb heads of one KV head (hb divides the
   // group) times rb rows, the keys of a row cut into splits ranges unless
   // there are enough work groups without
@@ -1394,23 +1411,33 @@ begin
       if (l = 0) or (l and 3 = 3) then
         fVk.BatchFlush;
     end;
-    if outRows > 0 then
+    if (outRows > 0) or (aNormed <> nil) then
     begin
       // the norm, then one dispatch per part of the head (the copies take no
       // descriptor set)
       NeedRoom((c.VocabSize + fHeadPart - 1) div fHeadPart + 4);
-      if outRows = 1 then
+      if outRows <= 1 then
       begin
         // the last row only: to the start of the scratch, its norm, the head
         fVk.BatchCopy(aCtx.fDevX, Int64(n - 1) * h * 4, aCtx.fDevTmp, 0, Int64(h) * 4);
         RecordNorm(aCtx.fDevTmp, 1, h, fModel.FinalNorm, aCtx.fDevH);
+        last := 0;
       end
       else
+      begin
         RecordNorm(aCtx.fDevX, n, h, fModel.FinalNorm, aCtx.fDevH);
-      fBackend.RecordLinear(aCtx.fDevH, outRows, h, fModel.Head, c.VocabSize,
-        aCtx.fLogits, true, aCtx.fHeadTemp);
-      fVk.BatchCopy(aCtx.fLogits, 0, aCtx.fOut, 0,
-        Int64(outRows) * c.VocabSize * 4);
+        last := n - 1;
+      end;
+      if outRows > 0 then
+      begin
+        fBackend.RecordLinear(aCtx.fDevH, outRows, h, fModel.Head, c.VocabSize,
+          aCtx.fLogits, true, aCtx.fHeadTemp);
+        fVk.BatchCopy(aCtx.fLogits, 0, aCtx.fOut, 0,
+          Int64(outRows) * c.VocabSize * 4);
+      end;
+      if aNormed <> nil then
+        fVk.BatchCopy(aCtx.fDevH, Int64(last) * h * 4, aCtx.fOut,
+          Int64(outRows) * c.VocabSize * 4, Int64(h) * 4);
     end;
   except
     fVk.BatchAbort;
@@ -1419,6 +1446,9 @@ begin
   fVk.BatchSubmit;
   if outRows > 0 then
     MoveFast(aCtx.fOut.Mapped^, aLogits^, outRows * c.VocabSize * SizeOf(single));
+  if aNormed <> nil then
+    MoveFast(PSingleArray(aCtx.fOut.Mapped)^[outRows * c.VocabSize], aNormed^[0],
+      h * SizeOf(single));
   if aIds <> nil then
     MoveFast(aIds^[0], aCtx.fIds[past], n * SizeOf(integer))
   else
@@ -1427,12 +1457,13 @@ begin
 end;
 
 procedure TQwen3Vulkan.ForwardRows(aCtx: TQwen3Context; aIds: PIntegerArray;
-  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
+  aNormed: PSingleArray);
 var
   i, n, done, vocab, h: PtrInt;
   last: boolean;
   ids: PIntegerArray;
-  embeds: PSingleArray;
+  embeds, normed: PSingleArray;
   ctx: TQwen3VkContext;
 begin
   if (aCtx = nil) or (aCtx.Device <> self) then
@@ -1443,6 +1474,9 @@ begin
   if aCount > fModel.Config.MaxPositions - ctx.fLength then
     EInferError.RaiseUtf8('%.Forward: % + % tokens exceed the % positions',
       [self, ctx.fLength, aCount, fModel.Config.MaxPositions]);
+  if (aLogits <> nil) and not fModel.HasHead then
+    EInferError.RaiseUtf8('%.Forward: no head for logits (the normed state only)',
+      [self]);
   vocab := fModel.Config.VocabSize;
   h := fModel.Config.Hidden;
   if aIds <> nil then
@@ -1466,12 +1500,15 @@ begin
         ids := @aIds^[done]
       else
         embeds := @aEmbeds^[done * h];
+      normed := nil;
+      if last then
+        normed := aNormed;
       if aAllLogits and (aLogits <> nil) then
-        Chunk(ctx, ids, embeds, n, @aLogits^[done * vocab], true)
+        Chunk(ctx, ids, embeds, n, @aLogits^[done * vocab], true, normed)
       else if last then
-        Chunk(ctx, ids, embeds, n, aLogits, false)
+        Chunk(ctx, ids, embeds, n, aLogits, false, normed)
       else
-        Chunk(ctx, ids, embeds, n, nil, false);
+        Chunk(ctx, ids, embeds, n, nil, false, nil);
       inc(done, n);
     end;
   finally
@@ -1486,15 +1523,15 @@ begin
     EInferError.RaiseUtf8('%.Forward: no ids', [self]);
   if not fModel.HasEmbedding then
     EInferError.RaiseUtf8('%.Forward: no token embedding (ForwardEmbeds only)', [self]);
-  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits);
+  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits, nil);
 end;
 
 procedure TQwen3Vulkan.ForwardEmbeds(aCtx: TQwen3Context; aEmbeds: PSingleArray;
-  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean; aNormed: PSingleArray);
 begin
   if (aEmbeds = nil) and (aCount > 0) then
     EInferError.RaiseUtf8('%.ForwardEmbeds: no rows', [self]);
-  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits);
+  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits, aNormed);
 end;
 
 function TQwen3Vulkan.Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;

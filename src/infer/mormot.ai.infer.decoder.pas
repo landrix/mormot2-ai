@@ -36,8 +36,9 @@
 //   blocks used in place
 // - a decoder may also be one stack of a larger checkpoint (CreateStack: its
 //   settings from an object inside config.json, its tensors under a prefix,
-//   its own embedding and head or none), and take embedding rows instead of
-//   token ids (ForwardEmbeds) - the language model of a speech, vision or
+//   its own embedding and head or none of either), and take embedding rows
+//   instead of token ids (ForwardEmbeds, which also hands back the normed last
+//   row, on a device too) - the language model of a speech, vision or
 //   audio model; a model forgets its weights on a GPU backend when it is
 //   freed (TInferBackend.ForgetWeights)
 // - arithmetic: matrix products through the backend; norms, rotary positions
@@ -351,6 +352,18 @@ type
     fLayer: TDecoderLayerDynArray;
     fInvFreq: TSingleDynArray;
     fRopeScale: single; // YaRN: the factor of cos and sin (1 without)
+    // the conversion running on Backend.RunItems (ConvertRows, WidenTensor)
+    fCvSrc: pointer;
+    fCvSrcType, fCvType: TInferDType;
+    fCvCols, fCvOwned, fCvCount: PtrInt;
+    fCvDest: PSingleArray;
+    fCvName: RawUtf8;
+    procedure ConvertItem(aItem: integer);
+    procedure WidenItem(aItem: integer);
+    /// the aRows rows of aSrc (aCols values of aSrcType each) quantized into
+    // the owned matrix aOwned of aType, the rows on the backend's threads
+    procedure ConvertRows(aSrc: pointer; aSrcType: TInferDType; aRows, aCols: PtrInt;
+      aType: TInferDType; aOwned: PtrInt; const aName: RawUtf8);
     procedure Init(aBackend: TInferBackend);
     /// read config.json into aDoc and return the object of the settings:
     // aDoc itself (its model_type checked against ModelType), or for a stack
@@ -365,7 +378,7 @@ type
     /// Forward of aIds or of aEmbeds (the other one nil)
     procedure ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
       aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
-      aAllLogits: boolean; const aOnState: TOnDecoderState);
+      aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
     /// fConfig from a Hugging Face config.json - raises EInferError for a
     // setting the family does not support; ends with CheckConfig
     procedure LoadConfig(const aConfigFile: TFileName); virtual; abstract;
@@ -405,11 +418,12 @@ type
     // does (aSrc left as it is, for the next matrix)
     function MatrixOf(var aSrc: TSingleDynArray; aRows, aCols: Int64;
       aType: TInferDType; const aName: RawUtf8): TInferWeight;
-    /// row aRow of aSrc (aCols F32 values) quantized into block aFirst.. of
-    // the owned matrix aOwned of aType - raises for a NaN, an infinity or a
-    // weight beyond the range
-    procedure QuantizeRow(aSrc: PSingleArray; aCols: PtrInt; aType: TInferDType;
-      aOwned, aRow: PtrInt; const aName: RawUtf8);
+    /// row aRow of aSrc (rows of aCols values of aSrcType) quantized into the
+    // blocks of that row of the owned matrix aOwned of aType, one block of 32
+    // after the other - raises for a NaN, an infinity or a weight beyond the
+    // range
+    procedure QuantizeRow(aSrc: pointer; aSrcType: TInferDType; aCols: PtrInt;
+      aType: TInferDType; aOwned, aRow: PtrInt; const aName: RawUtf8);
     /// raise unless every FP16 scale of the blocks of aTensor is finite
     procedure CheckBlockScales(aTensor: PInferTensor; const aName: RawUtf8);
     procedure Grow(aCtx: TDecoderContext; aTokens, aNew: PtrInt);
@@ -459,7 +473,9 @@ type
     // <aFolder>model.safetensors with aPrefix in place of "model." (e.g.
     // 'talker.model.'), the token embedding aEmbedding ('' = none: such a
     // model takes embedding rows only, ForwardEmbeds) and the head aHead
-    // (full tensor names, [VocabSize, Hidden] each)
+    // ('' = none: such a model gives no logits, only the normed state of
+    // ForwardEmbeds - for a stack whose caller applies a head per step) - full
+    // tensor names, [VocabSize, Hidden] each
     // - the other tensors of the file are left alone; every tensor under
     // aPrefix + 'layers.' must be understood
     // - aWeights as Create
@@ -496,12 +512,19 @@ type
     // aEmbeds at once
     // - a loop that feeds floats back (a speech model's talker) adds up
     // rounding: on a GPU device, keep its KV cache in floats (KvF16 false)
+    // - aNormed <> nil receives the last row after the final RMSNorm
+    // ([Hidden]): what the head multiplies, for a model that feeds it on
+    // (a talker's code predictor) or applies a head of its own - on a device
+    // too, and with aLogits nil also without a head
     procedure ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
       aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false;
-      const aOnState: TOnDecoderState = nil);
+      const aOnState: TOnDecoderState = nil; aNormed: PSingleArray = nil);
     /// true when the model has a token embedding: Forward, Embed and Greedy
     // need one (a stack without one takes ForwardEmbeds only)
     function HasEmbedding: boolean;
+    /// true when the model has a head: logits need one (a stack without one
+    // gives the normed state of ForwardEmbeds only)
+    function HasHead: boolean;
     /// keep the cached tokens of aCtx that start aIds[0..aCount-1], forget the
     // others, and return how many stayed: the rest of aIds is to be computed
     // - at most aCount - 1 stay, so a Forward of the rest has a token to give
@@ -591,7 +614,8 @@ type
     /// TDecoderModel.ForwardEmbeds for a context of this device (no states)
     // - raises EInferError here: a device that takes embedding rows overrides it
     procedure ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
-      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false); virtual;
+      aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false;
+      aNormed: PSingleArray = nil); virtual;
     /// TDecoderModel.Reuse for a context of this device
     function Reuse(aCtx: TDecoderContext; aIds: PIntegerArray;
       aCount: PtrInt): PtrInt; virtual; abstract;
@@ -742,13 +766,19 @@ end;
 { TDecoderDevice }
 
 procedure TDecoderDevice.ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
-  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean);
+  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean; aNormed: PSingleArray);
 begin
   EInferError.RaiseUtf8('%.ForwardEmbeds: embedding rows not supported', [self]);
 end;
 
 
 { TDecoderModel }
+
+const
+  /// the values WidenTensor converts per item of RunItems: small enough
+  // that the tiny test models take several (and a rest), large enough that
+  // claiming an item costs nothing next to it
+  WIDEN_ITEM = 1 shl 12;
 
 var
   /// the last model serial handed out (0 = none, an empty context's owner)
@@ -805,9 +835,9 @@ constructor TDecoderModel.CreateStack(const aFolder: TFileName;
   aBackend: TInferBackend; const aConfigPath, aPrefix, aEmbedding,
   aHead: RawUtf8; aWeights: TInferDType);
 begin
-  if (aConfigPath = '') or (aPrefix = '') or (aHead = '') then
-    EInferError.RaiseUtf8('%.CreateStack: a config path, a prefix and a head ' +
-      'are needed', [self]);
+  if (aConfigPath = '') or (aPrefix = '') then
+    EInferError.RaiseUtf8('%.CreateStack: a config path and a prefix are needed',
+      [self]);
   fStackConfig := aConfigPath;
   fStackPrefix := aPrefix;
   fStackEmbed := aEmbedding;
@@ -912,6 +942,11 @@ end;
 function TDecoderModel.HasEmbedding: boolean;
 begin
   result := fEmbedSrc <> nil;
+end;
+
+function TDecoderModel.HasHead: boolean;
+begin
+  result := fHead.Data <> nil;
 end;
 
 procedure TDecoderModel.CheckConfig(const aSource: TFileName);
@@ -1179,8 +1214,26 @@ begin
   n := length(fOwned);
   SetLength(fOwned, n + 1);
   SetLength(fOwned[n], t^.Count);
-  InferRowToF32(t^.Data, t^.DType, 0, t^.Count, pointer(fOwned[n]));
   result := pointer(fOwned[n]);
+  // in pieces of WIDEN_ITEM values on the backend's threads
+  fCvSrc := t^.Data;
+  fCvSrcType := t^.DType;
+  fCvCount := t^.Count;
+  fCvDest := result;
+  fBackend.RunItems(WidenItem, (t^.Count + WIDEN_ITEM - 1) div WIDEN_ITEM);
+end;
+
+procedure TDecoderModel.WidenItem(aItem: integer);
+var
+  first, n: PtrInt;
+begin
+  first := PtrInt(aItem) * WIDEN_ITEM;
+  n := fCvCount - first;
+  if n > WIDEN_ITEM then
+    n := WIDEN_ITEM;
+  // the types widened here (BF16, F16) hold one value per element
+  InferRowToF32(@PByteArray(fCvSrc)^[first * INFER_DTYPE_SIZE[fCvSrcType]],
+    fCvSrcType, 0, n, @fCvDest^[first]);
 end;
 
 function TDecoderModel.Own(var aValues: TSingleDynArray): PSingleArray;
@@ -1207,7 +1260,7 @@ end;
 function TDecoderModel.MatrixOf(var aSrc: TSingleDynArray; aRows, aCols: Int64;
   aType: TInferDType; const aName: RawUtf8): TInferWeight;
 var
-  r, n: PtrInt;
+  n: PtrInt;
 begin
   if Int64(length(aSrc)) <> aRows * aCols then
     EInferError.RaiseUtf8('%: % has % values for [%,%]',
@@ -1220,8 +1273,7 @@ begin
         n := length(fOwnedQ8);
         SetLength(fOwnedQ8, n + 1);
         SetLength(fOwnedQ8[n], aRows * (aCols shr 5));
-        for r := 0 to aRows - 1 do
-          QuantizeRow(@aSrc[r * aCols], aCols, aType, n, r, aName);
+        ConvertRows(pointer(aSrc), idtF32, aRows, aCols, aType, n, aName);
         result := InferWeight(pointer(fOwnedQ8[n]), idtQ8_0);
       end;
     idtQ4_0:
@@ -1229,8 +1281,7 @@ begin
         n := length(fOwnedQ4);
         SetLength(fOwnedQ4, n + 1);
         SetLength(fOwnedQ4[n], aRows * (aCols shr 5));
-        for r := 0 to aRows - 1 do
-          QuantizeRow(@aSrc[r * aCols], aCols, aType, n, r, aName);
+        ConvertRows(pointer(aSrc), idtF32, aRows, aCols, aType, n, aName);
         result := InferWeight(pointer(fOwnedQ4[n]), idtQ4_0);
       end;
   else
@@ -1239,34 +1290,61 @@ begin
   end;
 end;
 
-procedure TDecoderModel.QuantizeRow(aSrc: PSingleArray; aCols: PtrInt;
-  aType: TInferDType; aOwned, aRow: PtrInt; const aName: RawUtf8);
+procedure TDecoderModel.QuantizeRow(aSrc: pointer; aSrcType: TInferDType;
+  aCols: PtrInt; aType: TInferDType; aOwned, aRow: PtrInt; const aName: RawUtf8);
 var
-  nb, c: PtrInt;
+  nb, b, c, blk: PtrInt;
   d: word;
+  x: array[0..31] of single; // one block: no heap on the threads
 begin
   nb := aCols shr 5;
-  // a NaN or an infinity has no quantized form: refused, by its bits (no FPU)
-  for c := 0 to aCols - 1 do
-    if PCardinalArray(aSrc)^[c] and $7f800000 = $7f800000 then
-      EInferError.RaiseUtf8('%: % has a NaN or infinite weight at row % column %',
-        [self, aName, aRow, c]);
-  if aType = idtQ8_0 then
-    InferQuantizeRowQ8_0Ref(aSrc, aCols, @fOwnedQ8[aOwned][aRow * nb])
-  else
-    InferQuantizeRowQ4_0(aSrc, aCols, @fOwnedQ4[aOwned][aRow * nb]);
-  // a finite weight beyond the range still gets the FP16 scale +Inf (ggml
-  // writes it too): every product with it would be Inf or NaN
-  for c := aRow * nb to aRow * nb + nb - 1 do
+  for b := 0 to nb - 1 do
   begin
+    // Q8_0 and Q4_0 quantize every block of 32 on its own
+    blk := aRow * nb + b;
+    InferRowToF32(aSrc, aSrcType, blk, 32, @x);
+    // a NaN or an infinity has no quantized form: refused, by its bits (no FPU)
+    for c := 0 to 31 do
+      if PCardinal(@x[c])^ and $7f800000 = $7f800000 then
+        EInferError.RaiseUtf8('%: % has a NaN or infinite weight at row % column %',
+          [self, aName, aRow, b * 32 + c]);
     if aType = idtQ8_0 then
-      d := fOwnedQ8[aOwned][c].d
+    begin
+      InferQuantizeRowQ8_0Ref(@x, 32, @fOwnedQ8[aOwned][blk]);
+      d := fOwnedQ8[aOwned][blk].d;
+    end
     else
-      d := fOwnedQ4[aOwned][c].d;
+    begin
+      InferQuantizeRowQ4_0(@x, 32, @fOwnedQ4[aOwned][blk]);
+      d := fOwnedQ4[aOwned][blk].d;
+    end;
+    // a finite weight beyond the range still gets the FP16 scale +Inf (ggml
+    // writes it too): every product with it would be Inf or NaN
     if d and $7fff >= $7c00 then
       EInferError.RaiseUtf8('%: % has a weight beyond the % range in row %',
         [self, aName, INFER_DTYPE_NAME[aType], aRow]);
   end;
+end;
+
+procedure TDecoderModel.ConvertRows(aSrc: pointer; aSrcType: TInferDType;
+  aRows, aCols: PtrInt; aType: TInferDType; aOwned: PtrInt; const aName: RawUtf8);
+begin
+  fCvSrc := aSrc;
+  fCvSrcType := aSrcType;
+  fCvCols := aCols;
+  fCvType := aType;
+  fCvOwned := aOwned;
+  fCvName := aName;
+  try
+    fBackend.RunItems(ConvertItem, aRows);
+  finally
+    fCvName := '';
+  end;
+end;
+
+procedure TDecoderModel.ConvertItem(aItem: integer);
+begin
+  QuantizeRow(fCvSrc, fCvSrcType, fCvCols, fCvType, fCvOwned, aItem, fCvName);
 end;
 
 /// raise unless every MXFP4 block of t has an exponent the CPU computes
@@ -1361,8 +1439,7 @@ function TDecoderModel.Matrix(const aName: RawUtf8; aRows, aCols: Int64;
   aType: TInferDType): TInferWeight;
 var
   t: PInferTensor;
-  row: TSingleDynArray;
-  nb, r, n: PtrInt;
+  nb, n: PtrInt;
 begin
   if fGguf <> nil then
   begin
@@ -1387,7 +1464,7 @@ begin
     result := InferWeight(Weight(aName, [aRows, aCols]), idtF32);
     exit;
   end;
-  // Q8_0 or Q4_0: row by row through single precision, as ggml quantizes
+  // Q8_0 or Q4_0: block by block through single precision, as ggml quantizes
   t := Checked(aName, [aRows, aCols]);
   nb := aCols shr 5;
   if aType = idtQ8_0 then
@@ -1404,12 +1481,7 @@ begin
     SetLength(fOwnedQ4[n], aRows * nb);
     result := InferWeight(pointer(fOwnedQ4[n]), idtQ4_0);
   end;
-  SetLength(row, aCols);
-  for r := 0 to aRows - 1 do
-  begin
-    InferRowToF32(t^.Data, t^.DType, r, aCols, pointer(row));
-    QuantizeRow(pointer(row), aCols, aType, n, r, aName);
-  end;
+  ConvertRows(t^.Data, t^.DType, aRows, aCols, aType, n, aName);
 end;
 
 function TDecoderModel.NewContext: TDecoderContext;
@@ -1921,21 +1993,21 @@ procedure TDecoderModel.Forward(aCtx: TDecoderContext; aIds: PIntegerArray;
 begin
   if (aIds = nil) and (aCount > 0) then
     EInferError.RaiseUtf8('%.Forward: no ids', [self]);
-  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits, aOnState);
+  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits, aOnState, nil);
 end;
 
 procedure TDecoderModel.ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
-  const aOnState: TOnDecoderState);
+  const aOnState: TOnDecoderState; aNormed: PSingleArray);
 begin
   if (aEmbeds = nil) and (aCount > 0) then
     EInferError.RaiseUtf8('%.ForwardEmbeds: no rows', [self]);
-  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits, aOnState);
+  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits, aOnState, aNormed);
 end;
 
 procedure TDecoderModel.ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
-  aAllLogits: boolean; const aOnState: TOnDecoderState);
+  aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
 var
   i, l, n, h, f, qw, past, id: PtrInt;
 begin
@@ -1943,6 +2015,10 @@ begin
     EInferError.RaiseUtf8('%.Forward: no context', [self]);
   if (aIds <> nil) and (fEmbedSrc = nil) then
     EInferError.RaiseUtf8('%.Forward: no token embedding (ForwardEmbeds only)', [self]);
+  // before the cache changes
+  if (aLogits <> nil) and (fHead.Data = nil) then
+    EInferError.RaiseUtf8('%.Forward: no head for logits (the normed state only)',
+      [self]);
   if aCtx.fDevice <> nil then
   begin
     // the keys and values are on a device: computed there
@@ -1954,7 +2030,8 @@ begin
     if aIds <> nil then
       aCtx.fDevice.Forward(aCtx, aIds, aCount, aLogits, aAllLogits)
     else
-      aCtx.fDevice.ForwardEmbeds(aCtx, aEmbeds, aCount, aLogits, aAllLogits);
+      aCtx.fDevice.ForwardEmbeds(aCtx, aEmbeds, aCount, aLogits, aAllLogits,
+        aNormed);
     exit;
   end;
   if aCount <= 0 then
@@ -2008,11 +2085,13 @@ begin
   else
     FillCharFast(aCtx.fIds[past], n * SizeOf(integer), $ff); // -1: no id
   aCtx.fLength := past + n;
-  if (aLogits = nil) and not Assigned(aOnState) then
+  if (aLogits = nil) and (aNormed = nil) and not Assigned(aOnState) then
     exit;
   fBackend.RmsNorm(pointer(aCtx.fX), n, h, fNorm, fConfig.RmsEps, pointer(aCtx.fH));
   if Assigned(aOnState) then
     aOnState('norm', pointer(aCtx.fH), n, h);
+  if aNormed <> nil then
+    MoveFast(aCtx.fH[(n - 1) * h], aNormed^[0], h * SizeOf(single));
   if aLogits = nil then
     exit;
   if aAllLogits then

@@ -28,7 +28,8 @@ interface
 uses
   sysutils,
   mormot.core.base,
-  mormot.ai.infer.tensor;
+  mormot.ai.infer.tensor,
+  mormot.ai.infer.threads;
 
 type
   /// the operations of the backend contract
@@ -129,6 +130,13 @@ type
     // model in its destructor does it for its own); nothing to do here: the
     // CPU reads the host memory itself
     procedure ForgetWeights(aFrom, aTo: pointer); virtual;
+    /// aJob(0) .. aJob(aCount - 1), independent items: on the threads of the
+    // backend when it has a pool that is free, else in order on this thread
+    // - for work outside the operations, like converting weights at load; an
+    // item may call operations of the backend (they then run on its thread)
+    // - an exception in an item is raised once every item is done, as an
+    // EInferError with its message when the items ran on the pool
+    procedure RunItems(const aJob: TOnInferItem; aCount: integer); virtual;
   end;
 
 /// a TInferWeight from its parts
@@ -185,6 +193,14 @@ end;
 
 procedure TInferBackend.ForgetWeights(aFrom, aTo: pointer);
 begin
+end;
+
+procedure TInferBackend.RunItems(const aJob: TOnInferItem; aCount: integer);
+var
+  i: integer;
+begin
+  for i := 0 to aCount - 1 do
+    aJob(i);
 end;
 
 end.
