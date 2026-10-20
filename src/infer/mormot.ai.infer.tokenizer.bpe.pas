@@ -1,15 +1,21 @@
-/// native inference engine - byte-level BPE tokenizer (Qwen2 / Qwen3)
+/// native inference engine - byte-level BPE tokenizer (Qwen2 / Qwen3, gpt-oss)
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - clean-room implementation of the pipeline a Hugging Face tokenizer.json
 //   describes; the reference is the tokenizers library (Apache-2.0, read only
-//   for the documented behaviour) and the gate tests/data/infer-ref/qwen3-tokens:
-//   NFC normalizer, the Qwen2 Split regex (isolated), ByteLevel without prefix
-//   space, BPE merges by rank (leftmost first on equal rank)
-// - the split regex is not run by a regex engine: TBpeTokenizer.Split is the
-//   leftmost-first match of its seven alternatives, written out by hand
+//   for the documented behaviour) and the gates tests/data/infer-ref/qwen3-tokens
+//   and gpt-oss-tokens: an NFC normalizer or none, the Qwen2 or the o200k Split
+//   regex (isolated), ByteLevel without prefix space, BPE merges by rank
+//   (leftmost first on equal rank), with ignore_merges a piece that is a token
+//   of the vocabulary taken as it is
+// - the split regexes are not run by a regex engine: TBpeTokenizer.Split is the
+//   leftmost-first match of their alternatives, written out by hand - Qwen2
 //     (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} |
 //      ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+//   and o200k (gpt-oss; U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}], W = [\p{Ll}\p{Lm}
+//   \p{Lo}\p{M}], C = (?i:'s|'t|'re|'ve|'m|'ll|'d))
+//     [^\r\n\p{L}\p{N}]?U*W+C? | [^\r\n\p{L}\p{N}]?U+W*C? | \p{N}{1,3} |
+//      ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
 //   with the code point classes of mormot.ai.infer.unicode (measured against
 //   the regex of the tokenizers library, also the case folding of (?i))
 // - behaviour = parse_special=false: Encode treats every text as text, also
@@ -23,8 +29,9 @@ unit mormot.ai.infer.tokenizer.bpe;
   *****************************************************************************
 
     - TBpeTokenizer: load a byte-level BPE tokenizer.json, the older pair
-      vocab.json + merges.txt or the tokenizer of a GGUF file (Qwen2 pipeline),
-      Normalize, Split, Encode text to ids and Decode ids to bytes
+      vocab.json + merges.txt or the tokenizer of a GGUF file (the pipelines of
+      Qwen2 and of gpt-oss), Normalize, Split, Encode text to ids and Decode ids
+      to bytes
 
   *****************************************************************************
 }
@@ -67,9 +74,16 @@ type
     function Pop(out aPos, aNew: integer): boolean;
   end;
 
-  /// a byte-level BPE tokenizer with the Qwen2 pre-tokenizer
+  /// the Split regex of a byte-level BPE tokenizer
+  TBpePreTokenizer = (
+    bptQwen2,
+    bptO200k);
+
+  /// a byte-level BPE tokenizer with the Qwen2 or the o200k pre-tokenizer
   TBpeTokenizer = class(TInferTokenizer)
   protected
+    fPre: TBpePreTokenizer;
+    fNfc, fIgnoreMerges: boolean;
     fTokens: TRawByteStringDynArray; // id -> bytes ('' = no token)
     fVocabCount: integer;            // ids below are BPE tokens, above added ones
     fByteId: array[byte] of integer;
@@ -106,15 +120,18 @@ type
       var aCount: PtrInt; var aSym: TBpeSymbolDynArray; var aQueue: TBpeQueue);
   public
     /// load and validate a Hugging Face tokenizer.json of this pipeline:
-    // NFC, Split(Qwen2 regex, Isolated) + ByteLevel(no prefix space, no regex),
-    // BPE (no dropout, no unk, no prefix/suffix, no byte fallback), ByteLevel
+    // NFC or no normalizer, Split(Qwen2 or o200k regex, Isolated) +
+    // ByteLevel(no prefix space, no regex), BPE (no dropout, no unk, no
+    // prefix/suffix, no byte fallback, ignore_merges as it says), ByteLevel
     // decoder - raises EInferError otherwise
     constructor Create(const aFileName: TFileName); override;
     /// the same tokenizer from the tokenizer.ggml.* metadata of a GGUF file:
-    // model gpt2, pre-tokenizer qwen2; normal tokens are the BPE vocabulary,
-    // control and user-defined ones the added tokens, unused ones no token
-    // - GGUF stores no normalizer: NFC is applied, as Qwen's tokenizer.json has
-    // it (llama.cpp itself does not normalize)
+    // model gpt2, pre-tokenizer qwen2 or gpt-4o (o200k); normal tokens are the
+    // BPE vocabulary, control and user-defined ones the added tokens, unused
+    // ones no token
+    // - GGUF stores no normalizer and no ignore_merges: qwen2 gets NFC and
+    // gpt-4o ignore_merges, as the tokenizer.json of Qwen and of gpt-oss have
+    // them (llama.cpp itself does neither)
     constructor CreateFromGguf(aGguf: TGgufFile); override;
     /// the same tokenizer from the older pair vocab.json + merges.txt, the files
     // of transformers' Qwen2Tokenizer; the pipeline is not in them, so the one
@@ -145,7 +162,8 @@ type
     // 5.19: one "a b" per line, LF or CRLF, every line starting with
     // "#version" skipped; an empty line or one with more spaces is refused
     constructor CreateFromVocabMerges(const aVocabFile, aMergesFile: TFileName);
-    /// the NFC-normalized text (invalid UTF-8 replaced first)
+    /// the normalized text: invalid UTF-8 replaced, then NFC when the pipeline
+    // has it
     function Normalize(const aText: RawUtf8): RawUtf8;
     /// the pre-tokenized pieces of the normalized text, as UTF-8
     function Split(const aText: RawUtf8): TRawUtf8DynArray;
@@ -170,6 +188,15 @@ type
     /// number of merges
     property MergeCount: integer
       read fMergeCount;
+    /// the Split regex of the pipeline
+    property PreTokenizer: TBpePreTokenizer
+      read fPre;
+    /// true when the pipeline normalizes to NFC
+    property Nfc: boolean
+      read fNfc;
+    /// true when a piece that is a token of the vocabulary is taken as it is
+    property IgnoreMerges: boolean
+      read fIgnoreMerges;
   end;
 
 
@@ -178,6 +205,13 @@ const
   QWEN2_SPLIT_REGEX =
     '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|' +
     ' ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  /// the Split regex of gpt-oss (o200k), verbatim
+  O200K_SPLIT_REGEX =
+    '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+' +
+    '(?i:''s|''t|''re|''ve|''m|''ll|''d)?|[^\r\n\p{L}\p{N}]?' +
+    '[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*' +
+    '(?i:''s|''t|''re|''ve|''m|''ll|''d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|' +
+    '\s*[\r\n]+|\s+(?!\S)|\s+';
 
 
 implementation
@@ -251,16 +285,31 @@ begin
   inherited Create(aFileName);
   if not doc.InitJsonFromFile(aFileName, JSON_FAST_FLOAT) then
     EInferError.RaiseUtf8('%: cannot read %', [self, aFileName]);
-  // the pipeline this class implements, and nothing else
-  if not doc.GetAsObject('normalizer', norm) or (norm^.U['type'] <> 'NFC') then
-    EInferError.RaiseUtf8('%: normalizer is not NFC', [self]);
+  // the pipeline this class implements, and nothing else: NFC or none (absent
+  // or null - an object of another type is refused)
+  if doc.GetAsObject('normalizer', norm) then
+    if norm^.U['type'] = 'NFC' then
+      fNfc := true
+    else
+      EInferError.RaiseUtf8('%: normalizer is neither NFC nor none', [self])
+  else if not VarIsEmptyOrNull(doc.Value['normalizer']) then
+    EInferError.RaiseUtf8('%: normalizer is neither NFC nor none', [self]);
   if not doc.GetAsObject('pre_tokenizer', pre) or (pre^.U['type'] <> 'Sequence') or
      not pre^.GetAsArray('pretokenizers', list) or (list^.Count <> 2) then
     EInferError.RaiseUtf8('%: pre_tokenizer is not Sequence[Split, ByteLevel]', [self]);
   split := _Safe(list^.Values[0]);
   if (split^.U['type'] <> 'Split') or (split^.U['behavior'] <> 'Isolated') or
-     split^.B['invert'] or (split^.O['pattern']^.U['Regex'] <> QWEN2_SPLIT_REGEX) then
-    EInferError.RaiseUtf8('%: first pre-tokenizer is not the Qwen2 Split', [self]);
+     split^.B['invert'] then
+    EInferError.RaiseUtf8('%: first pre-tokenizer is not an isolating Split', [self]);
+  text := split^.O['pattern']^.U['Regex'];
+  if text = QWEN2_SPLIT_REGEX then
+    fPre := bptQwen2
+  else if text = O200K_SPLIT_REGEX then
+    fPre := bptO200k
+  else
+    EInferError.RaiseUtf8('%: the Split regex is neither that of Qwen2 nor o200k',
+      [self]);
+  // trim_offsets only changes the offsets, not the tokens
   level := _Safe(list^.Values[1]);
   if (level^.U['type'] <> 'ByteLevel') or level^.B['add_prefix_space'] or
      level^.B['use_regex'] then
@@ -273,8 +322,9 @@ begin
      not VarIsEmptyOrNull(model^.Value['unk_token']) or
      (model^.U['continuing_subword_prefix'] <> '') or
      (model^.U['end_of_word_suffix'] <> '') or model^.B['fuse_unk'] or
-     model^.B['byte_fallback'] or model^.B['ignore_merges'] then
+     model^.B['byte_fallback'] then
     EInferError.RaiseUtf8('%: model is not a plain BPE', [self]);
+  fIgnoreMerges := model^.B['ignore_merges'];
   if not model^.GetAsObject('vocab', vocab) or (vocab^.Count = 0) or
      not model^.GetAsArray('merges', merges) then
     EInferError.RaiseUtf8('%: BPE without vocab or merges', [self]);
@@ -325,14 +375,25 @@ var
   i, n: PtrInt;
 begin
   inherited CreateFromGguf(aGguf);
-  // llama.cpp's names of the Qwen2 pipeline: a GPT-2 byte-level BPE with the
-  // qwen2 pre-tokenizer (the Split regex of tokenizer.json); GGUF stores no
-  // normalizer - Qwen's tokenizer.json has NFC, which Normalize applies
+  // llama.cpp's names of the pipelines: a GPT-2 byte-level BPE with the qwen2
+  // or the gpt-4o pre-tokenizer (the Split regexes of tokenizer.json); GGUF
+  // stores neither a normalizer nor ignore_merges - Qwen's tokenizer.json has
+  // NFC, which Normalize applies, gpt-oss's ignore_merges
   if aGguf.Str('tokenizer.ggml.model') <> 'gpt2' then
     EInferError.RaiseUtf8('%: tokenizer model "%" is no byte-level BPE',
       [self, aGguf.Str('tokenizer.ggml.model')]);
-  if aGguf.Str('tokenizer.ggml.pre') <> 'qwen2' then
-    EInferError.RaiseUtf8('%: pre-tokenizer "%" is not qwen2',
+  if aGguf.Str('tokenizer.ggml.pre') = 'qwen2' then
+  begin
+    fPre := bptQwen2;
+    fNfc := true;
+  end
+  else if aGguf.Str('tokenizer.ggml.pre') = 'gpt-4o' then
+  begin
+    fPre := bptO200k;
+    fIgnoreMerges := true;
+  end
+  else
+    EInferError.RaiseUtf8('%: pre-tokenizer "%" is neither qwen2 nor gpt-4o',
       [self, aGguf.Str('tokenizer.ggml.pre')]);
   tokens := aGguf.Strings('tokenizer.ggml.tokens');
   count := length(tokens);
@@ -387,6 +448,7 @@ var
   sr: TSearchRec;
 begin
   inherited Create(aVocabFile);
+  fNfc := true; // the Qwen2 pipeline
   hasConfig := false;
   decoder := nil;
   if not doc.InitJsonFromFile(aVocabFile, JSON_FAST_FLOAT) or not doc.IsObject or
@@ -836,6 +898,19 @@ var
 begin
   if aLen <= 0 then
     exit;
+  // ignore_merges: a piece that is a token of the vocabulary is that token
+  if fIgnoreMerges then
+  begin
+    newId := BytesId(p, aLen);
+    if newId >= 0 then
+    begin
+      if aCount = length(aIds) then
+        SetLength(aIds, aCount * 2 + 16);
+      aIds[aCount] := newId;
+      inc(aCount);
+      exit;
+    end;
+  end;
   // one symbol per byte, then the merges of the tokenizers library: lowest
   // rank first, leftmost first on equal rank; a queue entry whose pair no
   // longer produces its merged id is stale and skipped
@@ -898,7 +973,30 @@ begin
     result := aCp;
 end;
 
-/// end of the regex match starting at aPos (exclusive) - see the unit header
+/// end of the match of the last three alternatives of both regexes, at a run
+// of white space aPos..aRunEnd-1 (exclusive)
+function SpaceEnd(cp: PCardinalArray; aPos, aRunEnd, aCount: PtrInt): PtrInt;
+var
+  k: PtrInt;
+begin
+  // \s*[\r\n]+ - up to the last CR/LF of the run
+  k := aRunEnd - 1;
+  while (k >= aPos) and (cp^[k] <> 10) and (cp^[k] <> 13) do
+    dec(k);
+  if k >= aPos then
+    result := k + 1
+  // \s+(?!\S) - the run up to the end, or all but its last char
+  else if aRunEnd = aCount then
+    result := aRunEnd
+  else if aRunEnd - aPos >= 2 then
+    result := aRunEnd - 1
+  // \s+ - a single white space before a non-space
+  else
+    result := aRunEnd;
+end;
+
+/// end of the Qwen2 regex match starting at aPos (exclusive) - see the unit
+// header
 function SplitEnd(cp: PCardinalArray; aPos, aCount: PtrInt): PtrInt;
 var
   c0, c1, c2: cardinal;
@@ -976,40 +1074,205 @@ begin
   j := aPos + 1;
   while (j < aCount) and (UnicodeClassOf(cp^[j]) = ucSpace) do
     inc(j);
-  // 5. \s*[\r\n]+ - up to the last CR/LF of the run
-  k := j - 1;
-  while (k >= aPos) and not IsCrLf(cp^[k]) do
-    dec(k);
-  if k >= aPos then
-    result := k + 1
-  // 6. \s+(?!\S) - the run up to the end, or all but its last char
-  else if j = aCount then
-    result := j
-  else if j - aPos >= 2 then
-    result := j - 1
-  // 7. \s+ - a single white space before a non-space
-  else
+  result := SpaceEnd(cp, aPos, j, aCount);
+end;
+
+/// end of the o200k regex match starting at aPos (exclusive) - see the unit
+// header; aCls holds the TO200kClass of every code point
+function O200kSplitEnd(cp: PCardinalArray; aCls: PByteArray;
+  aPos, aCount: PtrInt): PtrInt;
+var
+  j, k: PtrInt;
+
+  function InU(i: PtrInt): boolean; // [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]
+  begin
+    result := TO200kClass(aCls^[i]) in [ocUpper, ocLetter, ocMark];
+  end;
+
+  function InW(i: PtrInt): boolean; // [\p{Ll}\p{Lm}\p{Lo}\p{M}]
+  begin
+    result := TO200kClass(aCls^[i]) in [ocLower, ocLetter, ocMark];
+  end;
+
+  function IsPrefix(i: PtrInt): boolean; // [^\r\n\p{L}\p{N}]
+  begin
+    result := (TO200kClass(aCls^[i]) in [ocOther, ocMark, ocSpace]) and
+      (cp^[i] <> 10) and (cp^[i] <> 13);
+  end;
+
+  function IsOther(i: PtrInt): boolean; // [^\s\p{L}\p{N}]
+  begin
+    result := TO200kClass(aCls^[i]) in [ocOther, ocMark];
+  end;
+
+  function LowerEnd(t: PtrInt): PtrInt; // U*W+ from t: its end, or -1
+  var
+    u, e: PtrInt;
+  begin
+    u := t;
+    while (u < aCount) and InU(u) do
+      inc(u);
+    if (u < aCount) and InW(u) then
+    begin
+      // U* takes its whole run, W+ goes on from there
+      e := u + 1;
+      while (e < aCount) and InW(e) do
+        inc(e);
+      result := e;
+      exit;
+    end;
+    // U* gives back characters: W+ is the last one of the run that is in W
+    // (the characters after it are in U only)
+    e := u - 1;
+    while (e >= t) and not InW(e) do
+      dec(e);
+    if e >= t then
+      result := e + 1
+    else
+      result := -1;
+  end;
+
+  function UpperEnd(t: PtrInt): PtrInt; // U+W* from t: its end, or -1
+  var
+    u: PtrInt;
+  begin
+    u := t;
+    while (u < aCount) and InU(u) do
+      inc(u);
+    if u = t then
+    begin
+      result := -1;
+      exit;
+    end;
+    while (u < aCount) and InW(u) do
+      inc(u);
+    result := u;
+  end;
+
+  function Contraction(e: PtrInt): PtrInt; // (?i:'s|'t|'re|'ve|'m|'ll|'d)?
+  var
+    c1, c2: cardinal;
+  begin
+    result := e;
+    if (e + 1 >= aCount) or (cp^[e] <> ord('''')) then
+      exit;
+    c1 := FoldContraction(cp^[e + 1]);
+    if (c1 = ord('s')) or (c1 = ord('t')) or (c1 = ord('m')) or (c1 = ord('d')) then
+      result := e + 2
+    else if e + 2 < aCount then
+    begin
+      c2 := FoldContraction(cp^[e + 2]);
+      if (((c1 = ord('r')) or (c1 = ord('v'))) and (c2 = ord('e'))) or
+         ((c1 = ord('l')) and (c2 = ord('l'))) then
+        result := e + 3;
+    end;
+  end;
+
+begin
+  // 1. [^\r\n\p{L}\p{N}]?U*W+C? - with the prefix first, then without
+  j := -1;
+  if IsPrefix(aPos) then
+    j := LowerEnd(aPos + 1);
+  if j < 0 then
+    j := LowerEnd(aPos);
+  // 2. [^\r\n\p{L}\p{N}]?U+W*C? - the same order
+  if j < 0 then
+  begin
+    if IsPrefix(aPos) then
+      j := UpperEnd(aPos + 1);
+    if j < 0 then
+      j := UpperEnd(aPos);
+  end;
+  if j >= 0 then
+  begin
+    result := Contraction(j);
+    exit;
+  end;
+  // 3. \p{N}{1,3}
+  if TO200kClass(aCls^[aPos]) = ocNumber then
+  begin
+    j := aPos + 1;
+    while (j < aCount) and (j - aPos < 3) and (TO200kClass(aCls^[j]) = ocNumber) do
+      inc(j);
     result := j;
+    exit;
+  end;
+  // 4. ' '?[^\s\p{L}\p{N}]+[\r\n/]*
+  k := aPos;
+  if (cp^[aPos] = 32) and (aPos + 1 < aCount) and IsOther(aPos + 1) then
+    k := aPos + 1;
+  if IsOther(k) then
+  begin
+    j := k + 1;
+    while (j < aCount) and IsOther(j) do
+      inc(j);
+    while (j < aCount) and ((cp^[j] = 10) or (cp^[j] = 13) or (cp^[j] = ord('/'))) do
+      inc(j);
+    result := j;
+    exit;
+  end;
+  // only white space is left: its run is aPos..j-1
+  j := aPos + 1;
+  while (j < aCount) and (TO200kClass(aCls^[j]) = ocSpace) do
+    inc(j);
+  result := SpaceEnd(cp, aPos, j, aCount);
 end;
 
 function TBpeTokenizer.Normalize(const aText: RawUtf8): RawUtf8;
+var
+  cp: TCardinalDynArray;
+  n: PtrInt;
 begin
-  result := NfcNormalize(aText);
+  if fNfc then
+  begin
+    result := NfcNormalize(aText);
+    exit;
+  end;
+  n := Utf8ToCodePoints(pointer(aText), length(aText), cp);
+  result := CodePointsToUtf8(pointer(cp), n);
+end;
+
+/// the code points of aText as the pipeline sees them, and their o200k classes
+// when it needs them
+procedure Prepare(aTokenizer: TBpeTokenizer; const aText: RawUtf8;
+  var aCp: TCardinalDynArray; var aCls: TByteDynArray; out aCount: PtrInt);
+var
+  i: PtrInt;
+begin
+  aCount := Utf8ToCodePoints(pointer(aText), length(aText), aCp);
+  if aTokenizer.Nfc then
+    NfcCodePoints(aCp, aCount);
+  if aTokenizer.PreTokenizer <> bptO200k then
+    exit;
+  SetLength(aCls, aCount);
+  for i := 0 to aCount - 1 do
+    aCls[i] := ord(O200kClassOf(aCp[i]));
+end;
+
+/// the end of the piece starting at aPos
+function PieceEnd(aPre: TBpePreTokenizer; cp: PCardinalArray; aCls: PByteArray;
+  aPos, aCount: PtrInt): PtrInt;
+  {$ifdef HASINLINE}inline;{$endif}
+begin
+  if aPre = bptO200k then
+    result := O200kSplitEnd(cp, aCls, aPos, aCount)
+  else
+    result := SplitEnd(cp, aPos, aCount);
 end;
 
 function TBpeTokenizer.Split(const aText: RawUtf8): TRawUtf8DynArray;
 var
   cp: TCardinalDynArray;
+  cls: TByteDynArray;
   n, pos, e, count: PtrInt;
 begin
   result := nil;
-  n := Utf8ToCodePoints(pointer(aText), length(aText), cp);
-  NfcCodePoints(cp, n);
+  Prepare(self, aText, cp, cls, n);
   count := 0;
   pos := 0;
   while pos < n do
   begin
-    e := SplitEnd(pointer(cp), pos, n);
+    e := PieceEnd(fPre, pointer(cp), pointer(cls), pos, n);
     if count = length(result) then
       SetLength(result, count * 2 + 8);
     result[count] := CodePointsToUtf8(@cp[pos], e - pos);
@@ -1023,6 +1286,7 @@ procedure TBpeTokenizer.EncodeAppend(const aText: RawUtf8;
   var aIds: TIntegerDynArray; var aCount: PtrInt);
 var
   cp: TCardinalDynArray;
+  cls: TByteDynArray;
   n, pos, e, len: PtrInt;
   bytes: TByteDynArray;
   sym: TBpeSymbolDynArray;
@@ -1030,13 +1294,12 @@ var
 begin
   // one set of buffers for all pieces of the text: no allocation per piece
   queue.Count := 0;
-  n := Utf8ToCodePoints(pointer(aText), length(aText), cp);
-  NfcCodePoints(cp, n);
+  Prepare(self, aText, cp, cls, n);
   SetLength(bytes, n * 4 + 4);
   pos := 0;
   while pos < n do
   begin
-    e := SplitEnd(pointer(cp), pos, n);
+    e := PieceEnd(fPre, pointer(cp), pointer(cls), pos, n);
     len := CodePointsToUtf8Buffer(@cp[pos], e - pos, pointer(bytes));
     Bpe(pointer(bytes), len, aIds, aCount, sym, queue);
     pos := e;

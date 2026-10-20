@@ -1814,6 +1814,64 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5c1 erledigt (2026-10-20): der Tokenizer von gpt-oss (o200k).** `TBpeTokenizer` liest das
+`tokenizer.json` von `openai/gpt-oss-20b` (Revision `6cee5e8…`) und die Tokenizer-Metadaten
+von GGUF-Dateien mit dem Pre-Tokenizer `gpt-4o`; Harmony, Parser und die Familie folgen in
+D5c2.
+
+- *Pipeline:* kein Normalizer (Qwen hat NFC), der Split-Ausdruck von o200k (wörtlich aus
+  `tokenizer.json`, `O200K_SPLIT_REGEX`), ByteLevel, BPE mit `ignore_merges` (ein Stück, das
+  selbst ein Token ist, wird nicht zerlegt). Der Konstruktor nimmt Normalizer (NFC oder
+  keiner) und Ausdruck (Qwen2 oder o200k) in jeder Kombination; anderes lehnt er ab.
+  `ignore_merges` ändert bei o200k nichts: kein Token des Vokabulars zerfällt durch BPE allein
+  (der Generator hat jedes Token geprüft, das als Text ohne Ersatzzeichen U+FFFD dekodiert und
+  ein einzelnes Stück ist), es zählt also nur für andere Vokabulare und ist
+  mit einem Kunst-Tokenizer getestet.
+- *Ausdruck:* von Hand wie der von Qwen2, als leftmost-first über die sieben Alternativen;
+  `[^\r\n\p{L}\p{N}]?U*W+` mit dem Rückgabeschritt von `U*` (W+ ist dann das letzte Zeichen des
+  Laufs, das in W liegt), Großbuchstaben-Läufe, Ziffern zu dritt, `[\r\n/]*` nach Satzzeichen,
+  Kontraktionen nur als Anhang an ein Wort. Die Klassen dafür liegen in einer zweiten Tabelle
+  (`mormot.ai.infer.unicode.o200k.inc`, `O200kClassOf`): Groß- und Titelbuchstaben,
+  Kleinbuchstaben, Modifikator- und andere Buchstaben (in beiden Mengen), Marken (in beiden
+  Mengen, aber kein `\p{L}`), Ziffern, Leerraum. Gemessen Code Point für Code Point mit der
+  Regex-Engine von tokenizers 0.23.3, jede Menge einzeln, auch die beiden negierten Klassen;
+  Buchstaben, Ziffern und Leerraum sind exakt die der Qwen2-Tabelle, die Faltung der
+  Kontraktionen wieder ASCII plus U+017F.
+- *GGUF:* `ggml-org/gpt-oss-20b-GGUF` hat dieselben 199 998 Tokens und 446 189 Merges, die 21
+  Steuertokens als control und 1069 unbenutzte Füllzeilen bis zu den 201 088 Zeilen der
+  Einbettung (kein Token). GGUF speichert weder Normalizer noch `ignore_merges`: `gpt-4o`
+  bekommt `ignore_merges` wie das `tokenizer.json` von gpt-oss. llama.cpp selbst nimmt dort
+  eine Näherung des Ausdrucks und kein `ignore_merges` - wir folgen Hugging Face.
+- *Fixture* `gpt-oss-tokens` aus `make_reference_d5c.py`: 3095 Fälle (embed-de, die Fälle von
+  `bge-m3-tokens` und `qwen3-tokens`, 79 o200k-eigene - Groß/klein, Titelbuchstaben, Marken,
+  Ziffergruppen, Schrägstriche mit Zeilenumbruch, Harmony-Literale - und 2400 gemischte: je 600 aus `make_reference.py` und
+  `make_reference_qwen3.py`, 1200 über die o200k-Klassen),
+  je die Ids von `tokenizer.json` ohne Added Tokens (jeder Text ist Text) und die Stücke des
+  Pre-Tokenizers als Byte-Offsets. Das `tokenizer.json` liegt nicht im Repo
+  (`vendor/models/gpt-oss-20b/`, 27 MB).
+- *Tests* (`test.infer.harmony`): `O200kClasses` (Stichproben, jede Klasse gegen die
+  Qwen2-Tabelle für alle Code Points, die Zahlen des Generators), `O200kSplitMatchesReference`
+  (alle Fälle stückgleich, ohne Modell), `O200kPipeline` (`ignore_merges`, kein NFC, die
+  Kombinationen, drei Ablehnungen), `O200kIdsMatchReference` (alle Fälle idgleich, Dekodieren
+  gibt den Text zurück), `O200kTokens` (Größen, die Harmony-Steuertokens, Literale bleiben
+  Text), `O200kGguf` (die echte Datei: jedes Token gleich, alle Fälle idgleich).
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 6140 Assertions, mit der echten
+  GGUF-Datei) und unter WSL aarch64 (4745).
+- Gegenprobe: 20 eingebaute Fehler im Ausdruck (Rückgabeschritt von `U*`, die Klassen von U,
+  W, Präfix und Satzzeichen, Kontraktion, Ziffern zu viert, kein `/`, kein optionales
+  Leerzeichen), in der Pipeline (NFC immer, `ignore_merges` nie oder nicht gelesen, GGUF
+  `gpt-4o` mit NFC, das Paar `vocab.json` + `merges.txt` ohne NFC) und in der ASCII-Tabelle -
+  15 scheitern direkt, das Paar ohne NFC lokal mit dem Qwen3-Modell (in der
+  Mutationsumgebung fehlt es). Vier überleben und sind gleichwertig: Präfix zuerst oder
+  zuletzt (in Alternative 1 und in 2) und eine Marke als Präfix (eine Marke liegt in U und W, das Stück endet an derselben
+  Stelle), `W*` nach `U+` (Alternative 2 kommt nur zum Zug, wenn kein W folgt).
+- Review: Codex ohne Befund (verglich alle Referenztexte mit einer eigenen Nachbildung), im
+  Nachreview zwei falsche Angaben dieser Doku (jetzt korrigiert); der
+  Claude-Finder ohne Befund im Code (300 000 Zufallsketten gegen eine Backtracking-Engine),
+  aber vier ungenaue Doku-Stellen (eine veraltete Lücke im Backlog, die Prüfung von
+  `ignore_merges` zu weit beschrieben, „identisch mit Hugging Face“ statt mit der
+  tokenizers-Bibliothek ohne Added Tokens, die Zusammensetzung der Fälle) - korrigiert.
+
 **D5b2 erledigt (2026-10-20): gpt-oss aus GGUF.** `TGptOssModel` liest die Architektur
 `gpt-oss` von llama.cpp; geprüft mit einem Tiny-GGUF und mit `ggml-org/gpt-oss-20b-GGUF`
 (Revision `15dcfc7…`, `gpt-oss-20b-MXFP4.gguf`, aus derselben Checkpoint-Revision `6cee5e8`

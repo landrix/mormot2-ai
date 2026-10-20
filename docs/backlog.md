@@ -161,7 +161,7 @@ ausdrücklich ausnimmt.
 ### Was der Code heute mitbringt und was fehlt
 
 - Gewichtsformate auf der GPU: F32, Q8_0, Q4_K, Q6_K. Neu wären MXFP4, FP8-Blöcke, IQ2_XXS, NVFP4.
-- Tokenizer: Byte-BPE nur mit dem Qwen2-Pre-Tokenizer; Unigram fest auf BGE-M3 zugeschnitten.
+- Tokenizer: Byte-BPE nur mit den Pre-Tokenizern von Qwen2 und o200k (gpt-oss); Unigram fest auf BGE-M3 zugeschnitten.
 - `TQwen3Model.Forward` setzt gleich große Layer, QK-Norm, RoPE und SwiGLU voraus.
 - Die GPU-Attention kann Kopfdimensionen bis 256 (Gemma 4 global braucht 512).
 - `Truncate` des Kontexts setzt nur die Länge zurück. Mit Ringpuffer-KV oder rekurrentem
@@ -339,9 +339,13 @@ In Scheiben:
   bitgleich zum safetensors-Ordner, `ggml-org/gpt-oss-20b-GGUF` mit Experten Byte für Byte
   gleich unserem Umpacken. *Offen:* ein fusionierter MXFP4-Kernel (Skalarprodukt ohne den
   Umweg über Q8_0-Blöcke) nur, wenn eine Messung das Entpacken noch als Bremse zeigt.
-- *D5c:* o200k-Tokenizer (`tokenizer.json`, eigener Pre-Tokenizer-Ausdruck) und das
-  Harmony-Chatformat mit Parser (Kanäle `analysis`/`commentary`/`final`, Tool-Aufrufe),
-  `RegisterNativeFamily`.
+- *D5c1 erledigt 2026-10-20* (`native-inference.md`, Phase D): der o200k-Tokenizer aus
+  `tokenizer.json` und aus GGUF (`gpt-4o`) - kein Normalizer, der o200k-Ausdruck von Hand
+  mit einer eigenen gemessenen Klassentabelle, `ignore_merges`; 3095 Fälle stück- und
+  idgleich mit der tokenizers-Bibliothek (ohne Added Tokens: Text bleibt Text).
+- *D5c2:* das Harmony-Chatformat (Template des Checkpoints, mit der Umsetzung der
+  Tool-Schemas in TypeScript-Typen) und der Parser (Kanäle `analysis`/`commentary`/`final`,
+  Tool-Aufrufe), `RegisterNativeFamily`.
 - *D5d:* Vulkan und CUDA - Sinks in den Attention-Kernels, Bias auf O, Router- und
   Experten-Bias, die begrenzte SwiGLU, MXFP4-Linear; dann der schmale Cache auf dem Gerät,
   wenn er sich bei gpt-oss-20b lohnt.

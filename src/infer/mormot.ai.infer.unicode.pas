@@ -7,6 +7,11 @@
 //   regex (\p{L}, \p{N}, \s) and its NFC normalizer - which uses older Unicode
 //   data than current Python, so the tables follow the tokenizer, not the
 //   newest Unicode version
+// - a second class table (mormot.ai.infer.unicode.o200k.inc, written by
+//   tools/infer-ref/make_reference_d5c.py) splits the letters the way the
+//   o200k pre-tokenizer of gpt-oss needs them: upper and title case, lower
+//   case, modifier and other letters, and the marks; measured with the same
+//   regex engine, its letters, numbers and white space are those of the first
 // - NFC is the algorithm of UAX #15: full canonical decomposition (Hangul
 //   algorithmic), canonical ordering, canonical composition of primary
 //   composites with the blocking rules
@@ -18,6 +23,7 @@ unit mormot.ai.infer.unicode;
 
     - Utf8ToCodePoints / CodePointsToUtf8: UTF-8 decoding with U+FFFD
     - UnicodeClassOf: letter, number, white space or other
+    - O200kClassOf: the finer classes of the o200k pre-tokenizer
     - NfcCodePoints / NfcNormalize: Unicode normalization form C
 
   *****************************************************************************
@@ -41,6 +47,19 @@ type
     ucLetter,
     ucNumber,
     ucSpace);
+
+  /// the class of a code point, as the o200k pre-tokenizer regex of gpt-oss
+  // sees it: [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] are ocUpper, ocLetter and ocMark,
+  // [\p{Ll}\p{Lm}\p{Lo}\p{M}] are ocLower, ocLetter and ocMark, \p{L} are
+  // ocUpper, ocLower and ocLetter (a mark is no letter)
+  TO200kClass = (
+    ocOther,
+    ocUpper,
+    ocLower,
+    ocLetter,
+    ocMark,
+    ocNumber,
+    ocSpace);
 
 const
   /// U+FFFD REPLACEMENT CHARACTER
@@ -70,6 +89,9 @@ function IsStrictUtf8(p: PUtf8Char; aLen: PtrInt): boolean;
 /// the class of a code point, as the Qwen2 pre-tokenizer regex sees it
 function UnicodeClassOf(aCp: cardinal): TUnicodeClass;
 
+/// the class of a code point, as the o200k pre-tokenizer regex sees it
+function O200kClassOf(aCp: cardinal): TO200kClass;
+
 /// the canonical combining class of a code point (0 for a starter)
 function CombiningClassOf(aCp: cardinal): byte;
 
@@ -84,10 +106,12 @@ function NfcNormalize(const aText: RawUtf8): RawUtf8;
 implementation
 
 {$I mormot.ai.infer.unicode.inc}
+{$I mormot.ai.infer.unicode.o200k.inc}
 
 var
   /// the class of the 128 ASCII code points, from the same tables
   AsciiClass: array[0..127] of TUnicodeClass;
+  AsciiO200k: array[0..127] of TO200kClass;
 
 function Utf8ToCodePoints(p: PUtf8Char; aLen: PtrInt;
   var aCp: TCardinalDynArray): PtrInt;
@@ -356,6 +380,22 @@ begin
     result := TUnicodeClass(UNI_CLASS_KIND[i]);
 end;
 
+function O200kClassOf(aCp: cardinal): TO200kClass;
+var
+  i: PtrInt;
+begin
+  if aCp < 128 then
+  begin
+    result := AsciiO200k[aCp];
+    exit;
+  end;
+  i := FindRange(aCp, @UNI_O200K_LO, @UNI_O200K_HI, UNI_O200K_COUNT);
+  if i < 0 then
+    result := ocOther
+  else
+    result := TO200kClass(UNI_O200K_KIND[i]);
+end;
+
 function CombiningClassOf(aCp: cardinal): byte;
 var
   i: PtrInt;
@@ -617,6 +657,11 @@ begin
       AsciiClass[c] := ucOther
     else
       AsciiClass[c] := TUnicodeClass(UNI_CLASS_KIND[i]);
+    i := FindRange(c, @UNI_O200K_LO, @UNI_O200K_HI, UNI_O200K_COUNT);
+    if i < 0 then
+      AsciiO200k[c] := ocOther
+    else
+      AsciiO200k[c] := TO200kClass(UNI_O200K_KIND[i]);
   end;
 end;
 

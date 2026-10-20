@@ -101,6 +101,26 @@ RTX computer (Windows x86_64, 96 GB) in an environment with the same pins
 LAI_GPTOSS_DIR=/path/to/gpt-oss-20b python tools/infer-ref/make_reference_d5.py gpt-oss-20b
 ```
 
+## The tokenizer of gpt-oss (phase D, D5c)
+
+`make_reference_d5c.py` reads only the tokenizer files of `openai/gpt-oss-20b` in the same
+revision (`$LAI_GPTOSS_DIR`, by default `vendor/models/gpt-oss-20b`; checked against the
+pinned hashes, no weights needed) and loads no model:
+
+- `o200k-unicode` writes `src/infer/mormot.ai.infer.unicode.o200k.inc`: the classes of the
+  o200k Split regex (upper and title case, lower case, modifier and other letters, marks,
+  numbers, white space), each set measured code point by code point with the regex engine
+  of the tokenizers library, also the two negated classes; the letters, numbers and white
+  space must equal those of `mormot.ai.infer.unicode.inc`, and the case folding of the
+  contractions is measured as for Qwen2.
+- `gpt-oss-tokens` writes the tokenizer gate: the texts of `qwen3-tokens` plus o200k edge
+  cases and 1200 generated mixtures over the classes of the regex; per case the ids of
+  `tokenizer.json` without its added tokens and the pieces of its pre-tokenizer.
+
+```bash
+LAI_GPTOSS_DIR=/path/to/gpt-oss-20b python tools/infer-ref/make_reference_d5c.py
+```
+
 ## Decoder stacks (backlog B14)
 
 `make_reference_b14.py` needs only Python: it creates `tiny-qwen3/stack/` - the weights of
