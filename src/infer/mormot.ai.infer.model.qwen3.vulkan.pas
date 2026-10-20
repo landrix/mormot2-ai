@@ -34,6 +34,11 @@
 //   k unrotated; the cache on the device keeps every row (as
 //   TDecoderContext.FullCache on the CPU), so a context can go back to any
 //   length - the narrow cache of the CPU only saves memory
+// - gpt-oss (TDecoderModel.Extras, slice D5d2): attention sinks in every
+//   attention shader (binding 5, attnmerge.comp binding 2), the output, router
+//   and expert biases (an expert's row as an index in the push constants),
+//   the clamped SwiGLU (swiglu.comp with alpha and limit) and its MXFP4
+//   experts through linear8.comp and gemm8.comp
 unit mormot.ai.infer.model.qwen3.vulkan;
 
 {
@@ -159,6 +164,13 @@ type
       w: PSingleArray; y: TInferVkBuffer);
     procedure RecordElementwise(aPipeline: TInferVkPipeline;
       const aBuffers: array of TInferVkBuffer; aCount: PtrInt);
+    /// swiglu.comp over aCount values: the plain SwiGLU, or the clamped one
+    // of gpt-oss (SwiGluLimit)
+    procedure RecordSwiGlu(aGate, aUp: TInferVkBuffer; aCount: PtrInt);
+    /// the device copies of the expert biases of a layer (gpt-oss), nil each
+    // without
+    procedure ExpertBiases(const aLayer: TQwen3Layer; out aGate, aUp,
+      aDown: TInferVkBuffer);
     /// the dfMoe block of layer aLayer: fDevH in, fDevTmp out - submits the
     // batch so far and begins the next one
     procedure RecordMoe(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
@@ -286,10 +298,18 @@ type
   TAttentionPush = record
     Rows, Heads, HeadDim, KvHeads, Past, Splits, HeadBlock, RowBlock: cardinal;
     Window: cardinal; // > 0: the keys of the last Window positions only
+    HasSinks: cardinal; // 1: the attention sinks of binding 5 (gpt-oss)
   end;
 
   TMergePush = record
     Rows, Heads, HeadDim, Splits: cardinal;
+    HasSinks: cardinal; // 1: the attention sinks of binding 2
+  end;
+
+  /// swiglu.comp: Limit > 0 for the clamped SwiGLU of gpt-oss
+  TSwiGluPush = record
+    N: cardinal;
+    Alpha, Limit: single;
   end;
 
   TQkRopePush = record
@@ -415,10 +435,8 @@ begin
   for l := 0 to high(aModel.Config.Spec) do
     if aModel.Config.Spec[l].Mixer <> dmAttention then
       EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
-  // no attention sinks, output, router or expert biases, nor the clamped
-  // SwiGLU of gpt-oss yet (backlog D5)
-  if aModel.Extras <> [] then
-    EInferError.RaiseUtf8('%: the layers of % not supported', [self, aModel]);
+  // attention sinks, the output, router and expert biases and the clamped
+  // SwiGLU of gpt-oss run here too (slice D5d2)
   fMoe := not aModel.HasOnly(dmAttention, dfDense);
   // qkrope.comp keeps one normalized head in shared memory
   // and attention.comp reads it as vec4
@@ -432,21 +450,22 @@ begin
   fVk := aBackend.Vulkan;
   fNorm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM, length(SPV_RMSNORM), 3,
     SizeOf(TNormPush));
-  fSwiGlu := TInferVkPipeline.Create(fVk, @SPV_SWIGLU, length(SPV_SWIGLU), 2, 4);
+  fSwiGlu := TInferVkPipeline.Create(fVk, @SPV_SWIGLU, length(SPV_SWIGLU), 2,
+    SizeOf(TSwiGluPush));
   fAttention := TInferVkPipeline.Create(fVk, @SPV_ATTENTION, length(SPV_ATTENTION),
-    5, SizeOf(TAttentionPush));
+    6, SizeOf(TAttentionPush));
   fAttention16 := TInferVkPipeline.Create(fVk, @SPV_ATTENTION_F16,
-    length(SPV_ATTENTION_F16), 5, SizeOf(TAttentionPush));
-  fMerge := TInferVkPipeline.Create(fVk, @SPV_ATTNMERGE, length(SPV_ATTNMERGE), 2,
+    length(SPV_ATTENTION_F16), 6, SizeOf(TAttentionPush));
+  fMerge := TInferVkPipeline.Create(fVk, @SPV_ATTNMERGE, length(SPV_ATTNMERGE), 3,
     SizeOf(TMergePush));
   if (aModel.Config.HeadDim <= 128) and (fVk.MaxInvocations >= 256) and
      (fVk.MaxGroupSizeX >= 256) and (fVk.MaxSharedMemory >= FLASH_SHARED) then
   begin
-    fFlash := TInferVkPipeline.Create(fVk, @SPV_FLASH, length(SPV_FLASH), 5,
+    fFlash := TInferVkPipeline.Create(fVk, @SPV_FLASH, length(SPV_FLASH), 6,
       SizeOf(TAttentionPush));
     fFlash.Name := 'flash';
     fFlash16 := TInferVkPipeline.Create(fVk, @SPV_FLASH_F16,
-      length(SPV_FLASH_F16), 5, SizeOf(TAttentionPush));
+      length(SPV_FLASH_F16), 6, SizeOf(TAttentionPush));
     fFlash16.Name := 'flash';
     fUseFlash := fVk.VendorId = $106B; // Apple
   end;
@@ -456,11 +475,11 @@ begin
      ((fVk.VendorId = $106B) or (fVk.VendorId = $10DE)) and
      (aModel.Config.HeadDim <= 128) then
   begin
-    fDecode := TInferVkPipeline.Create(fVk, @SPV_ATTNDEC, length(SPV_ATTNDEC), 5,
+    fDecode := TInferVkPipeline.Create(fVk, @SPV_ATTNDEC, length(SPV_ATTNDEC), 6,
       SizeOf(TAttentionPush));
     fDecode.Name := 'attndec';
     fDecode16 := TInferVkPipeline.Create(fVk, @SPV_ATTNDEC_F16,
-      length(SPV_ATTNDEC_F16), 5, SizeOf(TAttentionPush));
+      length(SPV_ATTNDEC_F16), 6, SizeOf(TAttentionPush));
     fDecode16.Name := 'attndec';
     fUseDecode := fVk.VendorId = $106B; // Apple
   end;
@@ -566,6 +585,24 @@ end;
 function TQwen3Vulkan.Vector(v: PSingleArray; aCount: PtrInt): TInferVkBuffer;
 begin
   result := fBackend.DeviceWeight(v, idtF32, Int64(aCount) * 4);
+end;
+
+procedure TQwen3Vulkan.ExpertBiases(const aLayer: TQwen3Layer; out aGate, aUp,
+  aDown: TInferVkBuffer);
+var
+  ne, fi: PtrInt;
+begin
+  ne := fModel.Config.Experts;
+  fi := fModel.Config.ExpertIntermediate;
+  aGate := nil;
+  aUp := nil;
+  aDown := nil;
+  if aLayer.ExpertGateBias <> nil then
+    aGate := Vector(aLayer.ExpertGateBias, ne * fi);
+  if aLayer.ExpertUpBias <> nil then
+    aUp := Vector(aLayer.ExpertUpBias, ne * fi);
+  if aLayer.ExpertDownBias <> nil then
+    aDown := Vector(aLayer.ExpertDownBias, ne * fModel.Config.Hidden);
 end;
 
 procedure TQwen3Vulkan.UploadWeights;
@@ -709,6 +746,19 @@ begin
       Vector(ly^.KBias, kvw);
       Vector(ly^.VBias, kvw);
     end;
+    // gpt-oss: the output, router and expert biases, the sinks
+    if ly^.OBias <> nil then
+      Vector(ly^.OBias, c.Hidden);
+    if ly^.Sinks <> nil then
+      Vector(ly^.Sinks, c.Heads);
+    if ly^.RouterBias <> nil then
+      Vector(ly^.RouterBias, c.Experts);
+    if ly^.ExpertGateBias <> nil then
+      Vector(ly^.ExpertGateBias, c.Experts * c.ExpertIntermediate);
+    if ly^.ExpertUpBias <> nil then
+      Vector(ly^.ExpertUpBias, c.Experts * c.ExpertIntermediate);
+    if ly^.ExpertDownBias <> nil then
+      Vector(ly^.ExpertDownBias, c.Experts * c.Hidden);
   end;
   Vector(fModel.FinalNorm, c.Hidden);
   // the head: 165 MB in Qwen3-0.6B Q8_0, more than some GPUs bind at once
@@ -911,6 +961,16 @@ begin
   fVk.BatchDispatch(aPipeline, aBuffers, @n, (aCount + 127) div 128);
 end;
 
+procedure TQwen3Vulkan.RecordSwiGlu(aGate, aUp: TInferVkBuffer; aCount: PtrInt);
+var
+  push: TSwiGluPush;
+begin
+  push.N := aCount;
+  push.Alpha := fModel.Config.SwiGluAlpha;
+  push.Limit := fModel.Config.SwiGluLimit;
+  fVk.BatchDispatch(fSwiGlu, [aGate, aUp], @push, (aCount + 127) div 128);
+end;
+
 procedure TQwen3Vulkan.NeedRoom(aSets: PtrInt);
 begin
   if fVk.BatchRoom >= aSets then
@@ -931,6 +991,7 @@ var
   w: PSingleArray;
   push: TRowsPush;
   count: cardinal;
+  gb, ub, db: TInferVkBuffer;
 begin
   ly := @fModel.Layers[aLayer];
   n := aRows;
@@ -938,8 +999,10 @@ begin
   fi := fModel.Config.ExpertIntermediate;
   k := fModel.Config.ExpertsUsed;
   ne := fModel.Config.Experts;
+  ExpertBiases(ly^, gb, ub, db);
   // the router logits down: the batch so far submitted and waited for
-  fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Router, ne, aCtx.fDevRoute);
+  fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Router, ne, aCtx.fDevRoute, true,
+    nil, ly^.RouterBias);
   fVk.BatchCopy(aCtx.fDevRoute, 0, aCtx.fRouteOut, 0, Int64(n) * ne * 4);
   fVk.BatchSubmit;
   MoveFast(aCtx.fRouteOut.Mapped^, pointer(aCtx.fRoute)^, n * ne * SizeOf(single));
@@ -978,13 +1041,17 @@ begin
     NeedRoom(EXPERT_ROOM);
     push.First := aCtx.fStart[e];
     fVk.BatchDispatch(fGather, [aCtx.fDevH, aCtx.fDevIdx, aCtx.fDevGather], @push, cnt);
+    // the biases of expert e (gpt-oss): row e of the biases of all experts
     fBackend.RecordLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertGate[e].DType,
-      fExpertGate[aLayer][e], fExpertGateAt[aLayer][e], fi, aCtx.fDevGate, false);
+      fExpertGate[aLayer][e], fExpertGateAt[aLayer][e], fi, aCtx.fDevGate, false,
+      gb, e * fi);
     fBackend.RecordLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertUp[e].DType,
-      fExpertUp[aLayer][e], fExpertUpAt[aLayer][e], fi, aCtx.fDevUp);
-    RecordElementwise(fSwiGlu, [aCtx.fDevGate, aCtx.fDevUp], cnt * fi);
+      fExpertUp[aLayer][e], fExpertUpAt[aLayer][e], fi, aCtx.fDevUp, true,
+      ub, e * fi);
+    RecordSwiGlu(aCtx.fDevGate, aCtx.fDevUp, cnt * fi);
     fBackend.RecordLinearAt(aCtx.fDevGate, cnt, fi, ly^.ExpertDown[e].DType,
-      fExpertDown[aLayer][e], fExpertDownAt[aLayer][e], h, aCtx.fDevExpOut);
+      fExpertDown[aLayer][e], fExpertDownAt[aLayer][e], h, aCtx.fDevExpOut, true,
+      db, e * h);
     fVk.BatchDispatch(fScatter, [aCtx.fDevExpOut, aCtx.fDevIdx, aCtx.fDevW,
       aCtx.fDevTmp], @push, cnt);
   end;
@@ -1005,14 +1072,16 @@ var
   h, fi, k: PtrInt;
   rp: TRoutePush;
   cp: TCombinePush;
+  gb, ub, db: TInferVkBuffer;
 begin
   ly := @fModel.Layers[aLayer];
+  ExpertBiases(ly^, gb, ub, db);
   h := fModel.Config.Hidden;
   fi := fModel.Config.ExpertIntermediate;
   k := fModel.Config.ExpertsUsed;
   // the router logits, the choice into fDevKIds / fDevKW - no submit
   fBackend.RecordLinear(aCtx.fDevH, 1, h, ly^.Router, fModel.Config.Experts,
-    aCtx.fDevRoute);
+    aCtx.fDevRoute, true, nil, ly^.RouterBias);
   rp.Experts := fModel.Config.Experts;
   rp.K := k;
   rp.Norm := ord(fModel.Config.NormTopK);
@@ -1022,14 +1091,14 @@ begin
   // gate and up of the k experts side by side, SwiGLU, down per slot
   fBackend.RecordLinearIds(aCtx.fDevH, h, ly^.ExpertGate[0].DType,
     fExpertGate[aLayer][0], fStrideGate[aLayer], fi, aCtx.fDevKIds, k, false,
-    aCtx.fDevKGate, false);
+    aCtx.fDevKGate, false, gb);
   fBackend.RecordLinearIds(aCtx.fDevH, h, ly^.ExpertUp[0].DType,
     fExpertUp[aLayer][0], fStrideUp[aLayer], fi, aCtx.fDevKIds, k, false,
-    aCtx.fDevKUp);
-  RecordElementwise(fSwiGlu, [aCtx.fDevKGate, aCtx.fDevKUp], k * fi);
+    aCtx.fDevKUp, true, ub);
+  RecordSwiGlu(aCtx.fDevKGate, aCtx.fDevKUp, k * fi);
   fBackend.RecordLinearIds(aCtx.fDevKGate, fi, ly^.ExpertDown[0].DType,
     fExpertDown[aLayer][0], fStrideDown[aLayer], h, aCtx.fDevKIds, k, true,
-    aCtx.fDevKDown);
+    aCtx.fDevKDown, true, db);
   // the weighted sum in id order into fDevTmp
   cp.K := k;
   cp.N := h;
@@ -1104,6 +1173,7 @@ var
   norm: TNormPush;
   att: TAttentionPush;
   merge: TMergePush;
+  sinks: TInferVkBuffer;
   part: TInferVkBuffer;
 begin
   c := fModel.Config;
@@ -1278,12 +1348,20 @@ begin
       fVk.BatchDispatch(qkrope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV, qn, kn,
         aCtx.fDevCos, aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk,
         c.Heads + c.KvHeads, n);
+      // the attention sinks of gpt-oss; without, any buffer is bound
+      att.HasSinks := ord(ly^.Sinks <> nil);
+      merge.HasSinks := att.HasSinks;
+      if ly^.Sinks <> nil then
+        sinks := Vector(ly^.Sinks, c.Heads)
+      else
+        sinks := aCtx.fDevCos;
       fVk.BatchDispatch(layerAtt, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
-        aCtx.fDevAttn, part], @att, c.Heads div PtrInt(att.HeadBlock),
+        aCtx.fDevAttn, part, sinks], @att, c.Heads div PtrInt(att.HeadBlock),
         (n + PtrInt(att.RowBlock) - 1) div PtrInt(att.RowBlock), att.Splits);
       if att.Splits > 1 then
-        fVk.BatchDispatch(fMerge, [part, aCtx.fDevAttn], @merge, c.Heads, n);
-      fBackend.RecordLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);
+        fVk.BatchDispatch(fMerge, [part, aCtx.fDevAttn, sinks], @merge, c.Heads, n);
+      fBackend.RecordLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp, true, nil,
+        ly^.OBias);
       // residual and the feed-forward pre-norm, gate and up side by side,
       // SwiGLU, down
       fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp, Vector(ly^.PostNorm, h),
@@ -1302,7 +1380,7 @@ begin
       begin
         fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate, false);
         fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
-        RecordElementwise(fSwiGlu, [aCtx.fDevGate, aCtx.fDevUp], n * f);
+        RecordSwiGlu(aCtx.fDevGate, aCtx.fDevUp, n * f);
         fBackend.RecordLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
       end;
       // the residual, and the input norm of the next layer

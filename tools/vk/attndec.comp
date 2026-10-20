@@ -45,11 +45,16 @@ layout(std430, binding = 2) readonly buffer BufV { vec4 vals4[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 // [heads, rows, splits, headDim + 2]: the sums, then max and sum of exp
 layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
+// [heads]: the attention sinks (gpt-oss, slice D5d2) when hasSinks - logits
+// that join the softmax without a value, added once (here when splits is 1,
+// else by attnmerge.comp) and part of the maximum, as on the CPU
+layout(std430, binding = 5) readonly buffer BufS { float sinks[]; };
 
 // headBlock divides heads / kvHeads, headBlock * rowBlock <= MAXQ
 layout(push_constant) uniform Push {
   uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
   uint window; // > 0: a row sees only its last window keys, itself included
+  uint hasSinks; // 1: sinks[] (binding 5)
 } p;
 
 void main()
@@ -134,7 +139,15 @@ void main()
         if (p.splits == 1u)
         {
           uint yb = r * qw + h * d + 4u * lane;
-          a /= l[i];
+          float f = 1.0;
+          float den = l[i];
+          if (p.hasSinks != 0u)
+          {
+            float mm = max(m[i], sinks[h]);
+            f = exp(m[i] - mm);
+            den = l[i] * f + exp(sinks[h] - mm); // a share without a value
+          }
+          a = a * f / den;
           // not one subgroup: the sums are partial - NaN stored as is, no
           // arithmetic after it (Vulkan may assume operands without NaN)
           if (!one)

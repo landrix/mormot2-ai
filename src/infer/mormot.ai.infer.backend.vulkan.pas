@@ -2,8 +2,8 @@
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - phase 4b of docs/native-inference.md: TInferVulkanBackend is the fast CPU
-//   backend whose Linear runs on a Vulkan device for F32, Q8_0, Q5_0, Q4_K and
-//   Q6_K weights; every other operation, every other weight type and every
+//   backend whose Linear runs on a Vulkan device for F32, Q8_0, Q5_0, Q4_K,
+//   Q6_K and MXFP4 weights; every other operation, every other weight type and every
 //   call while the device is busy stay on the CPU
 // - weights and biases are uploaded once, on first use, and kept on the
 //   device, keyed by their address, type and size: they must neither change
@@ -84,8 +84,8 @@ type
     // (TInferVulkan.Create: raises EInferVulkan without one)
     constructor Create(aThreads: integer = 0); reintroduce;
     destructor Destroy; override;
-    /// y = x * w^T + bias on the device for F32, Q8_0, Q5_0, Q4_K and Q6_K
-    // weights, on the CPU otherwise (and while another thread uses the device)
+    /// y = x * w^T + bias on the device for F32, Q8_0, Q5_0, Q4_K, Q6_K and
+    // MXFP4 weights, on the CPU otherwise (and while another thread uses the device)
     procedure Linear(x: PSingleArray; aRows, aIn: PtrInt; const w: TInferWeight;
       aOut: PtrInt; bias: PSingleArray; y: PSingleArray); override;
     /// release every weight kept on the device
@@ -120,9 +120,12 @@ type
     // aType at byte aOffset of aWeight (e.g. one expert of a buffer which holds
     // every expert of a layer): aOffset a multiple of the device's
     // MinStorageAlignment, the matrix within one binding (LinearPart = aOut)
+    // - aBias: [aOut] floats from float aBiasFirst of that buffer (one expert's
+    // row of the biases of all experts, gpt-oss), nil for none
     procedure RecordLinearAt(x: TInferVkBuffer; aRows, aIn: PtrInt;
       aType: TInferDType; aWeight: TInferVkBuffer; aOffset: Int64; aOut: PtrInt;
-      y: TInferVkBuffer; aBarrier: boolean = true);
+      y: TInferVkBuffer; aBarrier: boolean = true; aBias: TInferVkBuffer = nil;
+      aBiasFirst: PtrInt = 0);
     /// true when RecordLinearIds runs an aOut x aIn matrix of aType per expert
     // from aWeight: the form of linear8 (any block type, F32 with aIn a
     // multiple of 8) and the whole buffer in one binding
@@ -133,9 +136,11 @@ type
     // matrix of aType at byte id * aStride of aWeight (the experts of a layer
     // one buffer, bound whole); x is row s of x when aXPerSlot, else row 0;
     // y receives row s - linear8.comp built with -DIDS
+    // - aBias: [experts, aOut] floats, slot s adds row aIds[s]; nil for none
     procedure RecordLinearIds(x: TInferVkBuffer; aIn: PtrInt; aType: TInferDType;
       aWeight: TInferVkBuffer; aStride: Int64; aOut: PtrInt; aIds: TInferVkBuffer;
-      aSlots: PtrInt; aXPerSlot: boolean; y: TInferVkBuffer; aBarrier: boolean = true);
+      aSlots: PtrInt; aXPerSlot: boolean; y: TInferVkBuffer; aBarrier: boolean = true;
+      aBias: TInferVkBuffer = nil);
     /// the output features of one part of an aOut x aIn matrix of aType on
     // the device: aOut when its bytes fit one binding (maxStorageBufferRange,
     // or MaxLinearBytes), else as many as do - e.g. the 165 MB head of
@@ -181,7 +186,7 @@ const
   // MXFP4;
   // 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
-    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 0);
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 6);
 
   /// from this many rows on a Linear runs the tiled gemm8.comp (UseGemm)
   GEMM_ROWS = 16;
@@ -190,6 +195,7 @@ type
   /// the push constants of tools/vk/linear.comp
   TLinearPush = record
     Rows, InCount, OutCount, DType, HasBias: cardinal;
+    BiasOff: cardinal; // the first bias of the matrix in the bias binding
   end;
 
   /// the push constants of linear8.comp built with -DIDS
@@ -462,6 +468,7 @@ begin
   push.InCount := aIn;
   push.DType := LINEAR_DTYPE[w.DType];
   push.HasBias := ord(aBias <> nil);
+  push.BiasOff := 0;
   part := LinearPart(w.DType, aIn, aOut);
   if part >= aOut then
   begin
@@ -501,12 +508,14 @@ end;
 
 procedure TInferVulkanBackend.RecordLinearAt(x: TInferVkBuffer; aRows,
   aIn: PtrInt; aType: TInferDType; aWeight: TInferVkBuffer; aOffset: Int64;
-  aOut: PtrInt; y: TInferVkBuffer; aBarrier: boolean);
+  aOut: PtrInt; y: TInferVkBuffer; aBarrier: boolean; aBias: TInferVkBuffer;
+  aBiasFirst: PtrInt);
 var
   push: TLinearPush;
   gx, gy: cardinal;
   pipe: TInferVkPipeline;
   bytes: Int64;
+  bias: TInferVkBuffer;
 begin
   if not GpuLinear(aType, aIn) or (aRows < 1) or (aRows > 65535) or (aOut < 1) or
      (aWeight = nil) or (LinearPart(aType, aIn, aOut) < aOut) then
@@ -525,9 +534,19 @@ begin
   push.InCount := aIn;
   push.OutCount := aOut;
   push.DType := LINEAR_DTYPE[aType];
-  push.HasBias := 0;
+  push.HasBias := ord(aBias <> nil);
+  push.BiasOff := 0;
+  bias := fNoBias;
+  if aBias <> nil then
+  begin
+    if (aBiasFirst < 0) or ((Int64(aBiasFirst) + aOut) * 4 > aBias.Size) then
+      raise EInferVulkan.CreateUtf8('%.RecordLinearAt: % biases from % of a buffer ' +
+        'of %', [self, aOut, aBiasFirst, aBias.Size]);
+    push.BiasOff := aBiasFirst;
+    bias := aBias;
+  end;
   pipe := LinearShape(aType, aIn, aRows, aOut, gx, gy);
-  fVk.BatchDispatchAt(pipe, [aWeight, x, fNoBias, y], [aOffset, 0, 0, 0],
+  fVk.BatchDispatchAt(pipe, [aWeight, x, bias, y], [aOffset, 0, 0, 0],
     [bytes, 0, 0, 0], @push, gx, gy, 1, aBarrier);
 end;
 
@@ -543,11 +562,12 @@ end;
 procedure TInferVulkanBackend.RecordLinearIds(x: TInferVkBuffer; aIn: PtrInt;
   aType: TInferDType; aWeight: TInferVkBuffer; aStride: Int64; aOut: PtrInt;
   aIds: TInferVkBuffer; aSlots: PtrInt; aXPerSlot: boolean; y: TInferVkBuffer;
-  aBarrier: boolean);
+  aBarrier: boolean; aBias: TInferVkBuffer);
 var
   push: TLinearIdsPush;
   pipe: TInferVkPipeline;
   n: PtrInt;
+  bias: TInferVkBuffer;
 begin
   // the byte address of a weight is a 32-bit value in the shader
   if not GpuLinearIds(aType, aIn, aWeight) or (aSlots < 1) or (aSlots > 65535) or
@@ -559,9 +579,12 @@ begin
   push.InCount := aIn;
   push.OutCount := aOut;
   push.DType := LINEAR_DTYPE[aType];
-  push.HasBias := 0;
+  push.HasBias := ord(aBias <> nil);
   push.Stride := aStride;
   push.XSlot := ord(aXPerSlot);
+  bias := fNoBias;
+  if aBias <> nil then
+    bias := aBias;
   if fUseSubgroups and (fLinear8IdsSg <> nil) then
     pipe := fLinear8IdsSg
   else
@@ -569,7 +592,7 @@ begin
   n := (aOut + 3) shr 2;
   if n > 65535 then
     n := 65535; // the shader loops over the features
-  fVk.BatchDispatch(pipe, [aWeight, x, fNoBias, y, aIds], @push, n, aSlots, 1,
+  fVk.BatchDispatch(pipe, [aWeight, x, bias, y, aIds], @push, n, aSlots, 1,
     aBarrier);
 end;
 
@@ -663,6 +686,7 @@ begin
     push.Rows := aRows;
     push.InCount := aIn;
     push.OutCount := aOut;
+    push.BiasOff := 0;
     push.DType := LINEAR_DTYPE[w.DType];
     push.HasBias := ord(bias <> nil);
     pipe := LinearShape(w.DType, aIn, aRows, aOut, gx, gy);

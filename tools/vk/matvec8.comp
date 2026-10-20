@@ -33,6 +33,7 @@ layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 // dtype: 2 = Q8_0, 3 = Q4_K, 4 = Q6_K (TInferVulkanBackend)
 layout(push_constant) uniform Push {
   uint rows, nin, nout, dtype, hasBias;
+  uint biasOff; // the first bias of the matrix (slice D5d2: an expert's row)
 } p;
 
 // built once per weight type (-DDTYPE=2/3/4): the code of the other types
@@ -219,7 +220,7 @@ void main()
       {
         float b = 0.0;
         if (p.hasBias != 0u)
-          b = bias[o];
+          b = bias[p.biasOff + o];
         y[o] = v + b;
       }
     }
@@ -238,7 +239,7 @@ void main()
       {
         float b = 0.0;
         if (p.hasBias != 0u)
-          b = bias[o];
+          b = bias[p.biasOff + o];
         y[o] = partial[t] + b;
       }
       barrier(); // partial[] is reused for the next features

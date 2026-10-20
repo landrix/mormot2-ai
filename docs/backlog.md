@@ -357,10 +357,11 @@ In Scheiben:
   alle Biases, die begrenzte SwiGLU, MXFP4 als Typ der Linear-Kernel (auch `linear8ids`);
   gpt-oss-20b auf der RTX 5090 gegen transformers (näher als die CPU) und hinter
   `ILlmClient`, Decode 124 Tokens/s.
-- *D5d2:* dasselbe auf Vulkan - Sinks in `attention`/`flash`/`attndec`/`attnmerge`, Biases
-  (`RecordLinearAt` und `linear8.comp -DIDS` brauchen einen Bias je Experte), `swiglu.comp`
-  mit alpha und Grenze, MXFP4 in `linear`/`linear8`/`gemm8`/`matvec8`; dann der schmale
-  Cache auf dem Gerät, wenn er sich bei gpt-oss-20b lohnt.
+- *D5d2 erledigt 2026-10-20* (`native-inference.md`, Phase D): dasselbe auf Vulkan - Sinks
+  in allen Attention-Shadern, Biases (Experten-Zeile als Index im Push), `swiglu.comp` mit
+  alpha und Grenze, MXFP4 in `linear8`/`gemm8`; gpt-oss-20b Decode 127 Tokens/s.
+  *Offen, nur bei Bedarf:* der schmale Cache auf dem Gerät (gpt-oss-20b hält 24 Layer, die
+  Hälfte mit Fenster 128: bei langem Kontext spart er rund die Hälfte des KV-Speichers).
 
 **D6 — Gemma 4 26B-A4B und 31B.** GELU-tanh, Norm-/Residual-Pfade, Router-Skalierung,
 Logit-Softcap, K=V, der dichte Parallelzweig neben den Experten (26B), lokale und globale

@@ -138,9 +138,17 @@ type
     // attention shader, both cache formats, the window wrapping many times -
     // and a branch back behind the window
     procedure SlidingWindowMatchesCpu;
-    /// D5: gpt-oss (sinks, biases, the clamped SwiGLU) is refused until the
-    // device computes it
-    procedure GptOssRefused;
+    /// D5d2: gpt-oss (sinks, the output, router and expert biases, the
+    // clamped SwiGLU, MXFP4 experts) against the CPU: F32 with the experts
+    // chosen on the host, the Q8_0 GGUF and the MXFP4 checkpoint chosen on the
+    // device (against the host's choice), a half-float cache, the narrow
+    // model; then CheckAttentionRanges for the sinks in every attention shader
+    procedure GptOssMatchesCpu;
+    /// D5d2: gpt-oss-20b on the device: the checkpoint against the
+    // transformers reference of TTestInferQwen3 (logits, greedy tokens), then
+    // the GGUF through TNativeLlmClient - reasoning and the answer, a tool
+    // call, the answer with its result
+    procedure GptOss20bOnDevice;
     /// D3c: route.comp against the host's choice (TDecoderModel.Route
     // written out, as in TTestInferCuda): random logits and ties, with and
     // without renorming
@@ -448,8 +456,8 @@ const
   SHAPES: array[0..9, 0..2] of integer = (
     (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001),
     (70, 512, 130), (1, 32, 3), (3, 96, 17), (1, 896, 65), (20, 896, 33));
-  TYPES: array[0..4] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
-    idtQ5_0);
+  TYPES: array[0..5] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
+    idtQ5_0, idtMXFP4);
 var
   gpu: TInferVulkanBackend;
   ref: TInferCpuBackend;
@@ -515,6 +523,13 @@ begin
                 wq := RandomQ5(nout, nin, 141 + i);
                 data := pointer(wq);
               end;
+            idtMXFP4:
+              begin
+                // 17 bytes per block: rows of an odd number of blocks are
+                // not 4-aligned
+                wq := RandomMxfp4(nout, nin, 241 + i);
+                data := pointer(wq);
+              end;
           else
             begin
               wq := RandomK(kind, nout, nin, 51 + i + 10 * t);
@@ -547,6 +562,30 @@ begin
     gpu.UseSubgroups := gpu.SubgroupLinear;
     gpu.UseMatvec := matvec;
     gpu.UseGemm := gemm;
+    // MXFP4 with the exponents 0 and 1: the scale is subnormal (Vulkan may
+    // flush it), the weights 4 * 2^-128 and 2 * 2^-127 are not - times
+    // inputs of 2^126, every row sums exactly to 32 (one row: linear8, 16
+    // rows: gemm8)
+    wq := RandomMxfp4(2, 32, 5);
+    PInferBlockMxfp4Array(wq)^[0].e := 0;
+    FillCharFast(PInferBlockMxfp4Array(wq)^[0].qs, 16, $44);
+    PInferBlockMxfp4Array(wq)^[1].e := 1;
+    FillCharFast(PInferBlockMxfp4Array(wq)^[1].qs, 16, $22);
+    for s := 0 to 1 do
+    begin
+      rows := 1 + s * 15;
+      SetLength(x, rows * 32);
+      for o := 0 to rows * 32 - 1 do
+        PCardinal(@x[o])^ := cardinal(253) shl 23; // 2^126
+      SetLength(y2, rows * 2);
+      calls := gpu.GpuLinears;
+      gpu.ClearWeights;
+      gpu.Linear(pointer(x), rows, 32, InferWeight(pointer(wq), idtMXFP4), 2, nil,
+        pointer(y2));
+      Check(gpu.GpuLinears = calls + 1, 'MXFP4 edge exponents on the device');
+      for o := 0 to rows * 2 - 1 do
+        CheckUtf8(y2[o] = 32, 'MXFP4 subnormal scale, % rows: % at %', [rows, y2[o], o]);
+    end;
     // F32 with inputs no multiple of 8: linear.comp instead of linear8.comp
     Fill(x, 3 * 36, 61, 2);
     Fill(wf, 5 * 36, 62, 0.5);
@@ -2158,32 +2197,341 @@ begin
   end;
 end;
 
-procedure TTestInferVulkan.GptOssRefused;
+procedure TTestInferVulkan.GptOssMatchesCpu;
+const
+  PROMPT = 300; // more than one chunk of the device forward pass (256)
+  /// the relative error of the F32 logits: a cache of floats, of half floats
+  // (as TinyMoeMatchesCpu)
+  TOL: array[boolean] of double = (1e-4, 6e-3);
 var
   dir: TFileName;
   gpu: TInferVulkanBackend;
+  ref: TInferCpuBackend;
   model: TDecoderModel;
-  why: RawUtf8;
+  dev: TQwen3Vulkan;
+  c1: TQwen3Context;
+  c2, c3: TQwen3VkContext;
+  ids: TIntegerDynArray;
+  l1, l2, l3: TSingleDynArray;
+  i, k, v: PtrInt;
+  seed: cardinal;
+  e: double;
+  cmp: TInferCompare;
+  id: integer;
+  routed, quantized: boolean;
 begin
   if not HasDevice then
     exit;
   dir := FindInferRefDir('tiny-gpt-oss');
   if CheckFailed(dir <> '', 'tiny-gpt-oss found') then
     exit;
-  gpu := TInferVulkanBackend.Create;
-  model := nil;
-  try
-    model := NewDecoderModel(dir, gpu);
-    why := '';
+  SetLength(ids, PROMPT);
+  seed := 17;
+  for i := 0 to PROMPT - 1 do
+  begin
+    seed := seed * 1103515245 + 12345;
+    ids[i] := 3 + (seed shr 16) mod 93;
+  end;
+  // 0: F32 (each expert a buffer of its own, chosen on the host), 1: the
+  // Q8_0 GGUF (MXFP4 experts, those of a layer one buffer: chosen on the
+  // device), 2: F32 with the cache in half floats, 3: the narrow model
+  // (head_dim 16, 4 experts, 2 per token), 4: the MXFP4 checkpoint (MXFP4
+  // experts in one buffer, the other matrices F32), 5: Q8_0 at load (each
+  // expert its own buffer) through matvec8.comp, where one row reads the
+  // biases of its expert at an offset; 6: the same without subgroups (the
+  // shared-memory builds of matvec8.comp and linear8.comp)
+  for k := 0 to 6 do
+  begin
+    gpu := TInferVulkanBackend.Create;
+    ref := TInferCpuBackend.Create;
+    model := nil;
+    dev := nil;
+    c1 := nil;
+    c2 := nil;
+    c3 := nil;
     try
-      TQwen3Vulkan.Create(model, gpu).Free;
-    except
-      on E: EInferError do
-        why := StringToUtf8(E.Message);
+      case k of
+        1:
+          model := NewDecoderModelFromGguf(MakePath([dir, 'gguf', 'q8_0.gguf']), ref);
+        3:
+          model := NewDecoderModel(MakePath([dir, 'narrow']), ref);
+        4:
+          model := NewDecoderModel(MakePath([dir, 'mxfp4']), ref);
+        5, 6:
+          model := NewDecoderModel(dir, ref, idtQ8_0);
+      else
+        model := NewDecoderModel(dir, ref);
+      end;
+      Check(model is TGptOssModel, 'a gpt-oss model');
+      Check(model.Extras = [dxSinks, dxOutputBias, dxRouterBias, dxExpertBias,
+        dxSwiGluLimit], 'every extra of gpt-oss');
+      v := model.Config.VocabSize;
+      // MXFP4 experts: the CPU computes them with Q8_0 activations, the
+      // device in float - compared by cosine, as Q8_0
+      routed := k in [1, 4];
+      quantized := k in [1, 4, 5, 6];
+      gpu.UseMatvec := k >= 5;
+      gpu.UseSubgroups := gpu.SubgroupLinear and (k <> 6);
+      dev := TQwen3Vulkan.Create(model, gpu);
+      dev.KvF16 := k = 2;
+      c1 := model.NewContext;
+      c2 := dev.NewContext;
+      SetLength(l1, PROMPT * v);
+      SetLength(l2, PROMPT * v);
+      SetLength(l3, v);
+      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+      dev.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      if not quantized then
+      begin
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= TOL[dev.KvF16], 'gpt-oss % prompt logits (KvF16 %): ' +
+          'relative error %', [k, dev.KvF16, e]);
+      end
+      else
+      begin
+        cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
+        CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.998),
+          'gpt-oss % prompt logits: %', [k, InferCompareText(cmp)]);
+      end;
+      CheckUtf8(dev.DeviceRoutable = routed, 'case %: routable on the device', [k]);
+      if routed then
+      begin
+        // the same steps with the choice on the host: the same arithmetic
+        c3 := dev.NewContext;
+        dev.RouteOnDevice := false;
+        dev.Forward(c3, pointer(ids), PROMPT, nil);
+        dev.CheckRoute := true;
+      end;
+      // decoding: one range and ranges of 64 keys (attnmerge.comp adds the sink)
+      for i := 0 to 5 do
+      begin
+        id := ids[i];
+        dev.SplitKeys := (i and 1) * 64;
+        model.Forward(c1, @id, 1, pointer(l1));
+        if routed then
+        begin
+          dev.RouteOnDevice := false;
+          dev.Forward(c3, @id, 1, pointer(l3));
+          dev.RouteOnDevice := true;
+        end;
+        dev.Forward(c2, @id, 1, pointer(l2));
+        if routed then
+        begin
+          e := RelError(pointer(l2), pointer(l3), v);
+          CheckUtf8(e <= 1e-6, 'gpt-oss decode step %: the choice on the device ' +
+            'against the host: relative error %', [i, e]);
+        end;
+        if quantized then
+        begin
+          cmp := InferCompare(pointer(l2), pointer(l1), v, 0.05, 0.02);
+          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.999),
+            'gpt-oss % decode step %: %', [k, i, InferCompareText(cmp)]);
+        end
+        else
+        begin
+          e := RelError(pointer(l2), pointer(l1), v);
+          CheckUtf8(e <= TOL[dev.KvF16], 'gpt-oss % decode step % (KvF16 %): ' +
+            'relative error %', [k, i, dev.KvF16, e]);
+        end;
+      end;
+      if routed then
+      begin
+        CheckUtf8((dev.RouteChecks > 0) and (dev.RouteMismatches = 0) and
+          (dev.RouteMaxDiff <= 1e-6),
+          'the device routed % rows, % otherwise, weights within %',
+          [dev.RouteChecks, dev.RouteMismatches, dev.RouteMaxDiff]);
+        dev.CheckRoute := false;
+        // more steps, the choice on the device
+        for i := 6 to 9 do
+        begin
+          id := ids[i];
+          dev.RouteOnDevice := false;
+          dev.Forward(c3, @id, 1, pointer(l3));
+          dev.RouteOnDevice := true;
+          dev.Forward(c2, @id, 1, pointer(l2));
+          e := RelError(pointer(l2), pointer(l3), v);
+          CheckUtf8(e <= 1e-6, 'gpt-oss decode step % against the host''s ' +
+            'choice: relative error %', [i, e]);
+        end;
+      end;
+    finally
+      c3.Free;
+      c2.Free;
+      c1.Free;
+      dev.Free;
+      model.Free;
+      ref.Free;
+      gpu.Free;
     end;
-    CheckUtf8(PosEx('not supported', why) > 0, 'gpt-oss on the device: %', [why]);
+  end;
+  // the sinks in every attention shader where the device runs it (flash.comp,
+  // attndec.comp), one range and a range per key, both cache formats
+  CheckAttentionRanges('tiny-gpt-oss');
+end;
+
+procedure TTestInferVulkan.GptOss20bOnDevice;
+var
+  dir, refdir, gguf: TFileName;
+  gpu: TInferVulkanBackend;
+  cpu: TInferCpuFastBackend;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  dev: TQwen3Vulkan;
+  ctx: TQwen3Context;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  msgs: TLlmMessageDynArray;
+  req: TLlmChatRequest;
+  a: TLlmChatResponse;
+  ids, want: PIntegerArray;
+  margins: PSingleArray;
+  prompt, mine: TIntegerDynArray;
+  logits: TSingleDynArray;
+  cmp: TInferCompare;
+  k, n, m, diff: PtrInt;
+  margin: double;
+  timer: TPrecisionTimer;
+  calls: Int64;
+begin
+  if not HasDevice then
+    exit;
+  {$ifdef CPU32}
+  AddConsole('SKIP gpt-oss-20b on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  dir := FindVendorModel('gpt-oss-20b' + PathDelim + 'model.safetensors.index.json');
+  gguf := FindVendorModel('gpt-oss-20b-mxfp4.gguf');
+  if (dir = '') or (gguf = '') then
+  begin
+    Check(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/gpt-oss-20b and ' +
+      'gpt-oss-20b-mxfp4.gguf');
+    AddConsole('SKIP gpt-oss-20b on the device: no vendor/models/gpt-oss-20b ' +
+      'and gpt-oss-20b-mxfp4.gguf');
+    exit;
+  end;
+  refdir := FindInferRefDir('gpt-oss-20b');
+  if CheckFailed(refdir <> '', 'gpt-oss-20b reference found') then
+    exit;
+  gpu := TInferVulkanBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  model := nil;
+  dev := nil;
+  try
+    // the checkpoint of the reference (MXFP4 experts, the other matrices F32)
+    // against transformers in float32 (TTestInferQwen3.GptOss20b): the
+    // logits of the last token and the greedy tokens of its four cases - the
+    // device keeps float activations (TTestInferCuda.GptOss20bOnDevice: the
+    // limits measured there)
+    timer.Start;
+    model := NewDecoderModel(ExtractFilePath(dir), cpu);
+    dev := TQwen3Vulkan.Create(model, gpu);
+    AddConsole(FormatString('gpt-oss-20b loaded and on % in %', [fVk.DeviceName,
+      timer.Stop]));
+    model.Device := dev;
+    SetLength(logits, model.Config.VocabSize);
+    for k := 0 to 3 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        Check(ctx is TQwen3VkContext, 'a context on the device');
+        model.Forward(ctx, pointer(prompt), n, pointer(logits));
+      finally
+        ctx.Free;
+      end;
+      cmp := InferCompare(pointer(logits), ref.F32(FormatUtf8('case%.logits_last',
+        [k]), m), model.Config.VocabSize, 1, 0);
+      want := ref.I32(FormatUtf8('case%.greedy', [k]), m);
+      margins := ref.F32(FormatUtf8('case%.greedy_margin', [k]), m);
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, m, []);
+      finally
+        ctx.Free;
+      end;
+      diff := 0;
+      while (diff < m) and (diff < length(mine)) and (mine[diff] = want^[diff]) do
+        inc(diff);
+      margin := 0;
+      if diff < m then
+        margin := margins^[diff];
+      AddConsole(FormatString('device case %: logits cos % maxabs %, greedy equal ' +
+        'for % of % tokens (reference margin there %)', [k, cmp.Cosine,
+        cmp.MaxAbs, diff, m, margin]));
+      CheckUtf8(cmp.NonFinite = 0, 'device case % logits finite', [k]);
+      CheckUtf8(cmp.Cosine >= 0.999, 'device case % logits cosine %', [k, cmp.Cosine]);
+      CheckUtf8(cmp.MaxAbs <= 1, 'device case % logits max error %', [k, cmp.MaxAbs]);
+      CheckUtf8((diff >= m) or (margin < 1), 'device case % greedy leaves the ' +
+        'reference at step % where it was % sure', [k, diff, margin]);
+    end;
+    model.Device := nil;
+    FreeAndNil(dev);
+    FreeAndNil(model);
+    // the GGUF through TNativeLlmClient on the device: reasoning and the
+    // answer, a tool call, the answer with the result of the tool
+    timer.Start;
+    // on the Vulkan backend: a fallback from the device to the model's own
+    // forward pass would count Linear calls there (GpuLinears)
+    client := TNativeLlmClient.CreateFromGguf(gguf, '', gpu);
+    llm := client; // the interface frees the client, and with it its Device
+    client.ReasoningEffort := 'low';
+    client.Device := TQwen3Vulkan.Create(client.Model, gpu);
+    AddConsole(FormatString('gpt-oss-20b GGUF loaded and on the device in %',
+      [timer.Stop]));
+    SetLength(msgs, 1);
+    msgs[0] := LlmMessage(lrUser, 'What is 17 times 23? Answer with the number.');
+    calls := gpu.GpuLinears;
+    req := LlmChatRequest('', msgs);
+    req.Temperature := 0;
+    req.MaxTokens := 400;
+    timer.Start;
+    a := llm.ChatComplete(req);
+    AddConsole(FormatString('17 x 23 on the device in %: reasoning "%" answer ' +
+      '"%" (% tokens)', [timer.Stop, copy(a.Reasoning, 1, 120), a.Content,
+      a.Usage.CompletionTokens]));
+    Check(gpu.GpuLinears = calls, 'the device computed it, not the backend');
+    Check(PosEx('391', a.Content) > 0, 'the answer 391');
+    Check(a.Reasoning <> '', 'with reasoning');
+    SetLength(req.Tools, 1);
+    req.Tools[0].Name := 'get_weather';
+    req.Tools[0].Description := 'Get the current weather of a city';
+    req.Tools[0].ParametersJson := '{"type":"object","properties":{"city":' +
+      '{"type":"string"}},"required":["city"]}';
+    req.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
+    timer.Start;
+    a := llm.ChatComplete(req);
+    AddConsole(FormatString('weather on the device in %: % calls, content "%"',
+      [timer.Stop, length(a.ToolCalls), a.Content]));
+    if not CheckFailed(length(a.ToolCalls) = 1, 'one tool call') then
+    begin
+      CheckEqual(a.ToolCalls[0].Name, 'get_weather', 'the tool');
+      CheckUtf8(PosEx('"city": "Berlin"', a.ToolCalls[0].ArgumentsJson) > 0,
+        'the city: %', [a.ToolCalls[0].ArgumentsJson]);
+      // the result back, with the reasoning before the call
+      SetLength(req.Messages, 3);
+      req.Messages[1] := LlmMessage(lrAssistant, a.Content);
+      req.Messages[1].ToolCalls := a.ToolCalls;
+      req.Messages[1].Reasoning := a.Reasoning;
+      req.Messages[2] := LlmMessage(lrTool, '{"temperature_c": 17, "sky": "rain"}');
+      req.Messages[2].ToolCallId := a.ToolCalls[0].Id;
+      timer.Start;
+      a := llm.ChatComplete(req);
+      AddConsole(FormatString('answer on the device in %: "%"', [timer.Stop,
+        a.Content]));
+      Check(PosEx('17', a.Content) > 0, 'with the temperature of the tool');
+    end;
   finally
+    llm := nil; // the client and its device before the backend they compute with
+    if model <> nil then
+      model.Device := nil;
+    dev.Free;
     model.Free;
+    ref.Free;
+    cpu.Free;
     gpu.Free;
   end;
 end;

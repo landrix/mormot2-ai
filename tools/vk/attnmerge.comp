@@ -3,6 +3,8 @@
 // - per (head, row): M = max of the range maxima, then
 //   y = sum_s exp(m_s - M) * acc_s / sum_s exp(m_s - M) * sum_s
 // - an empty range has m = -FLT_MAX and sum 0: its weight is 0
+// - hasSinks (gpt-oss, slice D5d2): sinks[h] joins the maximum and the
+//   denominator without a value
 // - one work group of 128 per (head, row), one output dimension per invocation
 #version 450
 
@@ -10,9 +12,11 @@ layout(local_size_x = 128) in;
 
 layout(std430, binding = 0) readonly buffer BufP { float part[]; };
 layout(std430, binding = 1) writeonly buffer BufY { float y[]; };
+layout(std430, binding = 2) readonly buffer BufS { float sinks[]; };
 
 layout(push_constant) uniform Push {
   uint rows, heads, headDim, splits;
+  uint hasSinks; // 1: sinks[] (binding 2)
 } p;
 
 void main()
@@ -24,11 +28,15 @@ void main()
   uint stride = d + 2u;
   uint base = (h * p.rows + r) * p.splits * stride;
   float mx = -3.402823e38;
+  if (p.hasSinks != 0u)
+    mx = sinks[h];
   for (uint s = 0u; s < p.splits; s++)
     mx = max(mx, part[base + s * stride + d]);
   float den = 0.0;
   for (uint s = 0u; s < p.splits; s++)
     den += exp(part[base + s * stride + d] - mx) * part[base + s * stride + d + 1u];
+  if (p.hasSinks != 0u)
+    den += exp(sinks[h] - mx); // a share without a value
   for (uint k = t; k < d; k += 128u)
   {
     float acc = 0.0;

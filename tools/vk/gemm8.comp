@@ -24,9 +24,11 @@ layout(std430, binding = 1) readonly buffer BufX { vec4 x[]; };
 layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 
-// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0 (TInferVulkanBackend)
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0, 6 = MXFP4
+// (TInferVulkanBackend)
 layout(push_constant) uniform Push {
   uint rows, nin, nout, dtype, hasBias;
+  uint biasOff; // the first bias of the matrix (slice D5d2: an expert's row)
 } p;
 
 // [k][4 rows or 4 features]: xs[k * 16 + j] holds rows 4j .. 4j + 3
@@ -66,6 +68,16 @@ float s8(uint v, uint k)
 uint u8(uint v, uint k)
 {
   return (v >> (k * 8u)) & 255u;
+}
+
+// MXFP4 (slice D5d2): ggml's block_mxfp4 - kvalues_mxfp4 (the E2M1 values
+// doubled) times E8M0_TO_FP32_HALF(e) = 2^(e - 128), subnormal below e = 2
+const float KV_MXFP4[16] = float[16](0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0,
+  0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0);
+
+float e8m0Half(uint e)
+{
+  return uintBitsToFloat(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
 }
 
 // the 8 weights e .. e + 7 of the row that starts at byte rowBase
@@ -118,6 +130,29 @@ void weights8(uint rowBase, uint e, out float wv[8])
     {
       wv[k] = d1 * float((u8(q0, k) >> sh) & 15u) - m1;
       wv[k + 4u] = d1 * float((u8(q1, k) >> sh) & 15u) - m1;
+    }
+  }
+  else if (p.dtype == 6u)
+  {
+    // MXFP4: 17 bytes per 32 values - e, qs[16]; value j is kvalues[q] *
+    // 2^(e - 128), q the low nibble of qs[j] below 16, the high one from 16;
+    // 8 values in one block
+    uint base = rowBase + (e >> 5) * 17u;
+    uint j = e & 31u;
+    uint eb = byteAt(base);
+    float d = e8m0Half(eb);
+    uvec2 q = bytes8(base + 1u + (j & 15u));
+    uint sh = j >= 16u ? 4u : 0u;
+    for (uint k = 0u; k < 4u; k++)
+    {
+      float a = KV_MXFP4[(u8(q.x, k) >> sh) & 15u];
+      float b = KV_MXFP4[(u8(q.y, k) >> sh) & 15u];
+      // e < 2: the scale is subnormal, and Vulkan may flush a subnormal
+      // operand (no DenormPreserve) - ldexp scales without one, its exponent
+      // kept at -126 or above (below, SPIR-V lets it flush too): a * 0.25 is
+      // exact for every value of the table
+      wv[k] = eb < 2u ? ldexp(a * 0.25, int(eb) - 126) : d * a;
+      wv[k + 4u] = eb < 2u ? ldexp(b * 0.25, int(eb) - 126) : d * b;
     }
   }
   else if (p.dtype == 5u)
@@ -180,6 +215,8 @@ void main()
     rowBytes = (p.nin >> 8) * 144u;
   else if (p.dtype == 5u)
     rowBytes = (p.nin >> 5) * 22u;
+  else if (p.dtype == 6u)
+    rowBytes = (p.nin >> 5) * 17u;
   else
     rowBytes = (p.nin >> 8) * 210u;
   // staging: invocation t loads 8 consecutive inputs of row / feature t / 4
@@ -243,7 +280,7 @@ void main()
         {
           float b = 0.0;
           if (p.hasBias != 0u)
-            b = bias[o];
+            b = bias[p.biasOff + o];
           y[r * p.nout + o] = acc[i][c] + b;
         }
       }

@@ -40,11 +40,16 @@ layout(std430, binding = 2) readonly buffer BufV { vec4 vals4[]; };
 layout(std430, binding = 3) writeonly buffer BufY { vec4 y4[]; };
 // [heads, rows, splits, headDim + 2]: the sums, then max and sum of exp
 layout(std430, binding = 4) writeonly buffer BufP { float part[]; };
+// [heads]: the attention sinks (gpt-oss, slice D5d2) when hasSinks - logits
+// that join the softmax without a value, added once (here when splits is 1,
+// else by attnmerge.comp) and part of the maximum, as on the CPU
+layout(std430, binding = 5) readonly buffer BufS { float sinks[]; };
 
 // headBlock divides heads / kvHeads, headBlock * rowBlock <= QN
 layout(push_constant) uniform Push {
   uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
   uint window; // > 0: a row sees only its last window keys, itself included
+  uint hasSinks; // 1: sinks[] (binding 5)
 } p;
 
 shared vec4 qs[QN * 32];   // the queries, 32 vec4 each
@@ -189,10 +194,17 @@ void main()
     if (p.splits == 1u)
     {
       float l = ls[sq];
+      float f = 1.0;
+      if (p.hasSinks != 0u)
+      {
+        float mm = max(ms[sq], sinks[h]);
+        f = exp(ms[sq] - mm);
+        l = l * f + exp(sinks[h] - mm); // a share without a value
+      }
       uint yb = r * qw4 + h * d4 + sd;
       for (uint c = 0u; c < 4u; c++)
         if (sd + c < d4)
-          y4[yb + c] = acc[c] / l;
+          y4[yb + c] = acc[c] * f / l;
     }
     else
     {

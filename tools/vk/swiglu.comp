@@ -1,5 +1,8 @@
 // LandrixAI - gate = silu(gate) * up on the device (phase 4c of
 // docs/native-inference.md; TInferCpuBackend.SwiGlu in float)
+// - limit > 0 (gpt-oss, slice D5d2): the clamped SwiGLU, (clamp(up, -limit,
+//   limit) + 1) * g * sigmoid(alpha * g) with g = min(gate, limit), clamped
+//   by comparison as the CPU (a NaN stays a NaN)
 #version 450
 
 layout(local_size_x = 128) in;
@@ -7,7 +10,7 @@ layout(local_size_x = 128) in;
 layout(std430, binding = 0) buffer BufG { float g[]; };
 layout(std430, binding = 1) readonly buffer BufU { float u[]; };
 
-layout(push_constant) uniform Push { uint n; } p;
+layout(push_constant) uniform Push { uint n; float alpha, limit; } p;
 
 void main()
 {
@@ -15,5 +18,18 @@ void main()
   if (i >= p.n)
     return;
   float a = g[i];
-  g[i] = (a / (1.0 + exp(-a))) * u[i];
+  if (p.limit > 0.0)
+  {
+    float b = u[i];
+    if (a > p.limit)
+      a = p.limit;
+    if (b > p.limit)
+      b = p.limit;
+    else if (b < -p.limit)
+      b = -p.limit;
+    float sg = 1.0 / (1.0 + exp(-(a * p.alpha)));
+    g[i] = (b + 1.0) * (a * sg);
+  }
+  else
+    g[i] = (a / (1.0 + exp(-a))) * u[i];
 }

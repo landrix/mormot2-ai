@@ -1814,8 +1814,62 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5d2 erledigt (2026-10-20): gpt-oss auf Vulkan.** `TQwen3Vulkan` nimmt gpt-oss an wie
+`TQwen3Cuda` seit D5d1.
+
+- *Sinks:* `attention.comp`, `flash.comp` und `attndec.comp` binden die Sinks als Binding 5
+  (Push `hasSinks`; ohne wird ein beliebiger Puffer gebunden), `attnmerge.comp` als Binding
+  2 - im Maximum und im Nenner wie auf CUDA und der CPU.
+- *Biases:* O und der Router über `RecordLinear`; die Experten beim Host-Weg über
+  `RecordLinearAt(..., aBias, aBiasFirst)`, beim Gerät-Weg über `RecordLinearIds(...,
+  aBias)`. Die Zeile eines Experten liegt nicht an einem Bindungs-Versatz (der müsste auf
+  `minStorageBufferOffsetAlignment` liegen, beim schmalen Modell sind es 64 Byte je Zeile),
+  sondern als Index im Push: `biasOff` in `linear`/`linear8`/`gemm8`/`matvec8`,
+  `ids[slot] * nout` in `linear8 -DIDS`. `TLinearPush` hat dafür `BiasOff`.
+- *SwiGLU:* `swiglu.comp` mit `alpha` und `limit` im Push (`TSwiGluPush`), per Vergleich
+  begrenzt wie die CPU.
+- *MXFP4:* Typ 6 in `linear8`/`gemm8` (und `linear`, dort nicht erreichbar: MXFP4 geht immer
+  über `linear8` oder `gemm8`, wie Q5_0); `matvec8` bleibt bei Q8_0/K-Quants. Bei den
+  Exponenten 0 und 1 ist die Skala `2^(e - 128)` subnormal, und Vulkan darf einen
+  subnormalen Operanden ohne `DenormPreserve` auf 0 setzen - auch wenn das Gewicht selbst
+  normal ist (4 · 2^-128 = 2^-126). Dort rechnen die Shader `ldexp(k * 0.25, e - 126)`
+  (exakt für jeden Wert der Tabelle, der Exponent nicht unter -126, wo SPIR-V `Ldexp` auch
+  auf 0 setzen darf). Eine Grenze bleibt: Gewichte, die selbst subnormal sind (e 0 mit k 1
+  bis 3, e 1 mit k 1, um 10^-38), darf solche Hardware beim Produkt weiter auf 0 setzen.
+- *Genauigkeit:* gpt-oss-20b gegen transformers: Kosinus 0,9999999 für Text, 0,999997 /
+  max. 0,048 für den Chatfall, alle 16 Greedy-Tokens der vier Fälle gleich.
+- *Tempo (RTX 5090, GGUF, Prompt 200):* Prefill 1120 Tokens/s (1413 bei 2000), Decode 127;
+  mit Wahl auf dem Host 83.
+- *Tests:* `LinearMatchesReference` mit MXFP4; `GptOssMatchesCpu` (aus `GptOssRefused`) wie
+  auf CUDA, dazu Q8_0 beim Laden über `matvec8.comp` (eine Zeile liest die Biases ihres
+  Experten am Offset), mit und ohne Subgroups, und `CheckAttentionRanges('tiny-gpt-oss')` - die Sinks in
+  `attention`, `flash` und `attndec`, ein Bereich und einer je Schlüssel, beide Cache-Formate,
+  Zurückgehen im Kontext; `GptOss20bOnDevice` wie auf CUDA.
+- Gegenprobe: 30 eingebaute Fehler - Sink nicht im Nenner (`attention`, `flash`, `attndec`),
+  Sink von Kopf 0, `attnmerge` ohne Sink, SwiGLU ohne +1, ohne Grenze für Up, ohne alpha,
+  MXFP4-Nibbles vertauscht (`linear8`, `gemm8`), E8M0 doppelt, `linear8 -DIDS` mit dem Bias
+  des Merkmals statt des Experten, `biasOff` übergangen (`linear8`, `gemm8`, beide Zweige
+  von `matvec8`), das Backend setzt `BiasOff` nicht oder bindet keinen Bias
+  (`RecordLinearAt`, `RecordLinearIds`), kein MXFP4-Shader, kein O-Bias, kein Router-Bias
+  (Host- und Gerät-Weg), Gate-Bias von Experte 0, kein Gate-Bias auf dem Gerät-Weg, keine
+  Sinks, `attnmerge` ohne Sinks, die schlichte SwiGLU. Zwei überlebten zuerst: der Sink von
+  Kopf 0 nur im Maximum (äquivalent - jedes M über allen Exponenten stabilisiert gleich;
+  im Nenner gefangen) und der Shared-Memory-Zweig von `matvec8` (auf der RTX 5090 läuft
+  der Subgroup-Build; jetzt ein Testfall ohne Subgroups). Alle übrigen scheitern direkt.
+- Review: Codex fand, dass Vulkan die subnormale MXFP4-Skala der Exponenten 0 und 1 vor
+  dem Produkt auf 0 setzen darf (jetzt `ldexp`, ein exakter Test mit Gewichten 2^-126 und
+  Eingaben 2^126; die alte Fassung scheitert daran auf dem M2 Pro unter MoltenVK mit 0 statt
+  32, NVIDIA und Lavapipe behalten subnormale Werte), dann dass `ldexp` selbst unter -126
+  auf 0 setzen darf (jetzt `ldexp(k * 0.25, e - 126)`); der Claude-Finder nur einen
+  veralteten Satz der Doku. Im letzten Nachreview beider ohne Befund bis auf die oben
+  genannte Grenze.
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 6733 Assertions; gpt-oss-20b auf
+  Vulkan und CUDA unter beiden mit denselben Antworten) und Delphi 7 (4277), unter WSL
+  aarch64 mit Lavapipe (Infer 5055, LLM 741) und macOS M2 Pro mit MoltenVK - dort laufen
+  `flash.comp`, `attndec.comp` und `matvec8.comp` von selbst (Infer 5101, LLM 730).
+
 **D5d1 erledigt (2026-10-20): gpt-oss auf CUDA.** `TQwen3Cuda` nimmt gpt-oss an; die
-Prüfung auf `TDecoderModel.Extras` ist dort weg. Vulkan lehnt weiter ab (D5d2).
+Prüfung auf `TDecoderModel.Extras` ist dort weg (auf Vulkan seit D5d2).
 
 - *Sinks:* `attention`/`attention16` bekommen die Sinks je Kopf als letzten Parameter
   (0: keine); mit einem Bereich kommt der Sink beim Abschluss in Maximum und Nenner
