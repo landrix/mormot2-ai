@@ -1814,6 +1814,63 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5c3 erledigt (2026-10-20): das Reasoning früherer Züge geht ans Template zurück.**
+`TLlmMessage.Reasoning` trägt die Überlegung eines Assistenten-Zugs, `TLlmChatResponse.Reasoning`
+und `TLlmStreamDelta.ReasoningDelta` liefern sie (bisher nur als `reasoning_content` in `Raw`,
+das bleibt). `TLlmAgent` übernimmt sie in den Zug mit den Tool-Aufrufen.
+
+- *Templates:* gpt-oss schreibt sie als `thinking` des Templates - die Analyse vor den
+  Aufrufen (außer ein späterer Zug antwortet ohne Aufruf) und im letzten Zug ohne
+  Generation-Prompt vor der Antwort; sonst fällt sie weg. Hat ein Aufruf-Zug Reasoning
+  *und* Inhalt - gpt-oss schreibt manchmal eine Analyse und eine Vorrede auf `commentary`,
+  der Parser macht daraus Reasoning und Inhalt -, folgt der Analyse die Vorrede als
+  `commentary`-Nachricht, wie das Modell sie schrieb; das Template lehnt dieses Paar ab,
+  die Agentenschleife bräche sonst im nächsten Schritt ab (bewusster Unterschied). Qwen3 nimmt sie als `reasoning_content`: der
+  `<think>`-Block der Züge nach der letzten Nutzerfrage, der Inhalt wird dann nicht mehr
+  nach einem `<think>` durchsucht. Qwen2.5 kennt kein Reasoning und übergeht das Feld.
+  Leer heißt keins (das Template unterschiede „vorhanden, aber leer“; `TLlmMessage` kann
+  das nicht ausdrücken).
+- *Wire:* `ParseOpenAIChatResponse` und der SSE-Stream lesen `reasoning_content` (vLLM,
+  DeepSeek), ist es leer oder fehlt, `reasoning` (neuere vLLM, Ollama, OpenRouter), nur als
+  String. `AddMessage` schickt es zurück, unter `TLlmProviderConfig.ReasoningField`: leer
+  heißt `reasoning_content` - DeepSeek verlangt das im Thinking-Modus in jeder späteren
+  Anfrage mit `tools` (sonst HTTP 400), vLLM gibt es an das Template -, `OllamaConfig`
+  setzt `reasoning`, den einzigen Namen, den Ollamas OpenAI-Endpunkt liest
+  (`LlmConfigFromEnv`: Umgebungsvariable `LLM_REASONING_FIELD`). Vorhanden ist
+  es nur, wenn ein Anbieter es geliefert hat; wer einen solchen Verlauf an OpenAI selbst
+  schickt, muss das Feld leeren (OpenAI lehnt unbekannte Felder ab). Der Anthropic-Wire
+  liest und sendet es nicht (ein Thinking-Block bräuchte seine Signatur).
+- *Fixtures:* `qwen3-chat` fünf Fälle mehr (26: Reasoning vor einem Aufruf mit und ohne
+  Inhalt, vor der letzten Nutzerfrage, letzte Antwort, Kette; `qwen25-chat` dieselben, Qwen2.5
+  übergeht sie), `gpt-oss-chat` sieben mehr (444, davon 106 abgelehnt: Aufruf mit
+  Reasoning, spätere Antwort, letzte Antwort mit und ohne Generation-Prompt, Zwischenzug,
+  Kette, letzter Aufruf); die alten Fälle unverändert, gleiche Pins.
+- *Tests:* die Template-Tests über beide Fixtures, dazu Qwen3 mit Reasoning und `<think>`
+  im Inhalt (nur im Text prüfbar: in der Referenz wäre `<think>` ein Zusatztoken) und
+  Qwen2.5 mit Reasoning (dieselben Ids); `HarmonyTemplateRules` mit Reasoning und Vorrede;
+  `ReasoningRoundTrip` (Wire), `StreamReasoning`
+  (SSE), der Agent-Test gibt das Reasoning zurück, die Parser liefern `Response.Reasoning`
+  und `ReasoningDelta` gleich dem `Raw`; `GptOss20bChat` gibt die Überlegung vor dem Aufruf
+  zurück und prüft die Analyse im Prompt.
+- Gegenprobe: 19 eingebaute Fehler (Agent vergisst das Reasoning, Wire liest keins, kein
+  Rückfall auf `reasoning` bei fehlendem oder leerem `reasoning_content`, ein Objekt als
+  Reasoning, Wire sendet keins, Feldname übergangen, Ollama mit `reasoning_content`, SSE
+  und Native-Parser ohne `ReasoningDelta`/`Response.Reasoning`, Qwen3 übergeht es oder
+  zerlegt den Inhalt trotzdem, Harmony nimmt den Inhalt vor dem Reasoning, verliert die
+  Vorrede oder die Analyse, behält sie nach einer Antwort, keine Analyse vor der letzten
+  Antwort, Analyse vor jeder Antwort) - alle scheitern.
+- Review: Codex und der Claude-Finder fanden beide, dass ein Aufruf-Zug von gpt-oss mit
+  Analyse *und* Vorrede (Reasoning und Inhalt) die Agentenschleife im nächsten Schritt
+  am Template scheitern ließ - jetzt die Vorrede als `commentary`; Codex dazu, dass
+  DeepSeek `reasoning_content` mit Tools zurückverlangt (der Entwurf schickte es nicht)
+  und dass Ollama nur `reasoning` liest (`ReasoningField`, auch über
+  `LLM_REASONING_FIELD`); der Finder einen leeren `reasoning_content` neben `reasoning`.
+  Alles behoben, im dritten Nachreview beider ohne Befund.
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 6244 Assertions; gpt-oss-20b
+  bekommt die Überlegung vor dem Aufruf zurück und antwortet weiter mit den 17 Grad des
+  Tools) und Delphi 7 (4001), unter WSL aarch64 (Infer 4838, LLM 741), macOS M2 Pro (Infer
+  4824, LLM 730); die LLM-Suite zuletzt unter Delphi 13 (740) und Delphi 7 (728).
+
 **D5c2 erledigt (2026-10-20): gpt-oss als Chat-Modell (Harmony).** gpt-oss-20b läuft hinter
 `ILlmClient`: `TNativeLlmClient` erkennt es an `model_type` bzw. an der GGUF-Architektur
 (`RegisterNativeFamily(TGptOssModel, TBpeTokenizer, THarmonyChatTemplate,
@@ -1895,9 +1952,8 @@ THarmonyOutputParser)`).
   Optionen (jetzt die Vorgabe).
 - Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 6218 Assertions, gpt-oss-20b unter
   beiden mit denselben Antworten; Laden 34 s, je Anfrage 4-5 s) und Delphi 7 (3977), unter
-  WSL aarch64 (4814).
-- *Offen:* das Reasoning früherer Züge kommt nicht zurück - `TLlmMessage` hat kein Feld
-  dafür, das Template rendert sonst die Analyse eines Aufruf-Zugs (Backlog).
+  WSL aarch64 (4814) und macOS M2 Pro (4830).
+- Das Reasoning früherer Züge kam hier noch nicht zurück - nachgezogen mit D5c3.
 
 **D5c1 erledigt (2026-10-20): der Tokenizer von gpt-oss (o200k).** `TBpeTokenizer` liest das
 `tokenizer.json` von `openai/gpt-oss-20b` (Revision `6cee5e8…`) und die Tokenizer-Metadaten

@@ -136,7 +136,9 @@ var
 begin
   stub := TStubLlmClient.Create;
   client := stub; // interface ref owns the stub from here
-  stub.Push(ToolCallResponse('call_1', 'get_weather', '{"loc":"NYC"}'));
+  resp := ToolCallResponse('call_1', 'get_weather', '{"loc":"NYC"}');
+  resp.Reasoning := 'I need the weather.';
+  stub.Push(resp);
   stub.Push(FinalResponse('It is sunny in NYC.'));
 
   weather := TWeatherTool.Create;
@@ -155,6 +157,8 @@ begin
     CheckEqual(weather.CalledWith, '{"loc":"NYC"}', 'tool got the model arguments');
     // history fed back: user + assistant(tool_calls) + tool result = 3
     CheckEqual(length(stub.LastRequest.Messages), 3, 'tool result fed back');
+    CheckEqual(stub.LastRequest.Messages[1].Reasoning, 'I need the weather.',
+      'the reasoning goes back with the calls');
     last := stub.LastRequest.Messages[high(stub.LastRequest.Messages)];
     Check(last.Role = lrTool, 'last history message is the tool result');
     CheckEqual(last.ToolCallId, 'call_1', 'tool result references the call id');

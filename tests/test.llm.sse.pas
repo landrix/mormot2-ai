@@ -20,6 +20,7 @@ type
   public
     ContentPieces: integer;
     Text: RawUtf8;
+    Reasoning: RawUtf8;
     FinishReason: RawUtf8;
     ToolName: RawUtf8;
     ToolArgs: RawUtf8;
@@ -49,6 +50,7 @@ type
     procedure RawBodyIsActuallyBounded;
     procedure EndlessLineIsRefused;
     procedure FalsyErrorKeyDoesNotAbortTheStream;
+    procedure StreamReasoning;
   end;
 
 
@@ -63,6 +65,7 @@ begin
     inc(ContentPieces);
     Text := Text + aDelta.ContentDelta;
   end;
+  Reasoning := Reasoning + aDelta.ReasoningDelta;
   if aDelta.FinishReason <> '' then
     FinishReason := aDelta.FinishReason;
   if aDelta.HasToolCall then
@@ -404,6 +407,32 @@ begin
     CheckEqual(s.StreamError, '', 'a null error key is not an inband error');
     CheckEqual(s.FullText, 'Hello', 'and the content still arrives');
     Check(s.Done, 'and the stream completes normally');
+  finally
+    s.Free;
+    coll.Free;
+  end;
+end;
+
+procedure TTestLlmSse.StreamReasoning;
+const
+  // reasoning_content (vLLM, DeepSeek), then reasoning (newer vLLM, Ollama, OpenRouter)
+  SSE_REASONING =
+    'data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Let "},"finish_reason":null}]}'#10 +
+    #10 +
+    'data: {"choices":[{"index":0,"delta":{"reasoning":"me think."},"finish_reason":null}]}'#10 +
+    #10 +
+    'data: {"choices":[{"index":0,"delta":{"reasoning_content":null,"content":"4"},"finish_reason":"stop"}]}'#10 +
+    #10 +
+    'data: [DONE]'#10#10;
+var
+  s: TLlmSseStream;
+  coll: TSseCollector;
+begin
+  coll := Parse(SSE_REASONING, 0, s);
+  try
+    CheckEqual(coll.Reasoning, 'Let me think.', 'streamed reasoning');
+    CheckEqual(coll.Text, '4', 'content apart');
+    CheckEqual(s.FullText, '4', 'FullText is the content only');
   finally
     s.Free;
     coll.Free;

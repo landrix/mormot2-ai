@@ -104,8 +104,8 @@ type
   // piece is also given out as a TLlmStreamDelta as soon as it is known
   // - a family overrides Token (and FlushOpen) for the grammar of its answers:
   // which ids stop, open reasoning or a tool call; the response is assembled
-  // here - content, reasoning (as vLLM returns it: reasoning_content in Raw),
-  // tool calls, finish reason and usage
+  // here - content, reasoning (Reasoning and ReasoningDelta, and as vLLM
+  // returns it: reasoning_content in Raw), tool calls, finish reason and usage
   TNativeOutputParser = class
   protected
     fTokenizer: TInferTokenizer;
@@ -144,7 +144,8 @@ type
     /// the answer, after Finish
     property Response: TLlmChatResponse
       read fResponse;
-    /// the reasoning text (also in Response.Raw as reasoning_content)
+    /// the reasoning text (also Response.Reasoning, and in Response.Raw as
+    // reasoning_content)
     property Reasoning: RawUtf8
       read fReasoning.Text;
     /// the ids pushed so far, stop token included
@@ -701,6 +702,7 @@ begin
     exit;
   Finalize(d);
   FillCharFast(d, SizeOf(d), 0);
+  d.ReasoningDelta := aText;
   // the chunk shape of vLLM's reasoning parser
   d.Raw := _ObjFast(['choices', _Arr([_ObjFast(['index', 0,
     'delta', _ObjFast(['reasoning_content', aText])])])]);
@@ -767,6 +769,7 @@ begin
   fResponse.Usage.PromptTokens := aPromptTokens;
   fResponse.Usage.CompletionTokens := fCount;
   fResponse.Usage.TotalTokens := aPromptTokens + fCount;
+  fResponse.Reasoning := fReasoning.Text;
   if fReasoning.Text <> '' then
     // the message shape of vLLM's reasoning parser
     fResponse.Raw := _ObjFast(['choices', _Arr([_ObjFast(['index', 0,

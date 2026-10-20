@@ -24,7 +24,7 @@
   }
  },
  "environment": {
-  "created_utc": "2026-10-19T08:28:21Z",
+  "created_utc": "2026-10-20T08:17:52Z",
   "platform": "Linux aarch64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
@@ -512,13 +512,166 @@
    "add_generation_prompt": false,
    "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"now\", \"description\": \"Uhrzeit\"}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nPlane.<|im_end|>\n<|im_start|>assistant\n<think>a</think>Schritt 1\n<tool_call>\n{\"name\": \"now\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>b</think>Schritt 2<|im_end|>\n",
    "tokens": 192
+  },
+  {
+   "id": "reasoning_tool_flow",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    },
+    {
+     "role": "assistant",
+     "content": "Ich schaue nach.",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Berlin\"}"
+      }
+     ],
+     "reasoning": "Ich frage das Wetter ab."
+    },
+    {
+     "role": "tool",
+     "content": "{\"temp\": 21}",
+     "tool_call_id": "c1"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Aktuelles Wetter f\u00fcr einen Ort\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Stadt, z. B. M\u00fcnchen\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWie ist das Wetter in Berlin?<|im_end|>\n<|im_start|>assistant\nIch schaue nach.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Berlin\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+   "tokens": 255
+  },
+  {
+   "id": "reasoning_no_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wetter Ulm?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Ulm\"}"
+      }
+     ],
+     "reasoning": "\nUlm abfragen.\n\n"
+    },
+    {
+     "role": "tool",
+     "content": "18 Grad",
+     "tool_call_id": "c1"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Aktuelles Wetter f\u00fcr einen Ort\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Stadt, z. B. M\u00fcnchen\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWetter Ulm?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Ulm\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 Grad\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+   "tokens": 244
+  },
+  {
+   "id": "reasoning_before_query",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning": "einfach"
+    },
+    {
+     "role": "user",
+     "content": "Und 3+3?"
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nUnd 3+3?<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": 50
+  },
+  {
+   "id": "reasoning_last_no_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Sag ja."
+    },
+    {
+     "role": "assistant",
+     "content": "Ja.",
+     "reasoning": "kurz"
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": false,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nSag ja.<|im_end|>\n<|im_start|>assistant\nJa.<|im_end|>\n",
+   "tokens": 37
+  },
+  {
+   "id": "reasoning_chain",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Plane."
+    },
+    {
+     "role": "assistant",
+     "content": "Schritt 1",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "now",
+       "arguments": "{}"
+      }
+     ],
+     "reasoning": "a"
+    },
+    {
+     "role": "tool",
+     "content": "12:00",
+     "tool_call_id": "c1"
+    },
+    {
+     "role": "assistant",
+     "content": "Schritt 2",
+     "reasoning": "b"
+    }
+   ],
+   "tools": [
+    {
+     "name": "now",
+     "description": "Uhrzeit",
+     "parameters": ""
+    }
+   ],
+   "add_generation_prompt": false,
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"now\", \"description\": \"Uhrzeit\"}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nPlane.<|im_end|>\n<|im_start|>assistant\nSchritt 1\n<tool_call>\n{\"name\": \"now\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n<|im_start|>assistant\nSchritt 2<|im_end|>\n",
+   "tokens": 180
   }
  ],
  "format": 1,
  "blob": {
   "file": "tensors.bin",
-  "bytes": 9540,
-  "sha256": "8f4a57bfedf5f099bd3b765d52c96758b70cfed9e1140c7913605fbb9850253a",
+  "bytes": 12624,
+  "sha256": "d05cd45ecab04d575b326beca3e3882b04e748f44c485212d526388a5c473f27",
   "byte_order": "little",
   "layout": "row-major (C order)"
  },
@@ -527,22 +680,22 @@
    "name": "ids",
    "dtype": "i32",
    "shape": [
-    2363
+    3129
    ],
    "offset": 0,
-   "bytes": 9452,
-   "sha256": "8bee98b1004ef6ae28c4b17282f0ab7bbfaded77aa3e147761afdf31c4308fac",
+   "bytes": 12516,
+   "sha256": "cb53585d5ab24823db70d17161491ec55373f46e1b9bb2ff42ddf7c8e9b8d33d",
    "note": "all cases concatenated"
   },
   {
    "name": "offsets",
    "dtype": "i32",
    "shape": [
-    22
+    27
    ],
-   "offset": 9452,
-   "bytes": 88,
-   "sha256": "53b6a91ab672520ded5c9cc3dc1f1f84062d69ea1d7a5728e92a3553ba29e807",
+   "offset": 12516,
+   "bytes": 108,
+   "sha256": "8affd533969f4a899214b89aa5806aebbb5b130736991a1b3d4e051cd0ca426b",
    "note": "case i = ids[offsets[i] .. offsets[i+1]-1]"
   }
  ]

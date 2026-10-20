@@ -11,6 +11,7 @@
 //        LEMBED_MODEL    (path to a .gguf embedding model)
 //        LEMBED_DIM      (embedding dimensions; default 384 for all-MiniLM)
 //        LLM_BASE_URL / LLM_API_KEY / LLM_MODEL  (generation, default OpenAI)
+//        LLM_REASONING_FIELD  (reasoning for a thinking model on Ollama)
 //   run with LD_LIBRARY_PATH=$SQLITE_EXT_DIR
 program rag.agent;
 

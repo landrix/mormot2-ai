@@ -3,7 +3,8 @@
 // back, and the model produces a final natural-language answer.
 //
 //   llm-agent
-//   provider via env: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY (key never logged)
+//   provider via env: LLM_BASE_URL / LLM_MODEL / LLM_API_KEY (key never logged);
+//   LLM_REASONING_FIELD=reasoning for a thinking model on Ollama
 program llm.agent;
 
 {$I mormot.defines.inc}

@@ -1,6 +1,6 @@
 {
  "dataset": "qwen3-chat",
- "note": "the chat template of the pinned revision (tokenizer_config.json), rendered by transformers and tokenized by the HF tokenizer. Messages as TLlmMessage carries them (tool call arguments are raw JSON text, inserted verbatim); tools as TLlmTool (name, description, raw JSON parameters), sent as {type: function, function: {name, description (when not empty), parameters (when not empty, json.loads)}}. No content holds an added-token literal: there the HF tokenizer would read control tokens, the native template keeps text",
+ "note": "the chat template of the pinned revision (tokenizer_config.json), rendered by transformers and tokenized by the HF tokenizer. Messages as TLlmMessage carries them (tool call arguments are raw JSON text, inserted verbatim), reasoning (TLlmMessage.Reasoning) as reasoning_content; tools as TLlmTool (name, description, raw JSON parameters), sent as {type: function, function: {name, description (when not empty), parameters (when not empty, json.loads)}}. No content holds an added-token literal: there the HF tokenizer would read control tokens, the native template keeps text",
  "model": {
   "id": "Qwen/Qwen3-0.6B",
   "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
@@ -16,7 +16,7 @@
   }
  },
  "environment": {
-  "created_utc": "2026-10-14T21:51:46Z",
+  "created_utc": "2026-10-20T08:01:50Z",
   "platform": "Linux aarch64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
@@ -511,13 +511,166 @@
    "add_generation_prompt": false,
    "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"now\", \"description\": \"Uhrzeit\"}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nPlane.<|im_end|>\n<|im_start|>assistant\n<think>\na\n</think>\n\nSchritt 1\n<tool_call>\n{\"name\": \"now\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nb\n</think>\n\nSchritt 2<|im_end|>\n",
    "tokens": 171
+  },
+  {
+   "id": "reasoning_tool_flow",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    },
+    {
+     "role": "assistant",
+     "content": "Ich schaue nach.",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Berlin\"}"
+      }
+     ],
+     "reasoning": "Ich frage das Wetter ab."
+    },
+    {
+     "role": "tool",
+     "content": "{\"temp\": 21}",
+     "tool_call_id": "c1"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Aktuelles Wetter f\u00fcr einen Ort\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Stadt, z. B. M\u00fcnchen\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWie ist das Wetter in Berlin?<|im_end|>\n<|im_start|>assistant\n<think>\nIch frage das Wetter ab.\n</think>\n\nIch schaue nach.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Berlin\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+   "tokens": 246
+  },
+  {
+   "id": "reasoning_no_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wetter Ulm?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Ulm\"}"
+      }
+     ],
+     "reasoning": "\nUlm abfragen.\n\n"
+    },
+    {
+     "role": "tool",
+     "content": "18 Grad",
+     "tool_call_id": "c1"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Aktuelles Wetter f\u00fcr einen Ort\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"Stadt, z. B. M\u00fcnchen\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWetter Ulm?<|im_end|>\n<|im_start|>assistant\n<think>\nUlm abfragen.\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\":\"Ulm\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n18 Grad\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+   "tokens": 232
+  },
+  {
+   "id": "reasoning_before_query",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning": "einfach"
+    },
+    {
+     "role": "user",
+     "content": "Und 3+3?"
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": true,
+   "rendered": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nUnd 3+3?<|im_end|>\n<|im_start|>assistant\n",
+   "tokens": 29
+  },
+  {
+   "id": "reasoning_last_no_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Sag ja."
+    },
+    {
+     "role": "assistant",
+     "content": "Ja.",
+     "reasoning": "kurz"
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": false,
+   "rendered": "<|im_start|>user\nSag ja.<|im_end|>\n<|im_start|>assistant\n<think>\nkurz\n</think>\n\nJa.<|im_end|>\n",
+   "tokens": 23
+  },
+  {
+   "id": "reasoning_chain",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Plane."
+    },
+    {
+     "role": "assistant",
+     "content": "Schritt 1",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "now",
+       "arguments": "{}"
+      }
+     ],
+     "reasoning": "a"
+    },
+    {
+     "role": "tool",
+     "content": "12:00",
+     "tool_call_id": "c1"
+    },
+    {
+     "role": "assistant",
+     "content": "Schritt 2",
+     "reasoning": "b"
+    }
+   ],
+   "tools": [
+    {
+     "name": "now",
+     "description": "Uhrzeit",
+     "parameters": ""
+    }
+   ],
+   "add_generation_prompt": false,
+   "rendered": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"now\", \"description\": \"Uhrzeit\"}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nPlane.<|im_end|>\n<|im_start|>assistant\n<think>\na\n</think>\n\nSchritt 1\n<tool_call>\n{\"name\": \"now\", \"arguments\": {}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nb\n</think>\n\nSchritt 2<|im_end|>\n",
+   "tokens": 171
   }
  ],
  "format": 1,
  "blob": {
   "file": "tensors.bin",
-  "bytes": 8080,
-  "sha256": "eb8ec9667cc04a61e58996c75a16dce6f10386bca8e309395723a5ee266c9358",
+  "bytes": 10904,
+  "sha256": "0ad5a0e4d4d2736b1c910f46bdd036588da8b38ab66708d93accd34721468983",
   "byte_order": "little",
   "layout": "row-major (C order)"
  },
@@ -526,22 +679,22 @@
    "name": "ids",
    "dtype": "i32",
    "shape": [
-    1998
+    2699
    ],
    "offset": 0,
-   "bytes": 7992,
-   "sha256": "b500198db6f30feebaabaaab87fa20e291f686676a03c69544b680ab273a59b0",
+   "bytes": 10796,
+   "sha256": "e057a5974bef0e0de15d22c60fecab24b6e91eb988951d9c28322065c8de6dd3",
    "note": "all cases concatenated"
   },
   {
    "name": "offsets",
    "dtype": "i32",
    "shape": [
-    22
+    27
    ],
-   "offset": 7992,
-   "bytes": 88,
-   "sha256": "bb1270e69e05ed8cf6260e332c276fa1f75ed175b72bd42fa47edfb4cccb80fd",
+   "offset": 10796,
+   "bytes": 108,
+   "sha256": "2d54184028ef4ef9d462bf17fa02afe16c5e6a939004dbcdcf5772c9b95ce404",
    "note": "case i = ids[offsets[i] .. offsets[i+1]-1]"
   }
  ]

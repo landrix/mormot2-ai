@@ -55,6 +55,11 @@ type
     // - guards ChatStream against a runaway/oversized stream: the per-chunk
     //   global MaxHttpChunkSize bounds one chunk, this bounds the cumulative body
     MaxResponseBytes: Int64;
+    /// the message field a TLlmMessage.Reasoning goes back in
+    // - '' is reasoning_content (DeepSeek requires it with tools, vLLM gives
+    //   it to the chat template); OllamaConfig sets reasoning, the only name
+    //   Ollama's OpenAI endpoint reads
+    ReasoningField: RawUtf8;
   end;
 
   /// raised on transport or provider errors
@@ -75,8 +80,10 @@ type
 
 /// build the OpenAI Chat Completions request JSON for a neutral request
 // - aStream toggles the "stream" flag; omitted fields stay absent
+// - aReasoningField: the field of TLlmMessage.Reasoning, '' = reasoning_content
+//   (TLlmProviderConfig.ReasoningField)
 function OpenAIChatRequestJson(const aRequest: TLlmChatRequest;
-  aStream: boolean): RawUtf8;
+  aStream: boolean; const aReasoningField: RawUtf8 = ''): RawUtf8;
 
 /// parse a (non-streamed) OpenAI Chat Completions response into the neutral record
 function ParseOpenAIChatResponse(const aJson: RawUtf8): TLlmChatResponse;
@@ -119,7 +126,12 @@ implementation
 { ************ Request building }
 
 // add a single chat message object to the messages array variant
-procedure AddMessage(const aMessages: variant; const aMsg: TLlmMessage);
+// - aMsg.Reasoning goes out as aReasoningField (reasoning_content, Ollama:
+//   reasoning): DeepSeek requires it back in every later request that carries
+//   tools (HTTP 400 otherwise), vLLM hands it to the chat template, Ollama
+//   to the model as its thinking; it only exists when a provider returned it
+procedure AddMessage(const aMessages: variant; const aMsg: TLlmMessage;
+  const aReasoningField: RawUtf8);
 var
   m, calls, call, parts: variant;
   i: PtrInt;
@@ -149,6 +161,11 @@ begin
     _Safe(m)^.AddValue('name', aMsg.Name);
   if aMsg.ToolCallId <> '' then
     _Safe(m)^.AddValue('tool_call_id', aMsg.ToolCallId);
+  if aMsg.Reasoning <> '' then
+    if aReasoningField = '' then
+      _Safe(m)^.AddValue('reasoning_content', aMsg.Reasoning)
+    else
+      _Safe(m)^.AddValue(aReasoningField, aMsg.Reasoning);
   if length(aMsg.ToolCalls) > 0 then
   begin
     calls := _Arr([]);
@@ -168,7 +185,7 @@ begin
 end;
 
 function OpenAIChatRequestJson(const aRequest: TLlmChatRequest;
-  aStream: boolean): RawUtf8;
+  aStream: boolean; const aReasoningField: RawUtf8): RawUtf8;
 var
   body, messages, tools, tool, fn: variant;
   i: PtrInt;
@@ -176,7 +193,7 @@ begin
   body := _ObjFast(['model', aRequest.Model, 'stream', aStream]);
   messages := _Arr([]);
   for i := 0 to high(aRequest.Messages) do
-    AddMessage(messages, aRequest.Messages[i]);
+    AddMessage(messages, aRequest.Messages[i], aReasoningField);
   _Safe(body)^.AddValue('messages', messages);
   if aRequest.Temperature >= 0 then
     _Safe(body)^.AddValue('temperature', aRequest.Temperature);
@@ -274,6 +291,7 @@ begin
   result.FinishReason := ToLlmFinishReason(choice^.U['finish_reason']);
   msg := choice^.O['message'];
   result.Content := msg^.U['content'];
+  result.Reasoning := LlmReasoningOf(msg);
   calls := msg^.A['tool_calls'];
   SetLength(result.ToolCalls, calls^.Count);
   for i := 0 to calls^.Count - 1 do
@@ -395,7 +413,7 @@ var
   path, body: RawUtf8;
   status: integer;
 begin
-  body := OpenAIChatRequestJson(aRequest, {stream=}false);
+  body := OpenAIChatRequestJson(aRequest, {stream=}false, fConfig.ReasoningField);
   sock := Connect('/chat/completions', path);
   try
     status := sock.Request(path, 'POST', 0,
@@ -439,7 +457,7 @@ var
   outStream: TStream;
   status: integer;
 begin
-  body := OpenAIChatRequestJson(aRequest, {stream=}true);
+  body := OpenAIChatRequestJson(aRequest, {stream=}true, fConfig.ReasoningField);
   sock := Connect('/chat/completions', path);
   try
     sse := TLlmSseStream.Create(aOnDelta);

@@ -118,7 +118,8 @@ pinned hashes, no weights needed) and loads no model:
   `tokenizer.json` without its added tokens and the pieces of its pre-tokenizer.
 - `gpt-oss-chat` writes the Harmony gate: conversations and tool schemas through the
   `chat_template.jinja` of the revision, rendered by transformers (`apply_chat_template`,
-  the template kwargs `reasoning_effort` and `model_identity`) with the date fixed - the
+  the template kwargs `reasoning_effort` and `model_identity`, a message's reasoning as
+  `thinking`; `qwen3-chat` passes it as `reasoning_content`) with the date fixed - the
   script replaces the `datetime` that transformers' `strftime_now` calls - and their ids;
   400 schemas generated over the branches of the TypeScript rendering. A case transformers
   refuses is stored with its error: the native template must refuse it too.

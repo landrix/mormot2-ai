@@ -580,6 +580,7 @@ begin
     m := _Safe(list^.Values[i]);
     result[i] := LlmMessage(ToLlmRole(m^.U['role']), m^.U['content']);
     result[i].ToolCallId := m^.U['tool_call_id'];
+    result[i].Reasoning := m^.U['reasoning'];
     if m^.GetAsArray('tool_calls', calls) then
     begin
       SetLength(result[i].ToolCalls, calls^.Count);
@@ -1063,6 +1064,16 @@ begin
       CheckUtf8(SameIds(mine, @ids^[first], count), '% ids % expected %',
         [c^.U['id'], IdsText(pointer(mine), length(mine)), IdsText(@ids^[first], count)]);
     end;
+    // a Reasoning is the <think> block, and the content is then not searched
+    // for one (the template: reasoning_content is a string) - the reference
+    // cannot hold this case, a <think> in the content is an added token there
+    SetLength(msgs, 2);
+    msgs[0] := LlmMessage(lrUser, 'x');
+    msgs[1] := LlmMessage(lrAssistant, '<think>a</think>b');
+    msgs[1].Reasoning := 'r';
+    CheckEqual(fTemplate.Render(msgs, nil, false, true),
+      '<|im_start|>user'#10'x<|im_end|>'#10'<|im_start|>assistant'#10'<think>'#10 +
+      'r'#10'</think>'#10#10'<think>a</think>b<|im_end|>'#10, 'reasoning, content kept');
   finally
     ref.Free;
   end;
@@ -1076,7 +1087,7 @@ var
   tpl: TQwen2ChatTemplate;
   cases, c: PDocVariantData;
   ids, offsets: PIntegerArray;
-  n, i, first, count: PtrInt;
+  n, i, j, first, count: PtrInt;
   mine: TIntegerDynArray;
   msgs: TLlmMessageDynArray;
   tools: TLlmToolDynArray;
@@ -1121,6 +1132,10 @@ begin
       // enable_thinking means nothing to Qwen2.5: both give the same
       text := tpl.Render(msgs, tools, gen, i and 1 = 0);
       CheckUtf8(text = c^.U['rendered'], '% rendered%%%', [c^.U['id'], #10, text, #10]);
+      // Qwen2.5 knows no reasoning: a Reasoning changes nothing
+      for j := 0 to high(msgs) do
+        if msgs[j].Role = lrAssistant then
+          msgs[j].Reasoning := 'r';
       mine := tpl.Encode(msgs, tools, gen, i and 1 = 1);
       first := offsets^[i];
       count := offsets^[i + 1] - first;

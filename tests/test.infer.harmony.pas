@@ -575,6 +575,7 @@ begin
     m := _Safe(list^.Values[i]);
     result[i] := LlmMessage(ToLlmRole(m^.U['role']), m^.U['content']);
     result[i].ToolCallId := m^.U['tool_call_id'];
+    result[i].Reasoning := m^.U['reasoning'];
     if m^.GetAsArray('tool_calls', calls) then
     begin
       SetLength(result[i].ToolCalls, calls^.Count);
@@ -776,6 +777,26 @@ begin
       '<|start|>functions.get_time to=assistant<|channel|>commentary<|message|>"B"<|end|>' +
       '<|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>"A"<|end|>' +
       '<|start|>assistant', 'two calls, results by id');
+    // reasoning and content before a call (gpt-oss wrote an analysis and a
+    // preamble on commentary): the analysis, then the preamble - the template
+    // refuses the pair, an agent loop must not break on it
+    SetLength(m, 3);
+    m[0] := LlmMessage(lrUser, 'Ulm?');
+    m[1] := LlmMessage(lrAssistant, 'Ich schaue nach.');
+    m[1].Reasoning := 'Wetter abfragen.';
+    SetLength(m[1].ToolCalls, 1);
+    m[1].ToolCalls[0] := Call('c1', 'get_weather', '{"city":"Ulm"}');
+    m[2] := LlmMessage(lrTool, '18');
+    m[2].ToolCallId := 'c1';
+    text := tpl.RenderWith(m, nil, true, o);
+    CheckEqual(copy(text, PosEx('<|start|>user', text), maxInt),
+      '<|start|>user<|message|>Ulm?<|end|>' +
+      '<|start|>assistant<|channel|>analysis<|message|>Wetter abfragen.<|end|>' +
+      '<|start|>assistant<|channel|>commentary<|message|>Ich schaue nach.<|end|>' +
+      '<|start|>assistant to=functions.get_weather<|channel|>commentary json' +
+      '<|message|>{"city": "Ulm"}<|call|>' +
+      '<|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>"18"<|end|>' +
+      '<|start|>assistant', 'reasoning and preamble');
     // the date of today when none is given
     today := StringToUtf8(FormatDateTime('yyyy"-"mm"-"dd', Now));
     text := tpl.Render(m, nil, true);
@@ -874,6 +895,7 @@ begin
       '<|channel|>final<|message|>Die Antwort.<|return|>', false);
     try
       CheckEqual(p.Reasoning, 'Denke nach.', 'analysis: reasoning');
+      CheckEqual(p.Response.Reasoning, p.Reasoning, 'Response.Reasoning');
       CheckEqual(p.Response.Content, 'Die Antwort.', 'final: content');
       Check(p.Response.FinishReason = lfrStop, 'stop');
       Check(p.Response.ToolCalls = nil, 'no call');
@@ -1254,6 +1276,13 @@ begin
       r.Messages[1].ToolCalls := a.ToolCalls;
       r.Messages[2] := LlmMessage(lrTool, '{"temperature_c": 17, "sky": "rain"}');
       r.Messages[2].ToolCallId := a.ToolCalls[0].Id;
+      // with the reasoning before the call, as TLlmAgent gives it back: the
+      // analysis message of the template
+      r.Messages[1].Reasoning := a.Reasoning;
+      if not CheckFailed(a.Reasoning <> '', 'reasoning before the call') then
+        Check(PosEx('<|channel|>analysis<|message|>' + a.Reasoning + '<|end|>',
+          llm.Template.Render(r.Messages, r.Tools, true, true)) > 0,
+          'the analysis goes back');
       timer.Start;
       a := llm.ChatComplete(r);
       AddConsole(FormatString('answer in %: "%"', [timer.Stop, a.Content]));

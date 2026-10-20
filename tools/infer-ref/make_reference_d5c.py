@@ -521,6 +521,8 @@ def chat_to_hf(messages, tools):
                                for c in m["tool_calls"]]
         if "tool_call_id" in m:
             h["tool_call_id"] = m["tool_call_id"]
+        if "reasoning" in m:
+            h["thinking"] = m["reasoning"]
         hm.append(h)
     ht = []
     for t in tools:
@@ -538,6 +540,7 @@ def harmony_cases():
     a = lambda t, calls=None: q3.msg("assistant", t, calls)  # noqa: E731
     s = lambda t: q3.msg("system", t)  # noqa: E731
     tr = lambda cid, t: q3.msg("tool", t, tool_call_id=cid)  # noqa: E731
+    r = lambda t, why, calls=None: q3.msg("assistant", t, calls, reasoning=why)  # noqa: E731
     W, P, NOW = q3.WEATHER, q3.NO_DESC, q3.NO_PARAMS
     return [
         ("user", [u("Hallo")], [], True, {}),
@@ -585,6 +588,32 @@ def harmony_cases():
         ("tool_numbers", [u("x"), a("", [q3.call("c1", "numbers",
                                                  '{"a": 1.50, "b": [1E5, -0, true]}')]),
                           tr("c1", "ok")], [q3.NUMBERS], True, {}),
+        # TLlmMessage.Reasoning, sent as thinking
+        ("thinking_tool_flow", [u("Wetter in Ulm?"),
+                                r("", "Ich frage das Wetter ab.",
+                                  [q3.call("c1", "get_weather", '{"city":"Ulm"}')]),
+                                tr("c1", "18 Grad")], [W], True, {}),
+        ("thinking_answered", [u("Wetter Ulm?"),
+                               r("", "Ich frage nach.",
+                                 [q3.call("c1", "get_weather", '{"city":"Ulm"}')]),
+                               tr("c1", "18 Grad"), r("In Ulm sind es 18 Grad.", "fertig"),
+                               u("Danke!")], [W], True, {}),
+        # content and thinking before a call: transformers refuses the pair, the
+        # native template writes the analysis and a commentary preamble (as
+        # gpt-oss wrote them) - tested in HarmonyTemplateRules, not here
+        ("thinking_last_no_prompt", [u("Sag ja."), r("Ja.", "kurz" + nl)], [], False, {}),
+        ("thinking_last_prompt", [u("Sag ja."), r("Ja.", "kurz")], [], True, {}),
+        ("thinking_middle", [u("a"), r("b", "r"), u("c")], [], True, {}),
+        ("thinking_chain", [u("Plane."),
+                            r("", "erst die Uhrzeit", [q3.call("c1", "now", "{}")]),
+                            tr("c1", "12:00"),
+                            r("", nl + "dann das Wetter" + nl,
+                              [q3.call("c2", "get_weather", '{"city":"Bonn"}')]),
+                            tr("c2", "Sonne")], [NOW, W], True, {}),
+        ("thinking_last_call_no_prompt", [u("Wetter?"),
+                                          r("", "abfragen",
+                                            [q3.call("c1", "get_weather",
+                                                     '{"city":"Ulm"}')])], [W], False, {}),
     ]
 
 
@@ -756,7 +785,8 @@ def chat():
         "note": "the chat template of the revision (chat_template.jinja), rendered by "
                 "transformers with the date fixed to " + CHAT_DATE + " (strftime_now) "
                 "and tokenized by the HF tokenizer. Messages as TLlmMessage carries them "
-                "(tool call arguments are raw JSON text, sent as their object); tools as "
+                "(tool call arguments are raw JSON text, sent as their object; reasoning "
+                "as thinking); tools as "
                 "TLlmTool (name, description - always sent, parameters as the object). "
                 "options: the template kwargs (reasoning_effort, model_identity). "
                 "schema_*: one tool each, its parameters through the TypeScript "

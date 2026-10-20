@@ -347,10 +347,12 @@ In Scheiben:
   das Harmony-Template des Checkpoints (437 Fälle text- und idgleich mit transformers, die
   TypeScript-Umsetzung der Tool-Schemas samt ihrer Eigenheiten), der Parser (Kanäle,
   Tool-Aufrufe), `reasoning_effort`; gezogen werden nur Ids des Tokenizers. gpt-oss-20b
-  beantwortet greedy eine Rechenfrage und ruft ein Tool auf. *Offen:* das Reasoning früherer
-  Züge (die Analyse vor einem Tool-Aufruf) an das Template zurückgeben - `TLlmMessage`
-  bräuchte ein Feld dafür und die Agentenschleife müsste es füllen; das Template von Qwen3
-  kennt dasselbe (`reasoning_content`).
+  beantwortet greedy eine Rechenfrage und ruft ein Tool auf.
+- *D5c3 erledigt 2026-10-20* (`native-inference.md`, Phase D): das Reasoning früherer Züge
+  geht ans Template zurück - `TLlmMessage.Reasoning`, `TLlmChatResponse.Reasoning`, die
+  Agentenschleife füllt es; gpt-oss als Analyse vor den Aufrufen, Qwen3 als `<think>`
+  (`reasoning_content`); das OpenAI-Wire liest es und schickt es zurück
+  (`reasoning_content`, DeepSeek verlangt das mit Tools; Ollama: `reasoning`).
 - *D5d:* Vulkan und CUDA - Sinks in den Attention-Kernels, Bias auf O, Router- und
   Experten-Bias, die begrenzte SwiGLU, MXFP4-Linear; dann der schmale Cache auf dem Gerät,
   wenn er sich bei gpt-oss-20b lohnt.

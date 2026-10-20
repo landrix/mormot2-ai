@@ -29,6 +29,7 @@ function OpenAIConfig(const aApiKey: RawUtf8;
 /// configuration for a local/remote Ollama via its OpenAI-compatible endpoint
 // - aBaseUrl points at the '/v1' root, e.g. 'http://localhost:11434/v1'
 // - Ollama ignores the API key, so none is sent
+// - a message's reasoning goes back as reasoning, the name Ollama reads
 function OllamaConfig(const aBaseUrl: RawUtf8 = 'http://localhost:11434/v1';
   const aModel: RawUtf8 = 'llama3.2'): TLlmProviderConfig;
 
@@ -39,6 +40,8 @@ function LiteLLMConfig(const aBaseUrl, aApiKey, aModel: RawUtf8): TLlmProviderCo
 // - LLM_BASE_URL (default 'https://api.openai.com/v1'), LLM_MODEL (default
 //   'gpt-4o-mini'), LLM_API_KEY (falls back to OPENAI_API_KEY)
 // - bearer auth is used when a key is present, otherwise none (e.g. local Ollama)
+// - LLM_REASONING_FIELD sets ReasoningField: reasoning for Ollama, empty (the
+//   default) for reasoning_content
 // - the key is read from the environment ONLY - never hard-code or log it
 function LlmConfigFromEnv: TLlmProviderConfig;
 
@@ -67,6 +70,8 @@ begin
   result.BaseUrl := aBaseUrl;
   result.AuthScheme := lasNone;
   result.DefaultModel := aModel;
+  // Ollama's OpenAI endpoint reads (and writes) the thinking as reasoning
+  result.ReasoningField := 'reasoning';
 end;
 
 function LiteLLMConfig(const aBaseUrl, aApiKey, aModel: RawUtf8): TLlmProviderConfig;
@@ -101,6 +106,8 @@ begin
     result.AuthScheme := lasBearer
   else
     result.AuthScheme := lasNone; // e.g. a local Ollama needs no key
+  result.ReasoningField :=
+    TrimU(StringToUtf8(GetEnvironmentVariable('LLM_REASONING_FIELD')));
 end;
 
 end.

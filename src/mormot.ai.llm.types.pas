@@ -105,6 +105,16 @@ type
     // - when present the wire serializes Content + these as a content-parts array
     //   (OpenAI image_url / Anthropic image source); usually on a user message
     Images: TLlmImageDynArray;
+    /// for Role=lrAssistant: the reasoning the model wrote before this turn
+    // - what TLlmChatResponse.Reasoning returned; TLlmAgent copies it here so
+    //   a local chat template can give it back to the model (gpt-oss: the
+    //   analysis before a tool call, Qwen3: the <think> block of the turns
+    //   after the last user query) - '' means none
+    // - the OpenAI wire sends it back, as TLlmProviderConfig.ReasoningField
+    //   (reasoning_content: DeepSeek requires it in later requests with tools,
+    //   vLLM gives it to the template; Ollama: reasoning); the Anthropic wire
+    //   does not (a thinking block needs its signature)
+    Reasoning: RawUtf8;
   end;
   TLlmMessageDynArray = array of TLlmMessage;
 
@@ -149,6 +159,11 @@ type
     FinishReason: TLlmFinishReason;
     Usage: TLlmUsage;
     Model: RawUtf8;
+    /// the reasoning of a thinking model, '' when there is none
+    // - the native client fills it, the OpenAI wire reads message
+    //   reasoning_content (vLLM, DeepSeek) or reasoning (newer vLLM, Ollama,
+    //   OpenRouter); the Anthropic wire leaves it empty
+    Reasoning: RawUtf8;
     /// the full provider payload, for fields not projected above
     Raw: variant;
   end;
@@ -158,6 +173,9 @@ type
   TLlmStreamDelta = record
     /// the text fragment added by this chunk (may be '')
     ContentDelta: RawUtf8;
+    /// the reasoning fragment added by this chunk (may be '') - see
+    // TLlmChatResponse.Reasoning for where it comes from
+    ReasoningDelta: RawUtf8;
     /// the role, usually only present on the first chunk ('assistant')
     Role: RawUtf8;
     /// non-empty on the final content chunk ('stop'/'length'/'tool_calls'/...)
@@ -234,6 +252,12 @@ function LlmEllipsize(const aText: RawUtf8): RawUtf8;
 // - lives here rather than in mormot.ai.llm because the SSE unit needs it
 //   too, and that one sits below the client
 function LlmProviderError(aDoc: PDocVariantData): RawUtf8;
+
+/// the reasoning text of an OpenAI-wire message or stream delta object
+// - reasoning_content (vLLM, DeepSeek), else - when it is absent, null or
+//   empty - reasoning (newer vLLM, Ollama, OpenRouter); only a string counts
+// - lives here for the same reason as LlmProviderError
+function LlmReasoningOf(aMsg: PDocVariantData): RawUtf8;
 
 
 implementation
@@ -388,6 +412,24 @@ begin
     // some shims put a bare string there
     VariantToUtf8(v, result);
   // null, false, an empty object or an absent key: not an error
+end;
+
+function LlmReasoningOf(aMsg: PDocVariantData): RawUtf8;
+var
+  v: variant;
+begin
+  result := '';
+  if aMsg = nil then
+    exit;
+  v := aMsg^.GetValueOrNull('reasoning_content');
+  if VarIsString(v) then
+    VariantToUtf8(v, result);
+  if result <> '' then
+    exit;
+  // absent, null or empty: the other name
+  v := aMsg^.GetValueOrNull('reasoning');
+  if VarIsString(v) then
+    VariantToUtf8(v, result);
 end;
 
 end.

@@ -130,6 +130,10 @@ type
 
   /// the chat template of Qwen3: ChatML with <think> blocks and <tools> in the
   // system turn
+  // - the Reasoning of an assistant message is its reasoning_content: written
+  // as its <think> block in the turns after the last user query, and its
+  // content is then not searched for one; '' is none (the content may still
+  // hold a <think> block)
   TQwen3ChatTemplate = class(TChatTemplate)
   protected
     fImStart, fImEnd, fThink, fThinkEnd, fToolCall, fToolCallEnd,
@@ -170,8 +174,13 @@ type
   // reasoning effort, channels), a developer message (the instructions of a
   // first system message, the tools as a TypeScript namespace "functions"),
   // then the turns; an assistant turn is its final message, a turn with tool
-  // calls an analysis message (its content, unless a later assistant turn
-  // answers without calls) and the calls to functions.NAME
+  // calls an analysis message (its Reasoning, else its content - unless a
+  // later assistant turn answers without calls) and the calls to
+  // functions.NAME
+  // - Reasoning is the template's "thinking": dropped in a turn without calls,
+  // except in the last one when no generation prompt follows (the analysis
+  // before the final message, as in training); '' is no thinking (the template
+  // would write an empty analysis message for a present but empty one there)
   // - the tool schemas are written as the template writes them, its quirks
   // included: the Python values of the schema (str() for enum and type lists,
   // tojson for defaults), the indentation the template puts into nested
@@ -179,8 +188,8 @@ type
   // in an enum) or the template could not take (a description that is no
   // string, a "required", oneOf or enum that is no array) raises EInferError
   // - differences by design: control tokens come as ids and every text is text
-  // (the template refuses an assistant content holding "<|channel|>..."; here
-  // it is text); an empty tool description is written as "// " (transformers
+  // (the template refuses an assistant content or thinking holding
+  // "<|channel|>..."; here it is text); an empty tool description is written as "// " (transformers
   // fails without one); several calls in one assistant turn each get their
   // message (the template writes the first only) and a tool result takes the
   // name of the call with its ToolCallId (the template: the last call); a
@@ -188,7 +197,9 @@ type
   // ReasoningEffort other than low, medium or high and a CurrentDate other
   // than yyyy-mm-dd raise, an empty one is the default (as an empty
   // ModelIdentity); parameters that are truthy but no object raise (the
-  // template would write "() => any")
+  // template would write "() => any"); a turn with calls, Reasoning and
+  // content writes the reasoning as analysis and the content as a commentary
+  // preamble, as gpt-oss wrote them (the template refuses the pair)
   THarmonyChatTemplate = class(TChatTemplate)
   protected
     fStart, fChannel, fMessage, fEnd, fCall, fReturn: integer;
@@ -986,8 +997,10 @@ begin
     end
     else if m^.Role = lrAssistant then
     begin
-      reasoning := '';
-      if PosEx('</think>', content) > 0 then
+      // the reasoning of the message (reasoning_content) - else a <think>
+      // block its content still holds
+      reasoning := m^.Reasoning;
+      if (reasoning = '') and (PosEx('</think>', content) > 0) then
       begin
         reasoning := StripNewlines(SplitLast(StripNewlines(
           SplitFirst(content, '</think>'), false, true), '<think>'), true, false);
@@ -1637,14 +1650,28 @@ begin
       lrAssistant:
         if m^.ToolCalls <> nil then
         begin
-          // its content is the analysis before the calls - unless a later
-          // assistant turn answers without calls (then it is dropped)
+          // its reasoning or content is the analysis before the calls -
+          // unless a later assistant turn answers without calls (then it is
+          // dropped)
           answered := false;
           for k := i + 1 to n - 1 do
             if (aMessages[k].Role = lrAssistant) and (aMessages[k].ToolCalls = nil) then
               answered := true;
-          if (m^.Content <> '') and not answered then
-            Message('assistant', 'analysis', m^.Content, fEnd, '<|end|>');
+          if not answered then
+            if m^.Reasoning = '' then
+            begin
+              if m^.Content <> '' then
+                Message('assistant', 'analysis', m^.Content, fEnd, '<|end|>');
+            end
+            else
+            begin
+              Message('assistant', 'analysis', m^.Reasoning, fEnd, '<|end|>');
+              // both: the content is the preamble gpt-oss wrote on commentary
+              // (THarmonyOutputParser takes it from there) - the template
+              // refuses this pair
+              if m^.Content <> '' then
+                Message('assistant', 'commentary', m^.Content, fEnd, '<|end|>');
+            end;
           for j := 0 to high(m^.ToolCalls) do
           begin
             args := m^.ToolCalls[j].ArgumentsJson;
@@ -1658,8 +1685,13 @@ begin
           calls := m^.ToolCalls;
         end
         else if (i = n - 1) and not aAddGenerationPrompt then
-          // the end of a conversation the model wrote: <|return|>
-          Message('assistant', 'final', m^.Content, fReturn, '<|return|>')
+        begin
+          // the end of a conversation the model wrote: its reasoning, then
+          // the final message with <|return|>
+          if m^.Reasoning <> '' then
+            Message('assistant', 'analysis', m^.Reasoning, fEnd, '<|end|>');
+          Message('assistant', 'final', m^.Content, fReturn, '<|return|>');
+        end
         else
         begin
           Message('assistant', 'final', m^.Content, fEnd, '<|end|>');

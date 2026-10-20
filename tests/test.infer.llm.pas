@@ -149,7 +149,10 @@ begin
   r := _Safe(aDelta.Raw)^.A['choices']^._[0]^.O['delta']^.U['reasoning_content'];
   if not IsStrictUtf8(pointer(r), length(r)) then
     inc(Invalid);
-  Reasoning := Reasoning + r;
+  // the projected field and the vLLM shape in Raw carry the same text
+  if r <> aDelta.ReasoningDelta then
+    inc(Invalid);
+  Reasoning := Reasoning + aDelta.ReasoningDelta;
   if aDelta.HasToolCall then
   begin
     n := length(CallIds);
@@ -278,6 +281,7 @@ begin
     p.Push(IM_END);
     p.Finish(false, 3);
     CheckEqual(p.Reasoning, 'Let me think.'#10'Twice.', 'reasoning');
+    CheckEqual(p.Response.Reasoning, p.Reasoning, 'Response.Reasoning');
     CheckEqual(p.Response.Content, 'The answer.', 'content');
     CheckEqual(_Safe(p.Response.Raw)^.A['choices']^._[0]^.O['message']^.
       U['reasoning_content'], p.Reasoning, 'reasoning_content in Raw');

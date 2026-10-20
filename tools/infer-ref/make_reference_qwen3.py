@@ -589,12 +589,16 @@ def call(cid, name, arguments):
     return {"id": cid, "name": name, "arguments": arguments}
 
 
-def msg(role, content, tool_calls=None, tool_call_id=None):
+def msg(role, content, tool_calls=None, tool_call_id=None, reasoning=None):
+    """a message as TLlmMessage carries it; reasoning is TLlmMessage.Reasoning
+    (none when empty)"""
     m = {"role": role, "content": content}
     if tool_calls:
         m["tool_calls"] = tool_calls
     if tool_call_id:
         m["tool_call_id"] = tool_call_id
+    if reasoning:
+        m["reasoning"] = reasoning
     return m
 
 
@@ -620,6 +624,7 @@ def chat_cases():
     a = lambda t, calls=None: msg("assistant", t, calls)  # noqa: E731
     s = lambda t: msg("system", t)  # noqa: E731
     tr = lambda cid, t: msg("tool", t, tool_call_id=cid)  # noqa: E731
+    r = lambda t, why, calls=None: msg("assistant", t, calls, reasoning=why)  # noqa: E731
     cases = [
         ("user", [u("Hallo")], [], True, None),
         ("user_no_think", [u("Hallo")], [], True, False),
@@ -665,6 +670,22 @@ def chat_cases():
                                      [call("c1", "now", "{}")]),
                                    tr("c1", "12:00"),
                                    a("<think>b</think>Schritt 2")], [NO_PARAMS], False, None),
+        # TLlmMessage.Reasoning, sent as reasoning_content
+        ("reasoning_tool_flow", [u("Wie ist das Wetter in Berlin?"),
+                                 r("Ich schaue nach.", "Ich frage das Wetter ab.",
+                                   [call("c1", "get_weather", '{"city": "Berlin"}')]),
+                                 tr("c1", '{"temp": 21}')], [WEATHER], True, None),
+        ("reasoning_no_content", [u("Wetter Ulm?"),
+                                  r("", nl + "Ulm abfragen." + nl + nl,
+                                    [call("c1", "get_weather", '{"city":"Ulm"}')]),
+                                  tr("c1", "18 Grad")], [WEATHER], True, None),
+        ("reasoning_before_query", [u("2+2?"), r("4", "einfach"), u("Und 3+3?")], [],
+         True, None),
+        ("reasoning_last_no_prompt", [u("Sag ja."), r("Ja.", "kurz")], [], False, None),
+        ("reasoning_chain", [u("Plane."),
+                             r("Schritt 1", "a", [call("c1", "now", "{}")]),
+                             tr("c1", "12:00"), r("Schritt 2", "b")], [NO_PARAMS], False,
+         None),
     ]
     return cases
 
@@ -679,6 +700,8 @@ def chat_to_hf(messages, tools):
                                for c in m["tool_calls"]]
         if "tool_call_id" in m:
             h["tool_call_id"] = m["tool_call_id"]
+        if "reasoning" in m:
+            h["reasoning_content"] = m["reasoning"]
         hm.append(h)
     ht = []
     for t in tools:
@@ -724,7 +747,8 @@ def chat(snapshot):
         "note": "the chat template of the pinned revision (tokenizer_config.json), "
                 "rendered by transformers and tokenized by the HF tokenizer. Messages "
                 "as TLlmMessage carries them (tool call arguments are raw JSON text, "
-                "inserted verbatim); tools as TLlmTool (name, description, raw JSON "
+                "inserted verbatim), reasoning (TLlmMessage.Reasoning) as reasoning_content; "
+                "tools as TLlmTool (name, description, raw JSON "
                 "parameters), sent as {type: function, function: {name, description "
                 "(when not empty), parameters (when not empty, json.loads)}}. No "
                 "content holds an added-token literal: there the HF tokenizer would "

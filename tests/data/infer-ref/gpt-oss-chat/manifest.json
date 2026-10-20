@@ -1,6 +1,6 @@
 {
  "dataset": "gpt-oss-chat",
- "note": "the chat template of the revision (chat_template.jinja), rendered by transformers with the date fixed to 2026-10-20 (strftime_now) and tokenized by the HF tokenizer. Messages as TLlmMessage carries them (tool call arguments are raw JSON text, sent as their object); tools as TLlmTool (name, description - always sent, parameters as the object). options: the template kwargs (reasoning_effort, model_identity). schema_*: one tool each, its parameters through the TypeScript rendering of the template; random_*: generated over its branches. error: transformers refused the case (the native template must too)",
+ "note": "the chat template of the revision (chat_template.jinja), rendered by transformers with the date fixed to 2026-10-20 (strftime_now) and tokenized by the HF tokenizer. Messages as TLlmMessage carries them (tool call arguments are raw JSON text, sent as their object; reasoning as thinking); tools as TLlmTool (name, description - always sent, parameters as the object). options: the template kwargs (reasoning_effort, model_identity). schema_*: one tool each, its parameters through the TypeScript rendering of the template; random_*: generated over its branches. error: transformers refused the case (the native template must too)",
  "date": "2026-10-20",
  "model": {
   "id": "openai/gpt-oss-20b",
@@ -14,7 +14,7 @@
   }
  },
  "environment": {
-  "created_utc": "2026-10-20T07:10:05Z",
+  "created_utc": "2026-10-20T08:50:48Z",
   "platform": "Windows AMD64",
   "python": "3.12.13",
   "torch": "2.14.1+cpu",
@@ -587,6 +587,241 @@
    "options": {},
    "rendered": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-20\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n// Zahlen und Escapes\ntype numbers = (_: {\na?: number, // default: -0.0,\n// Zeile1\nZeile2\t\"q\" \u0001 \u00fc \u20ac \ud83d\ude00 </script> / /\ns?: string,\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>x<|end|><|start|>assistant to=functions.numbers<|channel|>commentary json<|message|>{\"a\": 1.5, \"b\": [100000.0, 0, true]}<|call|><|start|>functions.numbers to=assistant<|channel|>commentary<|message|>\"ok\"<|end|><|start|>assistant",
    "tokens": 201
+  },
+  {
+   "id": "thinking_tool_flow",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wetter in Ulm?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Ulm\"}"
+      }
+     ],
+     "reasoning": "Ich frage das Wetter ab."
+    },
+    {
+     "role": "tool",
+     "content": "18 Grad",
+     "tool_call_id": "c1"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "add_generation_prompt": true,
+   "options": {},
+   "rendered": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-20\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n// Aktuelles Wetter f\u00fcr einen Ort\ntype get_weather = (_: {\n// Stadt, z. B. M\u00fcnchen\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\",\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>Wetter in Ulm?<|end|><|start|>assistant<|channel|>analysis<|message|>Ich frage das Wetter ab.<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Ulm\"}<|call|><|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>\"18 Grad\"<|end|><|start|>assistant",
+   "tokens": 193
+  },
+  {
+   "id": "thinking_answered",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wetter Ulm?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Ulm\"}"
+      }
+     ],
+     "reasoning": "Ich frage nach."
+    },
+    {
+     "role": "tool",
+     "content": "18 Grad",
+     "tool_call_id": "c1"
+    },
+    {
+     "role": "assistant",
+     "content": "In Ulm sind es 18 Grad.",
+     "reasoning": "fertig"
+    },
+    {
+     "role": "user",
+     "content": "Danke!"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "add_generation_prompt": true,
+   "options": {},
+   "rendered": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-20\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n// Aktuelles Wetter f\u00fcr einen Ort\ntype get_weather = (_: {\n// Stadt, z. B. M\u00fcnchen\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\",\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>Wetter Ulm?<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Ulm\"}<|call|><|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>\"18 Grad\"<|end|><|start|>assistant<|channel|>final<|message|>In Ulm sind es 18 Grad.<|end|><|start|>user<|message|>Danke!<|end|><|start|>assistant",
+   "tokens": 201
+  },
+  {
+   "id": "thinking_last_no_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Sag ja."
+    },
+    {
+     "role": "assistant",
+     "content": "Ja.",
+     "reasoning": "kurz\n"
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": false,
+   "options": {},
+   "rendered": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-20\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Sag ja.<|end|><|start|>assistant<|channel|>analysis<|message|>kurz\n<|end|><|start|>assistant<|channel|>final<|message|>Ja.<|return|>",
+   "tokens": 85
+  },
+  {
+   "id": "thinking_last_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Sag ja."
+    },
+    {
+     "role": "assistant",
+     "content": "Ja.",
+     "reasoning": "kurz"
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": true,
+   "options": {},
+   "rendered": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-20\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>Sag ja.<|end|><|start|>assistant<|channel|>final<|message|>Ja.<|end|><|start|>assistant",
+   "tokens": 78
+  },
+  {
+   "id": "thinking_middle",
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b",
+     "reasoning": "r"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "tools": [],
+   "add_generation_prompt": true,
+   "options": {},
+   "rendered": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-20\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>user<|message|>a<|end|><|start|>assistant<|channel|>final<|message|>b<|end|><|start|>user<|message|>c<|end|><|start|>assistant",
+   "tokens": 80
+  },
+  {
+   "id": "thinking_chain",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Plane."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "now",
+       "arguments": "{}"
+      }
+     ],
+     "reasoning": "erst die Uhrzeit"
+    },
+    {
+     "role": "tool",
+     "content": "12:00",
+     "tool_call_id": "c1"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c2",
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Bonn\"}"
+      }
+     ],
+     "reasoning": "\ndann das Wetter\n"
+    },
+    {
+     "role": "tool",
+     "content": "Sonne",
+     "tool_call_id": "c2"
+    }
+   ],
+   "tools": [
+    {
+     "name": "now",
+     "description": "Uhrzeit",
+     "parameters": ""
+    },
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "add_generation_prompt": true,
+   "options": {},
+   "rendered": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-20\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n// Uhrzeit\ntype now = () => any;\n\n// Aktuelles Wetter f\u00fcr einen Ort\ntype get_weather = (_: {\n// Stadt, z. B. M\u00fcnchen\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\",\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>Plane.<|end|><|start|>assistant<|channel|>analysis<|message|>erst die Uhrzeit<|end|><|start|>assistant to=functions.now<|channel|>commentary json<|message|>{}<|call|><|start|>functions.now to=assistant<|channel|>commentary<|message|>\"12:00\"<|end|><|start|>assistant<|channel|>analysis<|message|>\ndann das Wetter\n<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Bonn\"}<|call|><|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>\"Sonne\"<|end|><|start|>assistant",
+   "tokens": 237
+  },
+  {
+   "id": "thinking_last_call_no_prompt",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wetter?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Ulm\"}"
+      }
+     ],
+     "reasoning": "abfragen"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "add_generation_prompt": false,
+   "options": {},
+   "rendered": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-10-20\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n// Aktuelles Wetter f\u00fcr einen Ort\ntype get_weather = (_: {\n// Stadt, z. B. M\u00fcnchen\ncity: string,\nunit?: \"celsius\" | \"fahrenheit\",\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>Wetter?<|end|><|start|>assistant<|channel|>analysis<|message|>abfragen<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Ulm\"}<|call|>",
+   "tokens": 168
   },
   {
    "id": "schema_scalars",
@@ -8786,8 +9021,8 @@
  "format": 1,
  "blob": {
   "file": "tensors.bin",
-  "bytes": 183468,
-  "sha256": "2dfc1d535a779810db8ebc5a05827f7c31d43267c410e643c36c13c9273e1696",
+  "bytes": 187664,
+  "sha256": "1c6599126e6f6ed0cbe6f231d13142de549426a671a419824fb27b2afacf9df7",
   "byte_order": "little",
   "layout": "row-major (C order)"
  },
@@ -8796,22 +9031,22 @@
    "name": "ids",
    "dtype": "i32",
    "shape": [
-    45429
+    46471
    ],
    "offset": 0,
-   "bytes": 181716,
-   "sha256": "5df452d2f479e42a6e296e7fd20c268c130264a16552034119958b2364481c03",
+   "bytes": 185884,
+   "sha256": "92811173066c97c88488d23d72437e83eb6b8b8fc8dd2abf1af91bcf72e23376",
    "note": "all cases concatenated"
   },
   {
    "name": "offsets",
    "dtype": "i32",
    "shape": [
-    438
+    445
    ],
-   "offset": 181716,
-   "bytes": 1752,
-   "sha256": "707273860987850bc0c72df6d00df30ef24b347447c59bb6e9009a2aeffb6778",
+   "offset": 185884,
+   "bytes": 1780,
+   "sha256": "df858d91f34910ce1894ef9da2d15c84c53f3ce0b15b73034df473e21af57388",
    "note": "case i = ids[offsets[i] .. offsets[i+1]-1] (none for an error case)"
   }
  ]

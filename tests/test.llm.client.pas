@@ -36,6 +36,7 @@ type
     procedure NonChatBodyIsRefusedNotSilentlyEmpty;
     procedure ExtraCannotOverrideTheTransportMode;
     procedure FalsyErrorKeyIsNotAProviderError;
+    procedure ReasoningRoundTrip;
   end;
 
 
@@ -540,6 +541,52 @@ begin
       raised := true;
   end;
   Check(raised, 'and so is a null choice');
+end;
+
+procedure TTestLlmClient.ReasoningRoundTrip;
+
+  function Parsed(const aMessage: RawUtf8): TLlmChatResponse;
+  begin
+    result := ParseOpenAIChatResponse('{"choices":[{"index":0,"message":' +
+      aMessage + ',"finish_reason":"stop"}]}');
+  end;
+
+var
+  req: TLlmChatRequest;
+  msgs: TLlmMessageDynArray;
+  json: RawUtf8;
+begin
+  // vLLM, DeepSeek: reasoning_content
+  CheckEqual(Parsed('{"role":"assistant","content":"4",' +
+    '"reasoning_content":"2+2"}').Reasoning, '2+2', 'reasoning_content');
+  // newer vLLM, Ollama, OpenRouter: reasoning
+  CheckEqual(Parsed('{"role":"assistant","content":"4","reasoning":"2+2"}').Reasoning,
+    '2+2', 'reasoning');
+  CheckEqual(Parsed('{"role":"assistant","content":"4","reasoning_content":null,' +
+    '"reasoning":"2+2"}').Reasoning, '2+2', 'a null reasoning_content: reasoning');
+  CheckEqual(Parsed('{"role":"assistant","content":"4","reasoning_content":"",' +
+    '"reasoning":"2+2"}').Reasoning, '2+2', 'an empty reasoning_content: reasoning');
+  // only a string is reasoning
+  CheckEqual(Parsed('{"role":"assistant","content":"4","reasoning":{"x":1}}').Reasoning,
+    '', 'an object is no reasoning');
+  CheckEqual(Parsed('{"role":"assistant","content":"4"}').Reasoning, '', 'none');
+  // and it goes back as reasoning_content (DeepSeek requires it with tools)
+  SetLength(msgs, 3);
+  msgs[0] := LlmMessage(lrUser, '2+2?');
+  msgs[1] := LlmMessage(lrAssistant, '4');
+  msgs[1].Reasoning := 'add';
+  msgs[2] := LlmMessage(lrUser, 'and 3+3?');
+  req := LlmChatRequest('m', msgs);
+  json := OpenAIChatRequestJson(req, {stream=}false);
+  CheckEqual(_Safe(_Json(json))^.A['messages']^._[1]^.U['reasoning_content'], 'add',
+    'reasoning sent back');
+  CheckEqual(CountSubstr('reasoning', json), 1, 'only where there is one');
+  // Ollama reads it as reasoning
+  json := OpenAIChatRequestJson(req, {stream=}false,
+    OllamaConfig('http://localhost:11434/v1', 'm').ReasoningField);
+  CheckEqual(_Safe(_Json(json))^.A['messages']^._[1]^.U['reasoning'], 'add',
+    'Ollama: reasoning');
+  Check(PosEx('reasoning_content', json) = 0, 'Ollama: not reasoning_content');
 end;
 
 end.

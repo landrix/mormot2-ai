@@ -284,6 +284,7 @@ begin
     delta.FinishReason := choice^.U['finish_reason'];
     deltaObj := choice^.O['delta'];
     delta.ContentDelta := deltaObj^.U['content'];
+    delta.ReasoningDelta := LlmReasoningOf(deltaObj);
     delta.Role := deltaObj^.U['role'];
     tcArr := deltaObj^.A['tool_calls'];
     if tcArr^.Count > 0 then

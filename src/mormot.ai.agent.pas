@@ -151,6 +151,9 @@ begin
     //    tool_calls message to precede its tool results)
     assistantMsg := LlmMessage(lrAssistant, resp.Content);
     assistantMsg.ToolCalls := resp.ToolCalls;
+    // with its reasoning: a local template gives it back to the model (the
+    // analysis before the calls), the OpenAI wire as reasoning_content
+    assistantMsg.Reasoning := resp.Reasoning;
     SetLength(msgs, length(msgs) + 1);
     msgs[high(msgs)] := assistantMsg;
 
