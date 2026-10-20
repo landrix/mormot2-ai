@@ -44,7 +44,8 @@ type
     ioCausalAttention,
     ioRmsNorm,
     ioSwiGlu,
-    ioRope);
+    ioRope,
+    ioGeluTanhGlu);
 
   /// a weight matrix [out, in] as stored in the file: its first byte and type
   // - F32 holds out * in singles, Q8_0 out rows of in div 32 blocks
@@ -100,9 +101,12 @@ type
     // - aSinks <> nil ([aHeads]): attention sinks (gpt-oss) - a learned logit
     // per head joins the softmax of every row and takes its share of the
     // weight without a value: the weights of the keys sum to less than 1
+    // - aScale > 0: the factor of the scores in place of 1 / sqrt(aHeadDim)
+    // (Gemma 4: 1, its Q and K heads are normed)
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
-      aWindow: PtrInt = 0; aSinks: PSingleArray = nil); virtual; abstract;
+      aWindow: PtrInt = 0; aSinks: PSingleArray = nil;
+      aScale: double = 0); virtual; abstract;
     /// y[rows, cols] = x / sqrt(mean(x^2) + eps) * w, per row (RMSNorm)
     // - the normalized value is rounded to single before the weight, as the
     // float32 reference does; y may be x
@@ -115,6 +119,10 @@ type
     // * g), every step rounded to single; aAlpha is only used then
     procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
       aAlpha: single = 1; aLimit: single = 0); virtual; abstract;
+    /// gate := gelu_tanh(gate) * up elementwise (the GeGLU of Gemma), with
+    // gelu_tanh(g) = 0.5 g (1 + tanh(sqrt(2 / pi) (g + 0.044715 g^3))) in
+    // double, rounded to single before the product
+    procedure GeluTanhGlu(gate, up: PSingleArray; aCount: PtrInt); virtual; abstract;
     /// rotary positions in place, the halves of every head rotated together
     // (rotate_half): x[i], x[i + d/2] := x[i] c - x[i + d/2] s, x[i + d/2] c +
     // x[i] s, in double

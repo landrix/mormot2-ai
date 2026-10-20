@@ -446,6 +446,9 @@ begin
   // attention sinks, the output, router and expert biases and the clamped
   // SwiGLU of gpt-oss run here too (slice D5d2)
   fMoe := not aModel.HasOnly(dmAttention, dfDense);
+  // what Gemma 4 computes beyond gpt-oss is not here yet (slice D6e)
+  if aModel.Extras - DECODER_EXTRAS_GPTOSS <> [] then
+    EInferError.RaiseUtf8('%: % computes what this device does not', [self, aModel]);
   // qkrope.comp keeps one normalized head in shared memory
   // and attention.comp reads it as vec4
   if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then

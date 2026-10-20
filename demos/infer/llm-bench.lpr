@@ -38,6 +38,7 @@ uses
   mormot.core.perf,
   mormot.ai.infer.tensor,
   mormot.ai.infer.backend,
+  mormot.ai.infer.threads,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.kernels,
   mormot.ai.infer.tokenizer.bpe,
@@ -75,11 +76,14 @@ type
     procedure L2Normalize(x: PSingleArray; aCount: PtrInt); override;
     procedure CausalAttention(q: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       keys, values: PSingleArray; aPast, aKvHeads: PtrInt; y: PSingleArray;
-      aWindow: PtrInt = 0; aSinks: PSingleArray = nil); override;
+      aWindow: PtrInt = 0; aSinks: PSingleArray = nil;
+      aScale: double = 0); override;
     procedure RmsNorm(x: PSingleArray; aRows, aCols: PtrInt; w: PSingleArray;
       aEps: double; y: PSingleArray); override;
     procedure SwiGlu(gate, up: PSingleArray; aCount: PtrInt;
       aAlpha: single = 1; aLimit: single = 0); override;
+    procedure GeluTanhGlu(gate, up: PSingleArray; aCount: PtrInt); override;
+    procedure RunItems(const aJob: TOnInferItem; aCount: integer); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray); override;
     procedure Reset;
@@ -148,13 +152,13 @@ end;
 
 procedure TTimedBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
-  y: PSingleArray; aWindow: PtrInt; aSinks: PSingleArray);
+  y: PSingleArray; aWindow: PtrInt; aSinks: PSingleArray; aScale: double);
 var
   t0, t1: Int64;
 begin
   QueryPerformanceMicroSeconds(t0);
   fInner.CausalAttention(q, aRows, aHeads, aHeadDim, keys, values, aPast, aKvHeads, y,
-    aWindow, aSinks);
+    aWindow, aSinks, aScale);
   QueryPerformanceMicroSeconds(t1);
   inc(AttnUs, t1 - t0);
 end;
@@ -179,6 +183,21 @@ begin
   fInner.SwiGlu(gate, up, aCount, aAlpha, aLimit);
   QueryPerformanceMicroSeconds(t1);
   inc(GluUs, t1 - t0);
+end;
+
+procedure TTimedBackend.GeluTanhGlu(gate, up: PSingleArray; aCount: PtrInt);
+var
+  t0, t1: Int64;
+begin
+  QueryPerformanceMicroSeconds(t0);
+  fInner.GeluTanhGlu(gate, up, aCount);
+  QueryPerformanceMicroSeconds(t1);
+  inc(GluUs, t1 - t0);
+end;
+
+procedure TTimedBackend.RunItems(const aJob: TOnInferItem; aCount: integer);
+begin
+  fInner.RunItems(aJob, aCount); // the load on the threads of the inner one
 end;
 
 procedure TTimedBackend.Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;

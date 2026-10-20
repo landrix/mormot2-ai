@@ -95,9 +95,21 @@ type
   // picks ExpertsUsed SwiGLU blocks of ExpertIntermediate per token, their
   // outputs are summed with the router probabilities (renormed to a sum of 1
   // when NormTopK)
+  // - dfDenseMoe: both side by side on the same input (Gemma 4): the dense
+  // block on the pre-FFN norm, the experts on their own norm (MoeInNorm), each
+  // output normed (DenseOutNorm, MoeOutNorm), their sum normed again
+  // (FfnNorm); the router of Gemma (RouterScale, ExpertScale)
   TDecoderFfn = (
     dfDense,
-    dfMoe);
+    dfMoe,
+    dfDenseMoe);
+
+  /// the activation of the gate in every feed-forward block
+  // - daSilu: SwiGLU, silu(gate) * up; daGeluTanh: GeGLU with the tanh
+  // approximation of GELU (gelu_pytorch_tanh), gelu(gate) * up
+  TDecoderActivation = (
+    daSilu,
+    daGeluTanh);
 
   /// the kind of one layer
   // - all zero (the default of a new array) is attention over every cached
@@ -111,6 +123,15 @@ type
     Window: PtrInt;
     /// no rotary positions on Q and K in this layer (NoPE)
     NoRope: boolean;
+    /// the attention heads of this layer: 0 for HeadDim and KvHeads of the
+    // config (CheckConfig fills them in) - Gemma 4 has wider heads and fewer
+    // KV heads in its full-attention layers
+    HeadDim, KvHeads: PtrInt;
+    /// the second rotary set of the config (Rope2Theta, Rope2Partial)
+    Rope2: boolean;
+    /// V is the K projection (no V matrix): the raw keys before their norm
+    // and rotary positions (Gemma 4 attention_k_eq_v)
+    KIsV: boolean;
   end;
   TDecoderLayerSpecDynArray = array of TDecoderLayerSpec;
 
@@ -152,6 +173,24 @@ type
     /// the kind of every layer ([Layers]) - a family that leaves it empty
     // gets attention and a dense block in every layer
     Spec: TDecoderLayerSpecDynArray;
+    /// the gate activation of every feed-forward block
+    Activation: TDecoderActivation;
+    /// > 0: the factor of the attention scores in place of 1 / sqrt(head
+    // dim) (Gemma 4: 1)
+    AttentionScale: double;
+    /// > 0: the token embeddings times this (Gemma: sqrt(Hidden) in float32)
+    EmbedScale: single;
+    /// > 0: logits := tanh(logits / LogitSoftcap) * LogitSoftcap
+    LogitSoftcap: double;
+    /// the norms of Gemma around both blocks: the attention output normed
+    // (AttnNorm) and the feed-forward output (FfnNorm) before the residual
+    SandwichNorm: boolean;
+    /// an RMSNorm without weight over every V head (Gemma 4)
+    ValueNorm: boolean;
+    /// the rotary set of the layers with Spec.Rope2: its theta, and the share
+    // of each head that rotates (the "proportional" RoPE of Gemma 4: the
+    // frequencies over the whole head dimension, those beyond the share 0)
+    Rope2Theta, Rope2Partial: double;
   end;
 
   /// weights by expert
@@ -167,9 +206,19 @@ type
   // - RouterBias ([Experts]), ExpertGateBias and ExpertUpBias ([Experts *
   // ExpertIntermediate], expert by expert) and ExpertDownBias ([Experts *
   // Hidden]): the biases of a dfMoe layer (gpt-oss), nil without
+  // - Gemma (SandwichNorm): PostNorm is the pre-FFN norm, AttnNorm normes the
+  // attention output, FfnNorm the feed-forward output; a dfDenseMoe layer
+  // adds DenseOutNorm, MoeInNorm and MoeOutNorm, RouterScale ([Hidden], the
+  // router input after an RMSNorm without weight: router.scale * hidden^-0.5)
+  // and ExpertScale ([Experts], times the renormed top-k weights); Scalar
+  // ([1]) multiplies the whole state after the layer, whatever its value
+  // (nil: none)
   TDecoderLayer = record
     Q, K, V, O, Gate, Up, Down: TInferWeight;
     QNorm, KNorm, InputNorm, PostNorm: PSingleArray;
+    AttnNorm, FfnNorm, DenseOutNorm, MoeInNorm, MoeOutNorm: PSingleArray;
+    RouterScale, ExpertScale: PSingleArray;
+    Scalar: PSingleArray;
     QBias, KBias, VBias, OBias: PSingleArray;
     Sinks: PSingleArray;
     Router: TInferWeight;
@@ -184,13 +233,35 @@ type
   // - dxSinks: attention sinks; dxOutputBias: a bias on the attention output;
   // dxRouterBias, dxExpertBias: biases of a mixture of experts; dxSwiGluLimit:
   // the clamped SwiGLU of gpt-oss
+  // - Gemma 4: dxLayerShapes (heads of another width or count in some
+  // layers), dxAttentionScale, dxGeluTanh, dxSandwichNorm, dxValueNorm,
+  // dxSharedKv (Spec.KIsV), dxEmbedScale, dxLogitSoftcap, dxLayerScalar,
+  // dxSecondRope, dxDenseMoe
   TDecoderExtra = (
     dxSinks,
     dxOutputBias,
     dxRouterBias,
     dxExpertBias,
-    dxSwiGluLimit);
+    dxSwiGluLimit,
+    dxLayerShapes,
+    dxAttentionScale,
+    dxGeluTanh,
+    dxSandwichNorm,
+    dxValueNorm,
+    dxSharedKv,
+    dxEmbedScale,
+    dxLogitSoftcap,
+    dxLayerScalar,
+    dxSecondRope,
+    dxDenseMoe);
   TDecoderExtras = set of TDecoderExtra;
+
+const
+  /// the extras of gpt-oss, which the GPU devices compute
+  DECODER_EXTRAS_GPTOSS = [dxSinks, dxOutputBias, dxRouterBias, dxExpertBias,
+    dxSwiGluLimit];
+
+type
 
   /// called with intermediate states of a Forward, for diagnosis and tests
   // - aName: 'embed' (input of layer 0), 'layerNN' (output of layer NN),
@@ -268,7 +339,8 @@ type
   protected
     fDevice: TDecoderDevice; // nil: the keys and values are in the arrays below
     fLength, fCapacity: PtrInt;
-    fKvWidth, fLayers: PtrInt;
+    fLayers: PtrInt;
+    fKvW: array of PtrInt; // per layer: KV heads * head dim of the cache rows
     fOwner: integer; // serial of the model whose keys and values are cached
     fFullCache: boolean;
     fKeys, fValues: array of TSingleDynArray; // per layer [rows, kvWidth]
@@ -278,6 +350,8 @@ type
     fIds: TIntegerDynArray; // [capacity] the token at every cached position
     fX, fH, fQ, fK, fV, fAttn, fTmp, fGate, fUp: TSingleDynArray;
     fCos, fSin: TSingleDynArray; // [new tokens, HeadDim / 2] rotary factors
+    fCos2, fSin2: TSingleDynArray; // the second rotary set (Rope2)
+    fMoeOut: TSingleDynArray; // a dfDenseMoe layer: the experts' sum
     // a dfMoe layer: router logits [new tokens, Experts], the chosen experts
     // and their weights [new tokens, ExpertsUsed], the rows of one expert
     // (gathered input, output, row index, weight)
@@ -352,6 +426,11 @@ type
     fLayer: TDecoderLayerDynArray;
     fInvFreq: TSingleDynArray;
     fRopeScale: single; // YaRN: the factor of cos and sin (1 without)
+    fInvFreq2: TSingleDynArray; // the second rotary set ([Rope2HeadDim / 2])
+    fRope2HeadDim: PtrInt; // the head dimension of the Rope2 layers
+    fOnes: TSingleDynArray; // the weight of an RMSNorm without one
+    // the widest Q and KV rows of a layer, and the widest head
+    fMaxQw, fMaxKvw, fMaxHeadDim: PtrInt;
     // the conversion running on Backend.RunItems (ConvertRows, WidenTensor)
     fCvSrc: pointer;
     fCvSrcType, fCvType: TInferDType;
@@ -400,6 +479,11 @@ type
     function Weight(const aName: RawUtf8; const aDims: array of Int64): PSingleArray;
     function Matrix(const aName: RawUtf8; aRows, aCols: Int64;
       aType: TInferDType): TInferWeight;
+    /// aRows rows of aCols values of aSrcType at aSrc (a slice of a tensor,
+    // e.g. one expert of a 3-D one) quantized to Q8_0 or Q4_0 and kept with
+    // the model, as Matrix quantizes
+    function QuantizedRows(aSrc: pointer; aSrcType: TInferDType;
+      aRows, aCols: Int64; aType: TInferDType; const aName: RawUtf8): TInferWeight;
     /// the experts of a GGUF tensor [aExperts, aRows, aCols] (by its llama.cpp
     // name): one view per expert into the blocks as stored - Q8_0, Q4_0, Q4_K
     // or Q6_K
@@ -442,6 +526,17 @@ type
     /// the dfMoe block of layer aLayer, its output added to fX
     procedure MoeBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
       const aOnState: TOnDecoderState);
+    /// the dfDenseMoe block of layer aLayer (Gemma 4), its output added to fX
+    procedure DenseMoeBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
+      const aOnState: TOnDecoderState);
+    /// the dense feed-forward of layer aLayer on fH into fTmp
+    procedure DenseFfn(aCtx: TDecoderContext; aLayer, aRows: PtrInt);
+    /// the experts of layer aLayer: fH routed by the logits in fRoute, their
+    // weighted sum into aDest ([aRows, Hidden])
+    procedure Experts(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
+      aDest: PSingleArray);
+    /// gate := act(gate) * up as Config.Activation says
+    procedure Activate(gate, up: PSingleArray; aCount: PtrInt);
     procedure SetDevice(aDevice: TDecoderDevice);
   public
     /// the model_type of a Hugging Face config.json this class loads
@@ -547,13 +642,21 @@ type
     /// the rotary factors of aRows positions from aFirstPos into aCos and aSin
     // ([aRows, HeadDim / 2] each), as Forward computes them
     procedure Rotary(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
+    /// the factors of the second rotary set (Config.Rope2Theta): [aRows,
+    // Rope2HeadDim / 2] each - nothing without one
+    procedure Rotary2(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
     /// the experts of one token from its [Experts] router logits: aChosen and
     // aWeights ([ExpertsUsed] each), highest probability first - as MoeBlock
     // routes, also for a device that routes on the host
+    // - aExpertScale <> nil ([Experts], Gemma 4): every weight times the scale
+    // of its expert after the renorm
     // - with a RouteTape: recorded (drmRecord), or the recorded choice handed
     // out instead (drmReplay)
     procedure Route(aLogits: PSingleArray; aChosen: PIntegerArray;
-      aWeights: PSingleArray);
+      aWeights: PSingleArray; aExpertScale: PSingleArray = nil);
+    /// the head dimension of the layers of the second rotary set (0: none)
+    property Rope2HeadDim: PtrInt
+      read fRope2HeadDim;
     /// true when every layer is of the kind aMixer and aFfn - what a device
     // checks before it takes a model
     function HasOnly(aMixer: TDecoderMixer; aFfn: TDecoderFfn): boolean;
@@ -723,8 +826,9 @@ end;
 function TDecoderContext.CachedRows(aLayer: PtrInt): PtrInt;
 begin
   result := 0;
-  if (fKvWidth > 0) and (aLayer >= 0) and (aLayer <= high(fKeys)) then
-    result := system.length(fKeys[aLayer]) div fKvWidth;
+  if (aLayer >= 0) and (aLayer <= high(fKeys)) and (aLayer <= high(fKvW)) and
+     (fKvW[aLayer] > 0) then
+    result := system.length(fKeys[aLayer]) div fKvW[aLayer];
 end;
 
 function TDecoderContext.CachedBase(aLayer: PtrInt): PtrInt;
@@ -771,6 +875,29 @@ begin
   EInferError.RaiseUtf8('%.ForwardEmbeds: embedding rows not supported', [self]);
 end;
 
+
+/// x := tanh(x / aCap) * aCap, each step rounded to single like the float32
+// reference (Gemma's final_logit_softcapping)
+procedure InferSoftcap(x: PSingleArray; aCount: PtrInt; aCap: double);
+var
+  i: PtrInt;
+  a, t: single;
+  d: double;
+begin
+  for i := 0 to aCount - 1 do
+  begin
+    a := x^[i] / aCap;
+    d := a;
+    // tanh = 1 - 2 / (exp(2a) + 1); +-1 in double beyond 20
+    if d > 20 then
+      t := 1
+    else if d < -20 then
+      t := -1
+    else
+      t := 1 - 2 / (Exp(2 * d) + 1);
+    x^[i] := t * aCap;
+  end;
+end;
 
 { TDecoderModel }
 
@@ -951,8 +1078,9 @@ end;
 
 procedure TDecoderModel.CheckConfig(const aSource: TFileName);
 var
-  i: PtrInt;
+  i, rot: PtrInt;
   moe: boolean;
+  sp: ^TDecoderLayerSpec;
 begin
   // every dimension bounded on its own before any product: a product of
   // unbounded values could wrap around and pass
@@ -975,10 +1103,54 @@ begin
   else if length(fConfig.Spec) <> fConfig.Layers then
     EInferError.RaiseUtf8('%: % layer kinds for % layers',
       [self, length(fConfig.Spec), fConfig.Layers]);
-  // experts only with a dfMoe layer, and then bounded
+  // the heads of every layer: those of the config unless given, bounded as
+  // they are; the Rope2 layers share one head dimension
+  fMaxQw := 0;
+  fMaxKvw := 0;
+  fMaxHeadDim := 0;
+  fRope2HeadDim := 0;
+  for i := 0 to high(fConfig.Spec) do
+  begin
+    sp := @fConfig.Spec[i];
+    if sp^.HeadDim = 0 then
+      sp^.HeadDim := fConfig.HeadDim;
+    if sp^.KvHeads = 0 then
+      sp^.KvHeads := fConfig.KvHeads;
+    if (sp^.HeadDim < 0) or (sp^.HeadDim > 1024) or odd(sp^.HeadDim) or
+       (sp^.KvHeads < 0) or (sp^.KvHeads > fConfig.Heads) or
+       (fConfig.Heads mod sp^.KvHeads <> 0) or
+       (fConfig.Heads * sp^.HeadDim > 1 shl 16) then
+      EInferError.RaiseUtf8('%: % has heads of % x % (% KV heads) in layer %',
+        [self, aSource, fConfig.Heads, sp^.HeadDim, sp^.KvHeads, i]);
+    // the first rotary set is sized for HeadDim of the config
+    if not sp^.Rope2 and not sp^.NoRope and (sp^.HeadDim <> fConfig.HeadDim) then
+      EInferError.RaiseUtf8('%: % has heads of % with the rotary set of %',
+        [self, aSource, sp^.HeadDim, fConfig.HeadDim]);
+    if sp^.Rope2 then
+      if fRope2HeadDim = 0 then
+        fRope2HeadDim := sp^.HeadDim
+      else if fRope2HeadDim <> sp^.HeadDim then
+        EInferError.RaiseUtf8('%: % has layers of the second rotary set with ' +
+          'heads of % and %', [self, aSource, fRope2HeadDim, sp^.HeadDim]);
+    fMaxQw := MaxPtrInt(fMaxQw, fConfig.Heads * sp^.HeadDim);
+    fMaxKvw := MaxPtrInt(fMaxKvw, sp^.KvHeads * sp^.HeadDim);
+    fMaxHeadDim := MaxPtrInt(fMaxHeadDim, sp^.HeadDim);
+  end;
+  if not (fConfig.AttentionScale >= 0) or (fConfig.AttentionScale > 1e3) or
+     not (fConfig.EmbedScale >= 0) or (fConfig.EmbedScale > 1e6) or
+     not (fConfig.LogitSoftcap >= 0) or (fConfig.LogitSoftcap > 1e6) then
+    EInferError.RaiseUtf8('%: % has an attention scale of %, an embedding ' +
+      'scale of % or a logit softcap of %', [self, aSource, fConfig.AttentionScale,
+      fConfig.EmbedScale, fConfig.LogitSoftcap]);
+  if (fRope2HeadDim > 0) and
+     (not (fConfig.Rope2Theta > 1) or (fConfig.Rope2Theta > 1e12) or
+      not (fConfig.Rope2Partial > 0) or (fConfig.Rope2Partial > 1)) then
+    EInferError.RaiseUtf8('%: % has a second rotary set of theta % and share %',
+      [self, aSource, fConfig.Rope2Theta, fConfig.Rope2Partial]);
+  // experts only with a dfMoe or dfDenseMoe layer, and then bounded
   moe := false;
   for i := 0 to high(fConfig.Spec) do
-    if fConfig.Spec[i].Ffn = dfMoe then
+    if fConfig.Spec[i].Ffn in [dfMoe, dfDenseMoe] then
       moe := true;
   if moe then
   begin
@@ -1018,6 +1190,23 @@ begin
   fRopeScale := 1;
   if fConfig.RopeFactor <> 0 then
     YarnFrequencies;
+  // the second set as _compute_proportional_rope_parameters: the exponents
+  // over the whole head dimension, int(share * dim // 2) pairs rotate, the
+  // others get the frequency 0 (cos 1, sin 0: unchanged)
+  fInvFreq2 := nil;
+  if fRope2HeadDim > 0 then
+  begin
+    SetLength(fInvFreq2, fRope2HeadDim shr 1);
+    rot := Trunc(fConfig.Rope2Partial * fRope2HeadDim) shr 1;
+    if rot > length(fInvFreq2) then
+      rot := length(fInvFreq2);
+    for i := 0 to rot - 1 do
+      fInvFreq2[i] := 1 / RoundToSingle(Exp(Ln(fConfig.Rope2Theta) *
+        RoundToSingle((2 * i) / fRope2HeadDim)));
+  end;
+  SetLength(fOnes, MaxPtrInt(fMaxHeadDim, fConfig.Hidden));
+  for i := 0 to high(fOnes) do
+    fOnes[i] := 1;
 end;
 
 procedure TDecoderModel.YarnFrequencies;
@@ -1121,7 +1310,33 @@ begin
     if (fLayer[i].ExpertGateBias <> nil) or (fLayer[i].ExpertUpBias <> nil) or
        (fLayer[i].ExpertDownBias <> nil) then
       include(result, dxExpertBias);
+    if fLayer[i].Scalar <> nil then
+      include(result, dxLayerScalar);
   end;
+  for i := 0 to high(fConfig.Spec) do
+  begin
+    if (fConfig.Spec[i].HeadDim <> fConfig.HeadDim) or
+       (fConfig.Spec[i].KvHeads <> fConfig.KvHeads) then
+      include(result, dxLayerShapes);
+    if fConfig.Spec[i].KIsV then
+      include(result, dxSharedKv);
+    if fConfig.Spec[i].Rope2 then
+      include(result, dxSecondRope);
+    if fConfig.Spec[i].Ffn = dfDenseMoe then
+      include(result, dxDenseMoe);
+  end;
+  if fConfig.AttentionScale > 0 then
+    include(result, dxAttentionScale);
+  if fConfig.Activation = daGeluTanh then
+    include(result, dxGeluTanh);
+  if fConfig.SandwichNorm then
+    include(result, dxSandwichNorm);
+  if fConfig.ValueNorm then
+    include(result, dxValueNorm);
+  if fConfig.EmbedScale > 0 then
+    include(result, dxEmbedScale);
+  if fConfig.LogitSoftcap > 0 then
+    include(result, dxLogitSoftcap);
 end;
 
 function TDecoderModel.Find(const aName: RawUtf8): PInferTensor;
@@ -1439,7 +1654,6 @@ function TDecoderModel.Matrix(const aName: RawUtf8; aRows, aCols: Int64;
   aType: TInferDType): TInferWeight;
 var
   t: PInferTensor;
-  nb, n: PtrInt;
 begin
   if fGguf <> nil then
   begin
@@ -1466,6 +1680,17 @@ begin
   end;
   // Q8_0 or Q4_0: block by block through single precision, as ggml quantizes
   t := Checked(aName, [aRows, aCols]);
+  result := QuantizedRows(t^.Data, t^.DType, aRows, aCols, aType, aName);
+end;
+
+function TDecoderModel.QuantizedRows(aSrc: pointer; aSrcType: TInferDType;
+  aRows, aCols: Int64; aType: TInferDType; const aName: RawUtf8): TInferWeight;
+var
+  nb, n: PtrInt;
+begin
+  if (aCols and 31 <> 0) or not (aType in [idtQ8_0, idtQ4_0]) then
+    EInferError.RaiseUtf8('%: % as % of % columns', [self, aName,
+      INFER_DTYPE_NAME[aType], aCols]);
   nb := aCols shr 5;
   if aType = idtQ8_0 then
   begin
@@ -1481,7 +1706,7 @@ begin
     SetLength(fOwnedQ4[n], aRows * nb);
     result := InferWeight(pointer(fOwnedQ4[n]), idtQ4_0);
   end;
-  ConvertRows(t^.Data, t^.DType, aRows, aCols, aType, n, aName);
+  ConvertRows(aSrc, aSrcType, aRows, aCols, aType, n, aName);
 end;
 
 function TDecoderModel.NewContext: TDecoderContext;
@@ -1505,13 +1730,25 @@ begin
     SetLength(aBuffer, aCount);
 end;
 
+function SameWidths(aCtx: TDecoderContext; const aConfig: TDecoderConfig): boolean;
+var
+  i: PtrInt;
+begin
+  result := false;
+  if length(aCtx.fKvW) <> aConfig.Layers then
+    exit;
+  for i := 0 to aConfig.Layers - 1 do
+    if aCtx.fKvW[i] <> aConfig.Spec[i].KvHeads * aConfig.Spec[i].HeadDim then
+      exit;
+  result := true;
+end;
+
 procedure TDecoderModel.Grow(aCtx: TDecoderContext; aTokens, aNew: PtrInt);
 var
-  i, cap, kvw: PtrInt;
+  i, cap: PtrInt;
 begin
   // the cache belongs to one model: a context holding another model's
   // sequence is refused (same shape or not), an empty one is taken over
-  kvw := fConfig.KvHeads * fConfig.HeadDim;
   if aCtx.fOwner <> fSerial then
   begin
     if aCtx.fLength <> 0 then
@@ -1519,7 +1756,7 @@ begin
         [self]);
     aCtx.fOwner := fSerial;
   end;
-  if (aCtx.fKvWidth <> kvw) or (aCtx.fLayers <> fConfig.Layers) or
+  if not SameWidths(aCtx, fConfig) or (aCtx.fLayers <> fConfig.Layers) or
      (length(aCtx.fWindow) <> fConfig.Layers) then
   begin
     // the shape is only taken once its arrays are there: a failed SetLength
@@ -1531,6 +1768,7 @@ begin
     SetLength(aCtx.fValues, fConfig.Layers);
     SetLength(aCtx.fWindow, fConfig.Layers);
     SetLength(aCtx.fBase, fConfig.Layers);
+    aCtx.fKvW := nil; // taken last: a failed SetLength tries again
     for i := 0 to fConfig.Layers - 1 do
     begin
       aCtx.fBase[i] := 0;
@@ -1539,7 +1777,9 @@ begin
       else
         aCtx.fWindow[i] := fConfig.Spec[i].Window;
     end;
-    aCtx.fKvWidth := kvw;
+    SetLength(aCtx.fKvW, fConfig.Layers);
+    for i := 0 to fConfig.Layers - 1 do
+      aCtx.fKvW[i] := fConfig.Spec[i].KvHeads * fConfig.Spec[i].HeadDim;
     aCtx.fLayers := fConfig.Layers;
   end
   else
@@ -1569,15 +1809,15 @@ begin
     if cap > fConfig.MaxPositions then
       cap := fConfig.MaxPositions;
     // the byte size must fit PtrInt (a 32-bit process): SetLength would wrap
-    if cap > (High(PtrInt) div SizeOf(single)) div kvw then
+    if cap > (High(PtrInt) div SizeOf(single)) div fMaxKvw then
       EInferError.RaiseUtf8('%.Forward: a KV cache of % tokens is too large for ' +
         'this process', [self, cap]);
     // a sliding window layer sizes its own rows (Slide)
     for i := 0 to fConfig.Layers - 1 do
       if aCtx.fWindow[i] = 0 then
       begin
-        SetLength(aCtx.fKeys[i], cap * kvw);
-        SetLength(aCtx.fValues[i], cap * kvw);
+        SetLength(aCtx.fKeys[i], cap * aCtx.fKvW[i]);
+        SetLength(aCtx.fValues[i], cap * aCtx.fKvW[i]);
       end;
     SetLength(aCtx.fIds, cap);
     aCtx.fCapacity := cap;
@@ -1585,16 +1825,22 @@ begin
   Need(aCtx.fX, aNew * fConfig.Hidden);
   Need(aCtx.fH, aNew * fConfig.Hidden);
   Need(aCtx.fTmp, aNew * fConfig.Hidden);
-  Need(aCtx.fQ, aNew * fConfig.Heads * fConfig.HeadDim);
-  Need(aCtx.fAttn, aNew * fConfig.Heads * fConfig.HeadDim);
-  Need(aCtx.fK, aNew * kvw);
-  Need(aCtx.fV, aNew * kvw);
+  Need(aCtx.fQ, aNew * fMaxQw);
+  Need(aCtx.fAttn, aNew * fMaxQw);
+  Need(aCtx.fK, aNew * fMaxKvw);
+  Need(aCtx.fV, aNew * fMaxKvw);
   Need(aCtx.fGate, aNew * MaxPtrInt(fConfig.Intermediate, fConfig.ExpertIntermediate));
   Need(aCtx.fUp, aNew * MaxPtrInt(fConfig.Intermediate, fConfig.ExpertIntermediate));
   Need(aCtx.fCos, aNew * (fConfig.HeadDim shr 1));
   Need(aCtx.fSin, aNew * (fConfig.HeadDim shr 1));
+  if fRope2HeadDim > 0 then
+  begin
+    Need(aCtx.fCos2, aNew * (fRope2HeadDim shr 1));
+    Need(aCtx.fSin2, aNew * (fRope2HeadDim shr 1));
+  end;
   if fConfig.Experts > 0 then
   begin
+    Need(aCtx.fMoeOut, aNew * fConfig.Hidden);
     Need(aCtx.fRoute, aNew * fConfig.Experts);
     Need(aCtx.fChosenW, aNew * fConfig.ExpertsUsed);
     Need(aCtx.fGather, aNew * fConfig.Hidden);
@@ -1612,7 +1858,7 @@ var
   w, base, first, keep, need, rows, cap, kvw: PtrInt;
 begin
   w := aCtx.fWindow[aLayer];
-  kvw := aCtx.fKvWidth;
+  kvw := aCtx.fKvW[aLayer];
   base := aCtx.fBase[aLayer];
   // both buffers: a failed SetLength may have grown only the keys
   rows := MinPtrInt(length(aCtx.fKeys[aLayer]), length(aCtx.fValues[aLayer])) div kvw;
@@ -1660,8 +1906,25 @@ end;
 
 procedure TDecoderModel.RopeFactors(aCtx: TDecoderContext; aRows, aFirstPos: PtrInt);
 begin
-  // once per Forward: every layer and both Q and K use the same factors
+  // once per Forward: every layer of a set and both Q and K use the same
   Rotary(aFirstPos, aRows, pointer(aCtx.fCos), pointer(aCtx.fSin));
+  if fRope2HeadDim > 0 then
+    Rotary2(aFirstPos, aRows, pointer(aCtx.fCos2), pointer(aCtx.fSin2));
+end;
+
+procedure TDecoderModel.Rotary2(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
+var
+  r, i, half: PtrInt;
+  angle: single;
+begin
+  half := fRope2HeadDim shr 1;
+  for r := 0 to aRows - 1 do
+    for i := 0 to half - 1 do
+    begin
+      angle := fInvFreq2[i] * (aFirstPos + r); // 0 beyond the rotated share
+      aCos^[r * half + i] := Cos(angle);
+      aSin^[r * half + i] := Sin(angle);
+    end;
 end;
 
 procedure TDecoderModel.Rotary(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
@@ -1702,6 +1965,9 @@ begin
     InferRowToF32(fEmbedSrc^.Data, fEmbedSrc^.DType, id, fConfig.Hidden,
       @aDest^[i * fConfig.Hidden]);
   end;
+  if fConfig.EmbedScale > 0 then
+    for i := 0 to aCount * fConfig.Hidden - 1 do
+      aDest^[i] := aDest^[i] * fConfig.EmbedScale;
 end;
 
 procedure TDecoderModel.Attention(aCtx: TDecoderContext; aLayer, aRows: PtrInt);
@@ -1709,42 +1975,60 @@ begin
   // the reference backend computes in double; a fast one splits by head and
   // row block - the cache rows start at the base position of the layer, a
   // sliding window masks the older ones (they may be gone)
-  fBackend.CausalAttention(pointer(aCtx.fQ), aRows, fConfig.Heads, fConfig.HeadDim,
-    pointer(aCtx.fKeys[aLayer]), pointer(aCtx.fValues[aLayer]),
-    aCtx.fLength - aCtx.fBase[aLayer], fConfig.KvHeads, pointer(aCtx.fAttn),
-    fConfig.Spec[aLayer].Window, fLayer[aLayer].Sinks);
+  fBackend.CausalAttention(pointer(aCtx.fQ), aRows, fConfig.Heads,
+    fConfig.Spec[aLayer].HeadDim, pointer(aCtx.fKeys[aLayer]),
+    pointer(aCtx.fValues[aLayer]), aCtx.fLength - aCtx.fBase[aLayer],
+    fConfig.Spec[aLayer].KvHeads, pointer(aCtx.fAttn), fConfig.Spec[aLayer].Window,
+    fLayer[aLayer].Sinks, fConfig.AttentionScale);
 end;
 
 procedure TDecoderModel.AttentionBlock(aCtx: TDecoderContext;
   aLayer, aRows, aPast: PtrInt; const aOnState: TOnDecoderState);
 var
-  n, h, qw, kvw: PtrInt;
+  n, h, hd, kvh, qw, kvw: PtrInt;
   ly: ^TDecoderLayer;
+  sp: ^TDecoderLayerSpec;
+  cs, sn: PSingleArray;
 begin
   ly := @fLayer[aLayer];
+  sp := @fConfig.Spec[aLayer];
   n := aRows;
   h := fConfig.Hidden;
-  qw := fConfig.Heads * fConfig.HeadDim;
-  kvw := fConfig.KvHeads * fConfig.HeadDim;
+  hd := sp^.HeadDim;
+  kvh := sp^.KvHeads;
+  qw := fConfig.Heads * hd;
+  kvw := kvh * hd;
   // pre-norm, projections, per-head norms, rotary positions
   fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.InputNorm, fConfig.RmsEps,
     pointer(aCtx.fH));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Q, qw, ly^.QBias, pointer(aCtx.fQ));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.K, kvw, ly^.KBias, pointer(aCtx.fK));
-  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.V, kvw, ly^.VBias, pointer(aCtx.fV));
+  if sp^.KIsV then
+    // the values are the raw keys: normed (ValueNorm) but not rotated
+    MoveFast(pointer(aCtx.fK)^, pointer(aCtx.fV)^, n * kvw * SizeOf(single))
+  else
+    fBackend.Linear(pointer(aCtx.fH), n, h, ly^.V, kvw, ly^.VBias, pointer(aCtx.fV));
   if ly^.QNorm <> nil then
   begin
-    fBackend.RmsNorm(pointer(aCtx.fQ), n * fConfig.Heads, fConfig.HeadDim,
-      ly^.QNorm, fConfig.RmsEps, pointer(aCtx.fQ));
-    fBackend.RmsNorm(pointer(aCtx.fK), n * fConfig.KvHeads, fConfig.HeadDim,
-      ly^.KNorm, fConfig.RmsEps, pointer(aCtx.fK));
+    fBackend.RmsNorm(pointer(aCtx.fQ), n * fConfig.Heads, hd, ly^.QNorm,
+      fConfig.RmsEps, pointer(aCtx.fQ));
+    fBackend.RmsNorm(pointer(aCtx.fK), n * kvh, hd, ly^.KNorm, fConfig.RmsEps,
+      pointer(aCtx.fK));
   end;
-  if not fConfig.Spec[aLayer].NoRope then
+  if fConfig.ValueNorm then
+    fBackend.RmsNorm(pointer(aCtx.fV), n * kvh, hd, pointer(fOnes), fConfig.RmsEps,
+      pointer(aCtx.fV));
+  if not sp^.NoRope then
   begin
-    fBackend.Rope(pointer(aCtx.fQ), n, fConfig.Heads, fConfig.HeadDim,
-      pointer(aCtx.fCos), pointer(aCtx.fSin));
-    fBackend.Rope(pointer(aCtx.fK), n, fConfig.KvHeads, fConfig.HeadDim,
-      pointer(aCtx.fCos), pointer(aCtx.fSin));
+    cs := pointer(aCtx.fCos);
+    sn := pointer(aCtx.fSin);
+    if sp^.Rope2 then
+    begin
+      cs := pointer(aCtx.fCos2);
+      sn := pointer(aCtx.fSin2);
+    end;
+    fBackend.Rope(pointer(aCtx.fQ), n, fConfig.Heads, hd, cs, sn);
+    fBackend.Rope(pointer(aCtx.fK), n, kvh, hd, cs, sn);
   end;
   if aCtx.fWindow[aLayer] > 0 then
     Slide(aCtx, aLayer, aPast, n);
@@ -1756,11 +2040,21 @@ begin
   fBackend.Linear(pointer(aCtx.fAttn), n, qw, ly^.O, h, ly^.OBias, pointer(aCtx.fTmp));
   if Assigned(aOnState) and (aLayer = 0) then
     aOnState('layer00_attn', pointer(aCtx.fTmp), n, h);
+  if fConfig.SandwichNorm then
+    fBackend.RmsNorm(pointer(aCtx.fTmp), n, h, ly^.AttnNorm, fConfig.RmsEps,
+      pointer(aCtx.fTmp));
   fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
 end;
 
-procedure TDecoderModel.DenseBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
-  const aOnState: TOnDecoderState);
+procedure TDecoderModel.Activate(gate, up: PSingleArray; aCount: PtrInt);
+begin
+  if fConfig.Activation = daGeluTanh then
+    fBackend.GeluTanhGlu(gate, up, aCount)
+  else
+    fBackend.SwiGlu(gate, up, aCount, fConfig.SwiGluAlpha, fConfig.SwiGluLimit);
+end;
+
+procedure TDecoderModel.DenseFfn(aCtx: TDecoderContext; aLayer, aRows: PtrInt);
 var
   n, h, f: PtrInt;
   ly: ^TDecoderLayer;
@@ -1769,21 +2063,35 @@ begin
   n := aRows;
   h := fConfig.Hidden;
   f := fConfig.Intermediate;
-  // pre-norm, SwiGLU, residual
-  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, fConfig.RmsEps,
-    pointer(aCtx.fH));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Gate, f, nil, pointer(aCtx.fGate));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Up, f, nil, pointer(aCtx.fUp));
-  fBackend.SwiGlu(pointer(aCtx.fGate), pointer(aCtx.fUp), n * f,
-    fConfig.SwiGluAlpha, fConfig.SwiGluLimit);
+  Activate(pointer(aCtx.fGate), pointer(aCtx.fUp), n * f);
   fBackend.Linear(pointer(aCtx.fGate), n, f, ly^.Down, h, nil, pointer(aCtx.fTmp));
+end;
+
+procedure TDecoderModel.DenseBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
+  const aOnState: TOnDecoderState);
+var
+  n, h: PtrInt;
+  ly: ^TDecoderLayer;
+begin
+  ly := @fLayer[aLayer];
+  n := aRows;
+  h := fConfig.Hidden;
+  // pre-norm, SwiGLU (or GeGLU), residual - Gemma norms the output first
+  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, fConfig.RmsEps,
+    pointer(aCtx.fH));
+  DenseFfn(aCtx, aLayer, n);
   if Assigned(aOnState) and (aLayer = 0) then
     aOnState('layer00_mlp', pointer(aCtx.fTmp), n, h);
+  if fConfig.SandwichNorm then
+    fBackend.RmsNorm(pointer(aCtx.fTmp), n, h, ly^.FfnNorm, fConfig.RmsEps,
+      pointer(aCtx.fTmp));
   fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
 end;
 
 procedure TDecoderModel.Route(aLogits: PSingleArray; aChosen: PIntegerArray;
-  aWeights: PSingleArray);
+  aWeights: PSingleArray; aExpertScale: PSingleArray);
 var
   i, j, t, best, e, k: PtrInt;
   m, sum, picked: double;
@@ -1820,6 +2128,9 @@ begin
   if fConfig.NormTopK then
     for j := 0 to k - 1 do
       aWeights^[j] := aWeights^[j] / picked;
+  if aExpertScale <> nil then
+    for j := 0 to k - 1 do
+      aWeights^[j] := aWeights^[j] * aExpertScale^[aChosen^[j]];
   if fRouteTape <> nil then
     case fRouteTape.Mode of
       drmRecord:
@@ -1912,6 +2223,61 @@ end;
 procedure TDecoderModel.MoeBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
   const aOnState: TOnDecoderState);
 var
+  n, h: PtrInt;
+  ly: ^TDecoderLayer;
+begin
+  ly := @fLayer[aLayer];
+  n := aRows;
+  h := fConfig.Hidden;
+  // pre-norm, the router: its logits, then the experts of every token
+  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, fConfig.RmsEps,
+    pointer(aCtx.fH));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Router, fConfig.Experts,
+    ly^.RouterBias, pointer(aCtx.fRoute));
+  Experts(aCtx, aLayer, n, pointer(aCtx.fTmp));
+  if Assigned(aOnState) and (aLayer = 0) then
+    aOnState('layer00_mlp', pointer(aCtx.fTmp), n, h);
+  fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
+end;
+
+procedure TDecoderModel.DenseMoeBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
+  const aOnState: TOnDecoderState);
+var
+  n, h: PtrInt;
+  ly: ^TDecoderLayer;
+begin
+  ly := @fLayer[aLayer];
+  n := aRows;
+  h := fConfig.Hidden;
+  // the dense block on the pre-FFN norm, its output normed
+  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, fConfig.RmsEps,
+    pointer(aCtx.fH));
+  DenseFfn(aCtx, aLayer, n);
+  if Assigned(aOnState) and (aLayer = 0) then
+    aOnState('layer00_mlp', pointer(aCtx.fTmp), n, h);
+  fBackend.RmsNorm(pointer(aCtx.fTmp), n, h, ly^.DenseOutNorm, fConfig.RmsEps,
+    pointer(aCtx.fTmp));
+  // the router on the residual: an RMSNorm without weight, times its scale
+  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.RouterScale, fConfig.RmsEps,
+    pointer(aCtx.fH));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Router, fConfig.Experts, nil,
+    pointer(aCtx.fRoute));
+  // the experts on their own norm of the residual, their sum normed
+  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.MoeInNorm, fConfig.RmsEps,
+    pointer(aCtx.fH));
+  Experts(aCtx, aLayer, n, pointer(aCtx.fMoeOut));
+  fBackend.RmsNorm(pointer(aCtx.fMoeOut), n, h, ly^.MoeOutNorm, fConfig.RmsEps,
+    pointer(aCtx.fMoeOut));
+  // both summed, normed once more, then the residual
+  fBackend.Add(pointer(aCtx.fTmp), pointer(aCtx.fMoeOut), n * h);
+  fBackend.RmsNorm(pointer(aCtx.fTmp), n, h, ly^.FfnNorm, fConfig.RmsEps,
+    pointer(aCtx.fTmp));
+  fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
+end;
+
+procedure TDecoderModel.Experts(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
+  aDest: PSingleArray);
+var
   n, h, fi, k, e, r, j, c, cnt, i: PtrInt;
   w: single;
   ly: ^TDecoderLayer;
@@ -1922,15 +2288,10 @@ begin
   h := fConfig.Hidden;
   fi := fConfig.ExpertIntermediate;
   k := fConfig.ExpertsUsed;
-  // pre-norm, the router: its logits, then the experts of every token
-  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.PostNorm, fConfig.RmsEps,
-    pointer(aCtx.fH));
-  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Router, fConfig.Experts,
-    ly^.RouterBias, pointer(aCtx.fRoute));
   for r := 0 to n - 1 do
     Route(@aCtx.fRoute[r * fConfig.Experts], @aCtx.fChosen[r * k],
-      @aCtx.fChosenW[r * k]);
-  FillCharFast(pointer(aCtx.fTmp)^, n * h * SizeOf(single), 0);
+      @aCtx.fChosenW[r * k], ly^.ExpertScale);
+  FillCharFast(aDest^, n * h * SizeOf(single), 0);
   // expert by expert, in id order (as the reference adds them): its tokens
   // gathered, one SwiGLU block over them, weighted into their rows
   for e := 0 to fConfig.Experts - 1 do
@@ -1960,22 +2321,18 @@ begin
       pointer(aCtx.fGate));
     fBackend.Linear(pointer(aCtx.fGather), cnt, h, ly^.ExpertUp[e], fi, ub,
       pointer(aCtx.fUp));
-    fBackend.SwiGlu(pointer(aCtx.fGate), pointer(aCtx.fUp), cnt * fi,
-      fConfig.SwiGluAlpha, fConfig.SwiGluLimit);
+    Activate(pointer(aCtx.fGate), pointer(aCtx.fUp), cnt * fi);
     fBackend.Linear(pointer(aCtx.fGate), cnt, fi, ly^.ExpertDown[e], h, db,
       pointer(aCtx.fExpertOut));
     for c := 0 to cnt - 1 do
     begin
       w := aCtx.fRowW[c];
       src := @aCtx.fExpertOut[c * h];
-      dst := @aCtx.fTmp[aCtx.fRow[c] * h];
+      dst := @aDest^[aCtx.fRow[c] * h];
       for i := 0 to h - 1 do
         dst^[i] := dst^[i] + w * src^[i];
     end;
   end;
-  if Assigned(aOnState) and (aLayer = 0) then
-    aOnState('layer00_mlp', pointer(aCtx.fTmp), n, h);
-  fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
 end;
 
 /// 'layerNN' - two digits at least, like the reference ('layer%02d')
@@ -2010,6 +2367,7 @@ procedure TDecoderModel.ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
   aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
 var
   i, l, n, h, f, qw, past, id: PtrInt;
+  scalar: single;
 begin
   if aCtx = nil then
     EInferError.RaiseUtf8('%.Forward: no context', [self]);
@@ -2044,7 +2402,7 @@ begin
   h := fConfig.Hidden;
   f := MaxPtrInt(fConfig.Intermediate,
     MaxPtrInt(fConfig.ExpertIntermediate, fConfig.Experts));
-  qw := fConfig.Heads * fConfig.HeadDim;
+  qw := MaxPtrInt(fMaxQw, fMaxKvw);
   if n > (High(PtrInt) div SizeOf(single)) div MaxPtrInt(f, MaxPtrInt(h, qw)) then
     EInferError.RaiseUtf8('%.Forward: % tokens too many at once', [self, n]);
   if aIds <> nil then
@@ -2063,6 +2421,11 @@ begin
         @aCtx.fX[i * h])
   else
     MoveFast(aEmbeds^[0], aCtx.fX[0], n * h * SizeOf(single));
+  // Gemma scales the embeddings of ids (rows are taken as given, as
+  // transformers takes inputs_embeds)
+  if (aIds <> nil) and (fConfig.EmbedScale > 0) then
+    for i := 0 to n * h - 1 do
+      aCtx.fX[i] := aCtx.fX[i] * fConfig.EmbedScale;
   if Assigned(aOnState) then
     aOnState('embed', pointer(aCtx.fX), n, h);
   for l := 0 to fConfig.Layers - 1 do
@@ -2076,6 +2439,15 @@ begin
         DenseBlock(aCtx, l, n, aOnState);
       dfMoe:
         MoeBlock(aCtx, l, n, aOnState);
+      dfDenseMoe:
+        DenseMoeBlock(aCtx, l, n, aOnState);
+    end;
+    // Gemma: the whole state times the scalar of the layer (0 too)
+    if fLayer[l].Scalar <> nil then
+    begin
+      scalar := fLayer[l].Scalar^[0];
+      for i := 0 to n * h - 1 do
+        aCtx.fX[i] := aCtx.fX[i] * scalar;
     end;
     if Assigned(aOnState) then
       aOnState(LayerName(l), pointer(aCtx.fX), n, h);
@@ -2099,6 +2471,11 @@ begin
   else
     fBackend.Linear(@aCtx.fH[(n - 1) * h], 1, h, fHead, fConfig.VocabSize, nil,
       aLogits);
+  if fConfig.LogitSoftcap > 0 then
+    if aAllLogits then
+      InferSoftcap(aLogits, n * fConfig.VocabSize, fConfig.LogitSoftcap)
+    else
+      InferSoftcap(aLogits, fConfig.VocabSize, fConfig.LogitSoftcap);
 end;
 
 function TDecoderModel.Reuse(aCtx: TDecoderContext; aIds: PIntegerArray;

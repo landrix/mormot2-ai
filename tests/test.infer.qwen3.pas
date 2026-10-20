@@ -31,6 +31,7 @@ uses
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.gptoss,
+  mormot.ai.infer.model.gemma4,
   mormot.ai.infer.sampler,
   test.infer.ref,
   test.infer.fast,
@@ -195,6 +196,16 @@ type
     // settings, the same expert bytes and bit for bit the same logits as the
     // safetensors folder, Q8_0 matrices within tolerance, refusals
     procedure GptOssGguf;
+    /// D6a: tiny Gemma 4 against transformers - heads of two shapes, K = V,
+    // both rotary sets, the norms around both blocks, GeGLU, the dense block
+    // beside the experts, layer scalars, the soft cap: every state, the
+    // cache, greedy; a dense model from the default layer types and rope
+    procedure Gemma4MatchesReference;
+    /// D6a: tiny Gemma 4 quantized to Q8_0 and Q4_0 at load, and on the fast
+    // backend
+    procedure Gemma4Quantized;
+    /// D6a: the settings of a Gemma 4 config.json refused
+    procedure Gemma4Refused;
   end;
 
 const
@@ -1481,7 +1492,7 @@ begin
   others := false;
   missed := false;
   for i := 0 to high(fItemThread) do
-    if fItemThread[i] = 0 then
+    if fItemThread[i] = TThreadID(0) then
       missed := true
     else if fItemThread[i] <> GetCurrentThreadId then
       others := true;
@@ -3564,6 +3575,475 @@ begin
     full.Free;
     model.Free;
     ref.Free;
+  end;
+end;
+
+/// the factors of the second rotary set of aModel against aName.cos / .sin
+function Rotary2Matches(aModel: TDecoderModel; aRef: TInferRefSet;
+  const aName: RawUtf8; out aWhy: RawUtf8): boolean;
+var
+  cs, sn: TSingleDynArray;
+  half, n: PtrInt;
+  cmp, cmp2: TInferCompare;
+begin
+  half := aModel.Rope2HeadDim shr 1;
+  SetLength(cs, 64 * half);
+  SetLength(sn, 64 * half);
+  aModel.Rotary2(0, 64, pointer(cs), pointer(sn));
+  cmp := InferCompare(pointer(cs), aRef.F32(aName + '.cos', n), 64 * half, 4e-7, 0);
+  cmp2 := InferCompare(pointer(sn), aRef.F32(aName + '.sin', n), 64 * half, 4e-7, 0);
+  result := (n = 64 * half) and InferCompareOk(cmp) and InferCompareOk(cmp2);
+  aWhy := FormatUtf8('cos %, sin %', [InferCompareText(cmp), InferCompareText(cmp2)]);
+end;
+
+procedure TTestInferQwen3.Gemma4MatchesReference;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  full, step, ctx: TDecoderContext;
+  ids: PIntegerArray;
+  n, i, k, v, vocab, diff: PtrInt;
+  all, one, rows, viaRows: TSingleDynArray;
+  prompt, mine: TIntegerDynArray;
+  same: boolean;
+  margin: double;
+  detail: RawUtf8;
+  s: TDecoderLayerSpecDynArray;
+  keep: single;
+  zero: boolean;
+begin
+  dir := FindInferRefDir('tiny-gemma4');
+  if CheckFailed(dir <> '', 'tiny-gemma4 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  model := nil;
+  full := nil;
+  step := nil;
+  try
+    model := NewDecoderModel(dir, fCpu);
+    Check(model is TGemma4Model, 'gemma4: a TGemma4Model');
+    s := model.Config.Spec;
+    Check((s[0].Window = 5) and (s[1].Window = 0) and (s[2].Window = 5) and
+      (s[3].Window = 0), 'sliding and full layers');
+    Check((s[0].HeadDim = 16) and (s[0].KvHeads = 2) and not s[0].KIsV and
+      not s[0].Rope2 and (s[1].HeadDim = 32) and (s[1].KvHeads = 1) and s[1].KIsV and
+      s[1].Rope2 and (s[3].HeadDim = 32), 'the heads of both kinds');
+    Check((s[0].Ffn = dfDenseMoe) and (s[3].Ffn = dfDenseMoe), 'dense and experts');
+    CheckEqual(model.Rope2HeadDim, 32, 'the head of the second rotary set');
+    Check((model.Config.Experts = 8) and (model.Config.ExpertsUsed = 3) and
+      (model.Config.ExpertIntermediate = 32) and model.Config.NormTopK, 'experts');
+    Check((model.Config.AttentionScale = 1) and (model.Config.EmbedScale = 8) and
+      (model.Config.LogitSoftcap = 3) and (model.Config.Activation = daGeluTanh) and
+      model.Config.SandwichNorm and model.Config.ValueNorm, 'the Gemma settings');
+    Check((model.Config.RopeTheta = 10000) and (model.Config.Rope2Theta = 1000000) and
+      (model.Config.Rope2Partial = 0.25), 'the rotary sets');
+    Check(model.Extras = [dxLayerShapes, dxAttentionScale, dxGeluTanh, dxSandwichNorm,
+      dxValueNorm, dxSharedKv, dxEmbedScale, dxLogitSoftcap, dxLayerScalar,
+      dxSecondRope, dxDenseMoe], 'every extra of Gemma 4');
+    Check((model.Layers[1].Scalar <> nil) and (model.Layers[1].Scalar^[0] <> 1),
+      'a layer scalar');
+    CheckUtf8(RotaryMatches(model, ref, 'rope', detail), 'sliding rope: %', [detail]);
+    CheckUtf8(Rotary2Matches(model, ref, 'rope2', detail), 'proportional rope: %',
+      [detail]);
+    // every state of 5, 13 and 29 tokens (the window of 5 slides)
+    for k := 0 to 2 do
+      CheckStates(model, ref, FormatUtf8('case%', [k]), 1e-4, 1e-4, true);
+    // one token at a time = the prefill, bit for bit; two chunks alike
+    vocab := model.Config.VocabSize;
+    ids := ref.I32('case2.ids', n);
+    full := model.NewContext;
+    step := model.NewContext;
+    SetLength(all, n * vocab);
+    SetLength(one, vocab);
+    model.Forward(full, ids, n, pointer(all), true);
+    same := true;
+    for i := 0 to n - 1 do
+    begin
+      model.Forward(step, @ids^[i], 1, pointer(one));
+      for v := 0 to vocab - 1 do
+        if PCardinal(@one[v])^ <> PCardinal(@all[i * vocab + v])^ then
+          same := false;
+    end;
+    Check(same, 'cached logits bit-identical to the full pass');
+    step.Reset;
+    model.Forward(step, ids, 7, nil);
+    model.Forward(step, @ids^[7], n - 7, pointer(one));
+    Check(CompareMem(pointer(one), @all[(n - 1) * vocab], vocab * SizeOf(single)),
+      'prefill in two chunks');
+    // the rows of Embed (scaled) through ForwardEmbeds: the logits of the ids
+    SetLength(rows, n * model.Config.Hidden);
+    SetLength(viaRows, vocab);
+    model.Embed(ids, n, pointer(rows));
+    step.Reset;
+    model.ForwardEmbeds(step, pointer(rows), n, pointer(viaRows));
+    Check(CompareMem(pointer(viaRows), @all[(n - 1) * vocab], vocab * SizeOf(single)),
+      'embedding rows give the logits of their ids');
+    // greedy continuations of 24 tokens, through the sliding cache
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, 24, []);
+      finally
+        ctx.Free;
+      end;
+      diff := GreedyDiff(mine, ref, FormatUtf8('case%', [k]), margin, detail);
+      CheckUtf8(diff < 0, 'Gemma 4 case% greedy differs at step % (margin %, %)',
+        [k, diff, margin, detail]);
+    end;
+    // a layer scalar of 0 multiplies too: the state after that layer is 0
+    // (BF16 weights: the scalar is widened, so it can be changed here)
+    keep := model.Layers[1].Scalar^[0];
+    model.Layers[1].Scalar^[0] := 0;
+    try
+      fNames := nil;
+      fStates := nil;
+      ids := ref.I32('case0.ids', n);
+      ctx := model.NewContext;
+      try
+        model.Forward(ctx, ids, n, nil, false, KeepState);
+      finally
+        ctx.Free;
+      end;
+      zero := State('layer01') <> nil;
+      if zero then
+        for i := 0 to n * model.Config.Hidden - 1 do
+          if State('layer01')^[i] <> 0 then
+            zero := false;
+      Check(zero, 'a layer scalar of 0');
+    finally
+      model.Layers[1].Scalar^[0] := keep;
+    end;
+    // the dense model: layer types and rope from the defaults, V of its own
+    FreeAndNil(step);
+    FreeAndNil(full);
+    FreeAndNil(model);
+    FreeAndNil(ref);
+    dir := MakePath([dir, 'dense'], true);
+    ref := TInferRefSet.CreateFromFolder(dir);
+    model := NewDecoderModel(dir, fCpu);
+    s := model.Config.Spec;
+    Check((length(s) = 6) and (s[4].Window = 5) and (s[5].Window = 0) and
+      (s[5].HeadDim = 32) and (s[5].KvHeads = 2) and not s[5].KIsV and s[5].Rope2 and
+      (s[0].Ffn = dfDense), 'five sliding layers, then a full one');
+    Check((model.Config.RopeTheta = 10000) and (model.Config.Rope2Theta = 1000000) and
+      (model.Config.Rope2Partial = 0.25), 'the default rotary sets');
+    CheckUtf8(RotaryMatches(model, ref, 'rope', detail), 'dense rope: %', [detail]);
+    CheckUtf8(Rotary2Matches(model, ref, 'rope2', detail), 'dense rope2: %', [detail]);
+    for k := 0 to 2 do
+      CheckStates(model, ref, FormatUtf8('case%', [k]), 1e-4, 1e-4, true);
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, 24, []);
+      finally
+        ctx.Free;
+      end;
+      diff := GreedyDiff(mine, ref, FormatUtf8('case%', [k]), margin, detail);
+      CheckUtf8(diff < 0, 'dense Gemma 4 case% greedy differs at step % (margin %, %)',
+        [k, diff, margin, detail]);
+    end;
+  finally
+    step.Free;
+    full.Free;
+    model.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.Gemma4Quantized;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  q8, q4, f: TDecoderModel;
+  tape: TDecoderRouteTape;
+  lq, lf: TSingleDynArray;
+  ids: PIntegerArray;
+  n, m, k, v, w, e, r, nb, size: PtrInt;
+  cmp: TInferCompare;
+  q: TDecoderModel;
+  sliced: boolean;
+  blocks: array[0..63] of TInferBlockQ8_0; // a row of up to 2048 values
+  blocks4: array[0..63] of TInferBlockQ4_0;
+
+  /// every row of a quantized expert matrix is the quantization of the same
+  // row of the F32 model: the slice of the 3-D tensor is the right one
+  function SameRows(const aQ, aF: TInferWeight; aRows, aCols: PtrInt): boolean;
+  var
+    i: PtrInt;
+  begin
+    result := false;
+    nb := aCols shr 5;
+    size := nb * INFER_DTYPE_SIZE[aQ.DType];
+    for i := 0 to aRows - 1 do
+    begin
+      if aQ.DType = idtQ8_0 then
+      begin
+        InferQuantizeRowQ8_0Ref(@PSingleArray(aF.Data)^[i * aCols], aCols, @blocks);
+        if not CompareMem(@blocks, @PByteArray(aQ.Data)^[i * size], size) then
+          exit;
+      end
+      else
+      begin
+        InferQuantizeRowQ4_0(@PSingleArray(aF.Data)^[i * aCols], aCols, @blocks4);
+        if not CompareMem(@blocks4, @PByteArray(aQ.Data)^[i * size], size) then
+          exit;
+      end;
+    end;
+    result := true;
+  end;
+
+  procedure Run(aModel: TDecoderModel; aMode: TDecoderRouteMode; aLogits: PSingleArray);
+  var
+    c: TDecoderContext;
+  begin
+    // the same experts in both runs: the quantized one replays the choice of
+    // the F32 one, so only the error of the quantization is measured (the
+    // router of the tiny model is sharp: a near tie flips with Q8_0)
+    tape.Mode := aMode;
+    aModel.RouteTape := tape;
+    c := aModel.NewContext;
+    try
+      aModel.Forward(c, ids, n, aLogits, true);
+    finally
+      c.Free;
+      aModel.RouteTape := nil;
+    end;
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-gemma4');
+  if CheckFailed(dir <> '', 'tiny-gemma4 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  q8 := nil;
+  q4 := nil;
+  f := nil;
+  tape := TDecoderRouteTape.Create;
+  try
+    // F32 on the fast backend; Q8_0 and Q4_0 at load, the experts sliced from
+    // the 3-D tensors, the router F32, the tied head Q8_0
+    f := TGemma4Model.Create(dir, fFast);
+    q8 := TGemma4Model.Create(dir, fFast, idtQ8_0);
+    q4 := TGemma4Model.Create(dir, fFast, idtQ4_0);
+    Check((q8.Layers[1].Router.DType = idtF32) and
+      (q8.Layers[1].ExpertUp[7].DType = idtQ8_0) and (q8.Head.DType = idtQ8_0) and
+      (q4.Layers[1].ExpertDown[7].DType = idtQ4_0) and (q4.Head.DType = idtQ8_0),
+      'the types of the quantized weights');
+    // every expert of every layer: gate, up and down sliced at their rows
+    sliced := true;
+    for w := 0 to 1 do
+    begin
+      if w = 0 then
+        q := q8
+      else
+        q := q4;
+      for r := 0 to f.Config.Layers - 1 do
+        for e := 0 to f.Config.Experts - 1 do
+          if not SameRows(q.Layers[r].ExpertGate[e], f.Layers[r].ExpertGate[e], 32, 64) or
+             not SameRows(q.Layers[r].ExpertUp[e], f.Layers[r].ExpertUp[e], 32, 64) or
+             not SameRows(q.Layers[r].ExpertDown[e], f.Layers[r].ExpertDown[e], 64, 32) then
+            sliced := false;
+    end;
+    Check(sliced, 'every quantized expert row is that of the F32 expert');
+    v := f.Config.VocabSize;
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(lq, n * v);
+      SetLength(lf, n * v);
+      Run(f, drmOff, pointer(lf));
+      cmp := InferCompare(pointer(lf), ref.F32(FormatUtf8('case%.logits', [k]), m),
+        n * v, 1e-4, 1e-4);
+      CheckUtf8(InferCompareOk(cmp), 'Gemma 4 case % F32 fast path: %',
+        [k, InferCompareText(cmp)]);
+      for w := 0 to 1 do
+      begin
+        if w = 0 then
+          q := q8
+        else
+          q := q4;
+        tape.Clear;
+        Run(f, drmRecord, pointer(lf));
+        Run(q, drmReplay, pointer(lq));
+        CheckEqual(tape.Pending, 0, 'every choice replayed');
+        // the tiny model is chaotic (scores of normed heads at a factor of 1:
+        // a sharp softmax), its error grows with the tokens - measured
+        // 2026-10-20 with the same experts: Q8_0 max 0.64, cosine 0.989
+        // (case 2); Q4_0 max 2.1, cosine 0.705 (case 1)
+        cmp := InferCompare(pointer(lq), pointer(lf), n * v, 0.8 + 1.7 * w, 0);
+        CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.985 - w * 0.305),
+          'Gemma 4 case % % vs FP32: %', [k, INFER_DTYPE_NAME[q.Weights],
+          InferCompareText(cmp)]);
+        AddConsole(FormatString('Gemma 4 case % % vs FP32 (the same experts): %',
+          [k, INFER_DTYPE_NAME[q.Weights], InferCompareText(cmp)]));
+      end;
+    end;
+  finally
+    tape.Free;
+    f.Free;
+    q4.Free;
+    q8.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.Gemma4Refused;
+var
+  dir, tmp: TFileName;
+  cfg, c: TDocVariantData;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  g1, g2, u1: TSingleDynArray;
+  i: PtrInt;
+  one, up: single;
+  nullv: variant;
+
+  function Loads(const aPath: RawUtf8; const aValue: variant): boolean;
+  var
+    l: TDocVariantData;
+  begin
+    l.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT);
+    l.SetValueByPath(aPath, aValue, true, '.');
+    FileFromString(l.ToJson, tmp + 'config.json');
+    result := true;
+    try
+      TGemma4Model.Create(tmp, fCpu).Free;
+    except
+      on E: EInferError do
+      begin
+        AddConsole(FormatString('% = %: "%"', [aPath, aValue, E.Message]));
+        result := false;
+      end;
+    end;
+  end;
+
+  function Refused(const aPath: RawUtf8; const aValue: variant;
+    const aWhy: RawUtf8): boolean;
+  var
+    c: TDocVariantData;
+    why: RawUtf8;
+  begin
+    c.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT); // nested objects of its own
+    c.SetValueByPath(aPath, aValue, true, '.');
+    FileFromString(c.ToJson, tmp + 'config.json');
+    why := '';
+    try
+      TGemma4Model.Create(tmp, fCpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    result := PosEx(aWhy, why) > 0;
+    if not result then
+      AddConsole(FormatString('% = %: "%"', [aPath, aValue, why]));
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-gemma4');
+  if CheckFailed(dir <> '', 'tiny-gemma4 found') then
+    exit;
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-d6-' + Int64ToUtf8(GetTickCount64)], true);
+  ForceDirectories(tmp);
+  try
+    cfg.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT);
+    CopyFile(dir + 'model.safetensors', tmp + 'model.safetensors', false);
+    // the copy itself loads
+    FileFromString(cfg.ToJson, tmp + 'config.json');
+    TGemma4Model.Create(tmp, fCpu).Free;
+    Check(Refused('text_config.hidden_size_per_layer_input', 256,
+      'per-layer embeddings'), 'per-layer embeddings');
+    Check(Refused('text_config.num_kv_shared_layers', 2, 'shared KV'), 'shared KV');
+    Check(Refused('text_config.attention_bias', true, 'attention_bias'), 'bias');
+    Check(Refused('text_config.use_bidirectional_attention', 'all', 'bidirectional'),
+      'bidirectional attention');
+    Check(Refused('tie_word_embeddings', false, 'untied'), 'an untied head');
+    Check(Refused('text_config.tie_word_embeddings', false, 'untied'),
+      'an untied text head');
+    Check(Refused('text_config.hidden_activation', 'silu', 'hidden_activation'),
+      'another activation');
+    Check(Refused('text_config.rope_parameters.full_attention.rope_type', 'yarn',
+      'rope_type'), 'another full rope');
+    Check(Refused('text_config.rope_parameters.sliding_attention.partial_rotary_factor',
+      0.5, 'sliding rope_type'), 'a partial sliding rope');
+    Check(Refused('text_config.rope_parameters.full_attention.factor', 2,
+      'rope factor'), 'a scaled rope');
+    Check(Refused('text_config.rope_parameters.full_attention.mscale', 1,
+      'not supported'), 'an unknown rope key');
+    Check(Refused('text_config.layer_types', _Arr(['sliding_attention',
+      'chunked_attention', 'sliding_attention', 'full_attention']), 'layer type'),
+      'an unknown layer type');
+    Check(Refused('text_config.num_experts', 0, 'experts'), 'experts missing');
+    Check(Refused('text_config.global_head_dim', 64, 'shaped'),
+      'a global head of another width than the weights');
+    Check(Refused('text_config.num_global_key_value_heads', 3, 'heads'),
+      'global KV heads that do not divide the heads');
+    // K of its own: the 2 KV heads of the config, the weights have 1
+    Check(Refused('text_config.attention_k_eq_v', false, 'k_proj'),
+      'K = V turned off');
+    Check(Refused('model_type', 'gemma3', 'model_type'), 'another model_type');
+    Check(Refused('text_config.per_layer_config', _ObjFast(['7', _ObjFast(['head_dim',
+      32])]), 'names no layer'), 'per_layer_config of a layer that is not there');
+    Check(Refused('text_config.per_layer_config', _ObjFast(['1', _ObjFast(['sliding_window',
+      8])]), 'not supported'), 'per_layer_config of another setting');
+    // a null rope entry: transformers builds no rotary set and fails later
+    SetVariantNull(nullv);
+    Check(Refused('text_config.rope_parameters.sliding_attention', nullv,
+      'no object'), 'a null rope entry');
+    // per_layer_config null: the global keys are off all the same - every
+    // layer keeps head_dim, so the full layers no longer match the weights
+    Check(Refused('text_config.per_layer_config', nullv, 'shaped'),
+      'per_layer_config null');
+    // accepted: per_layer_config by layer type in place of the global keys,
+    // a last sliding layer made full
+    Check(Loads('text_config.per_layer_config', _ObjFast(['full_attention',
+      _ObjFast(['head_dim', 32, 'num_key_value_heads', 1])])),
+      'per_layer_config by layer type');
+    ref := TInferRefSet.CreateFromFolder(dir);
+    try
+      c.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT);
+      c.SetValueByPath('text_config.layer_types', _Arr(['sliding_attention',
+        'full_attention', 'sliding_attention', 'sliding_attention']), true, '.');
+      FileFromString(c.ToJson, tmp + 'config.json');
+      model := TGemma4Model.Create(tmp, fCpu);
+      try
+        Check((model.Config.Spec[3].Window = 0) and model.Config.Spec[3].Rope2,
+          'the last layer full whatever layer_types says');
+        CheckStates(model, ref, 'case0', 1e-4, 1e-4, true);
+      finally
+        model.Free;
+      end;
+    finally
+      ref.Free;
+    end;
+    // GeluTanhGlu: the fast backend in parallel slices = the reference
+    SetLength(g1, 5000);
+    SetLength(u1, 5000);
+    for i := 0 to high(g1) do
+    begin
+      g1[i] := (i mod 997) / 83 - 6;
+      u1[i] := 1 + (i mod 13) / 7;
+    end;
+    g2 := copy(g1);
+    fCpu.GeluTanhGlu(pointer(g1), pointer(u1), length(g1));
+    fFast.GeluTanhGlu(pointer(g2), pointer(u1), length(g2));
+    Check(CompareMem(pointer(g1), pointer(g2), length(g1) * SizeOf(single)),
+      'GeluTanhGlu on all cores');
+    one := 1;
+    up := 1;
+    fCpu.GeluTanhGlu(@one, @up, 1);
+    CheckSame(one, 0.8411919906, 1e-6, 'gelu_tanh(1)');
+  finally
+    DirectoryDeleteAll(tmp);
+    RemoveDir(tmp);
   end;
 end;
 

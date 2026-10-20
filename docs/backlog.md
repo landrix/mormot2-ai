@@ -144,6 +144,13 @@ der Hersteller (Stand Oktober 2026), vor jedem Slice gegen die gepinnte Revision
 Gemma 4. Kolibri ist auf dem RTX-Rechner machbar (96 GB RAM, die Experten liegen dort im
 Arbeitsspeicher), kommt aber nach DeltaNet.
 
+**Reihenfolge (Nutzerentscheidung 2026-10-20):** D6a (Gemma 4 auf der CPU), dann D6c (Tokenizer,
+Template und Parser: Gemma als Chat-Modell auf der CPU), dann D7 (Gated DeltaNet, vorgezogen:
+Qwen3.5-0.8B läuft auf allen Testrechnern, Qwen-Tokenizer und -Template sind da), dann die übrigen
+D6-Teile (D6b echte Modelle, D6d GGUF, D6e GPU). D8 (Kolibri) erst nach einem Vergleich der
+deutschen Antworten mit Gemma 4 und Qwen3.5 - fällt weg, wenn es dort nichts voraus hat. D9
+(Nemotron 3.5 Bolt) gestrichen: vier neue Bausteine für ein Modell, eigene Lizenz.
+
 ### Kandidaten
 
 | Modell | Lizenz | Aufbau | neue Bausteine |
@@ -369,6 +376,13 @@ Kopfdimension verschieden (global 512: Attention-Kernel auf Vulkan und CUDA erwe
 teilweise RoPE, eigener Tokenizer exakt nach der Referenz.
 E2B/E4B (Per-Layer Embeddings, geteilter KV) danach als eigener Schritt. Gate: Tiny-Gemma mit
 globalen Köpfen, echtes Modell quantisiert auf dem RTX-Rechner.
+In Scheiben:
+- *D6a erledigt 2026-10-20* (`native-inference.md`, Phase D): die Rechnung auf der CPU aus
+  safetensors - Köpfe zweier Formen je Layer, K=V, die proportionale RoPE, die Norms um beide
+  Blöcke, GeGLU, dichter Block neben den Experten mit dem Router von Gemma, Layer-Skalare,
+  Softcap; `per_layer_config`; gegen zwei Tiny-Modelle aus transformers 5.19.
+- *Offen:* D6c Tokenizer, Template und Parser (als Nächstes), D6b die echten Modelle (31B,
+  26B-A4B), D6d GGUF, D6e Vulkan und CUDA (Kopfdimension 512); E2B/E4B danach.
 
 **D7 — Gated DeltaNet.** Rekurrenz, Convolution-Zustand, Gates, Normierung, Ausgangsgate der
 vollen Attention. Erst seriell auf der CPU, dann Chunk-Prefill, dann GPU. Prompt-Cache mit

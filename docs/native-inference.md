@@ -1814,6 +1814,72 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D6a erledigt (2026-10-20): Gemma 4 auf der CPU.** Die Rechnung von Gemma 4 (26B-A4B, 31B)
+gegen `transformers` 5.19 (`modeling_gemma4.py`, nachgebaut, kein Code übernommen), zunächst auf
+der CPU und aus safetensors.
+
+- *Decoder:* Die Layer dürfen jetzt verschieden geformt sein - `Spec.HeadDim` und `Spec.KvHeads`
+  je Layer (Gemma 4: Sliding-Layer mit `head_dim` 256, volle Layer mit `global_head_dim` 512 und
+  eigenen KV-Köpfen), der KV-Cache mit eigener Breite je Layer. `Spec.KIsV`: V ist die
+  K-Projektion (`attention_k_eq_v`, kein `v_proj`), roh vor Norm und Rotation übernommen. Ein
+  zweiter Rotationssatz (`Spec.Rope2`, `Rope2Theta`, `Rope2Partial`): die „proportionale“ RoPE
+  der vollen Layer - die Frequenzen über die ganze Kopfdimension, nur der Anteil
+  `partial_rotary_factor` dreht, der Rest hat die Frequenz 0. `AttentionScale` (Gemma: 1, die
+  Köpfe sind normiert; `CausalAttention` hat dafür `aScale`), `ValueNorm` (RMSNorm ohne Gewicht
+  über jeden V-Kopf), `SandwichNorm` (Norm nach der Attention und nach dem FFN, jeweils vor dem
+  Residual), `Activation` mit GeGLU (`gelu_pytorch_tanh`, neue Backend-Operation
+  `GeluTanhGlu`), `EmbedScale` (sqrt(hidden) in float32), `LogitSoftcap`
+  (tanh(x / c) * c), `Scalar` je Layer (der ganze Zustand mal `layer_scalar`, jeder Wert).
+- *MoE von Gemma 4* (`dfDenseMoe`): der dichte GeGLU-Block und die Experten nebeneinander auf
+  demselben Residual - dicht auf der Pre-FFN-Norm, die Experten auf eigener Norm, jede Ausgabe
+  normiert, die Summe noch einmal; der Router auf einer RMSNorm ohne Gewicht mal `router.scale`
+  und hidden^-0,5 (in ein Normgewicht gefaltet), Softmax über alle Experten, Top-k renormiert,
+  jedes Gewicht mal `per_expert_scale` (`Route(..., aExpertScale)`). Die Experten liegen als
+  `gate_up_proj [E, 2I, H]` (erst Gate-, dann Up-Zeilen) und `down_proj [E, H, I]` vor; F32 zeigt
+  in die einmal verbreiterten Tensoren, Q8_0/Q4_0 quantisieren je Experte die Zeilen der Scheibe
+  (`QuantizedRows`).
+- *Familie* `mormot.ai.infer.model.gemma4`: `TGemma4Model` liest das Layout der veröffentlichten
+  Checkpoints (`Gemma4ForConditionalGeneration`, `model_type` gemma4, Einstellungen in
+  `text_config`, Tensoren unter `model.language_model.`; Bild- und Audioteil bleiben liegen),
+  `TGemma4TextModel` das von `Gemma4ForCausalLM` (`gemma4_text`). `per_layer_config` (so schreibt
+  `save_pretrained`) ersetzt `global_head_dim` und `num_global_key_value_heads` ganz, wie in
+  `Gemma4TextConfig`; der letzte Layer ist immer voll. Abgelehnt: Per-Layer-Embeddings und
+  geteilter KV (E2B, E4B), ein ungebundener Kopf, Bias, bidirektionale Attention über alles,
+  eine andere Aktivierung oder RoPE-Art, ein RoPE-Eintrag `null` (transformers baut dann keinen
+  Satz und scheitert im Durchlauf). Die GPU-Geräte lehnen jedes Extra jenseits von gpt-oss ab
+  (`DECODER_EXTRAS_GPTOSS`), bis D6e kommt.
+- *Referenz* (`make_reference_d6.py`): `tiny-gemma4` - 4 Layer (Sliding mit Fenster 5, voll,
+  Sliding, voll), Kopfdimension 16 (Sliding, 2 KV-Köpfe) bzw. 32 (voll, 1 KV-Kopf, K=V),
+  die proportionale RoPE, dichter
+  Block neben 8 Experten (Top-3, der Router scharf genug: Abstand zwischen k-tem und
+  (k+1)-tem Logit mindestens 0,022), Softcap 3 (greift: größtes Roh-Logit 3,02), Skalare
+  0,6-1,4; `tiny-gemma4/dense` - 6 Layer aus den Vorgaben (ohne `layer_types` und
+  `rope_parameters`), ohne Experten, K≠V, `config.json` so, wie `save_pretrained` sie schreibt
+  (`per_layer_config`).
+- *Tests:* `Gemma4MatchesReference` (jeder Zustand bis 1e-4 bei Kosinus 0,99999999999, beide
+  Rotationssätze, Cache und zwei Chunks bitgleich zum ganzen Durchlauf, Zeilen aus `Embed`
+  geben die Logits der Ids, Greedy über 24 Tokens gleich, ein Skalar 0 nullt den Zustand; das
+  dichte Modell ebenso), `Gemma4Quantized` (jede quantisierte Expertenzeile Byte für Byte die
+  Quantisierung der F32-Zeile; mit der Expertenwahl des F32-Laufs nachgespielt: Q8_0 bis 0,64
+  bei Kosinus 0,989, Q4_0 Kosinus 0,705 - das Tiny-Modell ist chaotisch, normierte Köpfe mit
+  Skala 1 geben eine scharfe Softmax), `Gemma4Refused` (die Ablehnungen; angenommen:
+  `per_layer_config` nach Layer-Art, ein letzter Sliding-Layer wird voll und gibt die Zustände
+  der Referenz; `GeluTanhGlu` des schnellen Backends parallel bitgleich zur Referenz).
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (6992 Assertions) und Delphi 7 (4521), unter
+  WSL (5299) und auf dem M2 Pro (5345; LLM-Suite 730). Gegenprobe: 24 eingebaute Fehler (V-Norm,
+  Skala 1, die Norm nach der Attention, nach dem FFN, nach dem dichten Block, nach den Experten,
+  der Router auf der falschen Norm, `per_expert_scale`, der Layer-Skalar, ein Skalar 0 als
+  „keiner“, die Embedding-Skala, das Softcap, SwiGLU statt GeGLU, alle Paare drehen, die
+  Exponenten über den gedrehten Anteil, eine KV-Breite für alle Layer, die GELU-Konstante,
+  `NormTopK` aus, der letzte Layer nicht voll, K=V aus, `per_layer_config` übergangen, Gate- und
+  Up-Scheibe vertauscht, die Router-Wurzel vergessen, V aus Q kopiert) - alle scheitern. Review:
+  Claude-Finder und Codex fanden je den Skalar 0 als „keiner“ und das übergangene
+  `per_layer_config` (so schreibt `save_pretrained`), der Finder dazu die fehlende Prüfung der
+  Backend-Operation und schwache Schwellen; im Nachreview Codex, dass ein `per_layer_config: null`
+  die globalen Schlüssel schon abschaltet und ein RoPE-Eintrag `null` in transformers scheitert
+  (jetzt abgelehnt), der Finder den fehlenden Test für einen Skalar 0. Behoben. Der Mac fand
+  nebenbei, dass der D5e-Test `TThreadID` mit 0 verglich (unter Darwin ein Zeiger).
+
 **D5e erledigt (2026-10-20): Issue #1 (flydev) - normierte Zeile vom Gerät, Stapel ohne Kopf,
 paralleles Laden.** flydev hat `mormot2-qwen-tts` auf `21aa4bb` gezogen und drei Dinge gemeldet
 (<https://github.com/landrix/mormot2-ai/issues/1>): Sein Nachbau des Vulkan-Durchlaufs brach
