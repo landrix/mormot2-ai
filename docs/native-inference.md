@@ -1814,6 +1814,65 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5d1 erledigt (2026-10-20): gpt-oss auf CUDA.** `TQwen3Cuda` nimmt gpt-oss an; die
+Prüfung auf `TDecoderModel.Extras` ist dort weg. Vulkan lehnt weiter ab (D5d2).
+
+- *Sinks:* `attention`/`attention16` bekommen die Sinks je Kopf als letzten Parameter
+  (0: keine); mit einem Bereich kommt der Sink beim Abschluss in Maximum und Nenner
+  (`M = max(m, sink)`, `y = acc * exp(m - M) / (l * exp(m - M) + exp(sink - M))`, wie die
+  CPU: ein Sink weit über allen Scores läuft nicht über), mit mehreren einmal in
+  `attnmerge` (das Maximum beginnt beim Sink).
+- *Biases:* O über `EnqueueLinear`, der Router in beiden Wegen (Wahl auf dem Host und auf dem
+  Gerät), die Experten beim Host-Weg über `EnqueueLinearAt` (die Zeile des Experten im
+  Bias-Puffer), beim Gerät-Weg in `linear8ids` (`bias[ids[slot] * nout + o]`, neuer letzter
+  Parameter, 0 für keinen). Alle Biases und Sinks gehen beim Anlegen hoch (ein Graph kann
+  nicht hochladen).
+- *SwiGLU:* `swiglu(g, u, n, alpha, limit)` - mit `limit > 0` die begrenzte Form von gpt-oss
+  in den Schritten von `TInferCpuBackend.SwiGlu`, sonst wie bisher.
+- *MXFP4:* Typ 6 in `linear`, `linear8`, `gemm8` und `linear8ids` - die Blöcke so gelesen,
+  wie sie liegen (17 Byte je 32 Werte, `byteAt`/`bytes8` an jeder Adresse), Wert =
+  `kvalues[q] * 2^(e - 128)` wie ggml (`E8M0_TO_FP32_HALF`, unter e = 2 subnormal), jedes
+  Produkt exakt in float. Die Experten eines Layers liegen am Stück: Die Wahl auf dem Gerät
+  greift (`linear8ids`), ein Decode-Schritt bleibt ein Graph.
+- *Genauigkeit:* Das Gerät rechnet die Aktivierungen in float, die CPU vor MXFP4- und
+  Q8_0-Gewichten in Q8_0. Gegen transformers (die Fälle von `TTestInferQwen3.GptOss20b`,
+  safetensors-Checkpoint) liegt das Gerät darum näher: Logits mit Kosinus 0,9999999 für Text
+  und 0,99989 / max. 0,37 für den Chatfall (die CPU 0,993 / 3,3), alle 16 Greedy-Tokens der
+  vier Fälle gleich.
+- *Tempo (RTX 5090, GGUF mit Q8_0-Matrizen, Prompt 200):* Prefill 861 Tokens/s (1156 bei
+  2000), Decode 124 Tokens/s; mit Wahl auf dem Host 72; die CPU (22 Threads) 133 / 21.
+- *Tests:* `OpsMatchCpu` mit der begrenzten SwiGLU (Grenze 7 und 0,8) und Sinks (ein Bereich,
+  fünf, mit Fenster; ein Sink weit über allen Scores); `LinearMatchesReference` mit MXFP4
+  (Zeilen ohne 4-Byte-Ausrichtung, alle Kernel) und einem exakten Fall für die
+  Randexponenten 0, 1, 2, 127, 128, 200; `GptOssMatchesCpu` (aus `GptOssRefused`):
+  tiny-gpt-oss in F32 (Wahl auf dem Host), aus dem Q8_0-GGUF und dem MXFP4-Checkpoint (Wahl
+  auf dem Gerät, gegen die Wahl des Hosts, auch als Graph), mit F16-Cache und das schmale
+  Modell, gegen die CPU; `GptOss20bOnDevice`: gpt-oss-20b gegen die transformers-Referenz,
+  dann über `TNativeLlmClient` auf dem Gerät - 391, der Aufruf von `get_weather`, die
+  Antwort mit den 17 Grad des Tools.
+- `llm-bench` registriert gpt-oss (`mormot.ai.infer.model.gptoss` in den uses).
+- Gegenprobe: 24 eingebaute Fehler - Sink übergangen (Attention, `attnmerge`), Sink von Kopf
+  0, SwiGLU ohne Grenze für Up oder Gate, ohne +1, ohne alpha, MXFP4-Nibbles vertauscht
+  (`linear8` und `linear`), E8M0 doppelt (normal und subnormal), 18 Byte je MXFP4-Block,
+  `linear8ids` ohne Bias oder mit dem Bias von Experte 0, das Backend lässt ihn fallen, kein
+  MXFP4-Kernel, kein O-Bias, kein Router-Bias (Host- und Gerät-Weg), alle Experten mit dem
+  Bias von Experte 0, kein Gate-Bias auf dem Gerät-Weg, die schlichte SwiGLU (beide Wege),
+  keine Sinks - alle scheitern (der subnormale Exponent nur am exakten Randfall).
+- Review: Codex fand, dass der Sink nicht ins Maximum ging (ein Sink weit über allen
+  Scores ließ `exp(sink - m)` überlaufen, die Ausgabe wurde 0) - jetzt wie die CPU, mit
+  einem Testfall großer Sinks, an dem die alte Formel scheitert -, dass die begrenzte
+  SwiGLU mit `fminf` ein NaN verlor (jetzt Vergleiche wie auf der CPU, Test `SwiGluNaN`),
+  im 20b-Test eine Prüfung, die nicht scheitern konnte (der Client rechnet jetzt auf dem
+  CUDA-Backend), das Freigeben bei einer Ausnahme und fehlende NaN-Prüfung der Logits; der
+  Claude-Finder, dass die drei Experten-Biases nur gemeinsam geprüft wurden (jetzt jeder
+  für sich). Eine Grenze bleibt dokumentiert: Liegt ein Sink mehr als etwa 103 über allen
+  Scores, ist der Anteil der Schlüssel kleiner als das kleinste float - 0, wie die Gewichte
+  des schnellen CPU-Backends. Im letzten Nachreview beider ohne Befund.
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 6431 Assertions, gpt-oss-20b auf
+  CUDA unter beiden mit denselben Antworten) und Delphi 7 (4003, ohne CUDA: ein
+  32-Bit-Prozess lädt den Treiber nicht), unter WSL aarch64 (Infer 4840, LLM 741) und
+  macOS M2 Pro (Infer 4826, LLM 730).
+
 **D5c3 erledigt (2026-10-20): das Reasoning früherer Züge geht ans Template zurück.**
 `TLlmMessage.Reasoning` trägt die Überlegung eines Assistenten-Zugs, `TLlmChatResponse.Reasoning`
 und `TLlmStreamDelta.ReasoningDelta` liefern sie (bisher nur als `reasoning_content` in `Raw`,

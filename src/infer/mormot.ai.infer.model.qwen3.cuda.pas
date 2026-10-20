@@ -31,6 +31,10 @@
 //   k unrotated; the cache on the device keeps every row (as
 //   TDecoderContext.FullCache on the CPU), so a context can go back to any
 //   length - the narrow cache of the CPU only saves memory
+// - gpt-oss (TDecoderModel.Extras, slice D5d1): attention sinks in the
+//   attention kernels (or attnmerge), the output, router and expert biases
+//   (expert e at row e of its bias), the clamped SwiGLU (swiglu with alpha and
+//   limit) and its MXFP4 experts through the Linear kernels
 unit mormot.ai.infer.model.qwen3.cuda;
 
 {
@@ -328,10 +332,8 @@ begin
   for l := 0 to high(aModel.Config.Spec) do
     if aModel.Config.Spec[l].Mixer <> dmAttention then
       EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
-  // no attention sinks, output, router or expert biases, nor the clamped
-  // SwiGLU of gpt-oss yet (backlog D5)
-  if aModel.Extras <> [] then
-    EInferError.RaiseUtf8('%: the layers of % not supported', [self, aModel]);
+  // attention sinks, the output, router and expert biases and the clamped
+  // SwiGLU of gpt-oss run here too (slice D5d)
   fMoe := not aModel.HasOnly(dmAttention, dfDense);
   // qkrope keeps one normalized head in shared memory, the attention reads
   // the keys as float4
@@ -496,13 +498,26 @@ begin
       Vector(ly^.QNorm, c.HeadDim);
       Vector(ly^.KNorm, c.HeadDim);
     end;
-    // the biases up front: a captured graph cannot upload
+    // the biases and sinks up front: a captured graph cannot upload
     if ly^.QBias <> nil then
     begin
       Vector(ly^.QBias, qw);
       Vector(ly^.KBias, kvw);
       Vector(ly^.VBias, kvw);
     end;
+    if ly^.OBias <> nil then
+      Vector(ly^.OBias, c.Hidden);
+    if ly^.Sinks <> nil then
+      Vector(ly^.Sinks, c.Heads);
+    if ly^.RouterBias <> nil then
+      Vector(ly^.RouterBias, c.Experts);
+    // each bias of the experts on its own, as TDecoderModel.MoeBlock
+    if ly^.ExpertGateBias <> nil then
+      Vector(ly^.ExpertGateBias, c.Experts * c.ExpertIntermediate);
+    if ly^.ExpertUpBias <> nil then
+      Vector(ly^.ExpertUpBias, c.Experts * c.ExpertIntermediate);
+    if ly^.ExpertDownBias <> nil then
+      Vector(ly^.ExpertDownBias, c.Experts * c.Hidden);
   end;
   Vector(fModel.FinalNorm, c.Hidden);
   Matrix(fModel.Head, c.VocabSize, c.Hidden);
@@ -670,12 +685,22 @@ begin
   fCu.Enqueue(fAddNorm, [@px, @pt, @pw, @py, @cols, @eps], aRows, OPS_BLOCK);
 end;
 
+// the device address of row aRow of aWidth floats in aBias, 0 for no bias
+function BiasRow(aBias: TCuDevicePtr; aRow, aWidth: PtrInt): TCuDevicePtr;
+begin
+  if aBias = 0 then
+    result := 0
+  else
+    result := aBias + TCuDevicePtr(Int64(aRow) * aWidth * 4);
+end;
+
 procedure TQwen3Cuda.EnqueueMoe(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
 var
   ly: ^TQwen3Layer;
   n, h, fi, k, ne, r, j, e, cnt, total: PtrInt;
-  ph, pg, pe, pt, pidx, pw, pu: TCuDevicePtr;
+  ph, pg, pe, pt, pidx, pw, pu, gb, ub, db: TCuDevicePtr;
   cols, count: cardinal;
+  alpha, limit: single;
 begin
   ly := @fModel.Layers[aLayer];
   n := aRows;
@@ -683,8 +708,21 @@ begin
   fi := fModel.Config.ExpertIntermediate;
   k := fModel.Config.ExpertsUsed;
   ne := fModel.Config.Experts;
+  alpha := fModel.Config.SwiGluAlpha;
+  limit := fModel.Config.SwiGluLimit;
+  // the biases of the experts (gpt-oss), expert e at row e
+  gb := 0;
+  ub := 0;
+  db := 0;
+  if ly^.ExpertGateBias <> nil then
+    gb := Vector(ly^.ExpertGateBias, ne * fi);
+  if ly^.ExpertUpBias <> nil then
+    ub := Vector(ly^.ExpertUpBias, ne * fi);
+  if ly^.ExpertDownBias <> nil then
+    db := Vector(ly^.ExpertDownBias, ne * h);
   // the router logits down (waits for the layer so far), the choice on the host
-  fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Router, ne, aCtx.fDevRoute);
+  fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Router, ne, aCtx.fDevRoute,
+    ly^.RouterBias);
   aCtx.fDevRoute.Download(0, pointer(aCtx.fRoute), Int64(n) * ne * 4);
   for r := 0 to n - 1 do
     fModel.Route(@aCtx.fRoute[r * ne], @aCtx.fChosen[r * k], @aCtx.fChosenW[r * k]);
@@ -722,15 +760,15 @@ begin
     pw := aCtx.fDevW.Ptr + Int64(aCtx.fStart[e]) * 4;
     fCu.Enqueue(fGather, [@ph, @pidx, @pg, @cols], cnt, OPS_BLOCK);
     fBackend.EnqueueLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertGate[e].DType,
-      fExpertGate[aLayer][e], fi, aCtx.fDevGate);
+      fExpertGate[aLayer][e], fi, aCtx.fDevGate, BiasRow(gb, e, fi));
     fBackend.EnqueueLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertUp[e].DType,
-      fExpertUp[aLayer][e], fi, aCtx.fDevUp);
+      fExpertUp[aLayer][e], fi, aCtx.fDevUp, BiasRow(ub, e, fi));
     pg := aCtx.fDevGate.Ptr;
     count := cnt * fi;
-    fCu.Enqueue(fSwiGlu, [@pg, @pu, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
-      OPS_BLOCK);
+    fCu.Enqueue(fSwiGlu, [@pg, @pu, @count, @alpha, @limit],
+      (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
     fBackend.EnqueueLinearAt(aCtx.fDevGate, cnt, fi, ly^.ExpertDown[e].DType,
-      fExpertDown[aLayer][e], h, aCtx.fDevExpOut);
+      fExpertDown[aLayer][e], h, aCtx.fDevExpOut, BiasRow(db, e, h));
     fCu.Enqueue(fScatter, [@pe, @pidx, @pw, @pt, @cols], cnt, OPS_BLOCK);
     pg := aCtx.fDevGather.Ptr;
   end;
@@ -740,16 +778,28 @@ procedure TQwen3Cuda.EnqueueMoeDevice(aCtx: TQwen3CuContext; aLayer: PtrInt);
 var
   ly: ^TQwen3Layer;
   h, fi, k: PtrInt;
-  pr, pids, pw, pg, pu, pd, pt: TCuDevicePtr;
+  pr, pids, pw, pg, pu, pd, pt, gb, ub, db: TCuDevicePtr;
   experts, used, norm, count: cardinal;
+  alpha, limit: single;
 begin
   ly := @fModel.Layers[aLayer];
   h := fModel.Config.Hidden;
   fi := fModel.Config.ExpertIntermediate;
   k := fModel.Config.ExpertsUsed;
+  alpha := fModel.Config.SwiGluAlpha;
+  limit := fModel.Config.SwiGluLimit;
+  gb := 0;
+  ub := 0;
+  db := 0;
+  if ly^.ExpertGateBias <> nil then
+    gb := Vector(ly^.ExpertGateBias, fModel.Config.Experts * fi);
+  if ly^.ExpertUpBias <> nil then
+    ub := Vector(ly^.ExpertUpBias, fModel.Config.Experts * fi);
+  if ly^.ExpertDownBias <> nil then
+    db := Vector(ly^.ExpertDownBias, fModel.Config.Experts * h);
   // the router logits, the choice into fDevKIds / fDevKW - no host involved
   fBackend.EnqueueLinear(aCtx.fDevH, 1, h, ly^.Router, fModel.Config.Experts,
-    aCtx.fDevRoute);
+    aCtx.fDevRoute, ly^.RouterBias);
   pr := aCtx.fDevRoute.Ptr;
   pids := aCtx.fDevKIds.Ptr;
   pw := aCtx.fDevKW.Ptr;
@@ -761,16 +811,18 @@ begin
     CheckDeviceRoute(aCtx);
   // gate and up of the k experts from the same row, SwiGLU, down per slot
   fBackend.EnqueueLinearIds(aCtx.fDevH, h, ly^.ExpertGate[0].DType,
-    fExpertGate[aLayer][0], fStrideGate[aLayer], fi, pids, k, false, aCtx.fDevKGate);
+    fExpertGate[aLayer][0], fStrideGate[aLayer], fi, pids, k, false, aCtx.fDevKGate,
+    gb);
   fBackend.EnqueueLinearIds(aCtx.fDevH, h, ly^.ExpertUp[0].DType,
-    fExpertUp[aLayer][0], fStrideUp[aLayer], fi, pids, k, false, aCtx.fDevKUp);
+    fExpertUp[aLayer][0], fStrideUp[aLayer], fi, pids, k, false, aCtx.fDevKUp, ub);
   pg := aCtx.fDevKGate.Ptr;
   pu := aCtx.fDevKUp.Ptr;
   count := k * fi;
-  fCu.Enqueue(fSwiGlu, [@pg, @pu, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
-    OPS_BLOCK);
+  fCu.Enqueue(fSwiGlu, [@pg, @pu, @count, @alpha, @limit],
+    (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
   fBackend.EnqueueLinearIds(aCtx.fDevKGate, fi, ly^.ExpertDown[0].DType,
-    fExpertDown[aLayer][0], fStrideDown[aLayer], h, pids, k, true, aCtx.fDevKDown);
+    fExpertDown[aLayer][0], fStrideDown[aLayer], h, pids, k, true, aCtx.fDevKDown,
+    db);
   // the weighted sum in id order into fDevTmp
   pd := aCtx.fDevKDown.Ptr;
   pt := aCtx.fDevTmp.Ptr;
@@ -835,10 +887,10 @@ var
     wsplits: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
-  pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt: TCuDevicePtr;
+  pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt, psk: TCuDevicePtr;
   rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count,
     norm, rope, window: cardinal;
-  eps: single;
+  eps, alpha, limit: single;
   capture, device: boolean;
   qkrope, attention: TCuHandle;
 begin
@@ -967,17 +1019,21 @@ begin
       end;
       pkc := aCtx.fDevKeys[l].Ptr;
       pvc := aCtx.fDevValues[l].Ptr;
+      // the attention sinks of gpt-oss, 0 without
+      psk := 0;
+      if ly^.Sinks <> nil then
+        psk := Vector(ly^.Sinks, c.Heads);
       fCu.Enqueue(qkrope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
         @heads, @kvHeads, @headDim, @ppast, @eps, @norm, @rope],
         c.Heads + c.KvHeads, OPS_BLOCK, n);
       fCu.Enqueue(attention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
-        @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock, @window],
+        @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock, @window, @psk],
         c.Heads div hb, OPS_BLOCK, (n + PtrInt(rblock) - 1) div PtrInt(rblock),
         nsplits);
       if nsplits > 1 then
-        fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits],
+        fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits, @psk],
           c.Heads, OPS_BLOCK, n);
-      fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp);
+      fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp, ly^.OBias);
       // residual and the feed-forward pre-norm, gate and up, SwiGLU, down
       EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, ly^.PostNorm, aCtx.fDevH);
       if c.Spec[l].Ffn = dfMoe then
@@ -994,8 +1050,10 @@ begin
         px := aCtx.fDevGate.Ptr;
         pt := aCtx.fDevUp.Ptr;
         count := n * f;
-        fCu.Enqueue(fSwiGlu, [@px, @pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
-          OPS_BLOCK);
+        alpha := c.SwiGluAlpha;
+        limit := c.SwiGluLimit;
+        fCu.Enqueue(fSwiGlu, [@px, @pt, @count, @alpha, @limit],
+          (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
         fBackend.EnqueueLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
       end;
       // the residual, and the input norm of the next layer

@@ -353,9 +353,14 @@ In Scheiben:
   Agentenschleife füllt es; gpt-oss als Analyse vor den Aufrufen, Qwen3 als `<think>`
   (`reasoning_content`); das OpenAI-Wire liest es und schickt es zurück
   (`reasoning_content`, DeepSeek verlangt das mit Tools; Ollama: `reasoning`).
-- *D5d:* Vulkan und CUDA - Sinks in den Attention-Kernels, Bias auf O, Router- und
-  Experten-Bias, die begrenzte SwiGLU, MXFP4-Linear; dann der schmale Cache auf dem Gerät,
-  wenn er sich bei gpt-oss-20b lohnt.
+- *D5d1 erledigt 2026-10-20* (`native-inference.md`, Phase D): gpt-oss auf CUDA - Sinks,
+  alle Biases, die begrenzte SwiGLU, MXFP4 als Typ der Linear-Kernel (auch `linear8ids`);
+  gpt-oss-20b auf der RTX 5090 gegen transformers (näher als die CPU) und hinter
+  `ILlmClient`, Decode 124 Tokens/s.
+- *D5d2:* dasselbe auf Vulkan - Sinks in `attention`/`flash`/`attndec`/`attnmerge`, Biases
+  (`RecordLinearAt` und `linear8.comp -DIDS` brauchen einen Bias je Experte), `swiglu.comp`
+  mit alpha und Grenze, MXFP4 in `linear`/`linear8`/`gemm8`/`matvec8`; dann der schmale
+  Cache auf dem Gerät, wenn er sich bei gpt-oss-20b lohnt.
 
 **D6 — Gemma 4 26B-A4B und 31B.** GELU-tanh, Norm-/Residual-Pfade, Router-Skalierung,
 Logit-Softcap, K=V, der dichte Parallelzweig neben den Experten (26B), lokale und globale

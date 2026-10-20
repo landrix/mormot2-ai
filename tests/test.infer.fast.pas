@@ -111,6 +111,8 @@ function RandomQ8(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 function RandomQ4(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// Q5_0 weights [aOut, aIn] with random scales, nibbles and fifth bits
 function RandomQ5(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+/// MXFP4 weights [aOut, aIn] with random nibbles and exponents in 110..140
+function RandomMxfp4(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// random K-quant rows (Q4_K, Q6_K): every bit pattern, finite scales
 function RandomK(aType: TInferDType; aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// true when both float arrays hold the same bits

@@ -43,6 +43,7 @@ uses
   mormot.ai.infer.tokenizer.bpe,
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.model.gptoss, // registers gpt-oss (NewDecoderModel)
   mormot.ai.infer.vulkan,
   mormot.ai.infer.backend.vulkan,
   mormot.ai.infer.model.qwen3.vulkan,

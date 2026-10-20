@@ -1,6 +1,6 @@
 // LandrixAI - CUDA: y[r, o] = bias[o] + sum_i w[o, i] * x[r, i] (backlog B3,
 // slice C2) - the CUDA form of tools/vk/linear.comp
-// - w in its storage type: F32, Q8_0, Q4_K, Q6_K or Q5_0 (ggml block layouts, see
+// - w in its storage type: F32, Q8_0, Q4_K, Q6_K, Q5_0 or MXFP4 (ggml block layouts, see
 //   mormot.ai.infer.tensor), dequantized per element in float, x in F32 - the
 //   arithmetic of InferRowToF32 followed by an F32 dot product, in another
 //   summation order (a tolerance, not bits)
@@ -10,7 +10,21 @@
 //   load is aligned; converted by cvt.f32.f16 (no cuda_fp16.h: it needs headers
 //   the nvcc wheel does not carry)
 
-// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0 (TInferCudaBackend)
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0, 6 = MXFP4
+// (TInferCudaBackend)
+
+// MXFP4 (slice D5d): 17 bytes per 32 values - e (E8M0), qs[16]; value j is
+// kvalues[q] * 2^(e - 128) with q the low nibble of qs[j] below 16, the high
+// one from 16: ggml's block_mxfp4 (kvalues_mxfp4, the E2M1 values doubled,
+// and E8M0_TO_FP32_HALF) - every product exact in float
+__constant__ float KV_MXFP4[16] = {0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f,
+  12.0f, 0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f};
+
+__device__ __forceinline__ float e8m0Half(unsigned int e)
+{
+  // 2^(e - 128): a subnormal for e 0 and 1
+  return __int_as_float(e < 2u ? 0x00200000u << e : (e - 1u) << 23);
+}
 
 __device__ __forceinline__ float halfAt(const unsigned char* p)
 {
@@ -53,6 +67,15 @@ __device__ float weight(const unsigned char* row, unsigned int dtype, unsigned i
     float d1 = halfAt(b) * float(sc);
     float m1 = halfAt(b + 2u) * float(m);
     return d1 * float(q) - m1;
+  }
+  if (dtype == 6u)
+  {
+    // MXFP4: 17 bytes per 32 values
+    const unsigned char* b = row + (i >> 5) * 17u;
+    unsigned int j = i & 31u;
+    unsigned int q = b[1u + (j & 15u)];
+    q = j >= 16u ? q >> 4 : q & 15u;
+    return e8m0Half(b[0]) * KV_MXFP4[q];
   }
   if (dtype == 5u)
   {
@@ -99,6 +122,8 @@ extern "C" __global__ void linear(const unsigned char* w, const float* x,
     rowBytes = (nin >> 8) * 144ull;
   else if (dtype == 5u)
     rowBytes = (nin >> 5) * 22ull;
+  else if (dtype == 6u)
+    rowBytes = (nin >> 5) * 17ull;
   else
     rowBytes = (nin >> 8) * 210ull;
   const unsigned char* row = w + o * rowBytes;
@@ -181,6 +206,8 @@ __device__ __forceinline__ unsigned long long rowBytesOf(unsigned int dtype,
     return (nin >> 8) * 144ull;
   if (dtype == 5u)
     return (nin >> 5) * 22ull;
+  if (dtype == 6u)
+    return (nin >> 5) * 17ull;
   return (nin >> 8) * 210ull;
 }
 
@@ -239,6 +266,21 @@ __device__ __forceinline__ void weights8(const unsigned int* w, unsigned int dty
     {
       wv[k] = d1 * float((u8(q0, k) >> sh) & 15u) - m1;
       wv[k + 4u] = d1 * float((u8(q1, k) >> sh) & 15u) - m1;
+    }
+  }
+  else if (dtype == 6u)
+  {
+    // MXFP4: 17 bytes per 32 values, 8 values in one block: 8 bytes of qs
+    unsigned long long base = rowBase + (e >> 5) * 17ull;
+    unsigned int j = e & 31u;
+    float d = e8m0Half(byteAt(w, base));
+    uint2 q = bytes8(w, base + 1u + (j & 15u));
+    unsigned int sh = j >= 16u ? 4u : 0u;
+#pragma unroll
+    for (unsigned int k = 0u; k < 4u; k++)
+    {
+      wv[k] = d * KV_MXFP4[(u8(q.x, k) >> sh) & 15u];
+      wv[k + 4u] = d * KV_MXFP4[(u8(q.y, k) >> sh) & 15u];
     }
   }
   else if (dtype == 5u)
@@ -348,9 +390,12 @@ extern "C" __global__ void linear8(const unsigned int* w, const float* x,
 // expert's matrix at byte ids[s] * stride of w (the experts of a layer in one
 // buffer); x is row s of x when xPerSlot (the down projection), else row 0
 // (gate and up); y is row s of y. The arithmetic of linear8 for one row.
+// - bias: [experts, nout] floats, the expert's row added (gpt-oss, slice
+//   D5d); 0 for none
 extern "C" __global__ void linear8ids(const unsigned int* w, const float* x,
   const int* ids, float* y, unsigned long long stride, unsigned int nin,
-  unsigned int nout, unsigned int dtype, unsigned int xPerSlot)
+  unsigned int nout, unsigned int dtype, unsigned int xPerSlot,
+  const float* bias)
 {
   unsigned int t = threadIdx.x;
   unsigned int lane = t & 31u;
@@ -375,7 +420,12 @@ extern "C" __global__ void linear8ids(const unsigned int* w, const float* x,
   for (unsigned int off = 16u; off > 0u; off >>= 1)
     acc += __shfl_down_sync(0xffffffffu, acc, off);
   if (lane == 0u)
-    y[(unsigned long long)slot * nout + o] = acc + 0.0f;
+  {
+    float b = 0.0f;
+    if (bias != 0)
+      b = bias[(unsigned long long)ids[slot] * nout + o];
+    y[(unsigned long long)slot * nout + o] = acc + b;
+  }
 }
 
 #define TM 64

@@ -2,7 +2,7 @@
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - backlog B3, slice C2: TInferCudaBackend is the fast CPU backend whose
-//   Linear runs on a CUDA device for F32, Q8_0, Q5_0, Q4_K and Q6_K weights;
+//   Linear runs on a CUDA device for F32, Q8_0, Q5_0, Q4_K, Q6_K and MXFP4 weights;
 //   every other operation, every other weight type and every call while the
 //   device is busy stay on the CPU (as TInferVulkanBackend)
 // - weights and biases are uploaded once, on first use, and kept on the
@@ -117,9 +117,11 @@ type
     // expert's [aOut, aIn] matrix of aType at aWeight + id * aStride bytes (the
     // experts of a layer in one buffer); x is row s of x when aXPerSlot, else
     // row 0; y receives row s - linear8ids, the arithmetic of linear8
+    // - aBias: a device address of [experts, aOut] floats (row id added), or 0
     procedure EnqueueLinearIds(x: TInferCuBuffer; aIn: PtrInt; aType: TInferDType;
       aWeight: TCuDevicePtr; aStride: Int64; aOut: PtrInt; aIds: TCuDevicePtr;
-      aSlots: PtrInt; aXPerSlot: boolean; y: TInferCuBuffer);
+      aSlots: PtrInt; aXPerSlot: boolean; y: TInferCuBuffer;
+      aBias: TCuDevicePtr = 0);
     /// the device context
     property Cuda: TInferCuda read fCu;
     /// how many Linear calls ran on the device
@@ -140,7 +142,7 @@ const
   // MXFP4;
   // 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
-    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 0);
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 6);
 
   /// the threads of a block of linear and linear8 in tools/cuda/linear.cu
   LINEAR_BLOCK = 128;
@@ -327,9 +329,10 @@ end;
 
 procedure TInferCudaBackend.EnqueueLinearIds(x: TInferCuBuffer; aIn: PtrInt;
   aType: TInferDType; aWeight: TCuDevicePtr; aStride: Int64; aOut: PtrInt;
-  aIds: TCuDevicePtr; aSlots: PtrInt; aXPerSlot: boolean; y: TInferCuBuffer);
+  aIds: TCuDevicePtr; aSlots: PtrInt; aXPerSlot: boolean; y: TInferCuBuffer;
+  aBias: TCuDevicePtr);
 var
-  pw, px, pids, py: TCuDevicePtr;
+  pw, px, pids, py, pb: TCuDevicePtr;
   stride: Int64;
   nin, nout, dtype, xslot: cardinal;
 begin
@@ -347,8 +350,9 @@ begin
   nout := aOut;
   dtype := LINEAR_DTYPE[aType];
   xslot := ord(aXPerSlot);
+  pb := aBias;
   fCu.Enqueue(fLinear8Ids, [@pw, @px, @pids, @py, @stride, @nin, @nout, @dtype,
-    @xslot], (aOut + 3) shr 2, LINEAR_BLOCK, aSlots);
+    @xslot, @pb], (aOut + 3) shr 2, LINEAR_BLOCK, aSlots);
 end;
 
 function TInferCudaBackend.Weight(aData: pointer; aType: TInferDType;

@@ -124,14 +124,31 @@ extern "C" __global__ void addnorm(float* x, const float* t, const float* w,
     y[base + c] = w[c] * (x[base + c] * inv);
 }
 
-// g = silu(g) * u over n values
-extern "C" __global__ void swiglu(float* g, const float* u, unsigned int n)
+// g = silu(g) * u over n values; with limit > 0 the clamped SwiGLU of gpt-oss
+// (slice D5d): (clamp(u, -limit, limit) + 1) * g * sigmoid(alpha * g), g
+// clamped from above - the steps of TInferCpuBackend.SwiGlu
+extern "C" __global__ void swiglu(float* g, const float* u, unsigned int n,
+  float alpha, float limit)
 {
   unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n)
   {
     float a = g[i];
-    g[i] = (a / (1.0f + expf(-a))) * u[i];
+    if (limit > 0.0f)
+    {
+      float b = u[i];
+      // by comparison, as the CPU: a NaN stays a NaN (fminf would drop it)
+      if (a > limit)
+        a = limit;
+      if (b > limit)
+        b = limit;
+      else if (b < -limit)
+        b = -limit;
+      float sg = 1.0f / (1.0f + expf(-(a * alpha)));
+      g[i] = (b + 1.0f) * (a * sg);
+    }
+    else
+      g[i] = (a / (1.0f + expf(-a))) * u[i];
   }
 }
 
@@ -250,6 +267,11 @@ extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
 //   (TQwen3Cuda), where every query shares one range; at the causal edge of
 //   a prompt chunk the earlier rows of a group still sum the later rows'
 //   values with a weight of 0, as since slice C5
+// - sinks (gpt-oss, slice D5d): [heads] logits that join the denominator of
+//   the softmax without a value - added once, here when splits is 1, else
+//   by attnmerge, and part of the maximum as on the CPU; 0 for none - a
+//   sink more than about 103 above every score leaves the keys a share below
+//   the smallest float: 0, as the weights of the fast CPU backend (single)
 #define MAXQ 8
 #define NEG -3.402823466e38f
 
@@ -258,7 +280,7 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
   const T* vals, float* y, float* part, unsigned int rows,
   unsigned int heads, unsigned int headDim, unsigned int kvHeads,
   unsigned int past, unsigned int splits, unsigned int headBlock,
-  unsigned int rowBlock, unsigned int window)
+  unsigned int rowBlock, unsigned int window, const float* sinks)
 {
   __shared__ float4 qs[MAXQ * 64];   // the queries
   __shared__ float ps[MAXQ * 128];   // the scores, then the weights of a tile
@@ -406,10 +428,20 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
       if (splits == 1u)
       {
         unsigned long long yb = r * qw + (unsigned long long)h * d + t;
+        // the sink joins the maximum, as on the CPU: a sink far above every
+        // score would overflow exp(sink - m)
+        float f = 1.0f;
+        float den = l[i];
+        if (sinks != 0)
+        {
+          float mm = fmaxf(m[i], sinks[h]);
+          f = expf(m[i] - mm);
+          den = l[i] * f + expf(sinks[h] - mm); // a share without a value
+        }
         if (t < d)
-          y[yb] = acc0[i] / l[i];
+          y[yb] = acc0[i] * f / den;
         if (t + 128u < d)
-          y[yb + 128u] = acc1[i] / l[i];
+          y[yb + 128u] = acc1[i] * f / den;
       }
       else
       {
@@ -431,29 +463,31 @@ extern "C" __global__ void attention(const float* q, const float* keys,
   const float* vals, float* y, float* part, unsigned int rows,
   unsigned int heads, unsigned int headDim, unsigned int kvHeads,
   unsigned int past, unsigned int splits, unsigned int headBlock,
-  unsigned int rowBlock, unsigned int window)
+  unsigned int rowBlock, unsigned int window, const float* sinks)
 {
   attentionT(q, keys, vals, y, part, rows, heads, headDim, kvHeads, past,
-    splits, headBlock, rowBlock, window);
+    splits, headBlock, rowBlock, window, sinks);
 }
 
 extern "C" __global__ void attention16(const float* q,
   const unsigned short* keys, const unsigned short* vals, float* y,
   float* part, unsigned int rows, unsigned int heads, unsigned int headDim,
   unsigned int kvHeads, unsigned int past, unsigned int splits,
-  unsigned int headBlock, unsigned int rowBlock, unsigned int window)
+  unsigned int headBlock, unsigned int rowBlock, unsigned int window,
+  const float* sinks)
 {
   attentionT(q, keys, vals, y, part, rows, heads, headDim, kvHeads, past,
-    splits, headBlock, rowBlock, window);
+    splits, headBlock, rowBlock, window, sinks);
 }
 
 // combines the key ranges of attention (flash-decoding), the CUDA form of
 // tools/vk/attnmerge.comp: per (head: grid x, row: grid y) M = max of the
 // range maxima, y = sum_s exp(m_s - M) * acc_s / sum_s exp(m_s - M) * l_s
 // - an empty range has m = -FLT_MAX and l = 0: its weight is 0
+// - sinks: [heads] logits added to the denominator (gpt-oss), 0 for none
 extern "C" __global__ void attnmerge(const float* part, float* y,
   unsigned int rows, unsigned int heads, unsigned int headDim,
-  unsigned int splits)
+  unsigned int splits, const float* sinks)
 {
   unsigned int t = threadIdx.x;
   unsigned int h = blockIdx.x;
@@ -461,12 +495,17 @@ extern "C" __global__ void attnmerge(const float* part, float* y,
   unsigned int d = headDim;
   unsigned int stride = d + 2u;
   const float* b = part + ((unsigned long long)h * rows + r) * splits * stride;
+  // the sink joins the maximum: exp(sink - mx) cannot overflow
   float mx = NEG;
+  if (sinks != 0)
+    mx = sinks[h];
   for (unsigned int s = 0u; s < splits; s++)
     mx = fmaxf(mx, b[s * stride + d]);
   float den = 0.0f;
   for (unsigned int s = 0u; s < splits; s++)
     den += expf(b[s * stride + d] - mx) * b[s * stride + d + 1u];
+  if (sinks != 0)
+    den += expf(sinks[h] - mx); // a share without a value
   for (unsigned int k = t; k < d; k += BLOCK)
   {
     float acc = 0.0f;
