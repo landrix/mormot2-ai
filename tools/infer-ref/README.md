@@ -82,6 +82,12 @@ accelerate); the script checks that it reads the same values it wrote.
 ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d5.py          # the tiny ones
 ```
 
+`tiny-gpt-oss-gguf` writes `tiny-gpt-oss/gguf/` from `tiny-gpt-oss/mxfp4`: the tensors and
+metadata keys llama.cpp's converter writes for gpt-oss (those of `ggml-org/gpt-oss-20b-GGUF`),
+the MXFP4 blocks repacked into ggml's layout and read back with ggml's own
+`dequantize_row_mxfp4` (so it needs the ggml build, `LD_LIBRARY_PATH` as for `make_reference.py
+q8`); matrices in BF16 or in Q8_0, one file with other YaRN betas, and damaged files.
+
 `gpt-oss-20b` runs only when named. It reads `openai/gpt-oss-20b` in the revision
 `6cee5e81ee83917806bbde320786a8fb61efebee` from `$LAI_GPTOSS_DIR` (by default
 `vendor/models/gpt-oss-20b`; the script downloads nothing and checks the pinned hashes).

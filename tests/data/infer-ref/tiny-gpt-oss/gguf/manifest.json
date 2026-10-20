@@ -1,0 +1,42 @@
+{
+ "dataset": "tiny-gpt-oss/gguf",
+ "environment": {
+  "created_utc": "2026-10-20T05:12:15Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": false,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "ggml": {
+  "dir": "vendor/sqlite-ext/aarch64-linux",
+  "sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  }
+ },
+ "source": "tiny-gpt-oss/mxfp4",
+ "note": "tiny-gpt-oss/mxfp4 as llama.cpp's converter writes gpt-oss, with the metadata keys of ggml-org/gpt-oss-20b-GGUF: norms, biases, sinks and the router in F32 (from BF16: exact), the experts as ffn_gate_exps / ffn_up_exps / ffn_down_exps in MXFP4 (type 39), repacked into ggml's blocks and read back by ggml's dequantize_row_mxfp4 as the checkpoint's values; the matrices and the embedding in BF16 as stored (bf16.gguf) or in Q8_0 from quantize_row_q8_0_ref (q8_0.gguf, as the published file); betas.gguf: q8_0.gguf with the YaRN betas 16 and 2. The expected values are those of tiny-gpt-oss/mxfp4. bad-* (from bf16.gguf; the first four only with the embedding and the head): another architecture, another rope scaling, a YaRN attn_factor, no output.weight, a missing sink, an extra tensor, an MXFP4 exponent of 150 in a block with values",
+ "files": {
+  "bad-arch.gguf": "8267d6d9e034dc7bb62465ab4a012f434ebb65d553a5eb20abdf203cbfc66eb0",
+  "bad-extra.gguf": "5e9b1e98f67f3b14a33ab6a66ea2e482475db02c66e196e2f5b47225ca4c0338",
+  "bad-missing.gguf": "a3a6b1935990b3359b3a6129110bdd3454e6dd942b232bc246cb6b90eda68288",
+  "bad-rope.gguf": "ccba1abda1083334c4e526f6214b29704c3362fc95c9a7bdbc49dcc83fbb036c",
+  "bad-scale.gguf": "a5148d7a8dccc66e1aa0a99e9b1af95024481218c85cb46be52e9e88d56c1110",
+  "bad-tied.gguf": "babb3bf65faf49929277e3020d232ef198b125b9eded3a9b73ba1ca25c61588d",
+  "bad-yarn.gguf": "2c42ed11ebe0ff2cb4ac08beeb2e1f64fbcf77896bf84932596cefd13cd0da9a",
+  "betas.gguf": "e5305f5f6c1ef7f0353615f163b00ff55688fd87a39ac41d938d509536e2784a",
+  "bf16.gguf": "ed7c3be3981220db6454a12cad60e456ac2d1e6d86dd0683e62cf9b6fdf95c71",
+  "q8_0.gguf": "861c88eb204c6697ede6c2b1d52b36601c626d7df685750d139062a606df8b0d"
+ }
+}

@@ -47,6 +47,11 @@ type
     procedure Setup; override;
     procedure CheckArgMaxRandom;
     procedure CleanUp; override;
+    /// the four cases of the gpt-oss-20b reference on aModel: the last row of
+    // every state, the logits, greedy (a step may differ only where the
+    // reference itself was less than 1 sure)
+    procedure CheckGptOss20b(aModel: TDecoderModel; aRef: TInferRefSet;
+      const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double);
     /// TOnQwen3State: copy every state, the model reuses its buffers
     procedure KeepState(const aName: RawUtf8; aValues: PSingleArray;
       aRows, aCols: PtrInt);
@@ -177,6 +182,10 @@ type
     // float32 - the last row of every state, the logits, greedy - skipped
     // without vendor/models/gpt-oss-20b
     procedure GptOss20b;
+    /// D5b2: tiny gpt-oss as GGUF (llama.cpp's converter layout) - the same
+    // settings, the same expert bytes and bit for bit the same logits as the
+    // safetensors folder, Q8_0 matrices within tolerance, refusals
+    procedure GptOssGguf;
   end;
 
 const
@@ -3680,7 +3689,8 @@ begin
     // the index is needed: without it, no model.safetensors
     CopyFile(dir + SHARD1, tmp + SHARD1, false);
     DeleteFile(tmp + 'model.safetensors.index.json');
-    CheckUtf8(GptOssRefused(tmp, fCpu, 'model.safetensors', why),
+    CheckUtf8(GptOssRefused(tmp, fCpu, 'missing or empty file', why) and
+      (PosEx('model.safetensors', why) > 0),
       'no index, no single file: %', [why]);
   finally
     f.Free;
@@ -3700,13 +3710,9 @@ begin
     result := '0' + result;
 end;
 
-procedure TTestInferQwen3.GptOss20b;
-const
-  GPTOSS20B = 'gpt-oss-20b';
+procedure TTestInferQwen3.CheckGptOss20b(aModel: TDecoderModel; aRef: TInferRefSet;
+  const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double);
 var
-  dir, refdir: TFileName;
-  ref: TInferRefSet;
-  model: TDecoderModel;
   ctx: TDecoderContext;
   ids, want: PIntegerArray;
   margins, last: PSingleArray;
@@ -3716,6 +3722,86 @@ var
   cmp: TInferCompare;
   margin, worst: double;
   name: RawUtf8;
+  timer: TPrecisionTimer;
+begin
+  h := aModel.Config.Hidden;
+  for k := 0 to 3 do
+  begin
+    ids := aRef.I32(FormatUtf8('case%.ids', [k]), n);
+    SetLength(prompt, n);
+    MoveFast(ids^, prompt[0], n * SizeOf(integer));
+    SetLength(logits, aModel.Config.VocabSize);
+    fNames := nil;
+    fStates := nil;
+    ctx := aModel.NewContext;
+    try
+      timer.Start;
+      aModel.Forward(ctx, pointer(prompt), n, pointer(logits), false, KeepState);
+      AddConsole(FormatString('% case % prefill of % tokens: %',
+        [aLabel, k, n, timer.Stop]));
+    finally
+      ctx.Free;
+    end;
+    // the last row of every state
+    worst := 1;
+    for s := 0 to aModel.Config.Layers + 1 do
+    begin
+      if s = 0 then
+        name := 'embed'
+      else if s <= aModel.Config.Layers then
+        name := FormatUtf8('layer%', [Pad0(s - 1)])
+      else
+        name := 'norm';
+      last := aRef.F32(FormatUtf8('case%.last.%', [k, name]), m);
+      if CheckFailed(State(name) <> nil, Utf8ToString('state ' + name)) then
+        continue;
+      cmp := InferCompare(@State(name)^[(n - 1) * h], last, h, 1, 1);
+      if cmp.Cosine < worst then
+        worst := cmp.Cosine;
+      CheckUtf8(cmp.Cosine >= aStateCos, '% case % % cosine %',
+        [aLabel, k, name, cmp.Cosine]);
+    end;
+    cmp := InferCompare(pointer(logits), aRef.F32(FormatUtf8('case%.logits_last',
+      [k]), m), aModel.Config.VocabSize, 1, 0);
+    want := aRef.I32(FormatUtf8('case%.greedy', [k]), m);
+    margins := aRef.F32(FormatUtf8('case%.greedy_margin', [k]), m);
+    ctx := aModel.NewContext;
+    try
+      timer.Start;
+      mine := aModel.Greedy(ctx, prompt, m, []);
+      AddConsole(FormatString('% case % greedy of % tokens: %',
+        [aLabel, k, m, timer.Stop]));
+    finally
+      ctx.Free;
+    end;
+    diff := 0;
+    while (diff < m) and (diff < length(mine)) and (mine[diff] = want^[diff]) do
+      inc(diff);
+    margin := 0;
+    if diff < m then
+      margin := margins^[diff];
+    AddConsole(FormatString('% case %: states cosine >= %, logits cos % maxabs %, ' +
+      'greedy equal for % of % tokens (reference margin there %)',
+      [aLabel, k, worst, cmp.Cosine, cmp.MaxAbs, diff, m, margin]));
+    CheckUtf8(cmp.Cosine >= aCos, '% case % logits cosine %', [aLabel, k, cmp.Cosine]);
+    CheckUtf8(cmp.MaxAbs <= aMaxAbs, '% case % logits max error %',
+      [aLabel, k, cmp.MaxAbs]);
+    CheckUtf8((diff >= m) or (margin < 1),
+      '% case % greedy leaves the reference at step % where it was % sure',
+      [aLabel, k, diff, margin]);
+  end;
+end;
+
+procedure TTestInferQwen3.GptOss20b;
+const
+  GPTOSS20B = 'gpt-oss-20b';
+  GPTOSS20B_GGUF = 'gpt-oss-20b-mxfp4.gguf';
+var
+  dir, refdir, gguf: TFileName;
+  ref: TInferRefSet;
+  model, g: TDecoderModel;
+  l, e, bytes: PtrInt;
+  same: boolean;
   timer: TPrecisionTimer;
 begin
   {$ifdef CPU32}
@@ -3737,81 +3823,220 @@ begin
     exit;
   ref := TInferRefSet.CreateFromFolder(refdir);
   model := nil;
+  g := nil;
   try
     timer.Start;
     model := NewDecoderModel(dir, fFast);
     AddConsole(FormatString('gpt-oss-20b loaded in %', [timer.Stop]));
     Check(model is TGptOssModel, 'a TGptOssModel');
     Check(model.Layers[23].ExpertDown[31].DType = idtMXFP4, 'MXFP4 experts');
-    h := model.Config.Hidden;
-    for k := 0 to 3 do
+    // the experts see Q8_0 activations, as in ggml. The chat case (78 tokens,
+    // Harmony tokens) loses most there: transformers itself with Q8_0 expert
+    // inputs gives logits at cosine 0.99258 / max 3.32 from float32 (measured
+    // 2026-10-20), the engine 0.99327 / 3.27; the other cases 0.99999
+    CheckGptOss20b(model, ref, 'safetensors', 0.985, 0.99, 4);
+    // the GGUF of the same revision (ggml-org/gpt-oss-20b-GGUF): its experts
+    // byte for byte ours, its matrices and embedding in Q8_0
+    gguf := FindVendorModel(GPTOSS20B_GGUF);
+    if gguf = '' then
     begin
-      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
-      SetLength(prompt, n);
-      MoveFast(ids^, prompt[0], n * SizeOf(integer));
-      SetLength(logits, model.Config.VocabSize);
-      fNames := nil;
-      fStates := nil;
-      ctx := model.NewContext;
-      try
-        timer.Start;
-        model.Forward(ctx, pointer(prompt), n, pointer(logits), false, KeepState);
-        AddConsole(FormatString('case % prefill of % tokens: %', [k, n, timer.Stop]));
-      finally
-        ctx.Free;
-      end;
-      // the last row of every state: the experts see Q8_0 activations, as in
-      // ggml. The chat case (78 tokens, Harmony tokens) loses most there:
-      // transformers itself with Q8_0 expert inputs gives logits at cosine
-      // 0.99258 / max 3.32 from float32 (measured 2026-10-20), the engine
-      // 0.99327 / 3.27; the other cases 0.99999
-      worst := 1;
-      for s := 0 to model.Config.Layers + 1 do
-      begin
-        if s = 0 then
-          name := 'embed'
-        else if s <= model.Config.Layers then
-          name := FormatUtf8('layer%', [Pad0(s - 1)])
-        else
-          name := 'norm';
-        last := ref.F32(FormatUtf8('case%.last.%', [k, name]), m);
-        if CheckFailed(State(name) <> nil, Utf8ToString('state ' + name)) then
-          continue;
-        cmp := InferCompare(@State(name)^[(n - 1) * h], last, h, 1, 1);
-        if cmp.Cosine < worst then
-          worst := cmp.Cosine;
-        CheckUtf8(cmp.Cosine >= 0.985, 'case % % cosine %', [k, name, cmp.Cosine]);
-      end;
-      cmp := InferCompare(pointer(logits), ref.F32(FormatUtf8('case%.logits_last',
-        [k]), m), model.Config.VocabSize, 1, 0);
-      want := ref.I32(FormatUtf8('case%.greedy', [k]), m);
-      margins := ref.F32(FormatUtf8('case%.greedy_margin', [k]), m);
-      ctx := model.NewContext;
-      try
-        timer.Start;
-        mine := model.Greedy(ctx, prompt, m, []);
-        AddConsole(FormatString('case % greedy of % tokens: %', [k, m, timer.Stop]));
-      finally
-        ctx.Free;
-      end;
-      diff := 0;
-      while (diff < m) and (diff < length(mine)) and (mine[diff] = want^[diff]) do
-        inc(diff);
-      margin := 0;
-      if diff < m then
-        margin := margins^[diff];
-      AddConsole(FormatString('case %: states cosine >= %, logits cos % maxabs %, ' +
-        'greedy equal for % of % tokens (reference margin there %)',
-        [k, worst, cmp.Cosine, cmp.MaxAbs, diff, m, margin]));
-      CheckUtf8(cmp.Cosine >= 0.99, 'case % logits cosine %', [k, cmp.Cosine]);
-      CheckUtf8(cmp.MaxAbs <= 4, 'case % logits max error %', [k, cmp.MaxAbs]);
-      CheckUtf8((diff >= m) or (margin < 1),
-        'case % greedy leaves the reference at step % where it was % sure',
-        [k, diff, margin]);
+      CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+        'LAI_REQUIRE_MODEL=1 but no vendor/models/gpt-oss-20b-mxfp4.gguf');
+      AddConsole('SKIP gpt-oss-20b GGUF: no vendor/models/gpt-oss-20b-mxfp4.gguf');
+      exit;
     end;
+    timer.Start;
+    g := NewDecoderModelFromGguf(gguf, fFast);
+    AddConsole(FormatString('gpt-oss-20b GGUF loaded in %', [timer.Stop]));
+    Check(g is TGptOssModel, 'GGUF: a TGptOssModel');
+    Check((g.Layers[0].Q.DType = idtQ8_0) and (g.Layers[5].ExpertUp[7].DType = idtMXFP4),
+      'GGUF: Q8_0 matrices, MXFP4 experts');
+    bytes := (model.Config.ExpertIntermediate * model.Config.Hidden div 32) *
+      SizeOf(TInferBlockMxfp4);
+    same := true;
+    for l := 0 to model.Config.Layers - 1 do
+      for e := 0 to model.Config.Experts - 1 do
+        if not CompareMem(g.Layers[l].ExpertGate[e].Data,
+             model.Layers[l].ExpertGate[e].Data, bytes) or
+           not CompareMem(g.Layers[l].ExpertUp[e].Data,
+             model.Layers[l].ExpertUp[e].Data, bytes) or
+           not CompareMem(g.Layers[l].ExpertDown[e].Data,
+             model.Layers[l].ExpertDown[e].Data, bytes) then
+          same := false;
+    Check(same, 'GGUF: every expert byte for byte as repacked from safetensors');
+    FreeAndNil(model);
+    CheckGptOss20b(g, ref, 'GGUF', 0.98, 0.99, 4);
   finally
+    g.Free;
     model.Free;
     ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.GptOssGguf;
+const
+  SHARD1 = 'model-00001-of-00002.safetensors';
+  SHARD2 = 'model-00002-of-00002.safetensors';
+var
+  dir, src, tmp: TFileName;
+  ref: TInferRefSet;
+  s, g, q: TDecoderModel;
+  cs, cg: TDecoderContext;
+  ls, lg: TSingleDynArray;
+  ids: PIntegerArray;
+  l, e, k, n, v, bytes: PtrInt;
+  ok: boolean;
+  cmp: TInferCompare;
+  why: RawUtf8;
+
+  function Refused(const aFile, aWhy: RawUtf8): boolean;
+  var
+    m: TDecoderModel;
+  begin
+    result := false;
+    why := 'accepted';
+    try
+      m := TGptOssModel.CreateFromGguf(dir + Utf8ToString(aFile), fCpu);
+      m.Free;
+    except
+      on E: Exception do
+      begin
+        why := StringToUtf8(E.Message);
+        result := (E is EInferError) and (PosEx(aWhy, why) > 0);
+      end;
+    end;
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-gpt-oss');
+  if CheckFailed(dir <> '', 'tiny-gpt-oss found') then
+    exit;
+  src := MakePath([dir, 'mxfp4'], true);
+  dir := MakePath([dir, 'gguf'], true);
+  ref := TInferRefSet.CreateFromFolder(src);
+  s := nil;
+  g := nil;
+  q := nil;
+  // llama.cpp fixes the SwiGLU limit of gpt-oss at 7 (no metadata for it):
+  // the safetensors folder with that limit is the counterpart of the file
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-d5b2-' +
+    Int64ToUtf8(GetTickCount64)], true);
+  ForceDirectories(tmp);
+  try
+    FileFromString(StringReplaceAll(StringFromFile(src + 'config.json'),
+      '"swiglu_limit": 0.8', '"swiglu_limit": 7'), tmp + 'config.json');
+    CopyFile(src + 'model.safetensors.index.json',
+      tmp + 'model.safetensors.index.json', false);
+    CopyFile(src + SHARD1, tmp + SHARD1, false);
+    CopyFile(src + SHARD2, tmp + SHARD2, false);
+    s := TGptOssModel.Create(tmp, fCpu);
+    CheckUtf8(s.Config.SwiGluLimit = 7, 'the counterpart has the limit 7');
+    g := NewDecoderModelFromGguf(dir + 'bf16.gguf', fCpu);
+    Check(g is TGptOssModel, 'architecture gpt-oss: a TGptOssModel');
+    // the settings of the metadata = those of config.json
+    Check((g.Config.Hidden = s.Config.Hidden) and (g.Config.Layers = s.Config.Layers) and
+      (g.Config.Heads = s.Config.Heads) and (g.Config.KvHeads = s.Config.KvHeads) and
+      (g.Config.HeadDim = s.Config.HeadDim) and (g.Config.VocabSize = s.Config.VocabSize) and
+      (g.Config.Experts = s.Config.Experts) and
+      (g.Config.ExpertsUsed = s.Config.ExpertsUsed) and
+      (g.Config.ExpertIntermediate = s.Config.ExpertIntermediate) and
+      (g.Config.MaxPositions = s.Config.MaxPositions), 'sizes');
+    Check((g.Config.RopeTheta = s.Config.RopeTheta) and
+      (g.Config.RopeFactor = s.Config.RopeFactor) and
+      (g.Config.RopeOriginal = s.Config.RopeOriginal) and
+      (g.Config.RopeBetaFast = s.Config.RopeBetaFast) and
+      (g.Config.RopeBetaSlow = s.Config.RopeBetaSlow) and
+      (g.Config.RopeTruncate = s.Config.RopeTruncate) and
+      (g.Config.RopeAttention = s.Config.RopeAttention), 'YaRN');
+    Check((g.Config.SwiGluLimit = s.Config.SwiGluLimit) and
+      (g.Config.SwiGluAlpha = s.Config.SwiGluAlpha), 'SwiGLU of llama.cpp');
+    ok := length(g.Config.Spec) = length(s.Config.Spec);
+    if ok then
+      for l := 0 to high(g.Config.Spec) do
+        if (g.Config.Spec[l].Window <> s.Config.Spec[l].Window) or
+           (g.Config.Spec[l].Ffn <> dfMoe) then
+          ok := false;
+    Check(ok, 'the even layers slide, all with experts');
+    Check(g.Extras = s.Extras, 'the same extras');
+    // the experts in place: the converter's repacking = ours, byte for byte
+    bytes := (s.Config.ExpertIntermediate * s.Config.Hidden div 32) *
+      SizeOf(TInferBlockMxfp4);
+    ok := true;
+    for l := 0 to g.Config.Layers - 1 do
+      for e := 0 to g.Config.Experts - 1 do
+        if (g.Layers[l].ExpertGate[e].DType <> idtMXFP4) or
+           not CompareMem(g.Layers[l].ExpertGate[e].Data,
+             s.Layers[l].ExpertGate[e].Data, bytes) or
+           not CompareMem(g.Layers[l].ExpertUp[e].Data,
+             s.Layers[l].ExpertUp[e].Data, bytes) or
+           not CompareMem(g.Layers[l].ExpertDown[e].Data,
+             s.Layers[l].ExpertDown[e].Data, bytes) then
+          ok := false;
+    Check(ok, 'the MXFP4 experts byte for byte as repacked from safetensors');
+    // the logits bit for bit, every position
+    v := s.Config.VocabSize;
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(ls, n * v);
+      SetLength(lg, n * v);
+      cs := s.NewContext;
+      cg := g.NewContext;
+      try
+        s.Forward(cs, ids, n, pointer(ls), true);
+        g.Forward(cg, ids, n, pointer(lg), true);
+      finally
+        cs.Free;
+        cg.Free;
+      end;
+      CheckUtf8(CompareMem(pointer(ls), pointer(lg), n * v * SizeOf(single)),
+        'case % GGUF = safetensors bit for bit', [k]);
+    end;
+    // the matrices in Q8_0 as the published file: within the Q8_0 error
+    q := NewDecoderModelFromGguf(dir + 'q8_0.gguf', fFast);
+    Check((q.Layers[0].Q.DType = idtQ8_0) and (q.Layers[0].ExpertUp[2].DType = idtMXFP4),
+      'Q8_0 matrices, MXFP4 experts');
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(lg, n * v);
+      SetLength(ls, n * v);
+      cs := s.NewContext;
+      cg := q.NewContext;
+      try
+        s.Forward(cs, ids, n, pointer(ls), true);
+        q.Forward(cg, ids, n, pointer(lg), true);
+      finally
+        cs.Free;
+        cg.Free;
+      end;
+      // measured 2026-10-20: logits within 0.042, cosine 0.99985
+      cmp := InferCompare(pointer(lg), pointer(ls), n * v, 0.1, 0.05);
+      CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.999),
+        'case % Q8_0 GGUF: %', [k, InferCompareText(cmp)]);
+      AddConsole(FormatString('gpt-oss GGUF case % Q8_0 vs BF16: %',
+        [k, InferCompareText(cmp)]));
+    end;
+    // YaRN betas of the file, not llama.cpp's defaults
+    FreeAndNil(q);
+    q := NewDecoderModelFromGguf(dir + 'betas.gguf', fCpu);
+    Check((q.Config.RopeBetaFast = 16) and (q.Config.RopeBetaSlow = 2),
+      'the YaRN betas of the metadata');
+    // refusals
+    CheckUtf8(Refused('bad-arch.gguf', 'architecture'), 'another architecture: %', [why]);
+    CheckUtf8(Refused('bad-rope.gguf', 'rope scaling'), 'another rope scaling: %', [why]);
+    CheckUtf8(Refused('bad-yarn.gguf', 'attention factor'), 'a YaRN attn_factor: %', [why]);
+    CheckUtf8(Refused('bad-tied.gguf', 'tied embeddings'), 'no output.weight: %', [why]);
+    CheckUtf8(Refused('bad-missing.gguf', 'attn_sinks'), 'a missing sink: %', [why]);
+    CheckUtf8(Refused('bad-extra.gguf', 'understood'), 'an extra tensor: %', [why]);
+    CheckUtf8(Refused('bad-scale.gguf', 'beyond the range'), 'an MXFP4 exponent of 150: %',
+      [why]);
+  finally
+    q.Free;
+    g.Free;
+    s.Free;
+    ref.Free;
+    DirectoryDeleteAll(tmp);
   end;
 end;
 

@@ -21,6 +21,13 @@ Targets (all of them when called without arguments):
                         greedy tokens with the margin and the last row of every state.
                         Needs about 50 GB of RAM: the experts stay in BF16 (MXFP4
                         dequantized: exact), each one taken to float32 when used
+  tiny-gpt-oss-gguf     tests/data/infer-ref/tiny-gpt-oss/gguf: tiny-gpt-oss/mxfp4 as llama.cpp's
+                        converter writes it (architecture gpt-oss, gate and up apart, MXFP4
+                        experts in ggml's block layout - checked with ggml's own
+                        dequantize_row_mxfp4), the matrices in BF16 (bf16.gguf) or in Q8_0
+                        as the published file has them (q8_0.gguf), plus damaged variants;
+                        the expected values are those of tiny-gpt-oss/mxfp4 (needs the ggml
+                        build of make_reference.py: LD_LIBRARY_PATH)
   tiny-gpt-oss-mxfp4    tests/data/infer-ref/tiny-gpt-oss/mxfp4: the config of tiny-gpt-oss
                         with its own seed, the experts in MXFP4 as the published
                         checkpoints store them (quantization_config mxfp4, *_blocks and
@@ -452,6 +459,184 @@ def tiny_gpt_oss_mxfp4():
     blob.write(folder, manifest)
 
 
+def hf_to_ggml_mxfp4(blocks, scales):
+    """[..., n / 32, 16] blocks and [..., n / 32] scales of the checkpoint as
+    ggml's 17-byte blocks [..., n / 32 * 17]: the exponent first, then value j in
+    the low and j + 16 in the high nibble of byte j (the checkpoint pairs 2j and
+    2j + 1 in byte j)"""
+    lo = blocks & 15
+    hi = blocks >> 4
+    codes = np.stack([lo, hi], axis=-1).reshape(blocks.shape[:-1] + (32,))
+    qs = (codes[..., :16] | (codes[..., 16:] << 4)).astype(np.uint8)
+    out = np.concatenate([scales[..., None].astype(np.uint8), qs], axis=-1)
+    return out.reshape(blocks.shape[:-2] + (-1,))
+
+
+def gpt_oss_gguf_tensors(g, cfg, sd, matrix):
+    """the tensors of a gpt-oss GGUF as llama.cpp's converter names and lays them
+    out; matrix: 'bf16' (the BF16 bits as stored) or 'q8' (Q8_0 from ggml's
+    reference quantizer, as llama-quantize writes the published file)"""
+    bf16 = {k for k in sd if sd[k].dtype == np.uint16}
+
+    def f32(name):
+        a = sd[name]
+        if name in bf16:
+            return (a.astype(np.uint32) << 16).view(np.float32)
+        return a.astype(np.float32)
+
+    ts = []
+
+    def vec(name, a):
+        a = np.ascontiguousarray(a, np.float32)
+        ts.append((name, 0, list(reversed(a.shape)), a.tobytes()))
+
+    def mat(name, hf):
+        ne = list(reversed(sd[hf].shape))
+        if matrix == "q8":
+            ts.append((name, 8, ne, b"".join(g.quant_ref(r) for r in f32(hf))))
+        else:
+            ts.append((name, 30, ne, np.ascontiguousarray(sd[hf]).tobytes()))
+
+    n = cfg["num_local_experts"]
+    lut = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+                   dtype=np.float32)
+    mat("token_embd.weight", "model.embed_tokens.weight")
+    vec("output_norm.weight", f32("model.norm.weight"))
+    mat("output.weight", "lm_head.weight")
+    for i in range(cfg["num_hidden_layers"]):
+        p = f"model.layers.{i}."
+        b = f"blk.{i}."
+        for hf, gg in [("self_attn.q_proj", "attn_q"), ("self_attn.k_proj", "attn_k"),
+                       ("self_attn.v_proj", "attn_v"), ("self_attn.o_proj", "attn_output")]:
+            mat(b + gg + ".weight", p + hf + ".weight")
+            vec(b + gg + ".bias", f32(p + hf + ".bias"))
+        vec(b + "attn_sinks.weight", f32(p + "self_attn.sinks"))
+        vec(b + "attn_norm.weight", f32(p + "input_layernorm.weight"))
+        vec(b + "post_attention_norm.weight", f32(p + "post_attention_layernorm.weight"))
+        vec(b + "ffn_gate_inp.weight", f32(p + "mlp.router.weight"))
+        vec(b + "ffn_gate_inp.bias", f32(p + "mlp.router.bias"))
+        e = p + "mlp.experts."
+        gub, gus = sd[e + "gate_up_proj_blocks"], sd[e + "gate_up_proj_scales"]
+        dnb, dns = sd[e + "down_proj_blocks"], sd[e + "down_proj_scales"]
+        mats = {"ffn_gate_exps": (gub[:, 0::2], gus[:, 0::2]),
+                "ffn_up_exps": (gub[:, 1::2], gus[:, 1::2]),
+                "ffn_down_exps": (dnb, dns)}
+        for gg, (bl, sc) in mats.items():
+            raw = hf_to_ggml_mxfp4(bl, sc)
+            rows, cols = bl.shape[1], bl.shape[2] * 32
+            # ggml's own dequantization of the repacked rows = the checkpoint's
+            # values (ldexp of the E2M1 value, the exponent bias 127)
+            codes = np.stack([bl & 15, bl >> 4], -1).reshape(bl.shape[:-1] + (32,))
+            want = np.ldexp(lut[codes], sc.astype(np.int32)[..., None] - 127)
+            want = want.reshape(n, rows, cols).astype(np.float32)
+            for x in range(n):
+                for r in range(rows):
+                    got = g.dequant_mx(raw[x, r].tobytes(), cols)
+                    if not np.array_equal(got, want[x, r]):
+                        raise ValueError(f"{b}{gg} expert {x} row {r}: ggml reads other values")
+            ts.append((b + gg + ".weight", 39, [cols, rows, n], raw.tobytes()))
+        gb = f32(e + "gate_up_proj_bias")
+        vec(b + "ffn_gate_exps.bias", gb[:, 0::2])
+        vec(b + "ffn_up_exps.bias", gb[:, 1::2])
+        vec(b + "ffn_down_exps.bias", f32(e + "down_proj_bias"))
+    return ts
+
+
+def tiny_gpt_oss_gguf():
+    """tiny-gpt-oss/mxfp4 as GGUF, as llama.cpp's converter writes gpt-oss"""
+    print("tiny gpt-oss as GGUF")
+    from safetensors.torch import load_file
+    g = mr.Ggml()
+    src = os.path.join(mr.OUT, "tiny-gpt-oss", "mxfp4")
+    folder = os.path.join(mr.OUT, "tiny-gpt-oss", "gguf")
+    os.makedirs(folder, exist_ok=True)
+    cfg = json.load(open(os.path.join(src, "config.json"), encoding="utf-8"))
+    idx = json.load(open(os.path.join(src, "model.safetensors.index.json"), encoding="utf-8"))
+    sd = {}
+    for f in sorted(set(idx["weight_map"].values())):
+        # BF16 as its uint16 bits, the MXFP4 blocks and scales as uint8
+        for k, v in load_file(os.path.join(src, f)).items():
+            sd[k] = (v.view(torch.int16).numpy().view(np.uint16)
+                     if v.dtype == torch.bfloat16 else v.numpy())
+    arch = "gpt-oss"
+    rp = cfg["rope_parameters"]
+    # the keys of the published file (ggml-org/gpt-oss-20b-GGUF)
+    kvs = [("general.architecture", "str", arch),
+           ("general.name", "str", "tiny-gpt-oss"),
+           (arch + ".block_count", "u32", cfg["num_hidden_layers"]),
+           (arch + ".context_length", "u32", cfg["max_position_embeddings"]),
+           (arch + ".embedding_length", "u32", cfg["hidden_size"]),
+           (arch + ".feed_forward_length", "u32", cfg["intermediate_size"]),
+           (arch + ".attention.head_count", "u32", cfg["num_attention_heads"]),
+           (arch + ".attention.head_count_kv", "u32", cfg["num_key_value_heads"]),
+           (arch + ".rope.scaling.type", "str", "yarn"),
+           (arch + ".rope.scaling.factor", "f32", rp["factor"]),
+           (arch + ".rope.scaling.original_context_length", "u32",
+            rp["original_max_position_embeddings"]),
+           (arch + ".rope.scaling.yarn_beta_fast", "f32", rp["beta_fast"]),
+           (arch + ".rope.scaling.yarn_beta_slow", "f32", rp["beta_slow"]),
+           (arch + ".rope.freq_base", "f32", rp["rope_theta"]),
+           (arch + ".attention.layer_norm_rms_epsilon", "f32", cfg["rms_norm_eps"]),
+           (arch + ".expert_count", "u32", cfg["num_local_experts"]),
+           (arch + ".expert_used_count", "u32", cfg["num_experts_per_tok"]),
+           (arch + ".attention.key_length", "u32", cfg["head_dim"]),
+           (arch + ".attention.value_length", "u32", cfg["head_dim"]),
+           (arch + ".attention.sliding_window", "u32", cfg["sliding_window"]),
+           (arch + ".expert_feed_forward_length", "u32", cfg["intermediate_size"])]
+    ts = gpt_oss_gguf_tensors(g, cfg, sd, "bf16")
+    q8 = gpt_oss_gguf_tensors(g, cfg, sd, "q8")
+    files = {"bf16.gguf": (kvs, ts), "q8_0.gguf": (kvs, q8)}
+    # other YaRN betas than llama.cpp's defaults: read from the file
+    betas = {arch + ".rope.scaling.yarn_beta_fast": 16.0,
+             arch + ".rope.scaling.yarn_beta_slow": 2.0}
+    files["betas.gguf"] = ([(k[0], k[1], betas[k[0]]) if k[0] in betas else k
+                            for k in kvs], q8)
+    # damaged: each one fails a different check of the loader; those refused
+    # while the settings are read carry only the embedding and the head
+    head = [t for t in ts if t[0] in ("token_embd.weight", "output.weight")]
+    files["bad-arch.gguf"] = ([("general.architecture", "str", "llama")] + kvs[1:], head)
+    files["bad-rope.gguf"] = ([k if k[0] != arch + ".rope.scaling.type"
+                               else (k[0], "str", "linear") for k in kvs], head)
+    files["bad-yarn.gguf"] = (kvs + [(arch + ".rope.scaling.attn_factor", "f32", 1.5)], head)
+    files["bad-tied.gguf"] = (kvs, [t for t in head if t[0] != "output.weight"])
+    files["bad-missing.gguf"] = (kvs, [t for t in ts if t[0] != "blk.1.attn_sinks.weight"])
+    files["bad-extra.gguf"] = (kvs, ts + [("blk.0.attn_q_norm.weight", 0, [cfg["head_dim"]],
+                                           np.ones(cfg["head_dim"], np.float32).tobytes())])
+    big = [list(t) for t in ts]
+    for t in big:
+        if t[0] == "blk.2.ffn_down_exps.weight":
+            raw = bytearray(t[3])
+            raw[17 * 4] = 150  # block 4: an exponent beyond the exact range
+            if not any(raw[17 * 4 + 1:17 * 5]):
+                raise ValueError("block 4 holds only zeros")
+            t[3] = bytes(raw)
+    files["bad-scale.gguf"] = (kvs, [tuple(t) for t in big])
+    for name, (k, t) in files.items():
+        mr.gguf_write(os.path.join(folder, name), k, t)
+    manifest = {"dataset": "tiny-gpt-oss/gguf", "environment": mr.environment(),
+                "ggml": {"dir": os.path.relpath(mr.GGML_DIR, mr.ROOT), "sha256": g.libs},
+                "source": "tiny-gpt-oss/mxfp4",
+                "note": "tiny-gpt-oss/mxfp4 as llama.cpp's converter writes gpt-oss, with "
+                        "the metadata keys of ggml-org/gpt-oss-20b-GGUF: norms, biases, "
+                        "sinks and the router in F32 (from BF16: exact), the experts as "
+                        "ffn_gate_exps / ffn_up_exps / ffn_down_exps in MXFP4 (type 39), "
+                        "repacked into ggml's blocks and read back by ggml's "
+                        "dequantize_row_mxfp4 as the checkpoint's values; the matrices "
+                        "and the embedding in BF16 as stored (bf16.gguf) or in Q8_0 from "
+                        "quantize_row_q8_0_ref (q8_0.gguf, as the published file); betas.gguf: "
+                        "q8_0.gguf with the YaRN betas 16 and 2. The "
+                        "expected values are those of tiny-gpt-oss/mxfp4. bad-* (from "
+                        "bf16.gguf; the first four only with the embedding and the "
+                        "head): another architecture, another rope scaling, a YaRN "
+                        "attn_factor, no output.weight, a missing sink, an extra tensor, "
+                        "an MXFP4 exponent of 150 in a block with values",
+                "files": {n: mr.sha256_file(os.path.join(folder, n)) for n in sorted(files)}}
+    with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8",
+              newline="\n") as f:
+        json.dump(manifest, f, indent=1)
+        f.write("\n")
+
+
 GPTOSS_ID = "openai/gpt-oss-20b"
 GPTOSS_REVISION = "6cee5e81ee83917806bbde320786a8fb61efebee"
 GPTOSS_SHA256 = {
@@ -605,7 +790,8 @@ def gpt_oss_20b():
 
 
 TARGETS = {"tiny-gpt-oss": tiny_gpt_oss, "tiny-gpt-oss-narrow": tiny_gpt_oss_narrow,
-           "tiny-gpt-oss-mxfp4": tiny_gpt_oss_mxfp4, "gpt-oss-20b": gpt_oss_20b}
+           "tiny-gpt-oss-mxfp4": tiny_gpt_oss_mxfp4, "tiny-gpt-oss-gguf": tiny_gpt_oss_gguf,
+           "gpt-oss-20b": gpt_oss_20b}
 
 if __name__ == "__main__":
     # gpt-oss-20b only when asked for: it needs the model and 50 GB of RAM

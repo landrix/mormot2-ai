@@ -335,11 +335,10 @@ In Scheiben:
   die vorhandenen Q8_0-Kernel; die `*_blocks`/`*_scales` der veröffentlichten safetensors
   beim Laden umgepackt; safetensors in Teildateien mit `model.safetensors.index.json`;
   gpt-oss-20b auf der CPU des RTX-Rechners gegen transformers.
-- *D5b2:* GGUF `gpt-oss` (llama.cpp: Gate und Up schon getrennt, `attn_sinks`, Biases als
-  `*.bias`, MXFP4 in place), mit einer Tiny-GGUF und `ggml-org/gpt-oss-20b-GGUF`; die
-  Skalenprüfung der MXFP4-Blöcke einer GGUF-Datei (`CheckScales`) bekommt dort ihren Test.
-  Ein fusionierter MXFP4-Kernel (Skalarprodukt ohne den Umweg über Q8_0-Blöcke) nur, wenn
-  eine Messung das Entpacken danach noch als Bremse zeigt.
+- *D5b2 erledigt 2026-10-20* (`native-inference.md`, Phase D): GGUF `gpt-oss` - Tiny-GGUF
+  bitgleich zum safetensors-Ordner, `ggml-org/gpt-oss-20b-GGUF` mit Experten Byte für Byte
+  gleich unserem Umpacken. *Offen:* ein fusionierter MXFP4-Kernel (Skalarprodukt ohne den
+  Umweg über Q8_0-Blöcke) nur, wenn eine Messung das Entpacken noch als Bremse zeigt.
 - *D5c:* o200k-Tokenizer (`tokenizer.json`, eigener Pre-Tokenizer-Ausdruck) und das
   Harmony-Chatformat mit Parser (Kanäle `analysis`/`commentary`/`final`, Tool-Aufrufe),
   `RegisterNativeFamily`.

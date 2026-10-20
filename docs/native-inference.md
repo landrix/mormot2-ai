@@ -1814,6 +1814,52 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5b2 erledigt (2026-10-20): gpt-oss aus GGUF.** `TGptOssModel` liest die Architektur
+`gpt-oss` von llama.cpp; geprüft mit einem Tiny-GGUF und mit `ggml-org/gpt-oss-20b-GGUF`
+(Revision `15dcfc7…`, `gpt-oss-20b-MXFP4.gguf`, aus derselben Checkpoint-Revision `6cee5e8`
+konvertiert).
+
+- *Metadaten* wie im veröffentlichten File: Größen, `expert_*`, `attention.sliding_window`
+  (die geraden Layer gleiten, wie `set_swa_pattern(2)`), `rope.scaling.type` yarn mit
+  `factor`, `original_context_length` und `yarn_beta_fast`/`_slow` (fehlen sie: 32 und 1;
+  die veröffentlichte Datei hat sie, geschrieben von einem neueren Konverter als dem in
+  UPSTREAM_BASE gepinnten llama.cpp-Stand, der die Betas nur aus den Kontextparametern nimmt).
+  llama.cpp legt die SwiGLU-Grenze 7 und alpha 1,702 im Code fest (kein Schlüssel) - wir
+  ebenso. `truncate` false wie der Checkpoint; llama.cpp selbst rundet die Grenzen des
+  YaRN-Korrekturbereichs (floor/ceil, also wie `truncate` true) und weicht damit leicht von
+  transformers ab. Abgelehnt: ein `rope.scaling.attn_factor` oder `yarn_log_multiplier`,
+  ein anderer Skalierungstyp, ein fehlendes `output.weight`.
+- *Tensoren:* 19 je Schicht - `attn_q/k/v/output` mit Bias, `attn_sinks.weight`,
+  `attn_norm`, `post_attention_norm`, `ffn_gate_inp` mit Bias, `ffn_gate_exps`/`ffn_up_exps`/
+  `ffn_down_exps` (Gate und Up schon getrennt, MXFP4 in place über `GgufExperts`) mit ihren
+  Biases. Die MXFP4-Blöcke einer GGUF-Datei prüft `CheckScales` (ein Block außerhalb des
+  exakten Bereichs muss nur Nullen halten).
+- *Fixture* `tiny-gpt-oss/gguf` aus `make_reference_d5.py`: `tiny-gpt-oss/mxfp4` so, wie der
+  Konverter schreibt, mit den Schlüsseln der echten Datei; das Umpacken der Blöcke liest
+  ggmls eigenes `dequantize_row_mxfp4` als die Werte des Checkpoints zurück. `bf16.gguf`
+  (Matrizen in BF16), `q8_0.gguf` (Matrizen und Embedding in Q8_0 wie die echte Datei),
+  `betas.gguf` (Betas 16 und 2) und sieben kaputte Varianten.
+- *Tests:* `GptOssGguf` - gegen den safetensors-Ordner mit `swiglu_limit` 7 (die Grenze, die
+  llama.cpp setzt): dieselben Einstellungen, alle Experten Byte für Byte gleich, die Logits
+  aller Positionen bitgleich; `q8_0.gguf` bis 0,042 (Kosinus 0,99985); die Betas der Datei;
+  sieben Ablehnungen. `GptOss20b` prüft nun auch die echte GGUF-Datei: alle 768 Experten
+  Byte für Byte gleich dem Umpacken aus safetensors, gegen transformers Logits bei Kosinus
+  0,9997-0,9999 (Chat-Turn 0,990, max. 3,1; die Q8_0-Matrizen kommen zum Q8_0-Effekt der
+  Aktivierungen dazu), Greedy 16 von 16 außer Fall 0 (weicht bei Schritt 3 ab, wo die
+  Referenz nur 0,067 Vorsprung hatte). Laden 4,8 s (in place) statt 20 s.
+- Gegenprobe: 11 eingebaute Fehler (Betas nicht gelesen, die ungeraden Layer gleiten,
+  andere SwiGLU-Grenze, `truncate` true, `attn_factor` oder gebundener Kopf angenommen,
+  Normen vertauscht, Gate und Up oder ihre Biases vertauscht, Tensorzahl, MXFP4-Skalen nicht
+  geprüft) - alle scheitern. Der gebundene Kopf überlebte erst: der Test suchte im Fehlertext
+  nach "tied", und das steht schon im Dateinamen `bad-tied.gguf`.
+- Review: Codex ohne Befund (prüfte auch die Fixture-Hashes und die Tensoren gegen
+  safetensors); der Claude-Finder fand, dass der gepinnte llama.cpp-Stand die Beta-Schlüssel
+  nicht kennt (jetzt dokumentiert: die echte Datei hat sie), einen verrutschten Kommentar und
+  eine zu weiche Erwartung im Fall ohne Index (jetzt mit dem Dateinamen).
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 6060 Assertions, die echte
+  GGUF-Datei unter beiden mit denselben Werten) und Delphi 7 (3839) und auf dem M2 Pro
+  (4690).
+
 **D5b erledigt (2026-10-20): MXFP4 und gpt-oss-20b auf der CPU.** Das veröffentlichte
 `openai/gpt-oss-20b` (Revision `6cee5e8…`, MXFP4-Experten, drei Teildateien) läuft auf der CPU
 und stimmt mit transformers in float32 überein; GGUF für gpt-oss folgt (D5b2), dann

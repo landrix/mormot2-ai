@@ -120,7 +120,9 @@ Qwen2.5  (Alibaba Cloud, Qwen team)  (MODEL INTERFACE, NOT CODE)
 
 gpt-oss  (OpenAI)  (MODEL INTERFACE, NOT CODE)
   The native decoder reads openai/gpt-oss-20b (revision
-  6cee5e81ee83917806bbde320786a8fb61efebee) at runtime; it is not part of this
+  6cee5e81ee83917806bbde320786a8fb61efebee) and its GGUF file
+  (ggml-org/gpt-oss-20b-GGUF, revision 15dcfc7e7c608c6161507211ed43c5b590801b4b)
+  at runtime; they are not part of this
   repository (vendor/models/, gitignored). Reference data under
   tests/data/infer-ref/gpt-oss-20b holds token ids, logits and states computed
   with the model, no weights; tests/data/infer-ref/tiny-gpt-oss* are seeded

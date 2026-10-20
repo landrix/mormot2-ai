@@ -116,7 +116,9 @@ never a build input.
            looked up in ggml/src/ggml-common.h and ggml-impl.h of the llama.cpp
            commit 4fd1242bef6cb2325b4ff1c1a80f3b54b64508a6 vendored by sqlite-lembed;
            the repacking of the safetensors *_blocks / *_scales in
-           convert_hf_to_gguf.py (GptOssModel)
+           convert_hf_to_gguf.py (GptOssModel), the gpt-oss tensor names and
+           metadata (src/llama-arch.cpp, src/llama-model.cpp) and the SwiGLU constants
+           of llm_graph_context::build_moe_ffn (src/llama-graph.cpp)
            -> mormot.ai.infer.tensor / backend.cpu / model.gptoss. Checked
            bit-exactly against the lembed oracle build (dataset mxfp4).
 
@@ -215,6 +217,11 @@ never a build input.
     model-00001-of-00002.safetensors  4fbe328ab445455d6f58dc73852b85873bd626986310abd91cd4d2ce3245eaea
     model-00002-of-00002.safetensors  a18106b209e9ab35c3406db4f6f12a927364a058b21e9d1373d682e20674b303
     tokenizer.json                    0614fe83cadab421296e664e1f48f4261fa8fef6e03e63bb75c20f38e37d07d3
+  Model:     ggml-org/gpt-oss-20b-GGUF, gpt-oss-20b-MXFP4.gguf (Apache-2.0; converted from
+             the revision above by llama.cpp, .src_sha in the repository)
+  Revision:  15dcfc7e7c608c6161507211ed43c5b590801b4b
+  File:      vendor/models/gpt-oss-20b-mxfp4.gguf (gitignored)
+             27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901
   Dataset from it: gpt-oss-20b (tools/infer-ref/make_reference_d5.py). Generated on
     the RTX computer (Windows x86_64, 96 GB RAM): Python 3.12.13, torch 2.14.1+cpu,
     transformers 5.19.0 and the rest of tools/infer-ref/requirements.txt, created
