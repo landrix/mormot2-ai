@@ -343,9 +343,14 @@ In Scheiben:
   `tokenizer.json` und aus GGUF (`gpt-4o`) - kein Normalizer, der o200k-Ausdruck von Hand
   mit einer eigenen gemessenen Klassentabelle, `ignore_merges`; 3095 Fälle stück- und
   idgleich mit der tokenizers-Bibliothek (ohne Added Tokens: Text bleibt Text).
-- *D5c2:* das Harmony-Chatformat (Template des Checkpoints, mit der Umsetzung der
-  Tool-Schemas in TypeScript-Typen) und der Parser (Kanäle `analysis`/`commentary`/`final`,
-  Tool-Aufrufe), `RegisterNativeFamily`.
+- *D5c2 erledigt 2026-10-20* (`native-inference.md`, Phase D): gpt-oss hinter `ILlmClient` -
+  das Harmony-Template des Checkpoints (437 Fälle text- und idgleich mit transformers, die
+  TypeScript-Umsetzung der Tool-Schemas samt ihrer Eigenheiten), der Parser (Kanäle,
+  Tool-Aufrufe), `reasoning_effort`; gezogen werden nur Ids des Tokenizers. gpt-oss-20b
+  beantwortet greedy eine Rechenfrage und ruft ein Tool auf. *Offen:* das Reasoning früherer
+  Züge (die Analyse vor einem Tool-Aufruf) an das Template zurückgeben - `TLlmMessage`
+  bräuchte ein Feld dafür und die Agentenschleife müsste es füllen; das Template von Qwen3
+  kennt dasselbe (`reasoning_content`).
 - *D5d:* Vulkan und CUDA - Sinks in den Attention-Kernels, Bias auf O, Router- und
   Experten-Bias, die begrenzte SwiGLU, MXFP4-Linear; dann der schmale Cache auf dem Gerät,
   wenn er sich bei gpt-oss-20b lohnt.

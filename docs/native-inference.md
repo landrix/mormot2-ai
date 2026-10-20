@@ -1814,6 +1814,91 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5c2 erledigt (2026-10-20): gpt-oss als Chat-Modell (Harmony).** gpt-oss-20b läuft hinter
+`ILlmClient`: `TNativeLlmClient` erkennt es an `model_type` bzw. an der GGUF-Architektur
+(`RegisterNativeFamily(TGptOssModel, TBpeTokenizer, THarmonyChatTemplate,
+THarmonyOutputParser)`).
+
+- *Template* (`THarmonyChatTemplate`): das `chat_template.jinja` der Revision `6cee5e8…` in
+  Pascal - Systemnachricht (Identität, Wissensstand, Datum, Reasoning-Effort, Kanäle, der
+  Hinweis auf `functions`), Entwicklernachricht (die Anweisungen einer ersten
+  Systemnachricht, die Tools als TypeScript-Namespace), dann die Züge: eine Antwort als
+  `final`, ein Zug mit Tool-Aufrufen als `analysis` (sein Inhalt, außer ein späterer Zug
+  antwortet ohne Aufruf) plus `assistant to=functions.NAME<|channel|>commentary json`, ein
+  Tool-Ergebnis als `functions.NAME to=assistant` mit dem Inhalt als JSON-String, der letzte
+  Zug ohne Generation-Prompt mit `<|return|>`. Die Tool-Schemas laufen durch die
+  TypeScript-Umsetzung des Templates samt ihrer Eigenheiten, nachgebaut auf einem Baum der
+  Python-Werte (`THarmonyJson`, aufgezeichnet vom vorhandenen `PythonJson`): `str()` für
+  Enum- und Typlisten (`True`, `None`), `tojson` für Defaults; `" | \n"` zwischen
+  oneOf-Varianten und 20 Leerzeichen vor ihrem Default, 16 vor dem Typ einer Eigenschaft
+  eines verschachtelten Objekts (Ausdrücke ohne `-` im Tag, `lstrip_blocks` greift nur vor
+  Block-Tags); der Merker für Objekt-Varianten wird in der Schleife gesetzt, wo Jinja ihn
+  einschließt - er wirkt nie; ohne `items` findet `['items']` die Methode `dict.items`
+  (wahr, aber ohne Typ: dasselbe `any[]`). Was Python als `repr` schriebe (ein Array in
+  einem Enum) oder das Template nicht nehmen kann (eine Beschreibung, die kein String ist,
+  `required`, `oneOf` oder `enum`, die kein Array sind), lehnt es ab. Optionen je Anfrage
+  (`TChatTemplateOptions`, `EncodeWith`/`RenderWith`): `ReasoningEffort` (low, medium,
+  high), `ModelIdentity`, `CurrentDate` (sonst heute, lokal wie `strftime_now`).
+- *Bewusste Unterschiede:* Steuertokens als Ids, jeder Text bleibt Text (das Template lehnt
+  einen Inhalt mit `<|channel|>…` ab - hier ist er Text); eine leere Tool-Beschreibung wird
+  `// ` (transformers scheitert ohne); mehrere Aufrufe in einem Zug bekommen je eine
+  Nachricht (das Template schreibt nur den ersten) und ein Ergebnis den Namen des Aufrufs
+  mit seiner `ToolCallId` (das Template: den letzten Aufruf); eine zweite Systemnachricht
+  wird abgelehnt (das Template lässt sie fallen); ein leerer Effort oder eine leere Identität
+  ist die Vorgabe (transformers schriebe sie leer); `parameters`, die als wahr gelten, aber
+  kein Objekt sind, werden abgelehnt (das Template schriebe `() => any`), falsche wie `null`
+  ergeben wie dort keine Parameter.
+- *Parser* (`THarmonyOutputParser`): die Nachrichten der Antwort - Kopf bis `<|message|>`
+  (`<|channel|>` und Kanal, `to=` vor oder nach dem Kanal, Inhaltstyp mit `<|constrain|>`),
+  Rumpf bis `<|end|>`, `<|call|>` oder `<|return|>` (die beiden halten an, ebenso
+  `<|endoftext|>`). `analysis` wird Reasoning (`reasoning_content` wie bei vLLM), `final`
+  und `commentary` ohne Empfänger der Inhalt, eine Nachricht an `functions.NAME` ein
+  Tool-Aufruf, wenn der Rumpf ein JSON-Objekt ist (in der Form von `json.dumps`, wie das
+  Template sie zurückschreibt), sonst Text im Inhalt; ein anderer Empfänger (ein
+  eingebautes Tool von OpenAI, keins angeboten) geht ins Reasoning.
+- *Client:* `NativeTemplateOptions` liest `reasoning_effort` als Feld der Anfrage (OpenAI) oder
+  aus `chat_template_kwargs` (vLLM), dazu `model_identity`; zwei verschiedene Werte oder einer,
+  der kein String ist, werden abgelehnt - für jede Familie, auch Qwen (wie bei vLLM); ein
+  leerer Wert zählt als keiner; `TNativeLlmClient.ReasoningEffort` ist die Vorgabe.
+  `NativeDecode` zieht nur Ids, die der Tokenizer kennt: gpt-oss hat 201 088 Zeilen in der
+  Einbettung für 200 019 Tokens, Qwen3 151 936 für 151 669; die Füllzeilen von gpt-oss haben
+  kleine, aber keine Null-Gewichte (Norm im Mittel 0,029 gegen 0,279), ein Zug dorthin brach
+  bisher mit „outside the tokenizer“ ab.
+- *Fixture* `gpt-oss-chat` aus `make_reference_d5c.py`: 22 Gespräche (Effort, Identität,
+  System, Mehrzüger, letzte Antwort mit und ohne Generation-Prompt, Zeilenumbrüche,
+  Unicode, Tools, Tool-Abläufe mit und ohne spätere Antwort, zwei Ergebnisse, Ketten) und 415
+  Tool-Schemas (15 entworfene, 400 erzeugte über die Zweige der TypeScript-Umsetzung), von
+  transformers mit festem Datum gerendert; 106 lehnt transformers ab (alle `"// " + Nicht-String`).
+- *Tests:* `HarmonyTemplateText` (alle 437 Fälle textgleich, die abgelehnten abgelehnt - mit
+  einem Mini-Tokenizer, ohne Modell), `HarmonyTemplateIds` (idgleich mit dem HF-Tokenizer),
+  `HarmonyTemplateRules` (zwei Aufrufe in einem Zug, das heutige Datum, zehn Ablehnungen,
+  Identität und Effort), `HarmonyParser` (Kanäle, Aufrufe, Empfänger vor und nach dem Kanal,
+  Präambel, kein Objekt, eingebautes Tool, Steuertoken im Text, Abbrüche, Stream),
+  `HarmonyRequestOptions`, `DecodeDrawsTokenizerIds` (Tiny-gpt-oss mit einem Tokenizer von 80
+  Ids: nur diese, bis zur ersten Füllzeile dieselben Züge), `GptOss20bChat` (das echte Modell,
+  greedy, Effort low: „17 × 23“ mit Reasoning und der Antwort 391, ein Aufruf
+  `get_weather` mit `{"city": "Berlin"}`, nach dem Ergebnis eine Antwort mit dessen 17 Grad).
+- Gegenprobe: 24 eingebaute Fehler im Template (oneOf-Trenner und -Einrückung, verschachtelte
+  Objekte, die Grenze von 50 Zeichen, `str()` von true, -0.0 als wahr, `required`
+  übergangen, Analyse trotz späterer Antwort, Tool-Ergebnis nicht als JSON-String, kein
+  `<|return|>`, Aufrufe nach einer Antwort behalten, die Tools-Zeile, die Leerzeile nach den
+  Anweisungen, leere Argumente, oneOf-Default als `str()`), im Parser (Analyse als Inhalt,
+  andere Empfänger als Inhalt, `<|call|>` hält nicht an, Empfänger nur vor dem Kanal, ein
+  abgebrochener oder ungültiger Aufruf verschwindet) und im Client (Effort der Anfrage
+  übergangen, die ganze Einbettung gezogen, Prompt ohne Optionen) - alle scheitern. Drei
+  überlebten zuerst (die Grenze von 50, -0.0, ein Empfänger auf `commentary`): Referenz und
+  Test hatten keinen Fall dafür, jetzt zwei Schemas mehr und der Test auf `commentary`.
+- Review: Codex und der Claude-Finder fanden beide, dass ein von `<|end|>` abgebrochener Kopf
+  stehen blieb und seinen Empfänger an die nächste Nachricht weitergab (ein erfundener
+  Tool-Aufruf möglich) - jetzt vergessen, mit Test; der Finder dazu `parameters` `null`
+  (ein MCP-Tool ohne Schema ließ die Anfrage scheitern, jetzt keine Parameter) und leere
+  Optionen (jetzt die Vorgabe).
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 6218 Assertions, gpt-oss-20b unter
+  beiden mit denselben Antworten; Laden 34 s, je Anfrage 4-5 s) und Delphi 7 (3977), unter
+  WSL aarch64 (4814).
+- *Offen:* das Reasoning früherer Züge kommt nicht zurück - `TLlmMessage` hat kein Feld
+  dafür, das Template rendert sonst die Analyse eines Aufruf-Zugs (Backlog).
+
 **D5c1 erledigt (2026-10-20): der Tokenizer von gpt-oss (o200k).** `TBpeTokenizer` liest das
 `tokenizer.json` von `openai/gpt-oss-20b` (Revision `6cee5e8…`) und die Tokenizer-Metadaten
 von GGUF-Dateien mit dem Pre-Tokenizer `gpt-4o`; Harmony, Parser und die Familie folgen in
@@ -1856,7 +1941,7 @@ D5c2.
   gibt den Text zurück), `O200kTokens` (Größen, die Harmony-Steuertokens, Literale bleiben
   Text), `O200kGguf` (die echte Datei: jedes Token gleich, alle Fälle idgleich).
 - Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 6140 Assertions, mit der echten
-  GGUF-Datei) und unter WSL aarch64 (4745).
+  GGUF-Datei), unter WSL aarch64 (4745) und auf dem M2 Pro (4761).
 - Gegenprobe: 20 eingebaute Fehler im Ausdruck (Rückgabeschritt von `U*`, die Klassen von U,
   W, Präfix und Satzzeichen, Kontraktion, Ziffern zu viert, kein `/`, kein optionales
   Leerzeichen), in der Pipeline (NFC immer, `ignore_merges` nie oder nicht gelesen, GGUF

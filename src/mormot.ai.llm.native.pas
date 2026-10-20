@@ -6,15 +6,20 @@
 //   tool bridge and RAG work unchanged against a model on this machine
 // - a decoder family registers its model, tokenizer, chat template and output
 //   parser classes (RegisterNativeFamily); the client picks them by the
-//   model_type of config.json or the architecture of a GGUF file - Qwen3 is
-//   registered here
+//   model_type of config.json or the architecture of a GGUF file - Qwen3,
+//   Qwen2.5 and gpt-oss are registered here
 // - the prompt is the model's chat template (TChatTemplate); the answer is
 //   parsed token by token (TNativeOutputParser) - for Qwen3 a leading <think>
 //   block becomes reasoning (returned like vLLM does, as reasoning_content in
 //   Raw, never in Content), every <tool_call> block a TLlmToolCall, the rest
-//   the content
+//   the content; for gpt-oss the Harmony messages (THarmonyOutputParser):
+//   the analysis channel becomes reasoning, a message to functions.NAME a tool
+//   call, the final channel the content
 // - ChatComplete and ChatStream share one decoding path, so a streamed answer
 //   is the complete answer cut into pieces - nothing else
+// - only the ids the tokenizer knows are drawn: a padded embedding (gpt-oss
+//   has 201088 rows for 200019 tokens, Qwen3 151936 for 151669) never yields
+//   an id without text
 // - sampling (mormot.ai.infer.sampler): the defaults of the model's
 //   generation_config.json, as vLLM takes them; a request overrides them with
 //   Temperature (0 = greedy) and Extra top_p, top_k, min_p and seed - the wire
@@ -29,6 +34,7 @@ unit mormot.ai.llm.native;
     - TNativeOutputParser: generated token ids to content, reasoning, tool calls
     - TQwen3OutputParser: the parser of Qwen3
     - TQwen2OutputParser: the parser of Qwen2.5 (no reasoning)
+    - THarmonyOutputParser: the parser of gpt-oss (Harmony)
     - NativeChatPrompt: a TLlmChatRequest as prompt ids
     - RegisterNativeFamily: the classes of a decoder family
     - TNativeLlmClient: ILlmClient over a model folder or a GGUF file
@@ -61,6 +67,7 @@ uses
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
+  mormot.ai.infer.model.gptoss,
   mormot.ai.infer.sampler;
 
 const
@@ -143,6 +150,9 @@ type
     /// the ids pushed so far, stop token included
     property Count: integer
       read fCount;
+    /// the tokenizer of the ids
+    property Tokenizer: TInferTokenizer
+      read fTokenizer;
   end;
 
   /// an output parser class, as a decoder family registers it
@@ -194,18 +204,85 @@ type
     class function Thinks: boolean; override;
   end;
 
+  /// where the Harmony parser is inside the generated answer
+  THarmonyParserState = (
+    hpsHeader,
+    hpsBody,
+    hpsBetween);
+
+  /// what the body of a Harmony message becomes
+  THarmonyTarget = (
+    htContent,
+    htReasoning,
+    htToolCall);
+
+  /// turns the token ids gpt-oss generates into a TLlmChatResponse
+  // - the prompt ends with <|start|>assistant: the answer is a sequence of
+  // messages, each a header up to <|message|> (<|channel|> and the channel,
+  // optionally to= a recipient and a content type, <|constrain|> included,
+  // before or after the channel), then its body up to <|end|> (another message
+  // follows after <|start|>), <|call|> or <|return|> - both stop, as does
+  // <|endoftext|>
+  // - the analysis channel becomes reasoning (reasoning_content in Raw), the
+  // final and the commentary channel without a recipient the content; a
+  // message to functions.NAME a tool call when its body is a JSON object
+  // (written like Python json.dumps, as the template renders the arguments
+  // back; only a float json.dumps would round kept as the model wrote it),
+  // else its body stays in the content as text; a message to another
+  // recipient (a built-in tool of OpenAI, none is offered) goes to the
+  // reasoning
+  // - text is verbatim, but for the newlines at the very start of the content
+  // and of the reasoning (TNativeTextChannel); control tokens inside a body are
+  // text, their content verbatim; text between messages is content
+  THarmonyOutputParser = class(TNativeOutputParser)
+  protected
+    fStart, fChannel, fMessage, fEnd, fCall, fReturn, fConstrain,
+    fEndOfText: integer;
+    fState: THarmonyParserState;
+    fTarget: THarmonyTarget;
+    fHeader, fBody, fRecipient: RawUtf8;
+    /// the header is complete: where its body goes
+    procedure EndHeader;
+    /// the body is complete: a tool call is parsed
+    procedure EndBody;
+    function Token(aId: integer): boolean; override;
+    procedure FlushOpen; override;
+  public
+    /// aTokenizer (not owned) must know the Harmony control tokens - raises
+    // EInferError otherwise
+    constructor Create(aTokenizer: TInferTokenizer;
+      const aOnDelta: TLlmStreamDeltaEvent = nil); override;
+    /// the channel and the recipient of a Harmony header (the text of its
+    // tokens, control tokens as their content): the word after <|channel|>,
+    // the word after "to=" - '' when absent
+    class procedure ParseHeader(const aHeader: RawUtf8;
+      out aChannel, aRecipient: RawUtf8);
+  end;
+
 /// the enable_thinking switch of a request: Extra.chat_template_kwargs.
 // enable_thinking as vLLM and SGLang read it, else aDefault
 // - raises ELlmClient when the value is there but no boolean
 function NativeEnableThinking(const aRequest: TLlmChatRequest;
   aDefault: boolean): boolean;
 
+/// the template options of a request: enable_thinking (NativeEnableThinking);
+// reasoning_effort as OpenAI sends it (a field of the request: Extra) or as
+// vLLM reads it (Extra.chat_template_kwargs), else aDefaultEffort;
+// model_identity of chat_template_kwargs; an empty string is no value (the
+// default stays - transformers would write it as it is)
+// - raises ELlmClient for a value that is no string, or two efforts that differ,
+// whatever the family (Qwen ignores both options, but refuses such a request
+// too, as vLLM does)
+function NativeTemplateOptions(const aRequest: TLlmChatRequest;
+  aDefaultThinking: boolean; const aDefaultEffort: RawUtf8 = ''): TChatTemplateOptions;
+
 /// the prompt ids of a request: its messages and tools through aTemplate, with
-// the assistant turn opened
+// the assistant turn opened and the options of NativeTemplateOptions
 // - raises ELlmClient for what the engine cannot honour (no messages, images,
-// ResponseFormat) and for a tool the template refuses
+// ResponseFormat) and for a tool or an option the template refuses
 function NativeChatPrompt(aTemplate: TChatTemplate;
-  const aRequest: TLlmChatRequest; aDefaultThinking: boolean): TIntegerDynArray;
+  const aRequest: TLlmChatRequest; aDefaultThinking: boolean;
+  const aDefaultEffort: RawUtf8 = ''): TIntegerDynArray;
 
 /// parse the text between <tool_call> and </tool_call>
 // - true when it is strict JSON (see PythonJson) and an object with exactly
@@ -215,6 +292,12 @@ function NativeChatPrompt(aTemplate: TChatTemplate;
 // a tool that reads its arguments as doubles rounds or refuses that value
 function ParseQwen3ToolCall(const aBody: RawUtf8;
   out aName, aArguments: RawUtf8): boolean;
+
+/// parse the body of a Harmony message to functions.NAME
+// - true when it is strict JSON (see PythonJson) and an object; aArguments is
+// then that object as Python json.dumps writes it, a float of more than 15
+// digits or beyond the double range kept verbatim
+function ParseHarmonyArguments(const aBody: RawUtf8; out aArguments: RawUtf8): boolean;
 
 /// the sampling of a request: aDefaults, overridden by Temperature (when >= 0)
 // and by Extra top_p, top_k, min_p and seed; without a seed a random one
@@ -227,6 +310,8 @@ function NativeSampling(const aRequest: TLlmChatRequest;
 
 /// decoding of aPrompt into aParser, which is finished afterwards
 // - every token drawn by a TInferSampler of aSampling (greedy at temperature 0)
+// among the ids of aParser.Tokenizer: a row of a padded embedding beyond them
+// is never drawn
 // - at most aMaxNew tokens, and never more than the context holds: the last
 // token is not fed back, so a prompt of P tokens leaves C - P + 1, C the
 // model's MaxPositions or aMaxContext when that is smaller (and above 0)
@@ -338,6 +423,7 @@ type
     fConfig: TLlmProviderConfig;
     fMaxTokens, fMaxContext: integer;
     fEnableThinking: boolean;
+    fReasoningEffort: RawUtf8;
     fSampling: TInferSampling;
     procedure Generate(const aRequest: TLlmChatRequest; aParser: TNativeOutputParser);
     procedure SetDevice(aDevice: TDecoderDevice);
@@ -389,6 +475,10 @@ type
     // (default true, the model's own default)
     property EnableThinking: boolean
       read fEnableThinking write fEnableThinking;
+    /// the reasoning effort of a request that does not say (gpt-oss: 'low',
+    // 'medium' or 'high'; '' = the template's medium)
+    property ReasoningEffort: RawUtf8
+      read fReasoningEffort write fReasoningEffort;
     /// the sampling of a request that does not say otherwise: from the
     // model's generation_config.json (greedy without one); its Seed is unused,
     // every request draws its own unless Extra.seed is given
@@ -797,6 +887,202 @@ begin
 end;
 
 
+{ THarmonyOutputParser }
+
+function ParseHarmonyArguments(const aBody: RawUtf8; out aArguments: RawUtf8): boolean;
+var
+  body: RawUtf8;
+begin
+  result := false;
+  aArguments := '';
+  body := TrimU(aBody);
+  if (body = '') or (body[1] <> '{') then
+    exit;
+  try
+    // strict JSON, one object and nothing after it, in json.dumps formatting
+    aArguments := PythonJson(body, {keepinexactfloats=}true);
+  except
+    on EInferError do
+    begin
+      aArguments := '';
+      exit;
+    end;
+  end;
+  result := true;
+end;
+
+function NeedHarmonyToken(aTokenizer: TInferTokenizer; const aContent: RawUtf8): integer;
+begin
+  result := aTokenizer.TokenId(aContent);
+  if result < 0 then
+    EInferError.RaiseUtf8('THarmonyOutputParser: no % token', [aContent]);
+end;
+
+constructor THarmonyOutputParser.Create(aTokenizer: TInferTokenizer;
+  const aOnDelta: TLlmStreamDeltaEvent);
+begin
+  inherited Create(aTokenizer, aOnDelta);
+  fStart := NeedHarmonyToken(aTokenizer, '<|start|>');
+  fChannel := NeedHarmonyToken(aTokenizer, '<|channel|>');
+  fMessage := NeedHarmonyToken(aTokenizer, '<|message|>');
+  fEnd := NeedHarmonyToken(aTokenizer, '<|end|>');
+  fCall := NeedHarmonyToken(aTokenizer, '<|call|>');
+  fReturn := NeedHarmonyToken(aTokenizer, '<|return|>');
+  fConstrain := NeedHarmonyToken(aTokenizer, '<|constrain|>');
+  fEndOfText := aTokenizer.TokenId('<|endoftext|>'); // -1 when absent
+  // the prompt ends with <|start|>assistant: the first header follows
+  fState := hpsHeader;
+end;
+
+class procedure THarmonyOutputParser.ParseHeader(const aHeader: RawUtf8;
+  out aChannel, aRecipient: RawUtf8);
+var
+  h, w: RawUtf8;
+  p: PUtf8Char;
+  nextIsChannel: boolean;
+begin
+  aChannel := '';
+  aRecipient := '';
+  // words, the control tokens as words of their own
+  h := StringReplaceAll(aHeader, ['<|channel|>', ' <|channel|> ',
+    '<|constrain|>', ' <|constrain|> ']);
+  p := pointer(h);
+  nextIsChannel := false;
+  while p <> nil do
+  begin
+    w := GetNextItem(p, ' ');
+    if w = '' then
+      continue;
+    if w = '<|channel|>' then
+    begin
+      nextIsChannel := true;
+      continue;
+    end;
+    if nextIsChannel then
+    begin
+      nextIsChannel := false;
+      if w <> '<|constrain|>' then
+      begin
+        aChannel := w;
+        continue;
+      end;
+    end;
+    if (aRecipient = '') and (length(w) > 3) and (copy(w, 1, 3) = 'to=') then
+      aRecipient := copy(w, 4, maxInt);
+  end;
+end;
+
+procedure THarmonyOutputParser.EndHeader;
+var
+  channel: RawUtf8;
+begin
+  ParseHeader(fHeader, channel, fRecipient);
+  fHeader := '';
+  fBody := '';
+  if (length(fRecipient) > 10) and (copy(fRecipient, 1, 10) = 'functions.') then
+  begin
+    fTarget := htToolCall;
+    fRecipient := copy(fRecipient, 11, maxInt);
+  end
+  else if (fRecipient <> '') or (channel = 'analysis') then
+    fTarget := htReasoning
+  else
+    fTarget := htContent;
+  fState := hpsBody;
+end;
+
+procedure THarmonyOutputParser.EndBody;
+var
+  args: RawUtf8;
+begin
+  case fTarget of
+    htToolCall:
+      if ParseHarmonyArguments(fBody, args) then
+        AddToolCall(fRecipient, args)
+      else
+        // not a call the agent could run: keep it visible as text
+        SendContent(fContent.Add(fBody));
+    htReasoning:
+      // a later message goes on from here: nothing waits
+      SendReasoning(fReasoning.Flush(false));
+  end;
+  fBody := '';
+end;
+
+function THarmonyOutputParser.Token(aId: integer): boolean;
+var
+  stop: boolean;
+begin
+  result := false;
+  stop := (aId = fCall) or (aId = fReturn) or
+    ((fEndOfText >= 0) and (aId = fEndOfText));
+  case fState of
+    hpsHeader:
+      if aId = fMessage then
+        EndHeader
+      else if stop then
+        result := true // a header without a body: nothing to give out
+      else if aId = fEnd then
+      begin
+        // a header without a body: forgotten, its recipient included
+        fHeader := '';
+        fState := hpsBetween;
+      end
+      else if aId = fStart then
+        fHeader := ''
+      else
+        // text, <|channel|>, <|constrain|>: as their content
+        fHeader := fHeader + Bytes(aId);
+    hpsBody:
+      if stop or (aId = fEnd) then
+      begin
+        EndBody;
+        fState := hpsBetween;
+        result := stop;
+      end
+      else if aId = fStart then
+      begin
+        // a new message without <|end|>
+        EndBody;
+        fState := hpsHeader;
+      end
+      else
+        case fTarget of
+          htToolCall:
+            fBody := fBody + Bytes(aId);
+          htReasoning:
+            SendReasoning(fReasoning.Add(Bytes(aId)));
+        else
+          SendContent(fContent.Add(Bytes(aId)));
+        end;
+    hpsBetween:
+      if aId = fStart then
+      begin
+        fHeader := '';
+        fState := hpsHeader;
+      end
+      else if stop then
+        result := true
+      else
+        // text outside of a message: the model's, keep it
+        SendContent(fContent.Add(Bytes(aId)));
+  end;
+end;
+
+procedure THarmonyOutputParser.FlushOpen;
+begin
+  if fState <> hpsBody then
+    exit;
+  case fTarget of
+    htReasoning:
+      SendReasoning(fReasoning.Flush(false));
+    htToolCall:
+      // cut before <|call|>: no call, the text stays
+      SendContent(fContent.Add(fBody));
+  end;
+end;
+
+
 { request helpers }
 
 function NativeEnableThinking(const aRequest: TLlmChatRequest;
@@ -816,11 +1102,55 @@ begin
   result := kw^.Values[i];
 end;
 
+function NativeTemplateOptions(const aRequest: TLlmChatRequest;
+  aDefaultThinking: boolean; const aDefaultEffort: RawUtf8): TChatTemplateOptions;
+var
+  x, kw: PDocVariantData;
+  top, inner: RawUtf8;
+  hasTop, hasInner: boolean;
+
+  function Text(aDoc: PDocVariantData; const aName, aWhere: RawUtf8;
+    out aValue: RawUtf8): boolean;
+  var
+    i: integer;
+  begin
+    aValue := '';
+    i := aDoc^.GetValueIndex(aName);
+    result := (i >= 0) and not VarIsEmptyOrNull(aDoc^.Values[i]);
+    if not result then
+      exit;
+    if not VarIsString(aDoc^.Values[i]) then
+      ELlmClient.RaiseUtf8('%%: % is no string',
+        [aWhere, aName, VariantSaveJson(aDoc^.Values[i])]);
+    VariantToUtf8(aDoc^.Values[i], aValue);
+  end;
+
+begin
+  result := ChatTemplateOptions(NativeEnableThinking(aRequest, aDefaultThinking));
+  x := _Safe(aRequest.Extra);
+  kw := x^.O['chat_template_kwargs'];
+  // an empty value is no value: the default stays
+  hasTop := Text(x, 'reasoning_effort', '', top) and (top <> '');
+  hasInner := Text(kw, 'reasoning_effort', 'chat_template_kwargs.', inner) and
+    (inner <> '');
+  if hasTop and hasInner and (top <> inner) then
+    ELlmClient.RaiseUtf8('reasoning_effort "%" and chat_template_kwargs.' +
+      'reasoning_effort "%" differ', [top, inner]);
+  if hasTop then
+    result.ReasoningEffort := top
+  else if hasInner then
+    result.ReasoningEffort := inner
+  else
+    result.ReasoningEffort := aDefaultEffort;
+  Text(kw, 'model_identity', 'chat_template_kwargs.', result.ModelIdentity);
+end;
+
 function NativeChatPrompt(aTemplate: TChatTemplate;
-  const aRequest: TLlmChatRequest; aDefaultThinking: boolean): TIntegerDynArray;
+  const aRequest: TLlmChatRequest; aDefaultThinking: boolean;
+  const aDefaultEffort: RawUtf8): TIntegerDynArray;
 var
   i: PtrInt;
-  thinking: boolean;
+  options: TChatTemplateOptions;
 begin
   if aRequest.Messages = nil then
     ELlmClient.RaiseUtf8('NativeChatPrompt: no messages', []);
@@ -831,10 +1161,10 @@ begin
   if aRequest.ResponseFormat <> '' then
     ELlmClient.RaiseUtf8('NativeChatPrompt: ResponseFormat is not supported ' +
       'by the native engine yet (no constrained decoding)', []);
-  thinking := NativeEnableThinking(aRequest, aDefaultThinking);
+  options := NativeTemplateOptions(aRequest, aDefaultThinking, aDefaultEffort);
   try
-    result := aTemplate.Encode(aRequest.Messages, aRequest.Tools,
-      {addgenerationprompt=}true, thinking);
+    result := aTemplate.EncodeWith(aRequest.Messages, aRequest.Tools,
+      {addgenerationprompt=}true, options);
   except
     on E: EInferError do
       ELlmClient.RaiseUtf8('NativeChatPrompt: %', [E.Message]);
@@ -987,7 +1317,7 @@ var
   logits: TSingleDynArray;
   ctx: TDecoderContext;
   sampler: TInferSampler;
-  n, limit: PtrInt;
+  n, limit, ids: PtrInt;
   id: integer;
   stopped: boolean;
 begin
@@ -1005,6 +1335,10 @@ begin
   if aMaxNew > limit - length(aPrompt) + 1 then
     aMaxNew := limit - length(aPrompt) + 1;
   SetLength(logits, aModel.Config.VocabSize);
+  // the rows a tokenizer has no id for (padding) are never drawn
+  ids := aModel.Config.VocabSize;
+  if aParser.Tokenizer.VocabSize < ids then
+    ids := aParser.Tokenizer.VocabSize;
   sampler := nil;
   ctx := aContext;
   if ctx = nil then
@@ -1016,7 +1350,7 @@ begin
     aModel.Forward(ctx, @aPrompt[result], length(aPrompt) - result, pointer(logits));
     n := 0;
     repeat
-      id := sampler.Next(pointer(logits), aModel.Config.VocabSize);
+      id := sampler.Next(pointer(logits), ids);
       inc(n);
       stopped := aParser.Push(id);
       if stopped or (n = aMaxNew) then
@@ -1293,7 +1627,8 @@ begin
   maxNew := aRequest.MaxTokens;
   if maxNew <= 0 then
     maxNew := fMaxTokens;
-  prompt := NativeChatPrompt(fTemplate, aRequest, fEnableThinking);
+  prompt := NativeChatPrompt(fTemplate, aRequest, fEnableThinking,
+    fReasoningEffort);
   sampling := NativeSampling(aRequest, fSampling);
   // Device stays as it is while this request runs (SetDevice refuses)
   fSafe.Lock;
@@ -1431,5 +1766,7 @@ initialization
     TQwen3OutputParser);
   RegisterNativeFamily(TQwen2Model, TBpeTokenizer, TQwen2ChatTemplate,
     TQwen2OutputParser);
+  RegisterNativeFamily(TGptOssModel, TBpeTokenizer, THarmonyChatTemplate,
+    THarmonyOutputParser);
 
 end.

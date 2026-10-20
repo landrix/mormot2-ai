@@ -116,6 +116,12 @@ pinned hashes, no weights needed) and loads no model:
 - `gpt-oss-tokens` writes the tokenizer gate: the texts of `qwen3-tokens` plus o200k edge
   cases and 1200 generated mixtures over the classes of the regex; per case the ids of
   `tokenizer.json` without its added tokens and the pieces of its pre-tokenizer.
+- `gpt-oss-chat` writes the Harmony gate: conversations and tool schemas through the
+  `chat_template.jinja` of the revision, rendered by transformers (`apply_chat_template`,
+  the template kwargs `reasoning_effort` and `model_identity`) with the date fixed - the
+  script replaces the `datetime` that transformers' `strftime_now` calls - and their ids;
+  400 schemas generated over the branches of the TypeScript rendering. A case transformers
+  refuses is stored with its error: the native template must refuse it too.
 
 ```bash
 LAI_GPTOSS_DIR=/path/to/gpt-oss-20b python tools/infer-ref/make_reference_d5c.py

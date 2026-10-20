@@ -7,7 +7,10 @@
 //   same text in Pascal (tokenizer_config.json of Qwen/Qwen3-0.6B revision
 //   c1899de289a04d12100db370d81485cdf75e47ca), gate tests/data/infer-ref/qwen3-chat;
 //   TQwen2ChatTemplate that of Qwen2.5 (Qwen/Qwen2.5-0.5B-Instruct revision
-//   7ae557604adf67be50417f59c2c2f167def9a775), gate tests/data/infer-ref/qwen25-chat
+//   7ae557604adf67be50417f59c2c2f167def9a775), gate tests/data/infer-ref/qwen25-chat;
+//   THarmonyChatTemplate that of gpt-oss (openai/gpt-oss-20b revision
+//   6cee5e81ee83917806bbde320786a8fb61efebee, chat_template.jinja), gate
+//   tests/data/infer-ref/gpt-oss-chat
 // - one difference by design: the template emits the control tokens
 //   (<|im_start|> <|im_end|> <think> </think> <tool_call> </tool_call>
 //   <tool_response> </tool_response>) as ids, and every message text is text.
@@ -25,6 +28,7 @@ unit mormot.ai.infer.chat;
     - TChatTemplate: messages and tools to token ids (and text), per family
     - TQwen3ChatTemplate: the template of Qwen3
     - TQwen2ChatTemplate: the template of Qwen2.5
+    - THarmonyChatTemplate: the template of gpt-oss (Harmony)
 
   *****************************************************************************
 }
@@ -48,6 +52,22 @@ uses
   mormot.ai.infer.tokenizer;
 
 type
+  /// what a request may set in a chat template beyond messages and tools
+  // - a family reads what it knows and ignores the rest
+  TChatTemplateOptions = record
+    /// false asks the model to answer without reasoning first (Qwen3: an empty
+    // <think> block); gpt-oss always reasons and ignores it
+    EnableThinking: boolean;
+    /// gpt-oss: 'low', 'medium' or 'high' - '' for the template's medium
+    ReasoningEffort: RawUtf8;
+    /// gpt-oss: the first line of the system message - '' for the template's
+    // own ("You are ChatGPT, a large language model trained by OpenAI.")
+    ModelIdentity: RawUtf8;
+    /// gpt-oss: the date of the system message as yyyy-mm-dd - '' for today
+    // (local time, as the template's strftime_now)
+    CurrentDate: RawUtf8;
+  end;
+
   /// the output of one template run: text is buffered and encoded in one
   // piece up to the next control token, exactly as the tokenizer would cut
   // the rendered text
@@ -71,8 +91,8 @@ type
     /// write the conversation into aOut: text with Add, control tokens with
     // Control
     procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
-      const aTools: TLlmToolDynArray; aAddGenerationPrompt, aEnableThinking: boolean);
-      virtual; abstract;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+      const aOptions: TChatTemplateOptions); virtual; abstract;
     /// the id of a control token - raises EInferError when the tokenizer has
     // none
     function Need(const aContent: RawUtf8): integer;
@@ -92,6 +112,14 @@ type
     function Render(const aMessages: TLlmMessageDynArray;
       const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
       aEnableThinking: boolean = true): RawUtf8;
+    /// the token ids of a conversation, with every option of a request
+    function EncodeWith(const aMessages: TLlmMessageDynArray;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+      const aOptions: TChatTemplateOptions): TIntegerDynArray;
+    /// the same conversation as text, with every option of a request
+    function RenderWith(const aMessages: TLlmMessageDynArray;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+      const aOptions: TChatTemplateOptions): RawUtf8;
     /// the tokenizer the ids belong to
     property Tokenizer: TInferTokenizer
       read fTokenizer;
@@ -107,8 +135,8 @@ type
     fImStart, fImEnd, fThink, fThinkEnd, fToolCall, fToolCallEnd,
     fToolResponse, fToolResponseEnd: integer;
     procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
-      const aTools: TLlmToolDynArray; aAddGenerationPrompt, aEnableThinking: boolean);
-      override;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+      const aOptions: TChatTemplateOptions); override;
   public
     /// look up the control tokens in aTokenizer (not owned) - raises
     // EInferError when one is missing
@@ -129,13 +157,52 @@ type
     fImStart, fImEnd, fToolCall, fToolCallEnd, fToolResponse,
     fToolResponseEnd: integer;
     procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
-      const aTools: TLlmToolDynArray; aAddGenerationPrompt, aEnableThinking: boolean);
-      override;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+      const aOptions: TChatTemplateOptions); override;
   public
     /// look up the control tokens in aTokenizer (not owned) - raises
     // EInferError when one is missing
     constructor Create(aTokenizer: TInferTokenizer); override;
   end;
+
+  /// the chat template of gpt-oss: the Harmony format of its
+  // chat_template.jinja - a system message (identity, knowledge cutoff, date,
+  // reasoning effort, channels), a developer message (the instructions of a
+  // first system message, the tools as a TypeScript namespace "functions"),
+  // then the turns; an assistant turn is its final message, a turn with tool
+  // calls an analysis message (its content, unless a later assistant turn
+  // answers without calls) and the calls to functions.NAME
+  // - the tool schemas are written as the template writes them, its quirks
+  // included: the Python values of the schema (str() for enum and type lists,
+  // tojson for defaults), the indentation the template puts into nested
+  // objects and oneOf; what Python would write as a repr (an array or object
+  // in an enum) or the template could not take (a description that is no
+  // string, a "required", oneOf or enum that is no array) raises EInferError
+  // - differences by design: control tokens come as ids and every text is text
+  // (the template refuses an assistant content holding "<|channel|>..."; here
+  // it is text); an empty tool description is written as "// " (transformers
+  // fails without one); several calls in one assistant turn each get their
+  // message (the template writes the first only) and a tool result takes the
+  // name of the call with its ToolCallId (the template: the last call); a
+  // system message after the first raises (the template drops it); a
+  // ReasoningEffort other than low, medium or high and a CurrentDate other
+  // than yyyy-mm-dd raise, an empty one is the default (as an empty
+  // ModelIdentity); parameters that are truthy but no object raise (the
+  // template would write "() => any")
+  THarmonyChatTemplate = class(TChatTemplate)
+  protected
+    fStart, fChannel, fMessage, fEnd, fCall, fReturn: integer;
+    procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+      const aOptions: TChatTemplateOptions); override;
+  public
+    /// look up the Harmony control tokens in aTokenizer (not owned) - raises
+    // EInferError when one is missing
+    constructor Create(aTokenizer: TInferTokenizer); override;
+  end;
+
+/// the options of a request that only sets EnableThinking
+function ChatTemplateOptions(aEnableThinking: boolean): TChatTemplateOptions;
 
 /// re-serialize JSON the way Python json.dumps(json.loads(aJson)) writes it
 // - separators ", " and ": ", non-ASCII kept (ensure_ascii=False), only " \
@@ -219,12 +286,78 @@ begin
 end;
 
 type
+  /// the kind of a JSON value in a THarmonyJson tree
+  THarmonyJsonKind = (
+    hjNull,
+    hjFalse,
+    hjTrue,
+    hjNumber,
+    hjString,
+    hjArray,
+    hjObject);
+
+  /// one value of a tool schema
+  THarmonyJsonNode = record
+    Kind: THarmonyJsonKind;
+    /// hjString: the decoded text; hjNumber: its Python form (str() = repr)
+    Text: RawUtf8;
+    /// the value as Python json.dumps writes it: THarmonyJson.Out from
+    // OutStart (0-based), OutLen bytes
+    OutStart, OutLen: integer;
+    /// hjArray, hjObject: the children are Child[First .. First + Count - 1]
+    First, Count: integer;
+  end;
+
+  PHarmonyJson = ^THarmonyJson;
+
+  /// a tool schema as the Jinja template of gpt-oss walks it: the Python
+  // values (json.loads), their json.dumps form (the template's tojson), the
+  // keys in their order
+  THarmonyJson = object
+    Nodes: array of THarmonyJsonNode;
+    NodeCount: integer;
+    Child: TIntegerDynArray;
+    Keys: TRawUtf8DynArray; // the key of Child[i] when its parent is an object
+    ChildCount: integer;
+    Out: RawUtf8;
+    /// a new node at aOutStart of the written text
+    function NewNode(aOutStart: integer): integer;
+    /// the children of aNode, in their order
+    procedure AddChildren(aNode: integer; const aKids: TIntegerDynArray;
+      const aKeys: TRawUtf8DynArray; aCount: integer);
+    /// parse aJson by the rules of PythonJson (a float it would round raises)
+    procedure Parse(const aJson: RawUtf8);
+    /// the member aKey of aNode - -1 (the Jinja undefined) when aNode is no
+    // object or has no such member
+    function Member(aNode: integer; const aKey: RawUtf8): integer;
+    /// the i-th child of an array or object node
+    function Item(aNode, i: integer): integer;
+    /// Python truthiness; undefined (-1) is false
+    function Truthy(aNode: integer): boolean;
+    /// true when aNode is the string aValue (Python ==)
+    function IsText(aNode: integer; const aValue: RawUtf8): boolean;
+    /// the template's tojson of aNode
+    function Json(aNode: integer): RawUtf8;
+    /// Python str() of a scalar - raises for an array or object, which the
+    // template would write as a Python repr
+    function Str(aNode: integer; const aWhat: RawUtf8): RawUtf8;
+    /// aNode as the string operand of a "+" - raises for anything else, as
+    // Python does
+    function TextOf(aNode: integer; const aWhat: RawUtf8): RawUtf8;
+    /// true when aName is in aList, a "required" array; undefined or a falsy
+    // value is none - another truthy value raises (Python's "in" would test a
+    // substring or a key)
+    function Listed(aList: integer; const aName: RawUtf8): boolean;
+  end;
+
   /// recursive descent over the JSON text, writing the Python form
   TPythonJsonWriter = object
     P, Start: PUtf8Char;
     Out: RawUtf8;
     Depth: integer;
     KeepInexactFloats: boolean;
+    /// not nil: every value is recorded there
+    Tree: PHarmonyJson;
     procedure Fail(const aWhat: RawUtf8);
     procedure SkipBlanks;
     procedure Value;
@@ -488,17 +621,24 @@ end;
 procedure TPythonJsonWriter.Value;
 var
   keys: TRawUtf8DynArray;
+  kids: TIntegerDynArray;
   key: RawUtf8;
-  n, i: integer;
+  n, i, node: integer;
+  kind: THarmonyJsonKind;
 begin
   SkipBlanks;
   // a tool schema nests a few levels: a deep one is hostile, refused before
   // the recursion exhausts the stack
   if (P^ in ['{', '[']) and (Depth >= JSON_MAX_DEPTH) then
     Fail('nested too deeply');
+  node := -1;
+  if Tree <> nil then
+    node := Tree^.NewNode(length(Out));
+  kind := hjNull;
   case P^ of
     '{':
       begin
+        kind := hjObject;
         inc(Depth);
         inc(P);
         Append(Out, '{');
@@ -516,7 +656,10 @@ begin
               if keys[i] = key then
                 Fail('duplicate key');
             if n = length(keys) then
+            begin
               SetLength(keys, n * 2 + 4);
+              SetLength(kids, length(keys));
+            end;
             keys[n] := key;
             inc(n);
             if n > 1 then
@@ -527,6 +670,8 @@ begin
               Fail('":" expected');
             inc(P);
             Append(Out, ': ');
+            if node >= 0 then
+              kids[n - 1] := Tree^.NodeCount; // the node Value records next
             Value;
             SkipBlanks;
             if P^ = ',' then
@@ -541,9 +686,12 @@ begin
           until false;
         Append(Out, '}');
         dec(Depth);
+        if node >= 0 then
+          Tree^.AddChildren(node, kids, keys, n);
       end;
     '[':
       begin
+        kind := hjArray;
         inc(Depth);
         inc(P);
         Append(Out, '[');
@@ -555,6 +703,13 @@ begin
           repeat
             if n > 0 then
               Append(Out, ', ');
+            if n = length(kids) then
+            begin
+              SetLength(kids, n * 2 + 4);
+              SetLength(keys, length(kids)); // no keys: ''
+            end;
+            if node >= 0 then
+              kids[n] := Tree^.NodeCount;
             inc(n);
             Value;
             SkipBlanks;
@@ -570,23 +725,44 @@ begin
           until false;
         Append(Out, ']');
         dec(Depth);
+        if node >= 0 then
+          Tree^.AddChildren(node, kids, keys, n);
       end;
     '"':
       begin
+        kind := hjString;
         StringValue(key);
         AddEscaped(Out, pointer(key), length(key));
       end;
     '-', '0'..'9':
-      Number;
+      begin
+        kind := hjNumber;
+        Number;
+      end;
     't':
-      Literal('true');
+      begin
+        kind := hjTrue;
+        Literal('true');
+      end;
     'f':
-      Literal('false');
+      begin
+        kind := hjFalse;
+        Literal('false');
+      end;
     'n':
       Literal('null');
   else
     Fail('value expected');
   end;
+  if node < 0 then
+    exit;
+  Tree^.Nodes[node].Kind := kind;
+  Tree^.Nodes[node].OutLen := length(Out) - Tree^.Nodes[node].OutStart;
+  if kind = hjString then
+    Tree^.Nodes[node].Text := key
+  else if kind = hjNumber then
+    Tree^.Nodes[node].Text := copy(Out, Tree^.Nodes[node].OutStart + 1,
+      Tree^.Nodes[node].OutLen);
 end;
 
 function PythonJson(const aJson: RawUtf8; aKeepInexactFloats: boolean): RawUtf8;
@@ -598,6 +774,7 @@ begin
   w.Out := '';
   w.Depth := 0;
   w.KeepInexactFloats := aKeepInexactFloats;
+  w.Tree := nil;
   if w.P = nil then
     w.Fail('empty');
   w.Value;
@@ -750,7 +927,7 @@ const
 
 procedure TQwen3ChatTemplate.Build(var aOut: TChatSegments;
   const aMessages: TLlmMessageDynArray; const aTools: TLlmToolDynArray;
-  aAddGenerationPrompt, aEnableThinking: boolean);
+  aAddGenerationPrompt: boolean; const aOptions: TChatTemplateOptions);
 var
   n, i, j, lastQuery: PtrInt;
   multiStep: boolean;
@@ -863,7 +1040,7 @@ begin
   begin
     aOut.Control(fImStart, '<|im_start|>');
     aOut.Add('assistant'#10);
-    if not aEnableThinking then
+    if not aOptions.EnableThinking then
     begin
       aOut.Control(fThink, '<think>');
       aOut.Add(#10#10);
@@ -894,7 +1071,7 @@ end;
 
 procedure TQwen2ChatTemplate.Build(var aOut: TChatSegments;
   const aMessages: TLlmMessageDynArray; const aTools: TLlmToolDynArray;
-  aAddGenerationPrompt, aEnableThinking: boolean);
+  aAddGenerationPrompt: boolean; const aOptions: TChatTemplateOptions);
 var
   n, i, j: PtrInt;
   args: RawUtf8;
@@ -989,9 +1166,561 @@ begin
   aOut.Flush;
 end;
 
+{ THarmonyJson }
+
+function THarmonyJson.NewNode(aOutStart: integer): integer;
+begin
+  if NodeCount = length(Nodes) then
+    SetLength(Nodes, NodeCount * 2 + 16);
+  result := NodeCount;
+  inc(NodeCount);
+  Nodes[result].Kind := hjNull;
+  Nodes[result].Text := '';
+  Nodes[result].OutStart := aOutStart;
+  Nodes[result].OutLen := 0;
+  Nodes[result].First := 0;
+  Nodes[result].Count := 0;
+end;
+
+procedure THarmonyJson.AddChildren(aNode: integer; const aKids: TIntegerDynArray;
+  const aKeys: TRawUtf8DynArray; aCount: integer);
+var
+  i: integer;
+begin
+  if ChildCount + aCount > length(Child) then
+  begin
+    SetLength(Child, (ChildCount + aCount) * 2 + 16);
+    SetLength(Keys, length(Child));
+  end;
+  Nodes[aNode].First := ChildCount;
+  Nodes[aNode].Count := aCount;
+  for i := 0 to aCount - 1 do
+  begin
+    Child[ChildCount] := aKids[i];
+    Keys[ChildCount] := aKeys[i];
+    inc(ChildCount);
+  end;
+end;
+
+procedure THarmonyJson.Parse(const aJson: RawUtf8);
+var
+  w: TPythonJsonWriter;
+begin
+  NodeCount := 0;
+  ChildCount := 0;
+  w.Start := pointer(aJson);
+  w.P := w.Start;
+  w.Out := '';
+  w.Depth := 0;
+  w.KeepInexactFloats := false;
+  w.Tree := @self;
+  if w.P = nil then
+    w.Fail('empty');
+  w.Value;
+  w.SkipBlanks;
+  if w.P - w.Start <> length(aJson) then
+    w.Fail('trailing data');
+  Out := w.Out;
+end;
+
+function THarmonyJson.Member(aNode: integer; const aKey: RawUtf8): integer;
+var
+  i: integer;
+begin
+  result := -1;
+  if (aNode < 0) or (Nodes[aNode].Kind <> hjObject) then
+    exit;
+  // the keys are unique: PythonJson refuses a duplicate
+  for i := Nodes[aNode].First to Nodes[aNode].First + Nodes[aNode].Count - 1 do
+    if Keys[i] = aKey then
+    begin
+      result := Child[i];
+      exit;
+    end;
+end;
+
+function THarmonyJson.Item(aNode, i: integer): integer;
+begin
+  result := Child[Nodes[aNode].First + i];
+end;
+
+function THarmonyJson.Truthy(aNode: integer): boolean;
+begin
+  result := false;
+  if aNode < 0 then
+    exit;
+  case Nodes[aNode].Kind of
+    hjTrue:
+      result := true;
+    hjNumber:
+      // the Python form of a zero: 0, 0.0 or -0.0
+      result := (Nodes[aNode].Text <> '0') and (Nodes[aNode].Text <> '0.0') and
+        (Nodes[aNode].Text <> '-0.0');
+    hjString:
+      result := Nodes[aNode].Text <> '';
+    hjArray, hjObject:
+      result := Nodes[aNode].Count > 0;
+  end;
+end;
+
+function THarmonyJson.IsText(aNode: integer; const aValue: RawUtf8): boolean;
+begin
+  result := (aNode >= 0) and (Nodes[aNode].Kind = hjString) and
+    (Nodes[aNode].Text = aValue);
+end;
+
+function THarmonyJson.Json(aNode: integer): RawUtf8;
+begin
+  result := copy(Out, Nodes[aNode].OutStart + 1, Nodes[aNode].OutLen);
+end;
+
+function THarmonyJson.Str(aNode: integer; const aWhat: RawUtf8): RawUtf8;
+begin
+  case Nodes[aNode].Kind of
+    hjNull:
+      result := 'None';
+    hjFalse:
+      result := 'False';
+    hjTrue:
+      result := 'True';
+    hjNumber, hjString:
+      result := Nodes[aNode].Text;
+  else
+    EInferError.RaiseUtf8('THarmonyChatTemplate: % is an array or object, ' +
+      'which the template writes as a Python repr', [aWhat]);
+  end;
+end;
+
+function THarmonyJson.TextOf(aNode: integer; const aWhat: RawUtf8): RawUtf8;
+begin
+  if Nodes[aNode].Kind <> hjString then
+    EInferError.RaiseUtf8('THarmonyChatTemplate: % is no string', [aWhat]);
+  result := Nodes[aNode].Text;
+end;
+
+function THarmonyJson.Listed(aList: integer; const aName: RawUtf8): boolean;
+var
+  i, v: integer;
+begin
+  result := false;
+  if not Truthy(aList) then
+    exit;
+  if Nodes[aList].Kind <> hjArray then
+    EInferError.RaiseUtf8('THarmonyChatTemplate: "required" is no array', []);
+  for i := 0 to Nodes[aList].Count - 1 do
+  begin
+    v := Item(aList, i);
+    if (Nodes[v].Kind = hjString) and (Nodes[v].Text = aName) then
+    begin
+      result := true;
+      exit;
+    end;
+  end;
+end;
+
+
+{ THarmonyChatTemplate }
+
+const
+  /// the indentation the template writes before the default of a oneOf
+  // variant and before the type of a property of a nested object: those
+  // expressions have no "-" in their tag, and lstrip_blocks strips only before
+  // block tags
+  HARMONY_INDENT_DEFAULT = '                    ';
+  HARMONY_INDENT_TYPE = '                ';
+  /// the identity line of the system message when none is given
+  HARMONY_IDENTITY = 'You are ChatGPT, a large language model trained by OpenAI.';
+
+/// Jinja's length of a string: its code points
+function CodePointCount(const s: RawUtf8): PtrInt;
+var
+  i: PtrInt;
+begin
+  result := 0;
+  for i := 1 to length(s) do
+    if ord(s[i]) and $c0 <> $80 then
+      inc(result);
+end;
+
+/// render_typescript_type of the template
+function HarmonyType(var T: THarmonyJson; aSpec: integer): RawUtf8;
+var
+  ty, items, it, one, props, req, v, d, i, n: integer;
+  inner: RawUtf8;
+begin
+  // a value that is no object has no members (all undefined): "any"
+  result := 'any';
+  if (aSpec < 0) or (T.Nodes[aSpec].Kind <> hjObject) then
+    exit;
+  ty := T.Member(aSpec, 'type');
+  if T.IsText(ty, 'array') then
+  begin
+    items := T.Member(aSpec, 'items');
+    // without "items", the subscript of Jinja finds the items() method of the
+    // dict - truthy, but without a type: the same "any[]" as an empty one; a
+    // value that is no object has no type either
+    if T.Truthy(items) and (T.Nodes[items].Kind = hjObject) then
+    begin
+      it := T.Member(items, 'type');
+      if T.IsText(it, 'string') then
+        result := 'string[]'
+      else if T.IsText(it, 'number') or T.IsText(it, 'integer') then
+        result := 'number[]'
+      else if T.IsText(it, 'boolean') then
+        result := 'boolean[]'
+      else
+      begin
+        inner := HarmonyType(T, items);
+        if (inner = 'object | object') or (CodePointCount(inner) > 50) then
+          result := 'any[]'
+        else
+          result := inner + '[]';
+      end;
+    end
+    else
+      result := 'any[]';
+    if T.Truthy(T.Member(aSpec, 'nullable')) then
+      result := result + ' | null';
+  end
+  else if (ty >= 0) and (T.Nodes[ty].Kind = hjArray) and (T.Nodes[ty].Count > 0) then
+  begin
+    // a list of types, joined (one alone written as it is): Python str()
+    result := T.Str(T.Item(ty, 0), 'an item of "type"');
+    for i := 1 to T.Nodes[ty].Count - 1 do
+      result := result + ' | ' + T.Str(T.Item(ty, i), 'an item of "type"');
+  end
+  else if T.Truthy(T.Member(aSpec, 'oneOf')) then
+  begin
+    one := T.Member(aSpec, 'oneOf');
+    if T.Nodes[one].Kind <> hjArray then
+      EInferError.RaiseUtf8('THarmonyChatTemplate: "oneOf" is no array', []);
+    // the template sets its flag of object variants inside the loop, where
+    // Jinja scopes it: never seen after the loop - every variant is written
+    result := '';
+    n := T.Nodes[one].Count;
+    for i := 0 to n - 1 do
+    begin
+      v := T.Item(one, i);
+      result := result + HarmonyType(T, v);
+      d := T.Member(v, 'description');
+      if T.Truthy(d) then
+        result := result + '// ' + T.TextOf(d, 'the description of a oneOf variant');
+      d := T.Member(v, 'default');
+      if d >= 0 then
+        result := result + HARMONY_INDENT_DEFAULT + '// default: ' + T.Json(d);
+      if i < n - 1 then
+        result := result + ' | '#10;
+    end;
+  end
+  else if T.IsText(ty, 'string') then
+  begin
+    v := T.Member(aSpec, 'enum');
+    if T.Truthy(v) then
+    begin
+      if T.Nodes[v].Kind <> hjArray then
+        EInferError.RaiseUtf8('THarmonyChatTemplate: "enum" is no array', []);
+      // '"' + enum|join('" | "') + '"': join takes str() of each value
+      result := '"';
+      for i := 0 to T.Nodes[v].Count - 1 do
+      begin
+        if i > 0 then
+          result := result + '" | "';
+        result := result + T.Str(T.Item(v, i), 'an enum value');
+      end;
+      result := result + '"';
+    end
+    else
+    begin
+      result := 'string';
+      if T.Truthy(T.Member(aSpec, 'nullable')) then
+        result := result + ' | null';
+    end;
+  end
+  else if T.IsText(ty, 'number') or T.IsText(ty, 'integer') then
+    result := 'number'
+  else if T.IsText(ty, 'boolean') then
+    result := 'boolean'
+  else if T.IsText(ty, 'object') then
+  begin
+    props := T.Member(aSpec, 'properties');
+    if T.Truthy(props) then
+    begin
+      if T.Nodes[props].Kind <> hjObject then
+        EInferError.RaiseUtf8('THarmonyChatTemplate: "properties" is no object', []);
+      req := T.Member(aSpec, 'required');
+      result := '{'#10;
+      n := T.Nodes[props].Count;
+      for i := 0 to n - 1 do
+      begin
+        result := result + T.Keys[T.Nodes[props].First + i];
+        if not T.Listed(req, T.Keys[T.Nodes[props].First + i]) then
+          result := result + '?';
+        result := result + ': '#10 + HARMONY_INDENT_TYPE +
+          HarmonyType(T, T.Item(props, i));
+        if i < n - 1 then
+          result := result + ', ';
+      end;
+      result := result + '}';
+    end
+    else
+      result := 'object';
+  end;
+end;
+
+/// render_tool_namespace("functions", tools) of the template
+function HarmonyTools(const aTools: TLlmToolDynArray): RawUtf8;
+var
+  T: THarmonyJson;
+  i, j, props, req, spec, d: integer;
+  s, key: RawUtf8;
+begin
+  result := '## functions'#10#10'namespace functions {'#10#10;
+  for i := 0 to high(aTools) do
+  begin
+    s := '// ' + aTools[i].Description + #10'type ' + aTools[i].Name + ' = ';
+    props := -1;
+    req := -1;
+    if aTools[i].ParametersJson <> '' then
+    begin
+      T.Parse(aTools[i].ParametersJson);
+      // falsy (null, {}, [], "", 0): no parameters, as the template sees them
+      if T.Truthy(0) and (T.Nodes[0].Kind <> hjObject) then
+        EInferError.RaiseUtf8('THarmonyChatTemplate: the parameters of % are ' +
+          'no object', [aTools[i].Name]);
+      props := T.Member(0, 'properties');
+      req := T.Member(0, 'required');
+    end;
+    if T.Truthy(props) then
+    begin
+      if T.Nodes[props].Kind <> hjObject then
+        EInferError.RaiseUtf8('THarmonyChatTemplate: "properties" of % is no ' +
+          'object', [aTools[i].Name]);
+      s := s + '(_: {'#10;
+      for j := 0 to T.Nodes[props].Count - 1 do
+      begin
+        key := T.Keys[T.Nodes[props].First + j];
+        spec := T.Item(props, j);
+        d := T.Member(spec, 'description');
+        if T.Truthy(d) then
+          s := s + '// ' + T.TextOf(d, 'a parameter description') + #10;
+        s := s + key;
+        if not T.Listed(req, key) then
+          s := s + '?';
+        s := s + ': ' + HarmonyType(T, spec);
+        d := T.Member(spec, 'default');
+        if d >= 0 then
+          if T.Truthy(T.Member(spec, 'enum')) then
+            s := s + ', // default: ' + T.TextOf(d, 'the default of an enum')
+          else if T.Truthy(T.Member(spec, 'oneOf')) then
+            s := s + '// default: ' + T.TextOf(d, 'the default of a oneOf')
+          else
+            s := s + ', // default: ' + T.Json(d);
+        s := s + ','#10;
+      end;
+      s := s + '}) => any;'#10#10;
+    end
+    else
+      s := s + '() => any;'#10#10;
+    result := result + s;
+  end;
+  result := result + '} // namespace functions';
+end;
+
+/// the date of the system message: aDate checked, or today
+function HarmonyDate(const aDate: RawUtf8): RawUtf8;
+var
+  i: PtrInt;
+begin
+  if aDate = '' then
+  begin
+    // strftime_now("%Y-%m-%d"): the local date, as datetime.now()
+    result := StringToUtf8(FormatDateTime('yyyy"-"mm"-"dd', Now));
+    exit;
+  end;
+  result := aDate;
+  if length(aDate) = 10 then
+    for i := 1 to 10 do
+      if (i = 5) or (i = 8) then
+      begin
+        if aDate[i] <> '-' then
+          break;
+      end
+      else if not (aDate[i] in ['0'..'9']) then
+        break
+      else if i = 10 then
+        exit;
+  EInferError.RaiseUtf8('THarmonyChatTemplate: CurrentDate "%" is no ' +
+    'yyyy-mm-dd', [aDate]);
+end;
+
+constructor THarmonyChatTemplate.Create(aTokenizer: TInferTokenizer);
+begin
+  inherited Create(aTokenizer);
+  fStart := Need('<|start|>');
+  fChannel := Need('<|channel|>');
+  fMessage := Need('<|message|>');
+  fEnd := Need('<|end|>');
+  fCall := Need('<|call|>');
+  fReturn := Need('<|return|>');
+end;
+
+procedure THarmonyChatTemplate.Build(var aOut: TChatSegments;
+  const aMessages: TLlmMessageDynArray; const aTools: TLlmToolDynArray;
+  aAddGenerationPrompt: boolean; const aOptions: TChatTemplateOptions);
+var
+  n, first, i, j, k: PtrInt;
+  text, name, args: RawUtf8;
+  calls: TLlmToolCallDynArray; // of the last turn with calls, nil after an answer
+  answered: boolean;
+  m: ^TLlmMessage;
+
+  procedure Message(const aHeader, aChannel, aBody: RawUtf8; aEndId: integer;
+    const aEndName: RawUtf8);
+  begin
+    // <|start|>header[<|channel|>channel]<|message|>body<end>
+    aOut.Control(fStart, '<|start|>');
+    aOut.Add(aHeader);
+    if aChannel <> '' then
+    begin
+      aOut.Control(fChannel, '<|channel|>');
+      aOut.Add(aChannel);
+    end;
+    aOut.Control(fMessage, '<|message|>');
+    aOut.Add(aBody);
+    aOut.Control(aEndId, aEndName);
+  end;
+
+begin
+  // the system message
+  text := aOptions.ModelIdentity;
+  if text = '' then
+    text := HARMONY_IDENTITY;
+  text := text + #10'Knowledge cutoff: 2024-06'#10'Current date: ' +
+    HarmonyDate(aOptions.CurrentDate) + #10#10'Reasoning: ';
+  if aOptions.ReasoningEffort = '' then
+    text := text + 'medium'
+  else if (aOptions.ReasoningEffort = 'low') or (aOptions.ReasoningEffort = 'medium') or
+          (aOptions.ReasoningEffort = 'high') then
+    text := text + aOptions.ReasoningEffort
+  else
+    EInferError.RaiseUtf8('%: ReasoningEffort "%" is not low, medium or high',
+      [self, aOptions.ReasoningEffort]);
+  text := text + #10#10'# Valid channels: analysis, commentary, final. Channel ' +
+    'must be included for every message.';
+  if aTools <> nil then
+    text := text + #10'Calls to these tools must go to the commentary channel: ' +
+      '''functions''.';
+  Message('system', '', text, fEnd, '<|end|>');
+  // the developer message: the instructions of a first system message, the
+  // tools
+  n := length(aMessages);
+  first := 0;
+  text := '';
+  if (n > 0) and (aMessages[0].Role = lrSystem) then
+  begin
+    first := 1;
+    if aMessages[0].Content <> '' then
+      text := '# Instructions'#10#10 + aMessages[0].Content + #10#10;
+  end;
+  if aTools <> nil then
+    text := text + '# Tools'#10#10 + HarmonyTools(aTools);
+  if text <> '' then
+    Message('developer', '', text, fEnd, '<|end|>');
+  // the turns
+  calls := nil;
+  for i := first to n - 1 do
+  begin
+    m := @aMessages[i];
+    case m^.Role of
+      lrUser:
+        Message('user', '', m^.Content, fEnd, '<|end|>');
+      lrAssistant:
+        if m^.ToolCalls <> nil then
+        begin
+          // its content is the analysis before the calls - unless a later
+          // assistant turn answers without calls (then it is dropped)
+          answered := false;
+          for k := i + 1 to n - 1 do
+            if (aMessages[k].Role = lrAssistant) and (aMessages[k].ToolCalls = nil) then
+              answered := true;
+          if (m^.Content <> '') and not answered then
+            Message('assistant', 'analysis', m^.Content, fEnd, '<|end|>');
+          for j := 0 to high(m^.ToolCalls) do
+          begin
+            args := m^.ToolCalls[j].ArgumentsJson;
+            if args = '' then
+              args := '{}'
+            else
+              args := PythonJson(args, {keepinexactfloats=}true);
+            Message('assistant to=functions.' + m^.ToolCalls[j].Name,
+              'commentary json', args, fCall, '<|call|>');
+          end;
+          calls := m^.ToolCalls;
+        end
+        else if (i = n - 1) and not aAddGenerationPrompt then
+          // the end of a conversation the model wrote: <|return|>
+          Message('assistant', 'final', m^.Content, fReturn, '<|return|>')
+        else
+        begin
+          Message('assistant', 'final', m^.Content, fEnd, '<|end|>');
+          calls := nil;
+        end;
+      lrTool:
+        begin
+          if calls = nil then
+            EInferError.RaiseUtf8('%: message % answers a tool call, but no ' +
+              'assistant turn with calls is before it', [self, i]);
+          // the call it answers, by its id - else the last one, as the template
+          name := calls[high(calls)].Name;
+          if m^.ToolCallId <> '' then
+            for k := 0 to high(calls) do
+              if calls[k].Id = m^.ToolCallId then
+              begin
+                name := calls[k].Name;
+                break;
+              end;
+          Message('functions.' + name + ' to=assistant', 'commentary',
+            PythonJsonString(m^.Content), fEnd, '<|end|>');
+        end;
+    else
+      EInferError.RaiseUtf8('%: message % is a system message - only the first ' +
+        'one is taken (as the developer instructions)', [self, i]);
+    end;
+  end;
+  if aAddGenerationPrompt then
+  begin
+    aOut.Control(fStart, '<|start|>');
+    aOut.Add('assistant');
+  end;
+  aOut.Flush;
+end;
+
+function ChatTemplateOptions(aEnableThinking: boolean): TChatTemplateOptions;
+begin
+  Finalize(result);
+  FillCharFast(result, SizeOf(result), 0);
+  result.EnableThinking := aEnableThinking;
+end;
+
 function TChatTemplate.Encode(const aMessages: TLlmMessageDynArray;
   const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
   aEnableThinking: boolean): TIntegerDynArray;
+begin
+  result := EncodeWith(aMessages, aTools, aAddGenerationPrompt,
+    ChatTemplateOptions(aEnableThinking));
+end;
+
+function TChatTemplate.Render(const aMessages: TLlmMessageDynArray;
+  const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+  aEnableThinking: boolean): RawUtf8;
+begin
+  result := RenderWith(aMessages, aTools, aAddGenerationPrompt,
+    ChatTemplateOptions(aEnableThinking));
+end;
+
+function TChatTemplate.EncodeWith(const aMessages: TLlmMessageDynArray;
+  const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+  const aOptions: TChatTemplateOptions): TIntegerDynArray;
 var
   o: TChatSegments;
 begin
@@ -999,7 +1728,7 @@ begin
   o.Tokenizer := fTokenizer;
   o.WithIds := true;
   try
-    Build(o, aMessages, aTools, aAddGenerationPrompt, aEnableThinking);
+    Build(o, aMessages, aTools, aAddGenerationPrompt, aOptions);
     result := o.Ids;
     SetLength(result, o.Count);
   finally
@@ -1009,16 +1738,16 @@ begin
   end;
 end;
 
-function TChatTemplate.Render(const aMessages: TLlmMessageDynArray;
+function TChatTemplate.RenderWith(const aMessages: TLlmMessageDynArray;
   const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
-  aEnableThinking: boolean): RawUtf8;
+  const aOptions: TChatTemplateOptions): RawUtf8;
 var
   o: TChatSegments;
 begin
   FillCharFast(o, SizeOf(o), 0);
   o.Tokenizer := fTokenizer;
   try
-    Build(o, aMessages, aTools, aAddGenerationPrompt, aEnableThinking);
+    Build(o, aMessages, aTools, aAddGenerationPrompt, aOptions);
     result := o.Text;
   finally
     Finalize(o.Ids);

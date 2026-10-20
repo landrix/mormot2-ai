@@ -226,9 +226,9 @@ never a build input.
   Revision:  15dcfc7e7c608c6161507211ed43c5b590801b4b
   File:      vendor/models/gpt-oss-20b-mxfp4.gguf (gitignored)
              27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901
-  Datasets from it: gpt-oss-20b (tools/infer-ref/make_reference_d5.py), gpt-oss-tokens
-    and src/infer/mormot.ai.infer.unicode.o200k.inc (tools/infer-ref/make_reference_d5c.py,
-    the tokenizer files only). Generated on
+  Datasets from it: gpt-oss-20b (tools/infer-ref/make_reference_d5.py), gpt-oss-tokens,
+    gpt-oss-chat and src/infer/mormot.ai.infer.unicode.o200k.inc
+    (tools/infer-ref/make_reference_d5c.py, the tokenizer files and the template only). Generated on
     the RTX computer (Windows x86_64, 96 GB RAM): Python 3.12.13, torch 2.14.1+cpu,
     transformers 5.19.0 and the rest of tools/infer-ref/requirements.txt, created
     with uv 0.11.18 - the model needs more memory than the WSL reference has.

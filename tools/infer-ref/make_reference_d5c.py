@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Reference data for phase D slice D5c of the native inference engine: the tokenizer of
-gpt-oss (o200k, the pre-tokenizer of tiktoken's o200k_base in tokenizer.json).
+gpt-oss (o200k, the pre-tokenizer of tiktoken's o200k_base in tokenizer.json) and its
+Harmony chat format.
 
 Targets (all of them when called without arguments):
   o200k-unicode   src/infer/mormot.ai.infer.unicode.o200k.inc: the code point classes of
@@ -12,6 +13,11 @@ Targets (all of them when called without arguments):
   gpt-oss-tokens  tests/data/infer-ref/gpt-oss-tokens: the tokenizer gate - per case the
                   ids of tokenizer.json without its added tokens (every text is text), the
                   pieces of the pre-tokenizer as byte offsets, decoding checked
+  gpt-oss-chat    tests/data/infer-ref/gpt-oss-chat: the Harmony gate - conversations and
+                  tool schemas through chat_template.jinja of the revision, rendered by
+                  transformers with a fixed date, and their ids; 400 generated schemas over
+                  the branches of the TypeScript rendering; what transformers refuses is
+                  marked as an error
 
 Both need the tokenizer files of openai/gpt-oss-20b in the pinned revision (not
 downloaded here: the folder $LAI_GPTOSS_DIR, by default vendor/models/gpt-oss-20b,
@@ -484,7 +490,289 @@ def tokens():
           f"HF differs {hf_differs}, ignore_merges matters in {merges_differ}")
 
 
-TARGETS = {"o200k-unicode": unicode_inc, "gpt-oss-tokens": tokens}
+# ---------------------------------------------------------------- Harmony chat template
+
+CHAT_DATE = "2026-10-20"
+
+
+def fixed_date():
+    """transformers renders strftime_now with datetime.now(): a fixed day instead"""
+    import datetime as dt
+    import transformers.utils.chat_template_utils as ctu
+
+    class Fixed(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 20, 12, 0, 0)
+    ctu.datetime = Fixed
+
+
+def chat_to_hf(messages, tools):
+    """TLlmMessage / TLlmTool as the gpt-oss template reads them: arguments as an
+    object (the template writes them with tojson), a description always (the
+    template concatenates it: an empty one is "")"""
+    hm = []
+    for m in messages:
+        h = {"role": m["role"], "content": m["content"]}
+        if "tool_calls" in m:
+            h["tool_calls"] = [{"id": c["id"], "type": "function",
+                                "function": {"name": c["name"],
+                                             "arguments": json.loads(c["arguments"] or "{}")}}
+                               for c in m["tool_calls"]]
+        if "tool_call_id" in m:
+            h["tool_call_id"] = m["tool_call_id"]
+        hm.append(h)
+    ht = []
+    for t in tools:
+        f = {"name": t["name"], "description": t["description"]}
+        if t["parameters"]:
+            f["parameters"] = json.loads(t["parameters"])
+        ht.append({"type": "function", "function": f})
+    return hm, ht
+
+
+def harmony_cases():
+    """(id, messages, tools, add_generation_prompt, options)"""
+    nl = "\n"
+    u = lambda t: q3.msg("user", t)  # noqa: E731
+    a = lambda t, calls=None: q3.msg("assistant", t, calls)  # noqa: E731
+    s = lambda t: q3.msg("system", t)  # noqa: E731
+    tr = lambda cid, t: q3.msg("tool", t, tool_call_id=cid)  # noqa: E731
+    W, P, NOW = q3.WEATHER, q3.NO_DESC, q3.NO_PARAMS
+    return [
+        ("user", [u("Hallo")], [], True, {}),
+        ("user_no_prompt", [u("Hallo")], [], False, {}),
+        ("effort_low", [u("Hallo")], [], True, {"reasoning_effort": "low"}),
+        ("effort_high", [u("Hallo")], [], True, {"reasoning_effort": "high"}),
+        ("identity", [u("Hallo")], [], True, {"model_identity": "Du bist ein Assistent."}),
+        ("system_user", [s("Du bist ein Assistent f\u00fcr Handwerker."),
+                         u("Wie verlege ich ein Kupferrohr?")], [], True, {}),
+        ("empty_system", [s(""), u("x")], [], True, {}),
+        ("multi_turn", [u("Hallo"), a("Hallo! Wie kann ich helfen?"),
+                        u("Erkl\u00e4re DN15.")], [], True, {}),
+        ("last_assistant", [u("Sag ja."), a("Ja.")], [], False, {}),
+        ("last_assistant_prompt", [u("Sag ja."), a("Ja.")], [], True, {}),
+        ("newlines", [u(nl + "a" + nl + nl), a(nl + "b" + nl), u("c" + nl)], [], True, {}),
+        ("empty_user", [u("")], [], True, {}),
+        ("unicode_user", [u("Gr\u00f6\u00dfe 30\u00d760, 5 \u20ac \U0001F600 \u7ba1")],
+         [], True, {}),
+        ("tools", [s("Sei knapp."), u("Wie ist das Wetter in Berlin?")], [W], True, {}),
+        ("tools_no_system", [u("Wetter?")], [W, P, NOW], True, {}),
+        ("tool_flow", [u("Wie ist das Wetter in Berlin?"),
+                       a("", [q3.call("c1", "get_weather", '{"city": "Berlin"}')]),
+                       tr("c1", '{"temp": 21, "sky": "sonnig"}')], [W], True, {}),
+        ("tool_flow_analysis", [u("Wetter in Ulm?"),
+                                a("Ich frage das Wetter ab.",
+                                  [q3.call("c1", "get_weather", '{"city":"Ulm"}')]),
+                                tr("c1", "18 Grad")], [W], True, {}),
+        ("tool_flow_answered", [u("Wetter Ulm?"),
+                                a("Ich frage nach.",
+                                  [q3.call("c1", "get_weather", '{"city":"Ulm"}')]),
+                                tr("c1", "18 Grad"), a("In Ulm sind es 18 Grad."),
+                                u("Danke! Und morgen?")], [W], True, {}),
+        ("tool_two_results", [u("Uhrzeit?"), a("", [q3.call("c1", "now", "")]),
+                              tr("c1", "12:00"), tr("c1", "noch einmal 12:00")],
+         [NOW], True, {}),
+        ("tool_chain", [u("Plane."), a("", [q3.call("c1", "now", "{}")]),
+                        tr("c1", "12:00"),
+                        a("", [q3.call("c2", "get_weather",
+                                       '{"city": "M\u00fcnchen", "unit": "celsius"}')]),
+                        tr("c2", 'Sonne "hell"' + nl + "\tkalt \\ \u00fc")],
+         [NOW, W], True, {}),
+        ("tool_last_no_prompt", [u("Wetter?"),
+                                 a("", [q3.call("c1", "get_weather", '{"city":"Ulm"}')])],
+         [W], False, {}),
+        ("tool_numbers", [u("x"), a("", [q3.call("c1", "numbers",
+                                                 '{"a": 1.50, "b": [1E5, -0, true]}')]),
+                          tr("c1", "ok")], [q3.NUMBERS], True, {}),
+    ]
+
+
+def harmony_schemas():
+    """designed tool schemas for the TypeScript rendering of the template - (id, schema)"""
+    obj = lambda props, req=None, **kw: dict(  # noqa: E731
+        {"type": "object", "properties": props}, **({"required": req} if req else {}), **kw)
+    return [
+        ("scalars", obj({"s": {"type": "string"}, "n": {"type": "number"},
+                         "i": {"type": "integer"}, "b": {"type": "boolean"},
+                         "x": {}, "nul": {"type": "null"}}, ["s", "b"])),
+        ("described", obj({"city": {"type": "string", "description": "Stadt"},
+                           "empty": {"type": "string", "description": ""}}, ["city"])),
+        ("enum", obj({"unit": {"type": "string", "enum": ["c", "f"], "default": "c"},
+                      "mixed": {"type": "string", "enum": ["a", 1, 2.5, True, None]},
+                      "empty_enum": {"type": "string", "enum": []}})),
+        ("nullable", obj({"s": {"type": "string", "nullable": True},
+                          "a": {"type": "array", "items": {"type": "string"}, "nullable": True},
+                          "n": {"type": "number", "nullable": True}})),
+        ("arrays", obj({"s": {"type": "array", "items": {"type": "string"}},
+                        "n": {"type": "array", "items": {"type": "number"}},
+                        "i": {"type": "array", "items": {"type": "integer"}},
+                        "b": {"type": "array", "items": {"type": "boolean"}},
+                        "none": {"type": "array"}, "empty": {"type": "array", "items": {}},
+                        "nested": {"type": "array", "items": {"type": "array",
+                                                              "items": {"type": "string"}}},
+                        "objs": {"type": "array", "items": obj({"k": {"type": "string"}})},
+                        "tuple": {"type": "array", "items": [{"type": "string"}]},
+                        "union": {"type": "array", "items": {"type": ["object", "object"]}},
+                        "long": {"type": "array", "items": obj(
+                            {"aaaaaaaaaa": {"type": "string"}, "bbbbbbbbbb": {"type": "number"},
+                             "cccccccccc": {"type": "boolean"}})}})),
+        ("type_list", obj({"a": {"type": ["string", "null"]}, "b": {"type": ["integer"]},
+                           "c": {"type": []}, "d": {"type": ["number", "string", "boolean"]}})),
+        ("one_of", obj({"v": {"oneOf": [{"type": "string", "description": "Name"},
+                                        {"type": "number", "default": 3}]},
+                        "o": {"oneOf": [obj({"a": {"type": "string"}}), {"type": "string"}],
+                              "default": "x"},
+                        "single": {"oneOf": [{"type": "boolean"}]}}, ["v"])),
+        ("objects", obj({"o": obj({"a": {"type": "string"}, "b": {"type": "number"}}, ["a"]),
+                         "e": {"type": "object"}, "deep": obj({"x": obj({"y": {}})})})),
+        ("defaults", obj({"n": {"type": "number", "default": 10},
+                          "f": {"type": "number", "default": 0.5},
+                          "s": {"type": "string", "default": "a\"b\u00fc"},
+                          "b": {"type": "boolean", "default": False},
+                          "z": {"type": "string", "default": None},
+                          "l": {"type": "array", "default": [1, "x"]},
+                          "d": {"type": "object", "default": {"k": 1}}})),
+        ("unicode", obj({"gr\u00f6\u00dfe": {"type": "string",
+                                             "description": "\u20ac \U0001F600"}})),
+        ("no_properties", {"type": "object"}),
+        ("empty_properties", {"type": "object", "properties": {}}),
+        ("not_required", obj({"a": {"type": "string"}}, [])),
+        # item types of 59 characters (any[] by the limit of 50) and of 49 (kept)
+        ("item_limit", obj({"t59": {"type": "array", "items": {"type": [
+            "string", "number", "boolean", "null", "object", "array", "integer"]}},
+            "t49": {"type": "array", "items": {"type": [
+                "string", "number", "boolean", "null", "object", "array"]}}})),
+        # zeros are false: no " | null", no description
+        ("falsy", obj({"a": {"type": "string", "nullable": -0.0},
+                       "b": {"type": "string", "nullable": 0.0, "description": -0.0},
+                       "c": {"type": "array", "nullable": 0}, "d": {"type": "string",
+                                                                  "nullable": 1}})),
+    ]
+
+
+def random_schema(rng, depth=0):
+    """a parameter schema over the branches of render_typescript_type"""
+    words = ["a", "b", "city", "n\u00e4me", "x_y", "Long Name"]
+    kinds = ["string", "number", "integer", "boolean", "object", "array", "null", "list",
+             "oneOf", "none", "enum"]
+    k = rng.choice(kinds if depth < 3 else kinds[:4] + ["null", "none"])
+    sp = {}
+    if k == "list":
+        sp["type"] = rng.sample(["string", "number", "null", "object", "boolean"],
+                                rng.randint(0, 3))
+    elif k == "oneOf":
+        sp["oneOf"] = [random_schema(rng, depth + 1) for _ in range(rng.randint(0, 3))]
+    elif k == "enum":
+        sp["type"] = "string"
+        sp["enum"] = [rng.choice(["c", "f", "\u00fc", 1, 2.5, True, None, ""])
+                      for _ in range(rng.randint(0, 3))]
+    elif k == "array":
+        sp["type"] = "array"
+        r = rng.random()
+        if r < 0.6:
+            sp["items"] = random_schema(rng, depth + 1)
+        elif r < 0.7:
+            sp["items"] = {}
+        elif r < 0.8:
+            sp["items"] = [random_schema(rng, depth + 1)]
+    elif k == "object":
+        sp["type"] = "object"
+        if rng.random() < 0.8:
+            sp["properties"] = {rng.choice(words) + str(i): random_schema(rng, depth + 1)
+                                for i in range(rng.randint(0, 3))}
+        if rng.random() < 0.5 and sp.get("properties"):
+            sp["required"] = rng.sample(list(sp["properties"]),
+                                        rng.randint(0, len(sp["properties"])))
+    elif k != "none":
+        sp["type"] = k
+    if rng.random() < 0.2:
+        sp["nullable"] = rng.choice([True, False, 0, 1])
+    if rng.random() < 0.3:
+        sp["description"] = rng.choice(["Ein Wert", "", "a // b\nc", 5])
+    if rng.random() < 0.25:
+        sp["default"] = rng.choice([1, 0.5, "x", True, None, [1, 2], {"k": "v"}, -0.0])
+    return sp
+
+
+def random_tools(n, seed):
+    import random
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        props = {f"p{j}": random_schema(rng) for j in range(rng.randint(1, 4))}
+        params = {"type": "object", "properties": props}
+        if rng.random() < 0.6:
+            params["required"] = rng.sample(list(props), rng.randint(0, len(props)))
+        out.append((f"random_{i:03d}", params))
+    return out
+
+
+def chat():
+    print("gpt-oss chat template cases")
+    folder = gpt_oss_folder()
+    fixed_date()
+    from transformers import AutoTokenizer
+    hf = AutoTokenizer.from_pretrained(folder)
+    with open(os.path.join(folder, "chat_template.jinja"), encoding="utf-8") as f:
+        if hf.chat_template != f.read():
+            raise ValueError("the tokenizer does not use chat_template.jinja")
+    flat, offsets, cases = [], [], []
+
+    def add(cid, messages, tools, gen, options):
+        hm, ht = chat_to_hf(messages, tools)
+        e = {"id": cid, "messages": messages, "tools": tools, "add_generation_prompt": gen,
+             "options": options}
+        try:
+            text = hf.apply_chat_template(hm, tools=ht or None, add_generation_prompt=gen,
+                                          tokenize=False, **options)
+        except Exception as x:  # what transformers refuses, the native one must too
+            e["error"] = f"{type(x).__name__}: {x}"
+            text = None
+        offsets.append(len(flat))
+        if text is not None:
+            if CHAT_DATE not in text:
+                raise ValueError(f"{cid}: the date is not fixed")
+            ids = hf(text, add_special_tokens=False)["input_ids"]
+            flat.extend(ids)
+            e["rendered"] = text
+            e["tokens"] = len(ids)
+        cases.append(e)
+
+    for cid, messages, tools, gen, options in harmony_cases():
+        add(cid, messages, tools, gen, options)
+    user = [q3.msg("user", "x")]
+    for cid, params in harmony_schemas() + random_tools(400, TOKENS_SEED):
+        tool = q3.tool("f_" + cid, "Schema " + cid, json.dumps(params, ensure_ascii=False))
+        add("schema_" + cid, user, [tool], True, {})
+    offsets.append(len(flat))
+    blob = mr.Blob()
+    blob.add("ids", np.array(flat, dtype=np.int64), "all cases concatenated")
+    blob.add("offsets", np.array(offsets, dtype=np.int64),
+             "case i = ids[offsets[i] .. offsets[i+1]-1] (none for an error case)")
+    errors = sum(1 for e in cases if "error" in e)
+    manifest = {
+        "dataset": "gpt-oss-chat",
+        "note": "the chat template of the revision (chat_template.jinja), rendered by "
+                "transformers with the date fixed to " + CHAT_DATE + " (strftime_now) "
+                "and tokenized by the HF tokenizer. Messages as TLlmMessage carries them "
+                "(tool call arguments are raw JSON text, sent as their object); tools as "
+                "TLlmTool (name, description - always sent, parameters as the object). "
+                "options: the template kwargs (reasoning_effort, model_identity). "
+                "schema_*: one tool each, its parameters through the TypeScript "
+                "rendering of the template; random_*: generated over its branches. "
+                "error: transformers refused the case (the native template must too)",
+        "date": CHAT_DATE,
+        "model": model_info(),
+        "environment": mr.environment(),
+        "errors": errors,
+        "cases": cases,
+    }
+    blob.write(os.path.join(mr.OUT, "gpt-oss-chat"), manifest)
+    print(f"  {len(cases)} cases ({errors} refused), {len(flat)} ids")
+
+
+TARGETS = {"o200k-unicode": unicode_inc, "gpt-oss-tokens": tokens, "gpt-oss-chat": chat}
 
 if __name__ == "__main__":
     want = sys.argv[1:] or list(TARGETS)

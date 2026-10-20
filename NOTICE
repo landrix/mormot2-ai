@@ -131,6 +131,11 @@ gpt-oss  (OpenAI)  (MODEL INTERFACE, NOT CODE)
   models of the same architecture. The o200k Split regex of its tokenizer.json
   is copied verbatim into mormot.ai.infer.tokenizer.bpe (O200K_SPLIT_REGEX);
   tests/data/infer-ref/gpt-oss-tokens holds token ids computed with that
-  tokenizer.json, which itself is not part of this repository.
+  tokenizer.json, which itself is not part of this repository. The Harmony
+  chat template of mormot.ai.infer.chat is written in Pascal after the
+  chat_template.jinja of that revision; its fixed prompt strings (the system
+  message, the TypeScript rendering of tools) are reproduced because the model
+  only works with them. tests/data/infer-ref/gpt-oss-chat holds conversations
+  rendered by transformers with that template, and their token ids.
   License: Apache-2.0.
   https://huggingface.co/openai/gpt-oss-20b
