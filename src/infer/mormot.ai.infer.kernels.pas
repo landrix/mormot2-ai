@@ -78,6 +78,11 @@ type
   /// aBlocks Q4_0 blocks at aSrc as Q8_0 blocks at aDst: the same scale,
   // q - 8 as the signed value (see InferQ4ToQ8 in mormot.ai.infer.backend.cpu)
   TInferQ4Unpack = procedure(aSrc: pointer; aBlocks: PtrInt; aDst: pointer);
+  /// aBlocks MXFP4 blocks at aSrc as Q8_0 blocks at aDst: aHalf[e] (256 FP16
+  // scales, raw bits) as the scale, the 16 int8 of aValues for the low and the
+  // high nibbles (see InferMxfp4ToQ8 in mormot.ai.infer.backend.cpu)
+  TInferMxfp4Unpack = procedure(aSrc: pointer; aBlocks: PtrInt; aDst, aHalf,
+    aValues: pointer);
   /// the same for the four weight rows w, w + aStride, w + 2 aStride and
   // w + 3 aStride (aStride in bytes) against one row x:
   // aSums[b * 4 + k] = block b of row k
@@ -121,6 +126,9 @@ var
   /// the Q4_0 to Q8_0 unpacking of this CPU (see TInferQ4Unpack), nil without
   // a kernel: the caller then uses the Pascal InferQ4ToQ8
   InferQ4Unpack: TInferQ4Unpack;
+  /// the MXFP4 to Q8_0 unpacking of this CPU (see TInferMxfp4Unpack), nil
+  // without a kernel: the caller then uses the Pascal InferMxfp4ToQ8
+  InferMxfp4Unpack: TInferMxfp4Unpack;
   /// which kernel InferQ8BlockDots is: 'pascal', 'neon-dotprod', 'avx2'
   InferQ8KernelName: RawUtf8;
   /// every IEEE half (raw bits) as single - 256 KB, filled at initialization
@@ -1247,6 +1255,31 @@ asm
 .Lq4u_0:
 end;
 
+/// MXFP4 -> Q8_0: per block the FP16 scale of the exponent from the table x3,
+// the low and the high nibbles through the 16-byte table x4 (tbl) as 32 int8
+// (plain NEON); x0 = aSrc (17-byte blocks), x1 = aBlocks, x2 = aDst (34-byte
+// blocks); the opcodes from GNU as 2.42
+procedure Mxfp4UnpackNeon(aSrc: pointer; aBlocks: PtrInt; aDst, aHalf,
+  aValues: pointer); assembler; nostackframe;
+asm
+  cbz x1, .Lmxu_0
+  .long 0x4c40709d // ld1 {v29.16b}, [x4]
+  .long 0x4f00e5ff // movi v31.16b, #0xf
+.Lmxu_1:
+  .long 0x38401409 // ldrb w9, [x0], #1
+  .long 0x78697869 // ldrh w9, [x3, x9, lsl #1]
+  .long 0x4cdf7000 // ld1 {v0.16b}, [x0], #16
+  .long 0x4e3f1c01 // and v1.16b, v0.16b, v31.16b
+  .long 0x6f0c0402 // ushr v2.16b, v0.16b, #4
+  .long 0x4e0103a1 // tbl v1.16b, {v29.16b}, v1.16b
+  .long 0x4e0203a2 // tbl v2.16b, {v29.16b}, v2.16b
+  .long 0x78002449 // strh w9, [x2], #2
+  .long 0x4c9fa041 // st1 {v1.16b-v2.16b}, [x2], #32
+  subs x1, x1, #1
+  b.ne .Lmxu_1
+.Lmxu_0:
+end;
+
 /// Q6_K x two Q8_K rows, fused: Q6KSumsNeonDot with the 6-bit values and the
 // group scales rebuilt once per half block for both rows; the activations of
 // row A, then of row B, go through the same registers (v0..v5, v7, v17)
@@ -1713,6 +1746,58 @@ begin
   args.A[3] := PtrInt(aSums);
   args.A[4] := aStride;
   Q8BlockDots4Avx2Asm(args);
+end;
+
+/// Mxfp4UnpackAvx2 body: A = aSrc, aBlocks, aDst, aHalf, aValues - per block
+// the FP16 scale from the table, the low and the high nibbles through the
+// 16-byte table (vpshufb) as 32 int8; only volatile registers
+procedure Mxfp4UnpackAvx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     r8, qword ptr [r11]
+        mov     rcx, qword ptr [r11 + 8]
+        mov     r10, qword ptr [r11 + 16]
+        mov     r9, qword ptr [r11 + 24]
+        mov     rdx, qword ptr [r11 + 32]
+        test    rcx, rcx
+        jz      @done
+        vmovdqu xmm5, oword ptr [rdx]    // the 16 values
+        mov     eax, 0F0F0F0FH
+        vmovd   xmm4, eax
+        vpshufd xmm4, xmm4, 0            // the nibble mask
+@block: movzx   eax, byte ptr [r8]
+        movzx   eax, word ptr [r9 + rax * 2]
+        mov     word ptr [r10], ax
+        vmovdqu xmm0, oword ptr [r8 + 1]
+        vpand   xmm1, xmm0, xmm4
+        vpsrlw  xmm2, xmm0, 4
+        vpand   xmm2, xmm2, xmm4
+        vpshufb xmm1, xmm5, xmm1
+        vpshufb xmm2, xmm5, xmm2
+        vmovdqu oword ptr [r10 + 2], xmm1
+        vmovdqu oword ptr [r10 + 18], xmm2
+        add     r8, 17
+        add     r10, 34
+        sub     rcx, 1
+        jnz     @block
+@done:
+end;
+
+procedure Mxfp4UnpackAvx2(aSrc: pointer; aBlocks: PtrInt; aDst, aHalf,
+  aValues: pointer);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(aSrc);
+  args.A[1] := aBlocks;
+  args.A[2] := PtrInt(aDst);
+  args.A[3] := PtrInt(aHalf);
+  args.A[4] := PtrInt(aValues);
+  Mxfp4UnpackAvx2Asm(args);
 end;
 
 /// Q8BlockDotsAvx2 body: A = w, x, aBlocks, aSums - exact, as the 4-row one
@@ -2953,6 +3038,7 @@ begin
   InferAxpyRowsF32 := TInferDotsF32(@AxpyRowsF32Neon);
   InferQ8QuantizeRow := TInferQ8QuantizeRow(@Q8QuantizeRowNeon);
   InferQ4Unpack := TInferQ4Unpack(@Q4UnpackNeon);
+  InferMxfp4Unpack := TInferMxfp4Unpack(@Mxfp4UnpackNeon);
   if HasArmDotProd then
   begin
     // an assembler routine: one calling convention on aarch64 whatever the
@@ -2986,6 +3072,7 @@ begin
     InferQ6KSums := Q6KSumsAvx2;
     InferQ4KSums2 := Q4KSums2Avx2;
     InferQ6KSums2 := Q6KSums2Avx2;
+    InferMxfp4Unpack := Mxfp4UnpackAvx2;
     InferQ8KernelName := 'avx2';
   end;
   {$endif INFERAVX2}

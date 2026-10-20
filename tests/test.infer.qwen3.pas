@@ -168,6 +168,15 @@ type
     /// D5: the settings of a gpt-oss config.json - defaults, the transformers
     // 4 form, the YaRN variants, refusals
     procedure GptOssConfig;
+    /// D5b: tiny gpt-oss with MXFP4 experts in two files and an index -
+    // the repacked experts equal transformers' values, the states within the
+    // error of Q8_0 activations, refusals of the quantization settings and
+    // of exponents beyond the exact range
+    procedure GptOssMxfp4;
+    /// D5b: gpt-oss-20b (MXFP4 experts, three files) against transformers in
+    // float32 - the last row of every state, the logits, greedy - skipped
+    // without vendor/models/gpt-oss-20b
+    procedure GptOss20b;
   end;
 
 const
@@ -3468,6 +3477,344 @@ begin
   end;
 end;
 
+/// true if creating a TGptOssModel over aDir raises an EInferError with aReason
+function GptOssRefused(const aDir: TFileName; aBackend: TInferBackend;
+  const aReason: RawUtf8; out aWhy: RawUtf8): boolean;
+var
+  m: TDecoderModel;
+begin
+  result := false;
+  aWhy := 'accepted';
+  try
+    m := TGptOssModel.Create(aDir, aBackend);
+    m.Free;
+  except
+    on E: Exception do
+    begin
+      aWhy := StringToUtf8(E.Message);
+      result := (E is EInferError) and (PosEx(aReason, aWhy) > 0);
+    end;
+  end;
+end;
+
+/// the byte offset in a safetensors file of the data of tensor aName
+function TensorOffset(const aContent: RawByteString; const aName: RawUtf8): PtrInt;
+var
+  len: Int64;
+  doc: TDocVariantData;
+  json: RawUtf8;
+begin
+  MoveFast(pointer(aContent)^, len, 8);
+  FastSetString(json, @PByteArray(aContent)^[8], len);
+  doc.InitJson(json, JSON_FAST);
+  result := 8 + len + VariantToInt64Def(doc.O[aName]^.A['data_offsets']^.Values[0], -1);
+end;
+
+procedure TTestInferQwen3.GptOssMxfp4;
+const
+  SHARD1 = 'model-00001-of-00002.safetensors';
+  SHARD2 = 'model-00002-of-00002.safetensors';
+var
+  dir, tmp: TFileName;
+  ref: TInferRefSet;
+  m, q, f: TDecoderModel;
+  cm, cf: TDecoderContext;
+  l, e, r, n, k, h, fi, v: PtrInt;
+  row, lm, lf: TSingleDynArray;
+  want: PSingleArray;
+  ids: PIntegerArray;
+  ok: boolean;
+  cmp: TInferCompare;
+  doc: TDocVariantData;
+  content: RawByteString;
+  why: RawUtf8;
+  nullv: variant;
+
+  procedure SameRows(const aWeight: TInferWeight; const aName: RawUtf8;
+    aRows, aCols: PtrInt);
+  var
+    i, c: PtrInt;
+  begin
+    want := ref.F32(aName, c);
+    CheckEqual(c, aRows * aCols, aName);
+    SetLength(row, aCols);
+    ok := true;
+    for i := 0 to aRows - 1 do
+    begin
+      InferRowToF32(aWeight.Data, aWeight.DType, i, aCols, pointer(row));
+      for c := 0 to aCols - 1 do
+        if row[c] <> want^[i * aCols + c] then
+          ok := false;
+    end;
+    CheckUtf8(ok, '% repacked = transformers', [aName]);
+  end;
+
+  procedure CopyFolder;
+  begin
+    tmp := MakePath([GetSystemPath(spTemp), 'lai-d5b-' +
+      Int64ToUtf8(GetTickCount64)], true);
+    ForceDirectories(tmp);
+    CopyFile(dir + 'config.json', tmp + 'config.json', false);
+    CopyFile(dir + 'model.safetensors.index.json',
+      tmp + 'model.safetensors.index.json', false);
+    CopyFile(dir + SHARD1, tmp + SHARD1, false);
+    CopyFile(dir + SHARD2, tmp + SHARD2, false);
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-gpt-oss');
+  if CheckFailed(dir <> '', 'tiny-gpt-oss found') then
+    exit;
+  dir := MakePath([dir, 'mxfp4'], true);
+  ref := TInferRefSet.CreateFromFolder(dir);
+  m := nil;
+  q := nil;
+  f := nil;
+  tmp := '';
+  try
+    // no model.safetensors: the two files of the index
+    m := NewDecoderModel(dir, fCpu);
+    Check(m is TGptOssModel, 'gpt_oss: a TGptOssModel');
+    h := m.Config.Hidden;
+    fi := m.Config.ExpertIntermediate;
+    ok := true;
+    for l := 0 to m.Config.Layers - 1 do
+      for e := 0 to m.Config.Experts - 1 do
+        if (m.Layers[l].ExpertGate[e].DType <> idtMXFP4) or
+           (m.Layers[l].ExpertUp[e].DType <> idtMXFP4) or
+           (m.Layers[l].ExpertDown[e].DType <> idtMXFP4) then
+          ok := false;
+    Check(ok, 'every expert in MXFP4');
+    Check((m.Layers[0].Q.DType = idtF32) and (m.Layers[0].Router.DType = idtF32),
+      'the other matrices as asked (F32)');
+    // the repacking: gate and up from the interleaved rows, the nibble pairs,
+    // the scales - expert 3 of every layer as transformers dequantized it
+    for l := 0 to m.Config.Layers - 1 do
+    begin
+      SameRows(m.Layers[l].ExpertGate[3], FormatUtf8('experts.l%.e3.gate', [l]), fi, h);
+      SameRows(m.Layers[l].ExpertUp[3], FormatUtf8('experts.l%.e3.up', [l]), fi, h);
+      SameRows(m.Layers[l].ExpertDown[3], FormatUtf8('experts.l%.e3.down', [l]), h, fi);
+    end;
+    // layer 0 expert 1: a zero block with the exponent 0 (gate row 0, block
+    // 0) and one of -0 values with the exponent 255 (up row 0, block 1) -
+    // accepted, both zero
+    SetLength(row, h);
+    InferRowToF32(m.Layers[0].ExpertGate[1].Data, idtMXFP4, 0, h, pointer(row));
+    ok := true;
+    for k := 0 to 31 do
+      if row[k] <> 0 then
+        ok := false;
+    InferRowToF32(m.Layers[0].ExpertUp[1].Data, idtMXFP4, 0, h, pointer(row));
+    for k := 32 to 63 do
+      if row[k] <> 0 then
+        ok := false;
+    Check(ok, 'zero blocks outside the exact range accepted as zero');
+    // and they really are outside it: the exponents as the generator wrote them
+    Check((PInferBlockMxfp4Array(m.Layers[0].ExpertGate[1].Data)^[0].e = 0) and
+      (PInferBlockMxfp4Array(m.Layers[0].ExpertUp[1].Data)^[1].e = 255),
+      'the zero blocks keep the exponents 0 and 255');
+    // every state: the experts see Q8_0 activations, the rest is exact -
+    // measured 2026-10-20: logits within 0.0098, cosine 0.999992
+    for k := 0 to 2 do
+      CheckStates(m, ref, FormatUtf8('case%', [k]), 0.05, 0.02, true);
+    // the fast backend: float lanes over the same MXFP4 tiles
+    f := TGptOssModel.Create(dir, fFast);
+    v := m.Config.VocabSize;
+    for k := 0 to 2 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(lm, n * v);
+      SetLength(lf, n * v);
+      cm := m.NewContext;
+      cf := f.NewContext;
+      try
+        m.Forward(cm, ids, n, pointer(lm), true);
+        f.Forward(cf, ids, n, pointer(lf), true);
+      finally
+        cm.Free;
+        cf.Free;
+      end;
+      cmp := InferCompare(pointer(lf), pointer(lm), n * v, 1e-3, 1e-3);
+      CheckUtf8(InferCompareOk(cmp), 'gpt-oss MXFP4 case % fast path: %',
+        [k, InferCompareText(cmp)]);
+    end;
+    // Q8_0 asked for: the other matrices in Q8_0, the experts stay MXFP4
+    q := TGptOssModel.Create(dir, fCpu, idtQ8_0);
+    Check((q.Layers[1].Q.DType = idtQ8_0) and (q.Layers[1].Router.DType = idtF32) and
+      (q.Layers[1].ExpertDown[5].DType = idtMXFP4), 'Q8_0 around MXFP4 experts');
+    FreeAndNil(q);
+    FreeAndNil(f);
+    FreeAndNil(m);
+    // refusals, on a copy
+    CopyFolder;
+    FileFromString(StringReplaceAll(StringFromFile(dir + 'config.json'),
+      '"mxfp4"', '"fp8"'), tmp + 'config.json');
+    CheckUtf8(GptOssRefused(tmp, fCpu, 'quantization "fp8"', why),
+      'another quantization: %', [why]);
+    doc.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT);
+    SetVariantNull(nullv);
+    doc.AddOrUpdateValue('quantization_config', nullv);
+    FileFromString(doc.ToJson, tmp + 'config.json');
+    CheckUtf8(GptOssRefused(tmp, fCpu, 'no object', why),
+      'quantization_config null: %', [why]);
+    // MXFP4 blocks without the quantization_config: unknown tensors
+    doc.Clear;
+    doc.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT);
+    doc.Delete('quantization_config');
+    FileFromString(doc.ToJson, tmp + 'config.json');
+    CheckUtf8(GptOssRefused(tmp, fCpu, 'gate_up_proj', why),
+      'blocks without quantization_config: %', [why]);
+    CopyFile(dir + 'config.json', tmp + 'config.json', false);
+    // a block with values and an exponent beyond the exact range (expert 0,
+    // gate row 0, block 0 of layer 0)
+    content := StringFromFile(tmp + SHARD1);
+    n := TensorOffset(content, 'model.layers.0.mlp.experts.gate_up_proj_scales');
+    PByteArray(content)^[n] := 150;
+    FileFromString(content, tmp + SHARD1);
+    CheckUtf8(GptOssRefused(tmp, fCpu, 'beyond the range', why),
+      'exponent 150 with values: %', [why]);
+    PByteArray(content)^[n] := 100;
+    FileFromString(content, tmp + SHARD1);
+    CheckUtf8(GptOssRefused(tmp, fCpu, 'beyond the range', why),
+      'exponent 100 with values: %', [why]);
+    // the index is needed: without it, no model.safetensors
+    CopyFile(dir + SHARD1, tmp + SHARD1, false);
+    DeleteFile(tmp + 'model.safetensors.index.json');
+    CheckUtf8(GptOssRefused(tmp, fCpu, 'model.safetensors', why),
+      'no index, no single file: %', [why]);
+  finally
+    f.Free;
+    q.Free;
+    m.Free;
+    ref.Free;
+    if tmp <> '' then
+      DirectoryDeleteAll(tmp);
+  end;
+end;
+
+/// two digits, as the state names of the decoder
+function Pad0(i: PtrInt): RawUtf8;
+begin
+  result := UInt32ToUtf8(i);
+  if i < 10 then
+    result := '0' + result;
+end;
+
+procedure TTestInferQwen3.GptOss20b;
+const
+  GPTOSS20B = 'gpt-oss-20b';
+var
+  dir, refdir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  ctx: TDecoderContext;
+  ids, want: PIntegerArray;
+  margins, last: PSingleArray;
+  k, n, m, h, s, diff: PtrInt;
+  prompt, mine: TIntegerDynArray;
+  logits: TSingleDynArray;
+  cmp: TInferCompare;
+  margin, worst: double;
+  name: RawUtf8;
+  timer: TPrecisionTimer;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP gpt-oss-20b: 13 GB of weights need a 64-bit process');
+  exit;
+  {$endif CPU32}
+  dir := FindVendorModel(GPTOSS20B + PathDelim + 'model.safetensors.index.json');
+  if dir = '' then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/gpt-oss-20b');
+    AddConsole('SKIP gpt-oss-20b: no vendor/models/gpt-oss-20b (revision in ' +
+      'tests/data/infer-ref/gpt-oss-20b/manifest.json)');
+    exit;
+  end;
+  dir := ExtractFilePath(dir);
+  refdir := FindInferRefDir(GPTOSS20B);
+  if CheckFailed(refdir <> '', 'gpt-oss-20b reference found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  model := nil;
+  try
+    timer.Start;
+    model := NewDecoderModel(dir, fFast);
+    AddConsole(FormatString('gpt-oss-20b loaded in %', [timer.Stop]));
+    Check(model is TGptOssModel, 'a TGptOssModel');
+    Check(model.Layers[23].ExpertDown[31].DType = idtMXFP4, 'MXFP4 experts');
+    h := model.Config.Hidden;
+    for k := 0 to 3 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      SetLength(logits, model.Config.VocabSize);
+      fNames := nil;
+      fStates := nil;
+      ctx := model.NewContext;
+      try
+        timer.Start;
+        model.Forward(ctx, pointer(prompt), n, pointer(logits), false, KeepState);
+        AddConsole(FormatString('case % prefill of % tokens: %', [k, n, timer.Stop]));
+      finally
+        ctx.Free;
+      end;
+      // the last row of every state: the experts see Q8_0 activations, as in
+      // ggml. The chat case (78 tokens, Harmony tokens) loses most there:
+      // transformers itself with Q8_0 expert inputs gives logits at cosine
+      // 0.99258 / max 3.32 from float32 (measured 2026-10-20), the engine
+      // 0.99327 / 3.27; the other cases 0.99999
+      worst := 1;
+      for s := 0 to model.Config.Layers + 1 do
+      begin
+        if s = 0 then
+          name := 'embed'
+        else if s <= model.Config.Layers then
+          name := FormatUtf8('layer%', [Pad0(s - 1)])
+        else
+          name := 'norm';
+        last := ref.F32(FormatUtf8('case%.last.%', [k, name]), m);
+        if CheckFailed(State(name) <> nil, Utf8ToString('state ' + name)) then
+          continue;
+        cmp := InferCompare(@State(name)^[(n - 1) * h], last, h, 1, 1);
+        if cmp.Cosine < worst then
+          worst := cmp.Cosine;
+        CheckUtf8(cmp.Cosine >= 0.985, 'case % % cosine %', [k, name, cmp.Cosine]);
+      end;
+      cmp := InferCompare(pointer(logits), ref.F32(FormatUtf8('case%.logits_last',
+        [k]), m), model.Config.VocabSize, 1, 0);
+      want := ref.I32(FormatUtf8('case%.greedy', [k]), m);
+      margins := ref.F32(FormatUtf8('case%.greedy_margin', [k]), m);
+      ctx := model.NewContext;
+      try
+        timer.Start;
+        mine := model.Greedy(ctx, prompt, m, []);
+        AddConsole(FormatString('case % greedy of % tokens: %', [k, m, timer.Stop]));
+      finally
+        ctx.Free;
+      end;
+      diff := 0;
+      while (diff < m) and (diff < length(mine)) and (mine[diff] = want^[diff]) do
+        inc(diff);
+      margin := 0;
+      if diff < m then
+        margin := margins^[diff];
+      AddConsole(FormatString('case %: states cosine >= %, logits cos % maxabs %, ' +
+        'greedy equal for % of % tokens (reference margin there %)',
+        [k, worst, cmp.Cosine, cmp.MaxAbs, diff, m, margin]));
+      CheckUtf8(cmp.Cosine >= 0.99, 'case % logits cosine %', [k, cmp.Cosine]);
+      CheckUtf8(cmp.MaxAbs <= 4, 'case % logits max error %', [k, cmp.MaxAbs]);
+      CheckUtf8((diff >= m) or (margin < 1),
+        'case % greedy leaves the reference at step % where it was % sure',
+        [k, diff, margin]);
+    end;
+  finally
+    model.Free;
+    ref.Free;
+  end;
+end;
+
 procedure TTestInferQwen3.GptOssConfig;
 var
   dir, tmp: TFileName;
@@ -3701,7 +4048,8 @@ begin
     CheckUtf8(PosEx('chunked_attention', why) > 0, 'an unknown layer type: %', [why]);
     doc.AddOrUpdateValue('quantization_config', _JsonFast('{"quant_method":"mxfp4"}'));
     why := Refused;
-    CheckUtf8(PosEx('quantization_config', why) > 0, 'MXFP4 checkpoint: %', [why]);
+    // MXFP4 settings over BF16 experts: the blocks are missing
+    CheckUtf8(PosEx('gate_up_proj_blocks', why) > 0, 'MXFP4 without blocks: %', [why]);
     doc.B['attention_bias'] := false;
     why := Refused;
     CheckUtf8(PosEx('attention_bias', why) > 0, 'attention_bias false: %', [why]);

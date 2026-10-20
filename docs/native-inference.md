@@ -1814,6 +1814,79 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D5b erledigt (2026-10-20): MXFP4 und gpt-oss-20b auf der CPU.** Das veröffentlichte
+`openai/gpt-oss-20b` (Revision `6cee5e8…`, MXFP4-Experten, drei Teildateien) läuft auf der CPU
+und stimmt mit transformers in float32 überein; GGUF für gpt-oss folgt (D5b2), dann
+Tokenizer und Harmony (D5c) und die Geräte (D5d).
+
+- *Typ* `idtMXFP4` (`TInferBlockMxfp4` wie ggml `block_mxfp4`: ein E8M0-Exponent, 16 Bytes
+  E2M1-Nibbles, Wert j unten und j + 16 oben, 17 Bytes je 32 Werte); GGUF-Typ 39.
+  `InferRowToF32` gibt 2^(e-127) mal den E2M1-Wert, exakt; ab e = 253 kann das über Single
+  hinausgehen, dann wird die Unendlichkeit als Bits geschrieben (Delphi würde bei einem
+  Float-Überlauf auslösen).
+- *Rechnung:* ein MXFP4-Block wird zu einem Q8_0-Block - die verdoppelten E2M1-Werte
+  (0, 1, 2, 3, 4, 6, 8, 12 und negativ, wie `kvalues_mxfp4` von ggml) als int8, 2^(e-128) als
+  FP16-Skala. Das ist exakt für e 104..143 (FP16 hält 2^-24..2^15), und die vorhandenen
+  Q8_0-Kernel rechnen damit, mit Q8_0-Aktivierungen wie ggml. gpt-oss-20b nutzt e 115..136
+  (alle 597 Mio. Blöcke gezählt). Ein Block außerhalb des Bereichs muss nur Nullen halten
+  (+0 oder -0), sonst lehnen die Lader die Datei ab. Der schnelle Pfad entpackt je Kachel
+  (16 Ausgaben) wie bei Q4_0/Q5_0; dafür gibt es `InferMxfp4Unpack` (AVX2 `vpshufb`, NEON
+  `tbl`, gleich der Pascal-Routine für jedes Byte und jeden Exponenten).
+- *Teildateien:* `TSafeTensorsFile.OpenFolder` nimmt `model.safetensors`, sonst die Dateien
+  von `model.safetensors.index.json` (die Reihenfolge von transformers);
+  `CreateFromIndex` prüft jede Datei wie bisher und die `weight_map` gegen die Dateien in
+  beide Richtungen: kein Tensor fehlt, keiner ist zu viel, keiner liegt in einer anderen
+  Datei, kein Name doppelt, nur schlichte Dateinamen neben dem Index (kein Pfad, kein
+  Laufwerk, nichts Verstecktes). Eine Datei, die die Map nicht nennt, gehört nicht zum
+  Checkpoint und wird nicht geöffnet. Der Decoder öffnet seinen Ordner darüber.
+- *gpt-oss:* `quantization_config` mit `quant_method` mxfp4 wird angenommen (anderes
+  abgelehnt); die Experten kommen dann aus `gate_up_proj_blocks`/`_scales` und
+  `down_proj_blocks`/`_scales` - Zeilen sind Ausgaben, Gate und Up abwechselnd, Byte j hält
+  Wert 2j unten und 2j + 1 oben. Beim Laden in die Blockform von ggml umgepackt
+  (`TDecoderModel.OwnMxfp4`, ein Feld je Matrixart für alle Experten einer Schicht) und
+  geprüft; sie bleiben MXFP4, was `aWeights` auch verlangt (die übrigen Matrizen folgen
+  `aWeights`).
+- *Fixtures:* `mxfp4` aus ggml selbst (`quantize_row_mxfp4_ref`, `dequantize_row_mxfp4`,
+  `ggml_vec_dot_mxfp4_q8_0` des lembed-Orakels); `tiny-gpt-oss/mxfp4` - die Konfiguration von
+  `tiny-gpt-oss` mit MXFP4-Experten wie im echten Checkpoint, zwei Dateien mit Index, ein
+  Nullblock mit e 0 und ein -0-Block mit e 255; transformers liest beim Laden genau die
+  Werte, die der Generator schrieb. `gpt-oss-20b`: vier Prompts (Text, Deutsch, Code, ein
+  Chat-Turn über das Template), je Ids, Logits der letzten Position, die letzte Zeile jedes
+  Zustands und 16 Greedy-Tokens. Erzeugt auf dem RTX-Rechner (Windows, 96 GB) in einer
+  Umgebung mit denselben Pins: die Experten bleiben BF16 (die MXFP4-Werte sind dort exakt)
+  und werden je Expert erst beim Gebrauch zu float32 - so reichen rund 50 GB statt 84.
+- *Ergebnis gpt-oss-20b* (RTX-Rechner, schnelles Backend, F32 um die MXFP4-Experten): Text,
+  Deutsch und Code mit Logits bei Kosinus 0,99999 (max. 0,12), Greedy 16 von 16; der
+  Chat-Turn (78 Tokens mit Harmony-Tokens) bei 0,9933 (max. 3,27), Greedy ebenfalls 16 von
+  16. Das ist der Q8_0-Effekt, kein Fehler: transformers selbst mit Q8_0-quantisierten
+  Experten-Eingaben liegt beim Chat-Turn bei 0,99258 (max. 3,32) und bei den anderen bei
+  0,9999 (gemessen mit einem Hilfsskript, das in transformers die Experten-Eingaben wie
+  `quantize_row_q8_0` quantisiert; nicht im Repo). Laden 20 s.
+- *Tempo* (RTX-Rechner, i9, 64 Prompt-Tokens, 32 neue): F32 um die Experten Prefill 39,
+  Decode 5,3 Tokens/s; Q8_0 um die Experten Prefill 42, Decode 7,6. Gemessen je Token beim
+  Decode: die 288 MXFP4-Linears 160 ms mit dem Pascal-Entpacken, 75 ms mit dem
+  SIMD-Entpacken (darum gibt es den Kernel); die übrigen Q8_0-Matrizen samt Kopf 41 ms.
+- *Tests:* `Mxfp4LikeGgml` (Entpacken bitgleich zu ggml, auch außerhalb des exakten Bereichs;
+  die Q8_0-Blöcke genau dort exakt; Linear gegen ggml), `LinearMxfp4MatchesReference`
+  (Entpacken gegen die Definition für jedes Byte und jeden Exponenten, Kernel = Pascal,
+  exakt = Referenz bitgleich, float in Toleranz), `SafeTensorsIndex` (27 Prüfungen),
+  `GptOssMxfp4` (Expert 3 jeder Schicht wie transformers, die Nullblöcke angenommen, alle
+  Zustände, schneller Pfad, Q8_0 um MXFP4, sechs Ablehnungen), `GptOss20b` (übersprungen
+  ohne `vendor/models/gpt-oss-20b`).
+- Review: Codex fand im Index-Lader die Größengrenze erst nach dem Lesen der ganzen Datei
+  (jetzt vorher über die Dateigröße) und einen doppelten `weight_map`-Schlüssel oben
+  (mORMot nähme den ersten, Python den letzten: jetzt abgelehnt); der Claude-Finder zwei
+  Doku-Zahlen und dass der Test die Exponenten der Nullblöcke nicht prüfte (jetzt 0 und 255).
+- Grün auf dem RTX-Rechner unter FPC und Delphi 13 (je 5813 Assertions, gpt-oss-20b unter
+  Delphi 13 mit denselben Werten wie FPC) und Delphi 7 (3815; dort ohne das 20b-Modell, 32 Bit),
+  auf dem M2 Pro (4666) und unter WSL aarch64 (4647, der NEON-Kernel).
+- Gegenprobe: 28 eingebaute Fehler (Exponent 0/1, Nibble vertauscht, keine oder zu späte
+  Unendlichkeit, ein falscher E2M1-Wert, der Bereich ab 105, das Entpacken nach Q8_0 auf
+  beiden Pfaden und im AVX2-Kernel, jede Prüfung des Index, Nibble-Paare, Gate/Up-Zeilen,
+  Down-Zeilen, die Skala des Nachbarblocks, der Exponentenbereich, -0 als Wert, jede
+  Quantisierung, die Biases ...) - alle scheitern. Der Bereich ab 105 überlebte erst, weil
+  der Test die Konstante selbst nutzte; er prüft jetzt mit festen Grenzen.
+
 **D5a erledigt (2026-10-19): gpt-oss auf der CPU.** Die Rechnung von gpt-oss, gegen
 transformers 5.19 mit einem Tiny-Modell; die veröffentlichten Gewichte (MXFP4), GGUF, der
 o200k-Tokenizer, Harmony und die Geräte folgen (D5b bis D5e, [backlog.md](backlog.md)).
@@ -1826,7 +1899,7 @@ o200k-Tokenizer, Harmony und die Geräte folgen (D5b bis D5e, [backlog.md](backl
   RoPE-Angaben das YaRN von `GptOssConfig` (32 über 4096, Betas 32/1, `truncate` false);
   `null` wie in transformers: `factor` = `max_position_embeddings` / Original,
   `attention_factor` keiner, `head_dim` = Hidden / Köpfe, `num_key_value_heads` = Köpfe.
-  Abgelehnt: `quantization_config` (kommt mit D5b), `attention_bias` false, gebundene
+  Abgelehnt (in D5a): `quantization_config` (seit D5b: MXFP4), `attention_bias` false, gebundene
   Embeddings, ein anderer `rope_type`, ein RoPE-Schlüssel, den wir nicht lesen (`mscale`
   ...), ein `factor` von 0 oder darunter.
 - *Experten im Layout von transformers 5:* `gate_up_proj` ist `[Experten, Hidden, 2 *

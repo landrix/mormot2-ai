@@ -39,6 +39,9 @@ type
     procedure SafeTensorsReadsFixture;
     /// damaged headers and ranges are refused before any read
     procedure SafeTensorsRefusesDamage;
+    /// a checkpoint in several files with model.safetensors.index.json: one
+    // view over all of them, every mismatch between map and files refused
+    procedure SafeTensorsIndex;
     /// erf/erfc at known values, odd symmetry, no cancellation in the tail
     procedure ErfIsAccurate;
     /// Linear, LayerNorm, Gelu, SoftmaxMasked, L2Normalize vs the ops fixtures
@@ -364,6 +367,130 @@ const
     (x: 4.5; erf: 0.9999999998033839558457; erfc: 1.966160441542887476279e-10),
     (x: 6; erf: 0.9999999999999999784803; erfc: 2.151973671249891311659e-17),
     (x: 10; erf: 1.0; erfc: 2.088487583762544757001e-45));
+
+/// true if CreateFromIndex refuses aDir + 'model.safetensors.index.json' with
+// an EInferError naming aReason, after writing aIndex there
+function IndexRefused(const aDir: TFileName; const aIndex, aReason: RawUtf8): boolean;
+var
+  f: TSafeTensorsFile;
+begin
+  result := false;
+  FileFromString(aIndex, aDir + 'model.safetensors.index.json');
+  try
+    f := TSafeTensorsFile.CreateFromIndex(aDir + 'model.safetensors.index.json');
+    f.Free;
+  except
+    on E: Exception do
+      result := (E is EInferError) and
+        (PosEx(aReason, StringToUtf8(E.Message)) > 0);
+  end;
+end;
+
+procedure TTestInferEngine.SafeTensorsIndex;
+const
+  X: RawUtf8 = '{"x":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]}}';
+  Y: RawUtf8 = '{"y":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}';
+  Z: RawUtf8 = '{"z":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}';
+  GOOD: RawUtf8 = '{"metadata":{"total_size":28},"weight_map":' +
+    '{"x":"a.safetensors","y":"b.safetensors"}}';
+var
+  dir: TFileName;
+  f: TSafeTensorsFile;
+begin
+  dir := MakePath([GetSystemPath(spTemp), 'lai-index-' +
+    Int64ToUtf8(GetTickCount64)], true);
+  ForceDirectories(dir);
+  try
+    FileFromString(SafeTensors(X, Floats(6)), dir + 'a.safetensors');
+    FileFromString(SafeTensors(Y, Floats(1)), dir + 'b.safetensors');
+    FileFromString(GOOD, dir + 'model.safetensors.index.json');
+    // the index alone: both files as one, each tensor at its own data
+    f := TSafeTensorsFile.OpenFolder(dir);
+    try
+      CheckEqual(length(f.Tensors), 2, 'tensors of both files');
+      CheckUtf8(f.F32('x', [2, 3])^[5] = 6, 'x from a.safetensors');
+      CheckUtf8(f.F32('y', [1])^[0] = 1, 'y from b.safetensors');
+      Check(f.Find('z') = nil, 'no other tensor');
+      CheckEqual(f.Metadata^.Count, 0, 'no metadata of the index');
+    finally
+      f.Free;
+    end;
+    // a model.safetensors beside the index wins, as in transformers
+    FileFromString(SafeTensors(Z, Floats(2)), dir + 'model.safetensors');
+    f := TSafeTensorsFile.OpenFolder(dir);
+    try
+      Check((length(f.Tensors) = 1) and (f.Find('z') <> nil),
+        'model.safetensors before the index');
+    finally
+      f.Free;
+    end;
+    DeleteFile(dir + 'model.safetensors');
+    // the map
+    Check(IndexRefused(dir, '{"metadata":{}}', 'weight_map'), 'no weight_map');
+    Check(IndexRefused(dir, '{"weight_map":[1]}', 'weight_map'), 'weight_map an array');
+    Check(IndexRefused(dir, '[1]', 'no JSON object'), 'no object');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"a.safetensors","y":"b.safetensors"},' +
+      '"weight_map":{"x":"b.safetensors","y":"b.safetensors"}}', 'twice'),
+      'weight_map twice: mORMot and Python would take different ones');
+    Check(IndexRefused(dir, '{"weight_map":{}}', 'no tensor'), 'empty map');
+    Check(IndexRefused(dir,
+      '{"weight_map":{"x":"a.safetensors","y":"b.safetensors","x":"a.safetensors"}}',
+      'twice'), 'a tensor mapped twice');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"a.safetensors","y":1}}',
+      'no string'), 'a file that is no string');
+    // files beside the index only
+    Check(IndexRefused(dir, '{"weight_map":{"x":"../a.safetensors",' +
+      '"y":"b.safetensors"}}', 'no file name'), 'a relative path');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"sub/a.safetensors",' +
+      '"y":"b.safetensors"}}', 'no file name'), 'a folder');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"sub\\a.safetensors",' +
+      '"y":"b.safetensors"}}', 'no file name'), 'a Windows folder');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"c:a.safetensors",' +
+      '"y":"b.safetensors"}}', 'no file name'), 'a drive');
+    Check(IndexRefused(dir, '{"weight_map":{"x":".a.safetensors",' +
+      '"y":"b.safetensors"}}', 'no file name'), 'a hidden name');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"","y":"b.safetensors"}}',
+      'no file name'), 'an empty name');
+    // the map against the files
+    // a file the map does not name is no part of the checkpoint (as in
+    // transformers): never opened
+    FileFromString('{"weight_map":{"x":"a.safetensors"}}',
+      dir + 'model.safetensors.index.json');
+    f := TSafeTensorsFile.OpenFolder(dir);
+    try
+      Check((length(f.Tensors) = 1) and (f.Find('y') = nil),
+        'b.safetensors left out of the map');
+    finally
+      f.Free;
+    end;
+    Check(IndexRefused(dir, '{"weight_map":{"x":"a.safetensors",' +
+      '"y":"b.safetensors","w":"b.safetensors"}}', 'where the index places it'),
+      'a tensor the files lack');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"b.safetensors",' +
+      '"y":"b.safetensors"}}', 'where the index places it'),
+      'x mapped to the other file');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"a.safetensors",' +
+      '"y":"a.safetensors"}}', 'where the index places it'),
+      'y mapped to the other file');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"a.safetensors",' +
+      '"y":"b.safetensors","v":"c.safetensors"}}', 'missing'), 'a missing file');
+    // a tensor in two files: the map names one of them
+    FileFromString(SafeTensors(X, Floats(6)), dir + 'c.safetensors');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"a.safetensors",' +
+      '"y":"b.safetensors","v":"c.safetensors"}}', 'the index says'),
+      'x in two files');
+    // a tensor of a named file that the map does not name
+    FileFromString(SafeTensors(Z, Floats(2)), dir + 'c.safetensors');
+    Check(IndexRefused(dir, '{"weight_map":{"x":"a.safetensors",' +
+      '"y":"b.safetensors","v":"c.safetensors"}}', 'not in the index'),
+      'a tensor the map does not name');
+    // a damaged file: the validation of TSafeTensorsFile.Create
+    FileFromString(SafeTensors(Y, ''), dir + 'b.safetensors');
+    Check(IndexRefused(dir, GOOD, 'exceeds the file'), 'a damaged file');
+  finally
+    DirectoryDeleteAll(dir);
+  end;
+end;
 
 procedure TTestInferEngine.ErfIsAccurate;
 var

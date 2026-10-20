@@ -19,8 +19,14 @@
 //   2 * width] with the gate and up columns interleaved (gate even, up odd),
 //   down_proj [experts, width, hidden] - both transposed against nn.Linear:
 //   reordered into one matrix per expert at load
-// - not yet (backlog D5): the MXFP4 experts of the published checkpoints
-//   (quantization_config), GGUF, a device (Vulkan, CUDA)
+// - the MXFP4 experts of the published checkpoints (quantization_config
+//   mxfp4): gate_up_proj_blocks [experts, 2 * width, hidden / 32, 16] and
+//   gate_up_proj_scales [experts, 2 * width, hidden / 32] - rows are outputs,
+//   gate and up rows interleaved, byte j of a block holds value 2j in its low
+//   and 2j + 1 in its high nibble, the scale an E8M0 exponent; down_proj the
+//   same over [experts, hidden, width / 32]. Repacked at load into ggml's
+//   block layout (TInferBlockMxfp4), never widened
+// - not yet (backlog D5): GGUF, a device (Vulkan, CUDA)
 unit mormot.ai.infer.model.gptoss;
 
 {
@@ -52,17 +58,23 @@ uses
 
 type
   /// a gpt-oss causal language model (e.g. gpt-oss-20b) over a safetensors
-  // folder with its weights in BF16 or F32
+  // folder (one file or several with an index) with its weights in BF16 or
+  // F32, the experts also in MXFP4
   // - config.json (model_type gpt_oss): head_dim, num_local_experts,
   // num_experts_per_tok, intermediate_size (the width of an expert),
   // sliding_window and layer_types, rope_parameters (transformers 5) or
   // rope_scaling and rope_theta (transformers 4) of rope_type yarn,
   // swiglu_limit and swiglu_alpha (default 7 and 1.702)
-  // - refused: attention_bias false, tied embeddings, a quantization_config
-  // (the MXFP4 checkpoints come with backlog D5), another rope_type
+  // - a quantization_config must be quant_method mxfp4: the experts are then
+  // read from their *_blocks and *_scales and stay MXFP4 whatever aWeights
+  // asks for (the other matrices follow aWeights); a block whose exponent is
+  // outside INFER_MXFP4_EXACT_MIN..MAX must hold only zeros
+  // - refused: attention_bias false, tied embeddings, another quantization,
+  // another rope_type
   // - the router stays F32 when the matrices are quantized at load
   TGptOssModel = class(TDecoderModel)
   protected
+    fMxfp4: boolean; // quantization_config mxfp4: the experts as blocks
     procedure LoadConfig(const aConfigFile: TFileName); override;
     procedure LoadGgufConfig; override;
     procedure LoadWeights; override;
@@ -71,6 +83,14 @@ type
     procedure LoadRope(const aDoc: TDocVariantData);
     /// the experts of layer aLayer from the transformers 5 tensors
     procedure LoadExperts(aLayer: PtrInt; const aPrefix: RawUtf8);
+    /// the gate and up biases of layer aLayer: the even and odd columns of
+    // gate_up_proj_bias, and down_proj_bias
+    procedure LoadExpertBiases(aLayer: PtrInt; const aPrefix: RawUtf8);
+    /// the MXFP4 experts of layer aLayer: the gate, up and down matrices of
+    // every expert repacked from the *_blocks and *_scales tensors
+    procedure LoadMxfp4Experts(aLayer: PtrInt; const aPrefix: RawUtf8);
+    /// a U8 tensor shaped aDims (MXFP4 blocks and scales)
+    function ByteTensor(const aName: RawUtf8; const aDims: array of Int64): PByteArray;
   public
     /// 'gpt_oss'
     class function ModelType: RawUtf8; override;
@@ -191,7 +211,7 @@ end;
 procedure TGptOssModel.LoadConfig(const aConfigFile: TFileName);
 var
   doc: TDocVariantData;
-  d, types: PDocVariantData;
+  d, types, q: PDocVariantData;
   i: PtrInt;
   w: Int64;
   t: RawUtf8;
@@ -200,9 +220,14 @@ begin
   for i := 0 to high(REQUIRED_KEYS) do
     if d^.GetValueIndex(REQUIRED_KEYS[i]) < 0 then
       EInferError.RaiseUtf8('%: % has no "%"', [self, aConfigFile, REQUIRED_KEYS[i]]);
-  if d^.GetValueIndex('quantization_config') >= 0 then
-    EInferError.RaiseUtf8('%: a quantization_config (MXFP4) not supported yet',
-      [self]);
+  // MXFP4 experts: transformers takes quant_method mxfp4 alone (no settings)
+  fMxfp4 := d^.GetValueIndex('quantization_config') >= 0;
+  if fMxfp4 then
+    if not d^.GetAsObject('quantization_config', q) then
+      EInferError.RaiseUtf8('%: quantization_config is no object', [self])
+    else if q^.U['quant_method'] <> 'mxfp4' then
+      EInferError.RaiseUtf8('%: quantization "%" not supported',
+        [self, q^.U['quant_method']]);
   // GptOssConfig defaults: attention_bias true, untied head
   if (d^.GetValueIndex('attention_bias') >= 0) and not d^.B['attention_bias'] then
     EInferError.RaiseUtf8('%: attention_bias false not supported', [self]);
@@ -292,26 +317,21 @@ begin
   result := '';
 end;
 
-procedure TGptOssModel.LoadExperts(aLayer: PtrInt; const aPrefix: RawUtf8);
+procedure TGptOssModel.LoadExpertBiases(aLayer: PtrInt; const aPrefix: RawUtf8);
 var
   l: ^TDecoderLayer;
-  h, fi, n, e, i, o: PtrInt;
-  gu, down, gub: PInferTensor;
-  row, gate, up, dn, gb, ub: TSingleDynArray;
+  fi, n, e, o: PtrInt;
+  gub: PInferTensor;
+  row, gb, ub: TSingleDynArray;
   b: RawUtf8;
 begin
   l := @fLayer[aLayer];
-  h := fConfig.Hidden;
   fi := fConfig.ExpertIntermediate;
   n := fConfig.Experts;
   b := aPrefix + 'mlp.experts.';
-  gu := Checked(b + 'gate_up_proj', [n, h, 2 * fi]);
-  down := Checked(b + 'down_proj', [n, fi, h]);
   gub := Checked(b + 'gate_up_proj_bias', [n, 2 * fi]);
-  l^.ExpertDownBias := Weight(b + 'down_proj_bias', [n, h]);
-  // the gate and up biases: even and odd columns of gate_up_proj_bias; row
-  // holds a row of gate_up_proj (2 * width) or of down_proj (hidden)
-  SetLength(row, MaxPtrInt(2 * fi, h));
+  l^.ExpertDownBias := Weight(b + 'down_proj_bias', [n, fConfig.Hidden]);
+  SetLength(row, 2 * fi);
   SetLength(gb, n * fi);
   SetLength(ub, n * fi);
   for e := 0 to n - 1 do
@@ -325,6 +345,146 @@ begin
   end;
   l^.ExpertGateBias := Own(gb);
   l^.ExpertUpBias := Own(ub);
+end;
+
+function TGptOssModel.ByteTensor(const aName: RawUtf8;
+  const aDims: array of Int64): PByteArray;
+var
+  t: PInferTensor;
+  want: TInt64DynArray;
+  i: PtrInt;
+begin
+  t := Find(aName);
+  if t = nil then
+    EInferError.RaiseUtf8('%: no tensor %', [self, aName]);
+  if t^.DType <> idtU8 then
+    EInferError.RaiseUtf8('%: % is %, expected U8',
+      [self, aName, INFER_DTYPE_NAME[t^.DType]]);
+  if not InferShapeIs(t^, aDims) then
+  begin
+    SetLength(want, length(aDims));
+    for i := 0 to high(aDims) do
+      want[i] := aDims[i];
+    EInferError.RaiseUtf8('%: % is shaped %, expected %',
+      [self, aName, InferShapeText(t^.Shape), InferShapeText(want)]);
+  end;
+  result := t^.Data;
+end;
+
+/// block aBlock of aRows rows of aBlocks MXFP4 blocks: from the checkpoint
+// layout (scale apart, value 2j low and 2j + 1 high nibble of byte j) into
+// ggml's (value j low and j + 16 high nibble of byte j) - false for a block
+// whose exponent is outside the exact range and that holds a value
+function RepackMxfp4(aSrc, aScales: PByteArray; aBlock: PtrInt;
+  aDst: PInferBlockMxfp4): boolean;
+var
+  j: PtrInt;
+  v: array[0..31] of byte;
+  s: PByteArray;
+begin
+  s := @aSrc^[aBlock * 16];
+  for j := 0 to 15 do
+  begin
+    v[2 * j] := s^[j] and 15;
+    v[2 * j + 1] := s^[j] shr 4;
+  end;
+  aDst^.e := aScales^[aBlock];
+  for j := 0 to 15 do
+    aDst^.qs[j] := v[j] or (v[j + 16] shl 4);
+  result := true;
+  if (aDst^.e < INFER_MXFP4_EXACT_MIN) or (aDst^.e > INFER_MXFP4_EXACT_MAX) then
+    // +0 and -0 are the nibbles 0 and 8
+    for j := 0 to 15 do
+      if aDst^.qs[j] and $77 <> 0 then
+        result := false;
+end;
+
+procedure TGptOssModel.LoadMxfp4Experts(aLayer: PtrInt; const aPrefix: RawUtf8);
+var
+  l: ^TDecoderLayer;
+  h, fi, n, e, r, k, hb, fb: PtrInt;
+  gub, gus, db, ds: PByteArray;
+  gate, up, down: PInferBlockMxfp4Array;
+  b: RawUtf8;
+
+  procedure Repack(aSrc, aScales: PByteArray; aSrcRow, aBlocks: PtrInt;
+    aDst: PInferBlockMxfp4Array; aDstRow: PtrInt; const aName: RawUtf8);
+  var
+    c: PtrInt;
+  begin
+    for c := 0 to aBlocks - 1 do
+      if not RepackMxfp4(aSrc, aScales, aSrcRow * aBlocks + c,
+               @aDst^[aDstRow * aBlocks + c]) then
+        EInferError.RaiseUtf8('%: % has the MXFP4 exponent % in row % block %, ' +
+          'beyond the range computed exactly',
+          [self, aName, aScales^[aSrcRow * aBlocks + c], aSrcRow, c]);
+  end;
+
+begin
+  l := @fLayer[aLayer];
+  h := fConfig.Hidden;
+  fi := fConfig.ExpertIntermediate;
+  n := fConfig.Experts;
+  if (h and 31 <> 0) or (fi and 31 <> 0) then
+    EInferError.RaiseUtf8('%: MXFP4 experts need widths that are multiples of 32',
+      [self]);
+  if not fBackend.Supports(ioLinear, idtMXFP4) then
+    EInferError.RaiseUtf8('%: the backend has no MXFP4 Linear', [self]);
+  hb := h shr 5;
+  fb := fi shr 5;
+  b := aPrefix + 'mlp.experts.';
+  gub := ByteTensor(b + 'gate_up_proj_blocks', [n, 2 * fi, hb, 16]);
+  gus := ByteTensor(b + 'gate_up_proj_scales', [n, 2 * fi, hb]);
+  db := ByteTensor(b + 'down_proj_blocks', [n, h, fb, 16]);
+  ds := ByteTensor(b + 'down_proj_scales', [n, h, fb]);
+  // one owned array per matrix kind for all experts, one view per expert
+  gate := OwnMxfp4(n * fi * hb);
+  up := OwnMxfp4(n * fi * hb);
+  down := OwnMxfp4(n * h * fb);
+  SetLength(l^.ExpertGate, n);
+  SetLength(l^.ExpertUp, n);
+  SetLength(l^.ExpertDown, n);
+  for e := 0 to n - 1 do
+  begin
+    // gate: the even rows of gate_up_proj, up: the odd ones
+    for r := 0 to fi - 1 do
+    begin
+      k := e * fi + r;
+      Repack(gub, gus, e * 2 * fi + 2 * r, hb, gate, k, b + 'gate_up_proj');
+      Repack(gub, gus, e * 2 * fi + 2 * r + 1, hb, up, k, b + 'gate_up_proj');
+    end;
+    for r := 0 to h - 1 do
+      Repack(db, ds, e * h + r, fb, down, e * h + r, b + 'down_proj');
+    l^.ExpertGate[e] := InferWeight(@gate^[e * fi * hb], idtMXFP4);
+    l^.ExpertUp[e] := InferWeight(@up^[e * fi * hb], idtMXFP4);
+    l^.ExpertDown[e] := InferWeight(@down^[e * h * fb], idtMXFP4);
+  end;
+  LoadExpertBiases(aLayer, aPrefix);
+end;
+
+procedure TGptOssModel.LoadExperts(aLayer: PtrInt; const aPrefix: RawUtf8);
+var
+  l: ^TDecoderLayer;
+  h, fi, n, e, i, o: PtrInt;
+  gu, down: PInferTensor;
+  row, gate, up, dn: TSingleDynArray;
+  b: RawUtf8;
+begin
+  if fMxfp4 then
+  begin
+    LoadMxfp4Experts(aLayer, aPrefix);
+    exit;
+  end;
+  l := @fLayer[aLayer];
+  h := fConfig.Hidden;
+  fi := fConfig.ExpertIntermediate;
+  n := fConfig.Experts;
+  b := aPrefix + 'mlp.experts.';
+  gu := Checked(b + 'gate_up_proj', [n, h, 2 * fi]);
+  down := Checked(b + 'down_proj', [n, fi, h]);
+  LoadExpertBiases(aLayer, aPrefix);
+  // row holds a row of gate_up_proj (2 * width) or of down_proj (hidden)
+  SetLength(row, MaxPtrInt(2 * fi, h));
   // one nn.Linear matrix per expert: gate and up [width, hidden] from the
   // rows of gate_up_proj (one per input), down [hidden, width] from those of
   // down_proj - transposed while read
@@ -405,7 +565,8 @@ begin
     l^.Router := Matrix(p + 'mlp.router.weight', fConfig.Experts, h, idtF32);
     l^.RouterBias := Weight(p + 'mlp.router.bias', [fConfig.Experts]);
     LoadExperts(i, p);
-    inc(used, 17);
+    // MXFP4: blocks and scales in place of each expert matrix
+    inc(used, 17 + 2 * ord(fMxfp4));
   end;
   // an unknown tensor means a model we do not understand
   if used <> TensorCount then

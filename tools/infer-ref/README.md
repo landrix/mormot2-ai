@@ -23,9 +23,10 @@ VIRTUAL_ENV=~/.venvs/lai-infer-ref uv pip install -r tools/infer-ref/requirement
 
 Targets: `ops`, `tiny`, `bge-m3` (model, cases, corpus vectors), `tokens` (tokenizer gate),
 plus for phase 1b `q8`, `tiny-gguf` and `lembed-tokens`, for phase 3e `q4` (Q4_0 from
-ggml itself: `quantize_row_q4_0_ref`, `dequantize_row_q4_0`, `ggml_vec_dot_q4_0_q8_0`)
-and for backlog B16 `q5` (Q5_0: `quantize_row_q5_0_ref`, `dequantize_row_q5_0`,
-`ggml_vec_dot_q5_0_q8_0`).
+ggml itself: `quantize_row_q4_0_ref`, `dequantize_row_q4_0`, `ggml_vec_dot_q4_0_q8_0`),
+for backlog B16 `q5` (Q5_0: `quantize_row_q5_0_ref`, `dequantize_row_q5_0`,
+`ggml_vec_dot_q5_0_q8_0`) and for backlog D5b `mxfp4` (MXFP4: `quantize_row_mxfp4_ref`,
+`dequantize_row_mxfp4`, `ggml_vec_dot_mxfp4_q8_0`).
 With `bge-m3` or `tokens` the script loads BAAI/bge-m3 in the fixed revision
 `5617a9f61b028005a4858fdac845db406aefb181` (about 2.3 GB into the Hugging Face cache).
 
@@ -39,7 +40,7 @@ GGUF `vendor/models/bge-m3-q8_0.gguf` (redirectable with `LAI_GGUF`); the script
 if its SHA-256 is not the one of reference contract v1. Invocation:
 
 ```bash
-LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 q4 tiny-gguf lembed-tokens
+LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 q4 q5 mxfp4 tiny-gguf lembed-tokens
 ```
 
 ## Sliding window and NoPE (phase D, D4)
@@ -69,8 +70,29 @@ positions 0..63 (`rope.*`), and those of two YaRN variants (`rope_t`: `truncate`
 `tiny-gpt-oss-narrow` writes `tiny-gpt-oss/narrow/`: experts of width 16 for a hidden width
 of 64.
 
+`tiny-gpt-oss-mxfp4` writes `tiny-gpt-oss/mxfp4/`: the same configuration with its own seed,
+the experts quantized to MXFP4 and stored the way `openai/gpt-oss-20b` stores them
+(`quantization_config` mxfp4, `*_blocks` and `*_scales`), split into two files with a
+`model.safetensors.index.json`. Layer 0 gets a zero block with the exponent 0 and a block of
+-0 values with the exponent 255. transformers loads the folder dequantized (exact in float32,
+`Mxfp4Config(dequantize=True)`: what it does on a CPU anyway, without asking for
+accelerate); the script checks that it reads the same values it wrote.
+
 ```bash
-~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d5.py
+~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference_d5.py          # the tiny ones
+```
+
+`gpt-oss-20b` runs only when named. It reads `openai/gpt-oss-20b` in the revision
+`6cee5e81ee83917806bbde320786a8fb61efebee` from `$LAI_GPTOSS_DIR` (by default
+`vendor/models/gpt-oss-20b`; the script downloads nothing and checks the pinned hashes).
+The experts stay in BF16 (the MXFP4 values are exact there) and are taken to float32 one
+expert at a time as transformers uses them; everything else computes in float32. That needs
+about 50 GB of RAM - more than the WSL reference has - so this dataset is generated on the
+RTX computer (Windows x86_64, 96 GB) in an environment with the same pins
+(`requirements.txt`, uv 0.11.18, Python 3.12.13, torch 2.14.1+cpu):
+
+```bash
+LAI_GPTOSS_DIR=/path/to/gpt-oss-20b python tools/infer-ref/make_reference_d5.py gpt-oss-20b
 ```
 
 ## Decoder stacks (backlog B14)

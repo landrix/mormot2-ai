@@ -732,6 +732,7 @@ GGUF_Q8_SHA256 = "aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a1
 Q8_BLOCK = 34  # bytes of one Q8_0 block: FP16 scale + 32 int8
 Q4_BLOCK = 18  # bytes of one Q4_0 block: FP16 scale + 32 nibbles
 Q5_BLOCK = 22  # bytes of one Q5_0 block: FP16 scale, 32 fifth bits, 32 nibbles
+MX_BLOCK = 17  # bytes of one MXFP4 block: E8M0 exponent + 32 nibbles
 Q4K_BLOCK = 144  # one Q4_K super-block of 256: d, dmin, 12 bytes scales, 128 nibbles
 Q6K_BLOCK = 210  # one Q6_K super-block of 256: 128 + 64 bytes quants, 16 scales, d
 Q8K_BLOCK = 292  # one Q8_K block of 256: float d, 256 int8, 16 int16 block sums
@@ -774,6 +775,12 @@ class Ggml:
         self.base.dequantize_row_q5_0.restype = None
         self.cpu.ggml_vec_dot_q5_0_q8_0.argtypes = self.cpu.ggml_vec_dot_q8_0_q8_0.argtypes
         self.cpu.ggml_vec_dot_q5_0_q8_0.restype = None
+        self.base.quantize_row_mxfp4_ref.argtypes = [fp, vp, i64]
+        self.base.quantize_row_mxfp4_ref.restype = None
+        self.base.dequantize_row_mxfp4.argtypes = [vp, fp, i64]
+        self.base.dequantize_row_mxfp4.restype = None
+        self.cpu.ggml_vec_dot_mxfp4_q8_0.argtypes = self.cpu.ggml_vec_dot_q8_0_q8_0.argtypes
+        self.cpu.ggml_vec_dot_mxfp4_q8_0.restype = None
         for name in ["quantize_row_q4_K_ref", "quantize_row_q6_K_ref"]:
             getattr(self.base, name).argtypes = [fp, vp, i64]
             getattr(self.base, name).restype = None
@@ -832,6 +839,20 @@ class Ggml:
     def dot_q5(self, n, w, x):
         s = self.ct.c_float()
         self.cpu.ggml_vec_dot_q5_0_q8_0(n, self.ct.byref(s), 0, w, 0, x, 0, 1)
+        return s.value
+
+    def quant_mx(self, x):
+        """weights, as a GGUF writer quantizes them to MXFP4"""
+        return self._quant(self.base.quantize_row_mxfp4_ref, x, MX_BLOCK)
+
+    def dequant_mx(self, raw, n):
+        y = np.zeros(n, dtype=np.float32)
+        self.base.dequantize_row_mxfp4(raw, y.ctypes.data_as(self.ct.POINTER(self.ct.c_float)), n)
+        return y
+
+    def dot_mx(self, n, w, x):
+        s = self.ct.c_float()
+        self.cpu.ggml_vec_dot_mxfp4_q8_0(n, self.ct.byref(s), 0, w, 0, x, 0, 1)
         return s.value
 
     def kquant(self, kind, x):
@@ -1040,6 +1061,67 @@ def q5():
              "ggml_vec_dot_q5_0_q8_0 (float sums) + bias in float64")
     blob.write(os.path.join(OUT, "q5"), {
         "dataset": "q5", "environment": environment(),
+        "ggml": {"dir": os.path.relpath(GGML_DIR, ROOT), "sha256": g.libs,
+                 "note": "the ggml build of the lembed oracle"}})
+
+
+def mxfp4():
+    """MXFP4 fixtures from ggml itself (backlog D5b): weights from the reference
+    quantizer of a GGUF writer, their dequantization, and the MXFP4 x Q8_0 dot
+    product of ggml-cpu; the blocks of x rows 6 and 7 carry exponents outside
+    the range the engine computes exactly (its loaders refuse them)"""
+    print("mxfp4")
+    g = Ggml()
+    rng = np.random.default_rng(TINY_SEED + 8)
+    f32 = lambda a: np.asarray(a, dtype=np.float32)
+    blob = Blob()
+    x = f32(rng.standard_normal((8, 96)))
+    # every E2M1 value and its negative at a scale of 1: max 6 gives e = 127
+    vals = [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+    x[0, :32] = vals + [-v for v in vals] + vals[::-1] + [-v for v in vals[::-1]]
+    x[0, 32:64] = np.linspace(-6, 6, 32)  # between the values: rounding
+    x[1, :32] = 0                  # a zero block
+    x[2] *= 1e-3
+    x[3] *= 1e3
+    x[4, 32:64] = 5.0              # one value repeated
+    x[5, 64:96] = -np.abs(x[5, 64:96])  # every value below zero
+    x[6] *= 1e-9                   # exponents below the exact range
+    x[7] *= 1e7                    # and above it
+    wq = b"".join(g.quant_mx(r) for r in x)
+    blob.add("quant/x", x)
+    blob.add("quant/blocks", np.frombuffer(wq, dtype=np.uint8).reshape(8, 3 * MX_BLOCK),
+             "quantize_row_mxfp4_ref per row")
+    blob.add("dequant/y", np.stack([g.dequant_mx(g.quant_mx(r), 96) for r in x]),
+             "dequantize_row_mxfp4 of those blocks")
+    exps = np.frombuffer(wq, dtype=np.uint8).reshape(-1, MX_BLOCK)[:, 0].copy()
+    if exps[3] != 0:
+        raise ValueError(f"the zero block has the exponent {exps[3]}")
+    exps[3] = 127  # a zero block: any exponent, ggml writes 0
+    if exps[:18].min() < 104 or exps[:18].max() > 143:
+        raise ValueError(f"rows 0..5 leave the exact range: {exps[:18]}")
+    if exps[18:21].max() >= 104 or exps[21:24].min() <= 143:
+        raise ValueError(f"rows 6 and 7 stay in the exact range: {exps[18:]}")
+    # MXFP4 linear: weights from the reference quantizer, activations
+    # quantized by ggml-cpu - inputs of 2880 as gpt-oss-20b, no multiple of 256
+    n_in, n_out = 2880, 6
+    xs = f32(rng.standard_normal((3, n_in)))
+    w = f32(rng.standard_normal((n_out, n_in)) * 0.05)
+    b = f32(rng.standard_normal(n_out))
+    wq = b"".join(g.quant_mx(r) for r in w)
+    rb = n_in // 32 * MX_BLOCK
+    y = np.zeros((3, n_out), dtype=np.float64)
+    for r in range(3):
+        xq = g.quant(xs[r])
+        for o in range(n_out):
+            y[r, o] = g.dot_mx(n_in, wq[o * rb:(o + 1) * rb], xq)
+    blob.add("linear/x", xs)
+    blob.add("linear/weight", np.frombuffer(wq, dtype=np.uint8).reshape(n_out, -1),
+             "[out, in/32 blocks] MXFP4")
+    blob.add("linear/bias", b)
+    blob.add("linear/y", y + b.astype(np.float64),
+             "ggml_vec_dot_mxfp4_q8_0 (float sums) + bias in float64")
+    blob.write(os.path.join(OUT, "mxfp4"), {
+        "dataset": "mxfp4", "environment": environment(),
         "ggml": {"dir": os.path.relpath(GGML_DIR, ROOT), "sha256": g.libs,
                  "note": "the ggml build of the lembed oracle"}})
 
@@ -1382,7 +1464,7 @@ def lembed_tokens():
 def main():
     setup_determinism()
     what = set(sys.argv[1:]) or {"ops", "tiny", "bge-m3", "tokens", "q8", "q4", "q5",
-                                 "qk", "tiny-gguf", "lembed-tokens"}
+                                 "mxfp4", "qk", "tiny-gguf", "lembed-tokens"}
     if "ops" in what:
         ops()
     if "tiny" in what:
@@ -1399,6 +1481,8 @@ def main():
         q4()
     if "q5" in what:
         q5()
+    if "mxfp4" in what:
+        mxfp4()
     if "qk" in what:
         qk()
     if "tiny-gguf" in what:

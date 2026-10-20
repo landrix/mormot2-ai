@@ -329,14 +329,17 @@ In Scheiben:
 - *D5a erledigt 2026-10-19* (`native-inference.md`, Phase D): die Rechnung auf der CPU -
   Sinks, YaRN, alle Biases, die begrenzte SwiGLU, die Experten im Layout von transformers 5;
   `tiny-gpt-oss` gegen transformers. Die Geräte lehnen gpt-oss ab (`TDecoderModel.Extras`).
-- *D5b:* MXFP4 - der Typ (Blöcke wie ggml `block_mxfp4`: ein E8M0-Exponent, 16 Bytes
-  Nibbles, untere Hälfte die Werte 0..15), Linear Referenz und schnell (NEON/AVX2 wie ggml:
-  Aktivierungen Q8_0, int8-Tabelle der FP4-Werte mal 2, Skala 2^(e-128)); die
-  `*_blocks`/`*_scales` der veröffentlichten safetensors (Zeilen schon Ausgaben, Gate und Up
-  abwechselnd, Nibbles paarweise statt halbiert: beim Laden umgepackt), safetensors in
-  Teildateien mit `model.safetensors.index.json`; GGUF `gpt-oss` (llama.cpp, Gate und Up
-  schon getrennt, `attn_sinks`, Biases als `*.bias`). Dann gpt-oss-20b (Revision `6cee5e8…`)
-  auf der CPU des RTX-Rechners gegen transformers.
+- *D5b erledigt 2026-10-20* (`native-inference.md`, Phase D): MXFP4 (`idtMXFP4`, Blöcke wie
+  ggml `block_mxfp4`) auf der CPU - als Q8_0-Blöcke entpackt (die verdoppelten E2M1-Werte,
+  2^(e-128) als FP16-Skala: exakt für e 104..143, gpt-oss-20b nutzt 115..136), also über
+  die vorhandenen Q8_0-Kernel; die `*_blocks`/`*_scales` der veröffentlichten safetensors
+  beim Laden umgepackt; safetensors in Teildateien mit `model.safetensors.index.json`;
+  gpt-oss-20b auf der CPU des RTX-Rechners gegen transformers.
+- *D5b2:* GGUF `gpt-oss` (llama.cpp: Gate und Up schon getrennt, `attn_sinks`, Biases als
+  `*.bias`, MXFP4 in place), mit einer Tiny-GGUF und `ggml-org/gpt-oss-20b-GGUF`; die
+  Skalenprüfung der MXFP4-Blöcke einer GGUF-Datei (`CheckScales`) bekommt dort ihren Test.
+  Ein fusionierter MXFP4-Kernel (Skalarprodukt ohne den Umweg über Q8_0-Blöcke) nur, wenn
+  eine Messung das Entpacken danach noch als Bremse zeigt.
 - *D5c:* o200k-Tokenizer (`tokenizer.json`, eigener Pre-Tokenizer-Ausdruck) und das
   Harmony-Chatformat mit Parser (Kanäle `analysis`/`commentary`/`final`, Tool-Aufrufe),
   `RegisterNativeFamily`.
@@ -801,7 +804,7 @@ beim Decode 2-3 % bei 200 Tokens Kontext, 6-8 % bei 4000, 16-32 % bei 16000; `Kv
 `ForwardEmbeds` sagen jetzt, wann man es abschaltet (zurückgespeiste floats wie beim Talker).
 Zu 5: `TInferThreadPool.RunWorkers` mit Worker-Index für Puffer je Thread; das Allokieren im
 Job kostet nur unter Delphi (32 Threads: 67 gegen 12 ms), FPCs Heap arbeitet je Thread.
-*Offen:* die Rückmeldung an flydev (Forum).
+*Rückmeldung an flydev* im Forum gegeben (2026-10-20): sein Submodul-Stand `5b30ded` liegt vor B14, mit dem Hinweis auf die neuen Einstiege.
 
 ## B15 — Schneller Einstieg: Gewichtsvorgabe und Quickstart-Demo (aufgenommen 2026-10-19, erledigt 2026-10-19)
 

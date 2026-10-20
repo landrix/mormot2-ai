@@ -11,12 +11,17 @@
 //   unique names, strict JSON integers, __metadata__ as a string map - a damaged
 //   or hostile file is refused with EInferError, never read past its end, and
 //   validation stays O(n log n) in the number of tensors
+// - a checkpoint split into several files (model-00001-of-00003.safetensors...)
+//   is opened through its model.safetensors.index.json: every file is
+//   validated as above, and the index must name exactly the tensors each file
+//   holds - one view over all of them (OpenFolder, CreateFromIndex)
 unit mormot.ai.infer.loader.safetensors;
 
 {
   *****************************************************************************
 
-    - TSafeTensorsFile: a validated, memory-mapped safetensors file
+    - TSafeTensorsFile: a validated, memory-mapped safetensors file, or the
+      files of a checkpoint split by model.safetensors.index.json
 
   *****************************************************************************
 }
@@ -45,22 +50,42 @@ const
   /// the largest JSON header accepted (the format itself caps it at 100 MB)
   SAFETENSORS_MAX_HEADER = 100 shl 20;
 
+  /// the largest model.safetensors.index.json accepted
+  SAFETENSORS_MAX_INDEX = 64 shl 20;
+
+  /// the most files an index may name
+  SAFETENSORS_MAX_PARTS = 4096;
+
 type
-  /// a validated safetensors file, mapped read-only
+  /// a validated safetensors file, mapped read-only - or the files of a split
+  // checkpoint as one (CreateFromIndex)
   TSafeTensorsFile = class
   protected
     fFile: TInferMappedFile;
+    fParts: array of TSafeTensorsFile; // CreateFromIndex: one per file
     fTensors: TInferTensorDynArray;
     fNames: TRawUtf8DynArray;
     fNameIndex: TIntegerDynArray;
     fMetadata: TDocVariantData;
     procedure Parse;
+    /// fNames and fNameIndex from fTensors
+    procedure IndexNames;
   public
     /// map and validate aFileName - raises EInferError on any defect
     constructor Create(const aFileName: TFileName);
     /// validate an in-memory content - for tests and small fixtures
     constructor CreateFromContent(const aContent: RawByteString);
-    /// unmap the file
+    /// map and validate every file of a model.safetensors.index.json (its
+    // "weight_map" from tensor name to file name, the files beside it)
+    // - raises EInferError when a file is not a plain name in the same folder,
+    // a file fails Create, a tensor is mapped twice, or the map and the files
+    // differ by a single tensor (missing, extra, or in another file)
+    // - Metadata stays empty (the index metadata is no string map)
+    constructor CreateFromIndex(const aIndexFile: TFileName);
+    /// <aFolder>model.safetensors if it exists, else the files of
+    // <aFolder>model.safetensors.index.json - the order transformers uses
+    class function OpenFolder(const aFolder: TFileName): TSafeTensorsFile;
+    /// unmap the file(s)
     destructor Destroy; override;
     /// the tensor named aName, or nil
     function Find(const aName: RawUtf8): PInferTensor;
@@ -96,9 +121,182 @@ begin
 end;
 
 destructor TSafeTensorsFile.Destroy;
+var
+  i: PtrInt;
 begin
+  for i := 0 to high(fParts) do
+    fParts[i].Free;
   fFile.Free;
   inherited Destroy;
+end;
+
+class function TSafeTensorsFile.OpenFolder(const aFolder: TFileName): TSafeTensorsFile;
+var
+  dir: TFileName;
+begin
+  dir := IncludeTrailingPathDelimiter(aFolder);
+  if FileExists(dir + 'model.safetensors') or
+     not FileExists(dir + 'model.safetensors.index.json') then
+    result := TSafeTensorsFile.Create(dir + 'model.safetensors') // or raises
+  else
+    result := TSafeTensorsFile.CreateFromIndex(dir + 'model.safetensors.index.json');
+end;
+
+/// a name of a file beside the index: no folder part, nothing hidden or relative
+function PlainFileName(const aName: RawUtf8): boolean;
+var
+  i: PtrInt;
+begin
+  result := false;
+  if (aName = '') or (aName[1] = '.') or
+     (StrLen(pointer(aName)) <> length(aName)) then
+    exit;
+  for i := 1 to length(aName) do
+    if aName[i] in ['/', '\', ':', #0..#31] then
+      exit;
+  result := true;
+end;
+
+/// the index of aValue in the sorted aList, -1 if absent
+function FindSorted(const aList: TRawUtf8DynArray; const aValue: RawUtf8): PtrInt;
+var
+  lo, hi, c: PtrInt;
+begin
+  lo := 0;
+  hi := high(aList);
+  while lo <= hi do
+  begin
+    result := (lo + hi) shr 1;
+    c := StrComp(pointer(aList[result]), pointer(aValue));
+    if c = 0 then
+      exit
+    else if c < 0 then
+      lo := result + 1
+    else
+      hi := result - 1;
+  end;
+  result := -1;
+end;
+
+constructor TSafeTensorsFile.CreateFromIndex(const aIndexFile: TFileName);
+var
+  json: RawUtf8;
+  doc: TDocVariantData;
+  map: PDocVariantData;
+  names, files, parts: TRawUtf8DynArray;
+  idx: TIntegerDynArray;
+  i, j, n, k, c, total: PtrInt;
+  dir: TFileName;
+  t: PInferTensor;
+begin
+  inherited Create;
+  // the size first: a huge file is refused before it is read
+  if FileSize(aIndexFile) > SAFETENSORS_MAX_INDEX then
+    EInferError.RaiseUtf8('%: % is larger than % bytes',
+      [self, aIndexFile, SAFETENSORS_MAX_INDEX]);
+  json := StringFromFile(aIndexFile);
+  if json = '' then
+    EInferError.RaiseUtf8('%: cannot read %', [self, aIndexFile]);
+  // an empty JSON object or array has no kind in mORMot: an array refused,
+  // an empty map counted below
+  if not doc.InitJson(json, JSON_FAST + [dvoNameCaseSensitive]) or
+     (doc.Kind <> dvObject) then
+    EInferError.RaiseUtf8('%: % is no JSON object', [self, aIndexFile]);
+  // a key twice at the top: mORMot would take the first weight_map, Python
+  // the last - refused, as in the tensor names below
+  names := copy(doc.Names, 0, doc.Count);
+  QuickSortRawUtf8(names, doc.Count);
+  for i := 1 to doc.Count - 1 do
+    if names[i] = names[i - 1] then
+      EInferError.RaiseUtf8('%: % has "%" twice', [self, aIndexFile, names[i]]);
+  if not _Safe(doc.Value['weight_map'], map) or (map^.Kind = dvArray) then
+    EInferError.RaiseUtf8('%: % has no "weight_map" object', [self, aIndexFile]);
+  n := map^.Count;
+  if n = 0 then
+    EInferError.RaiseUtf8('%: % maps no tensor', [self, aIndexFile]);
+  // the tensor names sorted (a duplicated JSON key stays twice in the
+  // document: refused) with the file of each
+  names := copy(map^.Names, 0, n);
+  SetLength(idx, n);
+  for i := 0 to n - 1 do
+    idx[i] := i;
+  QuickSortRawUtf8(names, n, @idx);
+  SetLength(files, n);
+  for i := 0 to n - 1 do
+  begin
+    if (i > 0) and (names[i] = names[i - 1]) then
+      EInferError.RaiseUtf8('%: % maps % twice', [self, aIndexFile, names[i]]);
+    if TVarData(map^.Values[idx[i]]).VType <> varString then // mORMot JSON text
+      EInferError.RaiseUtf8('%: the file of % is no string', [self, names[i]]);
+    files[i] := VariantToUtf8(map^.Values[idx[i]]);
+    if not PlainFileName(files[i]) then
+      EInferError.RaiseUtf8('%: "%" is no file name beside the index',
+        [self, files[i]]);
+  end;
+  // the distinct files, sorted
+  parts := copy(files, 0, n);
+  QuickSortRawUtf8(parts, n);
+  j := 0;
+  for i := 0 to n - 1 do
+    if (j = 0) or (parts[i] <> parts[j - 1]) then
+    begin
+      parts[j] := parts[i];
+      inc(j);
+    end;
+  SetLength(parts, j);
+  if j > SAFETENSORS_MAX_PARTS then
+    EInferError.RaiseUtf8('%: % names % files', [self, aIndexFile, j]);
+  // every file mapped and validated, each of its tensors where the map says
+  dir := ExtractFilePath(aIndexFile);
+  SetLength(fParts, length(parts));
+  total := 0;
+  for i := 0 to high(parts) do
+  begin
+    fParts[i] := TSafeTensorsFile.Create(dir + Utf8ToString(parts[i]));
+    t := pointer(fParts[i].fTensors);
+    for j := 1 to length(fParts[i].fTensors) do
+    begin
+      k := FindSorted(names, t^.Name);
+      if k < 0 then
+        EInferError.RaiseUtf8('%: % of % is not in the index', [self, t^.Name, parts[i]]);
+      if files[k] <> parts[i] then
+        EInferError.RaiseUtf8('%: % is in %, the index says %',
+          [self, t^.Name, parts[i], files[k]]);
+      inc(total);
+      inc(t);
+    end;
+  end;
+  // and every tensor of the map in its file: the two sets are the same (a
+  // name in two files cannot pass, the map names one file per tensor)
+  for i := 0 to n - 1 do
+    if fParts[FindSorted(parts, files[i])].Find(names[i]) = nil then
+      EInferError.RaiseUtf8('%: % is not in %, where the index places it',
+        [self, names[i], files[i]]);
+  SetLength(fTensors, total);
+  c := 0;
+  for i := 0 to high(fParts) do
+    for j := 0 to high(fParts[i].fTensors) do
+    begin
+      fTensors[c] := fParts[i].fTensors[j];
+      inc(c);
+    end;
+  IndexNames;
+end;
+
+procedure TSafeTensorsFile.IndexNames;
+var
+  i, n: PtrInt;
+begin
+  // name lookup by binary search over a sorted copy
+  n := length(fTensors);
+  SetLength(fNames, n);
+  SetLength(fNameIndex, n);
+  for i := 0 to n - 1 do
+  begin
+    fNames[i] := fTensors[i].Name;
+    fNameIndex[i] := i;
+  end;
+  QuickSortRawUtf8(fNames, n, @fNameIndex);
 end;
 
 /// true when every number outside the strings of aJson is a plain integer
@@ -292,15 +490,7 @@ begin
   if prevEnd <> dataLen then
     EInferError.RaiseUtf8('%: % unreferenced bytes after the last tensor',
       [self, dataLen - prevEnd]);
-  // name lookup by binary search over a sorted copy
-  SetLength(fNames, n);
-  SetLength(fNameIndex, n);
-  for i := 0 to n - 1 do
-  begin
-    fNames[i] := fTensors[i].Name;
-    fNameIndex[i] := i;
-  end;
-  QuickSortRawUtf8(fNames, n, @fNameIndex);
+  IndexNames;
 end;
 
 function TSafeTensorsFile.Find(const aName: RawUtf8): PInferTensor;

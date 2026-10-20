@@ -338,6 +338,7 @@ type
     fOwned: array of TSingleDynArray; // BF16 tensors widened at load
     fOwnedQ8: array of array of TInferBlockQ8_0; // matrices quantized at load
     fOwnedQ4: array of array of TInferBlockQ4_0;
+    fOwnedMx: array of array of TInferBlockMxfp4; // repacked MXFP4 experts
     fWeights: TInferDType;
     fEmbedSrc: PInferTensor; // the embedding as stored: read per token (nil: none)
     // CreateStack: the object of config.json (dotted path), the prefix that
@@ -395,6 +396,9 @@ type
     function WidenTensor(t: PInferTensor; const aName: RawUtf8): PSingleArray;
     /// aValues kept with the model (moved: aValues is nil afterwards)
     function Own(var aValues: TSingleDynArray): PSingleArray;
+    /// aBlocks zeroed MXFP4 blocks kept with the model - for a family that
+    // repacks the blocks of a checkpoint
+    function OwnMxfp4(aBlocks: PtrInt): PInferBlockMxfp4Array;
     /// a matrix of aType from the F32 rows of aSrc ([aRows, aCols]) - for a
     // family that reorders a tensor first: idtF32 keeps aSrc with the model
     // (moved, nil afterwards), Q8_0 or Q4_0 quantize it row by row as Matrix
@@ -430,7 +434,8 @@ type
     class function ModelType: RawUtf8; virtual; abstract;
     /// the general.architecture of a GGUF file this class loads
     class function Architecture: RawUtf8; virtual; abstract;
-    /// load <aFolder>config.json and <aFolder>model.safetensors
+    /// load <aFolder>config.json and <aFolder>model.safetensors (or the files
+    // of <aFolder>model.safetensors.index.json)
     // - raises EInferError when a setting is unsupported or a weight is missing
     // or shaped otherwise; aBackend is not owned
     // - aWeights: idtF32 (the reference arithmetic), idtQ8_0 (every matrix
@@ -781,8 +786,7 @@ begin
       ((fConfig.Heads * fConfig.HeadDim) and 31 <> 0)) then
     EInferError.RaiseUtf8('%: % needs widths that are multiples of 32',
       [self, INFER_DTYPE_NAME[aWeights]]);
-  fFile := TSafeTensorsFile.Create(IncludeTrailingPathDelimiter(aFolder) +
-    'model.safetensors');
+  fFile := TSafeTensorsFile.OpenFolder(aFolder);
   LoadWeights;
 end;
 
@@ -838,6 +842,9 @@ begin
   for i := 0 to high(fOwnedQ4) do
     InferForgetBytes(aBackend, pointer(fOwnedQ4[i]),
       length(fOwnedQ4[i]) * SizeOf(TInferBlockQ4_0));
+  for i := 0 to high(fOwnedMx) do
+    InferForgetBytes(aBackend, pointer(fOwnedMx[i]),
+      length(fOwnedMx[i]) * SizeOf(TInferBlockMxfp4));
 end;
 
 function TDecoderModel.ReadConfig(const aConfigFile: TFileName;
@@ -1187,6 +1194,16 @@ begin
   result := pointer(fOwned[n]);
 end;
 
+function TDecoderModel.OwnMxfp4(aBlocks: PtrInt): PInferBlockMxfp4Array;
+var
+  n: PtrInt;
+begin
+  n := length(fOwnedMx);
+  SetLength(fOwnedMx, n + 1);
+  SetLength(fOwnedMx[n], aBlocks);
+  result := pointer(fOwnedMx[n]);
+end;
+
 function TDecoderModel.MatrixOf(var aSrc: TSingleDynArray; aRows, aCols: Int64;
   aType: TInferDType; const aName: RawUtf8): TInferWeight;
 var
@@ -1252,12 +1269,37 @@ begin
   end;
 end;
 
+/// raise unless every MXFP4 block of t has an exponent the CPU computes
+// exactly (INFER_MXFP4_EXACT_MIN..MAX) or only zeros as values
+procedure CheckMxfp4Scales(t: PInferTensor; const aName: RawUtf8; aModel: TObject);
+var
+  b, j: PtrInt;
+  m: PInferBlockMxfp4;
+begin
+  m := t^.Data;
+  for b := 0 to t^.Count div 32 - 1 do
+  begin
+    if (m^.e < INFER_MXFP4_EXACT_MIN) or (m^.e > INFER_MXFP4_EXACT_MAX) then
+      // +0 and -0 are the nibbles 0 and 8
+      for j := 0 to 15 do
+        if m^.qs[j] and $77 <> 0 then
+          EInferError.RaiseUtf8('%: % has the MXFP4 exponent % in block %, ' +
+            'beyond the range computed exactly', [aModel, aName, m^.e, b]);
+    inc(m);
+  end;
+end;
+
 /// raise unless every FP16 scale of the blocks of t is finite
 procedure CheckScales(t: PInferTensor; const aName: RawUtf8; aModel: TObject);
 var
   b, size, first, second: PtrInt;
   p: PByteArray;
 begin
+  if t^.DType = idtMXFP4 then
+  begin
+    CheckMxfp4Scales(t, aName, aModel);
+    exit;
+  end;
   size := INFER_DTYPE_SIZE[t^.DType];
   // where the half-float scales sit: d first (Q8_0, Q4_0, Q5_0), d and dmin first
   // (Q4_K), d last (Q6_K)
@@ -1327,7 +1369,7 @@ begin
     // a GGUF file decides: blocks in place, F32 in place, F16 / BF16 widened
     t := Checked(aName, [aRows, aCols], true);
     case t^.DType of
-      idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K:
+      idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K, idtMXFP4:
         begin
           CheckScales(t, aName, self);
           result := InferWeight(t^.Data, t^.DType);

@@ -115,9 +115,15 @@ procedure InferQ4ToQ8(aSrc: PInferBlockQ4_0; aBlocks: PtrInt; aDst: PInferBlockQ
 // value - exact, so every Q8_0 kernel computes the Q5_0 x Q8_0 dot product
 procedure InferQ5ToQ8(aSrc: PInferBlockQ5_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
 
+/// aBlocks MXFP4 blocks as Q8_0 blocks: the doubled E2M1 values as the signed
+// value, 2^(e - 128) as the FP16 scale - exact for an exponent in
+// INFER_MXFP4_EXACT_MIN..INFER_MXFP4_EXACT_MAX, a scale of 0 for any other
+// (the loaders accept such a block only when all its values are zero)
+procedure InferMxfp4ToQ8(aSrc: PInferBlockMxfp4; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
+
 type
   /// scalar reference backend: every operation; Linear takes F32, Q8_0, Q4_0,
-  // Q5_0, Q4_K or Q6_K
+  // Q5_0, Q4_K, Q6_K or MXFP4
   TInferCpuBackend = class(TInferBackend)
   protected
     /// query rows aFirst..aLast of one head: scores, masked softmax, weighted
@@ -1037,6 +1043,44 @@ begin
   end;
 end;
 
+var
+  /// the FP16 scale of each E8M0 exponent (InferMxfp4ToQ8)
+  MXFP4_HALF: array[byte] of word;
+
+procedure InitMxfp4Half;
+var
+  e: PtrInt;
+  d: single;
+begin
+  for e := 0 to 255 do
+    if (e >= INFER_MXFP4_EXACT_MIN) and (e <= INFER_MXFP4_EXACT_MAX) then
+    begin
+      PCardinal(@d)^ := InferE8M0HalfBits(e);
+      MXFP4_HALF[e] := InferSingleToHalf(d);
+    end
+    else
+      MXFP4_HALF[e] := 0;
+end;
+
+procedure InferMxfp4ToQ8(aSrc: PInferBlockMxfp4; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
+var
+  b, j, v: PtrInt;
+begin
+  for b := 0 to aBlocks - 1 do
+  begin
+    aDst^.d := MXFP4_HALF[aSrc^.e];
+    // qs[j] low nibble -> qs[j], high nibble -> qs[j + 16]
+    for j := 0 to 15 do
+    begin
+      v := aSrc^.qs[j];
+      aDst^.qs[j] := INFER_MXFP4_VALUES[v and 15];
+      aDst^.qs[j + 16] := INFER_MXFP4_VALUES[v shr 4];
+    end;
+    inc(aSrc);
+    inc(aDst);
+  end;
+end;
+
 const
   /// CausalRows keeps its scores on the stack up to this many keys
   CAUSAL_STACK = 4096;
@@ -1208,7 +1252,8 @@ end;
 function TInferCpuBackend.Supports(aOp: TInferOp; aWeights: TInferDType): boolean;
 begin
   if aOp = ioLinear then
-    result := aWeights in [idtF32, idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K]
+    result := aWeights in [idtF32, idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K,
+      idtMXFP4]
   else
     result := aWeights = idtF32;
 end;
@@ -1300,6 +1345,17 @@ begin
         // as Q4_0: the whole matrix as Q8_0 blocks, then the Q8_0 path
         SetLength(w8, aOut * (aIn shr 5));
         InferQ5ToQ8(w.Data, length(w8), pointer(w8));
+        LinearQ8_0(x, aRows, aIn, pointer(w8), aOut, bias, y);
+        exit;
+      end;
+    idtMXFP4:
+      begin
+        if aIn and 31 <> 0 then
+          EInferError.RaiseUtf8('%.Linear: % inputs are no whole MXFP4 blocks',
+            [self, aIn]);
+        // as Q4_0: the whole matrix as Q8_0 blocks, then the Q8_0 path
+        SetLength(w8, aOut * (aIn shr 5));
+        InferMxfp4ToQ8(w.Data, length(w8), pointer(w8));
         LinearQ8_0(x, aRows, aIn, pointer(w8), aOut, bias, y);
         exit;
       end;
@@ -1704,7 +1760,8 @@ var
   xr, wo: PSingleArray;
   wq, wb: PInferBlockQ8_0;
   pair: boolean;
-  // the weight rows of the tile as Q8_0: the matrix itself, or its Q4_0 / Q5_0 rows
+  // the weight rows of the tile as Q8_0: the matrix itself, or its Q4_0 / Q5_0 /
+  // MXFP4 rows
   // unpacked once per tile (on the stack up to 128 blocks per row)
   wbase: PInferBlockQ8_0Array;
   wfirst: PtrInt;
@@ -1822,7 +1879,7 @@ begin
     nb := aJob.Blocks;
     wbase := aJob.W.Data;
     wfirst := 0;
-    if aJob.W.DType in [idtQ4_0, idtQ5_0] then
+    if aJob.W.DType in [idtQ4_0, idtQ5_0, idtMXFP4] then
     begin
       wfirst := aTile * TILE;
       if nb <= 128 then
@@ -1835,6 +1892,15 @@ begin
       if aJob.W.DType = idtQ5_0 then
         InferQ5ToQ8(@PInferBlockQ5_0Array(aJob.W.Data)^[wfirst * nb],
           (oEnd - wfirst + 1) * nb, @wbase^[0])
+      else if aJob.W.DType = idtMXFP4 then
+      begin
+        if Assigned(InferMxfp4Unpack) then
+          InferMxfp4Unpack(@PInferBlockMxfp4Array(aJob.W.Data)^[wfirst * nb],
+            (oEnd - wfirst + 1) * nb, @wbase^[0], @MXFP4_HALF, @INFER_MXFP4_VALUES)
+        else
+          InferMxfp4ToQ8(@PInferBlockMxfp4Array(aJob.W.Data)^[wfirst * nb],
+            (oEnd - wfirst + 1) * nb, @wbase^[0]);
+      end
       else if Assigned(InferQ4Unpack) then
         InferQ4Unpack(@PInferBlockQ4_0Array(aJob.W.Data)^[wfirst * nb],
           (oEnd - wfirst + 1) * nb, @wbase^[0])
@@ -1980,7 +2046,8 @@ var
   r, t, n: PtrInt;
   kq: boolean;
 begin
-  if not (w.DType in [idtF32, idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K]) or
+  if not (w.DType in [idtF32, idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K,
+     idtMXFP4]) or
      ((w.DType <> idtF32) and (aIn mod INFER_DTYPE_BLOCK[w.DType] <> 0)) then
   begin
     inherited Linear(x, aRows, aIn, w, aOut, bias, y); // raises
@@ -2000,7 +2067,7 @@ begin
     job.Blocks := aIn shr 5;
   if kq then
     job.Fp32 := false // the exact block sums for now
-  else if w.DType <> idtF32 then // Q4_0 / Q5_0 tiles become Q8_0: the same kernels
+  else if w.DType <> idtF32 then // Q4_0 / Q5_0 / MXFP4 tiles become Q8_0
     job.Fp32 := not fExact and Assigned(InferQ8DotF32x4x2)
   else
     // the float row kernel needs whole lanes of 16
@@ -2452,6 +2519,7 @@ end;
 
 initialization
   InitGeluTable;
+  InitMxfp4Half;
   {$ifdef INFERQ4WORDS}
   InitQ5High;
   {$endif INFERQ4WORDS}

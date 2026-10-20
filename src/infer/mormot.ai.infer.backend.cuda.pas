@@ -136,10 +136,11 @@ implementation
 
 const
   /// the dtype parameter of tools/cuda/linear.cu
-  // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K, Q5_0;
+  // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K, Q5_0,
+  // MXFP4;
   // 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
-    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5);
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 0);
 
   /// the threads of a block of linear and linear8 in tools/cuda/linear.cu
   LINEAR_BLOCK = 128;

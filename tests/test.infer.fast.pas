@@ -72,6 +72,10 @@ type
     /// Q5_0 Linear: the unpacking against its definition, exact = the
     // reference bit for bit, the float path within tolerance
     procedure LinearQ5MatchesReference;
+    /// MXFP4 Linear: the unpacking against its definition (every byte, every
+    // exponent), exact = the reference bit for bit, the float path within
+    // tolerance
+    procedure LinearMxfp4MatchesReference;
     /// Q4_K and Q6_K Linear: exact on all cores = the reference bit for bit,
     // the float path within tolerance, both near F32 of the dequantized rows
     procedure LinearKMatchesReference;
@@ -163,6 +167,39 @@ begin
   begin
     aSeed := aSeed * 1103515245 + 12345;
     blk^.d := InferSingleToHalf((integer((aSeed shr 8) and 1023) - 512) / 16384 + 1e-4);
+    for j := 0 to 15 do
+    begin
+      aSeed := aSeed * 1103515245 + 12345;
+      blk^.qs[j] := aSeed shr 24;
+    end;
+    inc(blk);
+  end;
+end;
+
+/// 2^n in double, exact for -1022..1023
+function Pow2(n: integer): double;
+var
+  i: integer;
+begin
+  result := 1;
+  for i := 1 to abs(n) do
+    result := result * 2;
+  if n < 0 then
+    result := 1 / result;
+end;
+
+/// MXFP4 weights [aOut, aIn] with random nibbles and exponents in 110..140
+function RandomMxfp4(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+var
+  b, j: PtrInt;
+  blk: PInferBlockMxfp4;
+begin
+  SetLength(result, aOut * (aIn div 32) * SizeOf(TInferBlockMxfp4));
+  blk := pointer(result);
+  for b := 0 to aOut * (aIn div 32) - 1 do
+  begin
+    aSeed := aSeed * 1103515245 + 12345;
+    blk^.e := 110 + (aSeed shr 16) mod 31;
     for j := 0 to 15 do
     begin
       aSeed := aSeed * 1103515245 + 12345;
@@ -832,6 +869,129 @@ begin
       nil, pointer(y1));
     e := RelError(pointer(y3), pointer(y1), rows * nout);
     CheckUtf8(e <= 2e-6, 'Q5_0 float % x % x %: relative error %', [rows, nin, nout, e]);
+  end;
+end;
+
+procedure TTestInferFast.LinearMxfp4MatchesReference;
+const
+  // rows, in, out: partial tiles, 2880 inputs (gpt-oss-20b: 90 blocks, no
+  // multiple of 256), 4352 inputs = 136 blocks, beyond the tile buffer on the
+  // stack
+  SHAPES: array[0..5, 0..2] of integer = (
+    (1, 32, 1), (3, 96, 17), (37, 2880, 33), (64, 1024, 100), (1, 2880, 70),
+    (2, 4352, 20));
+  VALUES: array[0..15] of single = (
+    0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6);
+var
+  i, j, k, e, rows, nin, nout: PtrInt;
+  x, bias, y1, y2, y3, row: TSingleDynArray;
+  wq: RawByteString;
+  err, scale, want: double;
+  mx: array[0..15] of TInferBlockMxfp4;
+  q8, q8b: array[0..15] of TInferBlockQ8_0;
+  half: array[byte] of word;
+  ok, okRow, okKernel: boolean;
+begin
+  // the FP16 scale of each exponent as InferMxfp4ToQ8 writes it: the table a
+  // kernel takes
+  for e := 0 to 255 do
+  begin
+    mx[0].e := e;
+    InferMxfp4ToQ8(@mx, 1, @q8);
+    half[e] := q8[0].d;
+  end;
+  okKernel := true;
+  // the unpacking against the definition of an MXFP4 value: every byte value
+  // in the nibbles, every exponent - FP16 scale 2^(e - 128) in the exact
+  // range, 0 outside it; the dequantization 2^(e - 127) times the E2M1 value
+  ok := true;
+  okRow := true;
+  SetLength(row, 32);
+  for e := 0 to 255 do
+  begin
+    for i := 0 to 15 do
+    begin
+      mx[i].e := e;
+      for j := 0 to 15 do
+        mx[i].qs[j] := i * 16 + j;
+    end;
+    InferMxfp4ToQ8(@mx, 16, @q8);
+    if Assigned(InferMxfp4Unpack) then
+    begin
+      FillCharFast(q8b, SizeOf(q8b), 0);
+      InferMxfp4Unpack(@mx, 16, @q8b, @half, @INFER_MXFP4_VALUES);
+      if not CompareMem(@q8, @q8b, SizeOf(q8)) then
+        okKernel := false;
+    end;
+    scale := Pow2(e - 128);
+    for i := 0 to 15 do
+    begin
+      // FP16 holds 2^-24..2^15 exactly: e = 104..143 (not the constants
+      // themselves, or a wrong constant would pass)
+      if (e >= 104) and (e <= 143) then
+      begin
+        if InferHalfToSingle(q8[i].d) <> scale then
+          ok := false;
+      end
+      else if q8[i].d <> 0 then
+        ok := false;
+      for k := 0 to 31 do
+      begin
+        if k < 16 then
+          j := mx[i].qs[k] and 15
+        else
+          j := mx[i].qs[k - 16] shr 4;
+        if q8[i].qs[k] <> 2 * VALUES[j] then
+          ok := false;
+      end;
+      InferRowToF32(@mx, idtMXFP4, i, 32, pointer(row));
+      for k := 0 to 31 do
+      begin
+        if k < 16 then
+          j := mx[i].qs[k] and 15
+        else
+          j := mx[i].qs[k - 16] shr 4;
+        // ggml: e 0 and 1 are 2^-128 and 2^-127, 255 is 2^127 (no NaN);
+        // from 2^128 on an infinity of the sign of the value
+        want := 2 * scale * VALUES[j];
+        if Abs(want) >= Pow2(128) then
+        begin
+          if (PCardinal(@row[k])^ and $7fffffff <> $7f800000) or
+             ((PCardinal(@row[k])^ shr 31 = 1) <> (want < 0)) then
+            okRow := false;
+        end
+        else if row[k] <> want then
+          okRow := false;
+      end;
+    end;
+  end;
+  Check(ok, 'InferMxfp4ToQ8: the doubled E2M1 values, 2^(e - 128) in the range');
+  Check(okRow, 'InferRowToF32 = 2^(e - 127) * E2M1 for every exponent');
+  Check(okKernel, 'MXFP4 unpack kernel = Pascal for every byte and exponent');
+  for i := 0 to high(SHAPES) do
+  begin
+    rows := SHAPES[i, 0];
+    nin := SHAPES[i, 1];
+    nout := SHAPES[i, 2];
+    Fill(x, rows * nin, 411 + i, 3);
+    Fill(bias, nout, 431 + i, 1);
+    wq := RandomMxfp4(nout, nin, 441 + i);
+    SetLength(y1, rows * nout);
+    SetLength(y2, rows * nout);
+    SetLength(y3, rows * nout);
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtMXFP4), nout,
+      pointer(bias), pointer(y1));
+    fExact.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtMXFP4), nout,
+      pointer(bias), pointer(y2));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), rows * nout), 'MXFP4 exact % x % x %',
+      [rows, nin, nout]);
+    fFast.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtMXFP4), nout,
+      nil, pointer(y3));
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtMXFP4), nout,
+      nil, pointer(y1));
+    err := RelError(pointer(y3), pointer(y1), rows * nout);
+    CheckUtf8(err <= 2e-6, 'MXFP4 float % x % x %: relative error %',
+      [rows, nin, nout, err]);
   end;
 end;
 

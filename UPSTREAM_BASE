@@ -110,6 +110,15 @@ never a build input.
            -> mormot.ai.infer.tensor / backend.cpu / kernels. Checked byte- and
            bit-exactly against the same lembed oracle build (libggml-*.so sha256
            in the next section; datasets q4 and qk), not against a source commit.
+  Followed (backlog D5b, written anew - no code taken): the MXFP4 block (an E8M0
+           exponent and 16 bytes of E2M1 nibbles, value j low and j + 16 high),
+           kvalues_mxfp4 (the E2M1 values doubled) and GGML_E8M0_TO_FP32_HALF,
+           looked up in ggml/src/ggml-common.h and ggml-impl.h of the llama.cpp
+           commit 4fd1242bef6cb2325b4ff1c1a80f3b54b64508a6 vendored by sqlite-lembed;
+           the repacking of the safetensors *_blocks / *_scales in
+           convert_hf_to_gguf.py (GptOssModel)
+           -> mormot.ai.infer.tensor / backend.cpu / model.gptoss. Checked
+           bit-exactly against the lembed oracle build (dataset mxfp4).
 
 ## GPU: Vulkan (phase 4)
 
@@ -198,6 +207,18 @@ never a build input.
   Revision:  50968a4468ef4233ed78cd7c3de230dd1d61a56b
   File:      vendor/models/qwen3-0.6b-q4_k_m.gguf (gitignored)
              ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a
+
+  Model:     openai/gpt-oss-20b (Apache-2.0) - https://huggingface.co/openai/gpt-oss-20b
+  Revision:  6cee5e81ee83917806bbde320786a8fb61efebee
+  Files (sha256), in vendor/models/gpt-oss-20b (gitignored):
+    model-00000-of-00002.safetensors  16d0f997dcfc4462089d536bffe51b4bcea2f872f5c430be09ef8ed392312427
+    model-00001-of-00002.safetensors  4fbe328ab445455d6f58dc73852b85873bd626986310abd91cd4d2ce3245eaea
+    model-00002-of-00002.safetensors  a18106b209e9ab35c3406db4f6f12a927364a058b21e9d1373d682e20674b303
+    tokenizer.json                    0614fe83cadab421296e664e1f48f4261fa8fef6e03e63bb75c20f38e37d07d3
+  Dataset from it: gpt-oss-20b (tools/infer-ref/make_reference_d5.py). Generated on
+    the RTX computer (Windows x86_64, 96 GB RAM): Python 3.12.13, torch 2.14.1+cpu,
+    transformers 5.19.0 and the rest of tools/infer-ref/requirements.txt, created
+    with uv 0.11.18 - the model needs more memory than the WSL reference has.
 
   Rule: a new revision, model or environment means regenerating every dataset and
         updating this section in the same commit.

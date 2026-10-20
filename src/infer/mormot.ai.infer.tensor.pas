@@ -39,6 +39,9 @@ type
   // - idtQ8_0, idtQ4_0 and idtQ5_0 are block types of GGUF files: 32 elements
   // share one FP16 scale (see TInferBlockQ8_0, TInferBlockQ4_0,
   // TInferBlockQ5_0) - only GGUF files hold them, safetensors never
+  // - idtMXFP4 is the OCP microscaling FP4 type: 32 E2M1 values share one
+  // power-of-two scale (see TInferBlockMxfp4) - a GGUF type, and the layout
+  // the engine repacks the *_blocks / *_scales of a safetensors checkpoint into
   TInferDType = (
     idtUnknown,
     idtF32,
@@ -52,7 +55,8 @@ type
     idtQ4_0,
     idtQ4_K,
     idtQ6_K,
-    idtQ5_0);
+    idtQ5_0,
+    idtMXFP4);
 
   /// one Q8_0 block as ggml stores it: value[i] = d * qs[i]
   // - d is an IEEE half float (raw bits), 34 bytes per 32 elements
@@ -91,6 +95,20 @@ type
   TInferBlockQ5_0Array = array[0..(MaxInt div SizeOf(TInferBlockQ5_0)) - 1] of
     TInferBlockQ5_0;
   PInferBlockQ5_0Array = ^TInferBlockQ5_0Array;
+
+  /// one MXFP4 block as ggml stores it: value[i] = 2^(e - 128) * k[q[i]],
+  // with k the E2M1 values doubled (INFER_MXFP4_VALUES) - so 2^(e - 127) times
+  // the FP4 value, e an E8M0 exponent
+  // - qs[j] holds q[j] in its low and q[j + 16] in its high nibble, as Q4_0;
+  // 17 bytes per 32 elements
+  TInferBlockMxfp4 = packed record
+    e: byte;
+    qs: array[0..15] of byte;
+  end;
+  PInferBlockMxfp4 = ^TInferBlockMxfp4;
+  TInferBlockMxfp4Array = array[0..(MaxInt div SizeOf(TInferBlockMxfp4)) - 1] of
+    TInferBlockMxfp4;
+  PInferBlockMxfp4Array = ^TInferBlockMxfp4Array;
 
   /// one Q4_K super-block of 256 values as ggml stores it
   // - 8 sub-blocks of 32: value = d * sc[j] * q - dmin * m[j], q in 0..15, sc
@@ -150,19 +168,31 @@ type
 const
   /// size in bytes of one block of each type (0 = unknown)
   INFER_DTYPE_SIZE: array[TInferDType] of byte = (
-    0, 4, 2, 2, 4, 8, 1, 1, 34, 18, 144, 210, 22);
+    0, 4, 2, 2, 4, 8, 1, 1, 34, 18, 144, 210, 22, 17);
 
   /// elements per block of each type: 1 for plain element types
   INFER_DTYPE_BLOCK: array[TInferDType] of word = (
-    0, 1, 1, 1, 1, 1, 1, 1, 32, 32, 256, 256, 32);
+    0, 1, 1, 1, 1, 1, 1, 1, 32, 32, 256, 256, 32, 32);
 
   /// the block types of GGUF matrices the engine reads in place
-  INFER_BLOCK_DTYPES = [idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K];
+  INFER_BLOCK_DTYPES = [idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K, idtMXFP4];
 
   /// the name of each type (safetensors names, ggml's for block types)
   INFER_DTYPE_NAME: array[TInferDType] of RawUtf8 = (
     '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8', 'Q8_0', 'Q4_0', 'Q4_K',
-    'Q6_K', 'Q5_0');
+    'Q6_K', 'Q5_0', 'MXFP4');
+
+  /// the E2M1 values of an MXFP4 nibble, doubled to integers: 0, 0.5, 1, 1.5,
+  // 2, 3, 4, 6 and their negatives (bit 3 the sign) - as ggml's kvalues_mxfp4
+  INFER_MXFP4_VALUES: array[0..15] of shortint = (
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+
+  /// the E8M0 exponents whose MXFP4 scale 2^(e - 128) is an FP16 number: the
+  // CPU computes MXFP4 as Q8_0 blocks with that scale, exact in this range
+  // (2^-24..2^15) - a block with another exponent must hold only zeros (the
+  // loaders check it); the published gpt-oss-20b uses 115..136
+  INFER_MXFP4_EXACT_MIN = 104;
+  INFER_MXFP4_EXACT_MAX = 143;
 
 /// the element type of a safetensors dtype name, idtUnknown if not supported
 // - block types are no safetensors types and never returned
@@ -185,10 +215,16 @@ function InferHalfToSingleBits(aHalf: word): cardinal;
 // the F16C / NEON conversion ggml uses; overflow gives infinity
 function InferSingleToHalf(aValue: single): word;
 
+/// the bits of the single 2^(e - 128): the scale of an MXFP4 block for the
+// doubled values - as ggml's GGML_E8M0_TO_FP32_HALF (e 0 and 1 subnormal, 255
+// is 2^127, no NaN)
+function InferE8M0HalfBits(e: byte): cardinal;
+
 /// row aRow of a [rows, aCols] matrix of type aType, as F32 into aDst
 // - F32 is copied, BF16 and F16 widened (exact, bit by bit: NaN and infinity
 // kept, never loaded into the FPU), Q8_0, Q4_0 and Q5_0 dequantized (d * q,
-// d * (q - 8), d * (q - 16): exact in single), Q4_K and Q6_K with the single
+// d * (q - 8), d * (q - 16): exact in single), MXFP4 as 2^(e - 128) * k (exact
+// but for an infinity beyond the single range), Q4_K and Q6_K with the single
 // steps of ggml's dequantize_row_*; aCols must be a multiple of the block size
 procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
   aDst: PSingleArray);
@@ -396,6 +432,18 @@ begin
   end;
 end;
 
+const
+  /// the binary exponent of each doubled E2M1 magnitude (0 for 0: no overflow)
+  MXFP4_LOG2: array[0..7] of byte = (0, 0, 1, 1, 2, 2, 3, 3);
+
+function InferE8M0HalfBits(e: byte): cardinal;
+begin
+  if e < 2 then
+    result := cardinal($00200000) shl e
+  else
+    result := cardinal(e - 1) shl 23;
+end;
+
 procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
   aDst: PSingleArray);
 var
@@ -403,6 +451,7 @@ var
   blk: PInferBlockQ8_0;
   b4: PInferBlockQ4_0;
   b5: PInferBlockQ5_0;
+  bm: PInferBlockMxfp4;
   d: single;
   qh: cardinal;
   w: PWordArray;
@@ -481,6 +530,29 @@ begin
               (((qh shr (j + 16)) and 1) shl 4)) - 16);
           end;
           inc(b5);
+        end;
+      end;
+    idtMXFP4:
+      begin
+        nb := aCols div 32;
+        bm := @PInferBlockMxfp4Array(aData)^[aRow * nb];
+        for b := 0 to nb - 1 do
+        begin
+          PCardinal(@d)^ := InferE8M0HalfBits(bm^.e);
+          for j := 0 to 31 do
+          begin
+            if j < 16 then
+              qh := bm^.qs[j] and 15
+            else
+              qh := bm^.qs[j - 16] shr 4;
+            // beyond the single range from e = 253 on: the infinity written,
+            // not computed (Delphi raises on a float overflow)
+            if bm^.e + MXFP4_LOG2[qh and 7] >= 256 then
+              PCardinalArray(aDst)^[b * 32 + j] := $7f800000 or ((qh and 8) shl 28)
+            else
+              aDst^[b * 32 + j] := d * INFER_MXFP4_VALUES[qh];
+          end;
+          inc(bm);
         end;
       end;
   else

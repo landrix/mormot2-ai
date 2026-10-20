@@ -69,6 +69,10 @@ type
     /// Q5_0 weights of ggml's reference quantizer dequantize exactly and give
     // the Q5_0 Linear of ggml-cpu
     procedure Q5LikeGgml;
+    /// MXFP4 weights of ggml's reference quantizer dequantize exactly (also
+    // with exponents outside the range the CPU computes exactly) and give the
+    // MXFP4 Linear of ggml-cpu
+    procedure Mxfp4LikeGgml;
     /// Q8_K activations, Q4_K and Q6_K dequantization and their Linear: the
     // bytes and sums of ggml itself
     procedure KQuantsLikeGgml;
@@ -592,6 +596,76 @@ begin
     // ggml sums in single, we in double: the integer block sums are the same
     cmp := InferCompare(pointer(out), y, rows * nout, 1e-5, 1e-5);
     CheckUtf8(InferCompareOk(cmp), 'Q5_0 linear like ggml: %', [InferCompareText(cmp)]);
+  finally
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferGguf.Mxfp4LikeGgml;
+var
+  ref: TInferRefSet;
+  dir: TFileName;
+  x, b, y, deq: PSingleArray;
+  blocks, w: PByteArray;
+  t: PInferRefTensor;
+  n, m, rows, cols, nin, nout, r, k: PtrInt;
+  out, row: TSingleDynArray;
+  cmp: TInferCompare;
+  q8: array[0..2] of TInferBlockQ8_0;
+  blk: PInferBlockMxfp4;
+  exact: boolean;
+begin
+  dir := FindInferRefDir('mxfp4');
+  if CheckFailed(dir <> '', 'mxfp4 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  try
+    // blocks of quantize_row_mxfp4_ref - every E2M1 value of either sign,
+    // values between them, a zero block (exponent 0), tiny and large rows,
+    // and rows 6 and 7 with exponents below and above the exact range -
+    // dequantize to the values of dequantize_row_mxfp4: 2^(e - 128) * k is
+    // exact in single
+    t := ref.Tensor('quant/x');
+    rows := t^.Shape[0];
+    cols := t^.Shape[1];
+    blocks := ref.U8('quant/blocks', m);
+    CheckEqual(m, rows * (cols div 32) * SizeOf(TInferBlockMxfp4), 'block bytes');
+    deq := ref.F32('dequant/y', n);
+    SetLength(row, cols);
+    for r := 0 to rows - 1 do
+    begin
+      InferRowToF32(blocks, idtMXFP4, r, cols, pointer(row));
+      cmp := InferCompare(pointer(row), @deq^[r * cols], cols, 0, 0);
+      CheckUtf8(InferCompareOk(cmp), 'dequantized row %: %', [r, InferCompareText(cmp)]);
+    end;
+    // as Q8_0 blocks: the same values where the exponent is in the range;
+    // rows 6 and 7 are outside it (the loaders refuse such non-zero blocks)
+    for r := 0 to rows - 1 do
+    begin
+      blk := @PInferBlockMxfp4Array(blocks)^[r * (cols div 32)];
+      InferMxfp4ToQ8(blk, cols div 32, @q8);
+      exact := true;
+      for k := 0 to cols - 1 do
+        if InferHalfToSingle(q8[k shr 5].d) * q8[k shr 5].qs[k and 31] <>
+           deq^[r * cols + k] then
+          exact := false;
+      CheckUtf8(exact = (r < 6), 'Q8_0 blocks of row % exact: %', [r, exact]);
+    end;
+    // the Linear against ggml_vec_dot_mxfp4_q8_0
+    t := ref.Tensor('linear/x');
+    rows := t^.Shape[0];
+    nin := t^.Shape[1];
+    nout := ref.Tensor('linear/bias')^.Shape[0];
+    x := ref.F32('linear/x', n);
+    b := ref.F32('linear/bias', n);
+    y := ref.F32('linear/y', n);
+    w := ref.U8('linear/weight', n);
+    CheckUtf8(fCpu.Supports(ioLinear, idtMXFP4), 'the CPU backend takes MXFP4');
+    SetLength(out, rows * nout);
+    fCpu.Linear(x, rows, nin, InferWeight(w, idtMXFP4), nout, b, pointer(out));
+    // ggml sums in single, we in double: the integer block sums are the same
+    cmp := InferCompare(pointer(out), y, rows * nout, 1e-5, 1e-5);
+    CheckUtf8(InferCompareOk(cmp), 'MXFP4 linear like ggml: %', [InferCompareText(cmp)]);
   finally
     ref.Free;
   end;
