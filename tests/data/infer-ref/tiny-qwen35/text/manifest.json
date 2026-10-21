@@ -1,0 +1,715 @@
+{
+ "dataset": "tiny-qwen35/text",
+ "note": "seeded Qwen3.5 as Qwen3_5ForCausalLM (model_type qwen3_5_text, the settings at the top of config.json, tensors under model., lm_head of its own), 5 layers: linear, full, linear, linear, full; 2 key heads read by 4 value heads (each key head by two neighbours: repeat_interleave), a convolution of 3, half of each head rotating; otherwise as tiny-qwen35; the same kinds of cases",
+ "config": {
+  "vocab_size": 96,
+  "hidden_size": 64,
+  "intermediate_size": 96,
+  "num_hidden_layers": 5,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 32,
+  "linear_conv_kernel_dim": 3,
+  "linear_key_head_dim": 16,
+  "linear_value_head_dim": 16,
+  "linear_num_key_heads": 2,
+  "linear_num_value_heads": 4,
+  "hidden_act": "silu",
+  "rms_norm_eps": 1e-06,
+  "max_position_embeddings": 512,
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "attn_output_gate": true,
+  "mlp_only_layers": [],
+  "tie_word_embeddings": false,
+  "rope_parameters": {
+   "rope_type": "default",
+   "rope_theta": 10000000.0,
+   "partial_rotary_factor": 0.5,
+   "mrope_interleaved": true,
+   "mrope_section": [
+    4,
+    2,
+    2
+   ]
+  },
+  "bos_token_id": null,
+  "eos_token_id": 1,
+  "pad_token_id": null,
+  "use_cache": true,
+  "initializer_range": 0.02,
+  "layer_types": [
+   "linear_attention",
+   "full_attention",
+   "linear_attention",
+   "linear_attention",
+   "full_attention"
+  ],
+  "architectures": [
+   "Qwen3_5ForCausalLM"
+  ],
+  "model_type": "qwen3_5_text",
+  "dtype": "bfloat16"
+ },
+ "safetensors_sha256": "8a4e4ff43107e0ab97dca0e86e98a7c7f84c6bc29f32b2a1b7bde59a4515ce86",
+ "seed": 20261022,
+ "recurrence_effect": 2.7921810150146484,
+ "gate_effect": 0.7002298831939697,
+ "environment": {
+  "created_utc": "2026-10-21T11:11:20Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": false,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "cases": [
+  {
+   "case": 0,
+   "ids": [
+    15,
+    16,
+    42,
+    3,
+    67
+   ],
+   "tokens": 5,
+   "steps_vs_pass": 1.780688762664795e-06,
+   "greedy": [
+    7,
+    26,
+    49,
+    75,
+    82,
+    71,
+    73,
+    82,
+    7,
+    22,
+    2,
+    29,
+    82,
+    7,
+    59,
+    41,
+    46,
+    81,
+    9,
+    43,
+    22,
+    54,
+    39,
+    2
+   ],
+   "min_margin": 0.0006543397903442383
+  },
+  {
+   "case": 1,
+   "ids": [
+    18,
+    78,
+    27,
+    79,
+    16,
+    31,
+    28,
+    3,
+    72,
+    65,
+    45,
+    10,
+    17
+   ],
+   "tokens": 13,
+   "steps_vs_pass": 3.814697265625e-06,
+   "greedy": [
+    16,
+    24,
+    36,
+    67,
+    82,
+    20,
+    60,
+    81,
+    78,
+    70,
+    7,
+    46,
+    82,
+    69,
+    81,
+    11,
+    92,
+    38,
+    71,
+    85,
+    72,
+    40,
+    79,
+    7
+   ],
+   "min_margin": 0.0039969682693481445
+  },
+  {
+   "case": 2,
+   "ids": [
+    44,
+    35,
+    58,
+    75,
+    71,
+    9,
+    32,
+    28,
+    94,
+    72,
+    64,
+    95,
+    68,
+    61,
+    90,
+    39,
+    30,
+    89,
+    14,
+    11,
+    73,
+    15,
+    94,
+    3,
+    43,
+    83,
+    14,
+    74,
+    72
+   ],
+   "tokens": 29,
+   "steps_vs_pass": 6.75395131111145e-06,
+   "greedy": [
+    92,
+    39,
+    94,
+    64,
+    7,
+    18,
+    60,
+    17,
+    44,
+    78,
+    26,
+    65,
+    36,
+    18,
+    50,
+    61,
+    9,
+    12,
+    7,
+    74,
+    65,
+    23,
+    63,
+    2
+   ],
+   "min_margin": 0.019912362098693848
+  }
+ ],
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 149244,
+  "sha256": "446782e55f7b586289aa9a5ce82713c8ec0d09c3eb2b5265489e45579508fcd7",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "case0.ids",
+   "dtype": "i32",
+   "shape": [
+    5
+   ],
+   "offset": 0,
+   "bytes": 20,
+   "sha256": "a8fa8d6ff079166a832471853d72d5d5e736e148ade49db9831f8ad136f7666d"
+  },
+  {
+   "name": "case0.embed",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 20,
+   "bytes": 1280,
+   "sha256": "f86f2558d9e46c2d758c17ecc9137d74ee9f431dfd6bfdfcb9e1ce88bc865e65"
+  },
+  {
+   "name": "case0.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 1300,
+   "bytes": 1280,
+   "sha256": "425958fdd37064cab1e63e8a0fde3485edf87c8e9968a4918562c6b7597ce055"
+  },
+  {
+   "name": "case0.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 2580,
+   "bytes": 1280,
+   "sha256": "04f853d79cc13cd71307b62af36020d628cd86506093bb772676311052012a8d"
+  },
+  {
+   "name": "case0.layer00",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 3860,
+   "bytes": 1280,
+   "sha256": "945c316d9bda392cdd8d23fd7b5827ff7143fea20f543adf34d98fd666340a2f"
+  },
+  {
+   "name": "case0.layer01",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 5140,
+   "bytes": 1280,
+   "sha256": "6af78218651adcf7640eefe69b53e9982a00a0a9666eaac2d59b1a975a838c99"
+  },
+  {
+   "name": "case0.layer02",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 6420,
+   "bytes": 1280,
+   "sha256": "32d108fc24001307d9d2f7bce829650a932b2ea223fcf6cada85683061d632e3"
+  },
+  {
+   "name": "case0.layer03",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 7700,
+   "bytes": 1280,
+   "sha256": "98be6a7b68476ebbfc87206e35931c0c412f70d07d22fa03755287e5553ddb94"
+  },
+  {
+   "name": "case0.layer04",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 8980,
+   "bytes": 1280,
+   "sha256": "00f0b1239b948999dfad7a1aa6ed806bd7f409d4c13c39c6fdf005f7273db036"
+  },
+  {
+   "name": "case0.norm",
+   "dtype": "f32",
+   "shape": [
+    5,
+    64
+   ],
+   "offset": 10260,
+   "bytes": 1280,
+   "sha256": "c6828318cf74e6fc3ccc0f2253f4fee8fa7e8f6658efea8e6ed09c8f90025d79"
+  },
+  {
+   "name": "case0.logits",
+   "dtype": "f32",
+   "shape": [
+    5,
+    96
+   ],
+   "offset": 11540,
+   "bytes": 1920,
+   "sha256": "6ba21495f7583bd1439b9342a38a30cc6f474988385eb1e287c6573a0b7471fe"
+  },
+  {
+   "name": "case0.logits_steps",
+   "dtype": "f32",
+   "shape": [
+    5,
+    96
+   ],
+   "offset": 13460,
+   "bytes": 1920,
+   "sha256": "4777840f318a4fa85b4b875ec576d70be45918caedbe539ef47172fa1a379928",
+   "note": "the logits of every position, one token at a time with the cache"
+  },
+  {
+   "name": "case0.greedy",
+   "dtype": "i32",
+   "shape": [
+    24
+   ],
+   "offset": 15380,
+   "bytes": 96,
+   "sha256": "d7c511e70c10f4c26a2fab11796de2cebe3324e7a1e687d940a3103323018b7e"
+  },
+  {
+   "name": "case0.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    24
+   ],
+   "offset": 15476,
+   "bytes": 96,
+   "sha256": "bf6fd6e5f54978305ae79a500dc2721ad981be34abb6e00489aa69c18bb92f79"
+  },
+  {
+   "name": "case1.ids",
+   "dtype": "i32",
+   "shape": [
+    13
+   ],
+   "offset": 15572,
+   "bytes": 52,
+   "sha256": "34e6ff9efac3cefab785e6107eef37828b9ac0104a852f6cb7f8a480fa750262"
+  },
+  {
+   "name": "case1.embed",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 15624,
+   "bytes": 3328,
+   "sha256": "bc43debb82538d9ef0669a9b8144a8e7bb9333d158b9f155310fdcb1ad98e195"
+  },
+  {
+   "name": "case1.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 18952,
+   "bytes": 3328,
+   "sha256": "315ef9fa73ed5fde667c559429797ab8a513531e933a5ca32803250004bcd542"
+  },
+  {
+   "name": "case1.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 22280,
+   "bytes": 3328,
+   "sha256": "714e49cf5ce4470e1c5bcf36af09f261f568c450d43a1ad7a5ff1deebd0a128a"
+  },
+  {
+   "name": "case1.layer00",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 25608,
+   "bytes": 3328,
+   "sha256": "17e4bf45dcd5231a3a5e0b326f2a9e4f708c4c0de97e103211df3c694cea4bc0"
+  },
+  {
+   "name": "case1.layer01",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 28936,
+   "bytes": 3328,
+   "sha256": "7ec4b0f3880a186454f47d19a4a8fb7b9561847a0fbc2fbac0edcc60371497ff"
+  },
+  {
+   "name": "case1.layer02",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 32264,
+   "bytes": 3328,
+   "sha256": "4950bd7f97f2862fc96d23a56acea5ca7173e9b9a5e639c52ea5e76f365378d2"
+  },
+  {
+   "name": "case1.layer03",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 35592,
+   "bytes": 3328,
+   "sha256": "bd87a7a068f2ef96fe357b176083ef65fc96a1a8298a038c6a0b2dcf4beede18"
+  },
+  {
+   "name": "case1.layer04",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 38920,
+   "bytes": 3328,
+   "sha256": "6462734f0321e66c581c250afa310a764c44d6e42888e2869106f046f3454f9c"
+  },
+  {
+   "name": "case1.norm",
+   "dtype": "f32",
+   "shape": [
+    13,
+    64
+   ],
+   "offset": 42248,
+   "bytes": 3328,
+   "sha256": "3fc58839c9a95896c86acf5eae81db42fa6c6224de99096a3bd521b400fa0d7f"
+  },
+  {
+   "name": "case1.logits",
+   "dtype": "f32",
+   "shape": [
+    13,
+    96
+   ],
+   "offset": 45576,
+   "bytes": 4992,
+   "sha256": "3a1fc3ae019bee67f7ee9a4a021e27a347c28fb4886a209614a6756a784c95da"
+  },
+  {
+   "name": "case1.logits_steps",
+   "dtype": "f32",
+   "shape": [
+    13,
+    96
+   ],
+   "offset": 50568,
+   "bytes": 4992,
+   "sha256": "026d21b7bd70ed9bb9954e710669d153bee4df95830c5cc3e4ddef88e14a0df9",
+   "note": "the logits of every position, one token at a time with the cache"
+  },
+  {
+   "name": "case1.greedy",
+   "dtype": "i32",
+   "shape": [
+    24
+   ],
+   "offset": 55560,
+   "bytes": 96,
+   "sha256": "75a175598f7b6de3b353d9f8f5894c56efd2bea16374d53a531b18df7decaf7f"
+  },
+  {
+   "name": "case1.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    24
+   ],
+   "offset": 55656,
+   "bytes": 96,
+   "sha256": "d1c71ed24ecf0ac3788d6b2a7e3daa6e2823b518dfa3928ae08ff7e2afb275ec"
+  },
+  {
+   "name": "case2.ids",
+   "dtype": "i32",
+   "shape": [
+    29
+   ],
+   "offset": 55752,
+   "bytes": 116,
+   "sha256": "073a24a57e03d8a531c7d918fc6849968f122f96736e320053a5e39ee2eccc74"
+  },
+  {
+   "name": "case2.embed",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 55868,
+   "bytes": 7424,
+   "sha256": "cde3fbe906e8152b35906293f3f82509e2a8dbede3f3e845e1ab5b84c03eb22b"
+  },
+  {
+   "name": "case2.layer00_attn",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 63292,
+   "bytes": 7424,
+   "sha256": "700ae5d3ceb1018bd3c0a64e3309475169ac4ee7ce1da031af639543ec7cd15e"
+  },
+  {
+   "name": "case2.layer00_mlp",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 70716,
+   "bytes": 7424,
+   "sha256": "745a89b49caac30a305a113c31bf2a184d4d09ae61cf0fe6ed8aaffc31c827e9"
+  },
+  {
+   "name": "case2.layer00",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 78140,
+   "bytes": 7424,
+   "sha256": "9463a43fc50df6d83ac1bbc31723bb0140d1314206d1e422b23b8468c90e4661"
+  },
+  {
+   "name": "case2.layer01",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 85564,
+   "bytes": 7424,
+   "sha256": "46579272d19c051d97ed4d7aaa38f76e46df45b83b160a55f46e73840d2f0ae7"
+  },
+  {
+   "name": "case2.layer02",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 92988,
+   "bytes": 7424,
+   "sha256": "dad2fee6f06fe36fdc2bc365be8a68c8399248805617778d639e1617564efb6c"
+  },
+  {
+   "name": "case2.layer03",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 100412,
+   "bytes": 7424,
+   "sha256": "ea21483e5a40284b0b64a3ff6f189c7101b59dc9af2558ee8692bf8870aa1364"
+  },
+  {
+   "name": "case2.layer04",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 107836,
+   "bytes": 7424,
+   "sha256": "546fd5c58f62a1c156ed5026cbe0d39e83e354f3a707055f27a2a92abb9ebab9"
+  },
+  {
+   "name": "case2.norm",
+   "dtype": "f32",
+   "shape": [
+    29,
+    64
+   ],
+   "offset": 115260,
+   "bytes": 7424,
+   "sha256": "29a68d851ac1309b64ec3dedaaf2265340c2361f9819242f5b832e12b160f270"
+  },
+  {
+   "name": "case2.logits",
+   "dtype": "f32",
+   "shape": [
+    29,
+    96
+   ],
+   "offset": 122684,
+   "bytes": 11136,
+   "sha256": "b1ca5f0584a7f9831d48b81b36cf5f2828ed68d6ab78b64de0a89f6b2e5c29e2"
+  },
+  {
+   "name": "case2.logits_steps",
+   "dtype": "f32",
+   "shape": [
+    29,
+    96
+   ],
+   "offset": 133820,
+   "bytes": 11136,
+   "sha256": "651e522dc782bbc92140d2cf47881124bc31e670ead1b3a49771dd5699a316aa",
+   "note": "the logits of every position, one token at a time with the cache"
+  },
+  {
+   "name": "case2.greedy",
+   "dtype": "i32",
+   "shape": [
+    24
+   ],
+   "offset": 144956,
+   "bytes": 96,
+   "sha256": "bb9fc427a1332ed9d0ee1814145b966404bb4e648a071bcb60f8075ad6fe96a1"
+  },
+  {
+   "name": "case2.greedy_margin",
+   "dtype": "f32",
+   "shape": [
+    24
+   ],
+   "offset": 145052,
+   "bytes": 96,
+   "sha256": "b6bc900ec87def07b6ac2bce4d86772bfbded6d8bf10fdb4ddfc7e1b9887442e"
+  },
+  {
+   "name": "rope.cos",
+   "dtype": "f32",
+   "shape": [
+    64,
+    8
+   ],
+   "offset": 145148,
+   "bytes": 2048,
+   "sha256": "18ef3a68c716a48fbcb20a05c9a06c4d7a9841cb6c1195896a155d209a697a47"
+  },
+  {
+   "name": "rope.sin",
+   "dtype": "f32",
+   "shape": [
+    64,
+    8
+   ],
+   "offset": 147196,
+   "bytes": 2048,
+   "sha256": "3f8d5911868e90fcbb9df8a8de58b12f23fbee4eb1e6fa4e60e4246eb3a50149"
+  }
+ ]
+}

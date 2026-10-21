@@ -153,7 +153,7 @@ type
       aAlpha: single = 1; aLimit: single = 0); override;
     procedure GeluTanhGlu(gate, up: PSingleArray; aCount: PtrInt); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-      aCos, aSin: PSingleArray); override;
+      aCos, aSin: PSingleArray; aRotDim: PtrInt = 0); override;
   end;
 
   /// one CausalAttention: its operands and the arithmetic to use
@@ -205,6 +205,7 @@ type
     fJob: TInferLinearJob;
     fX, fY, fQ, fK, fV: PSingleArray;
     fRows, fSeq, fHeadDim, fWidth: PtrInt;
+    fRotDim: PtrInt; // of the running Rope
     fKeep: PIntegerArray;
     fXq: array of TInferBlockQ8_0;
     fXk: array of TInferBlockQ8_K;
@@ -254,7 +255,7 @@ type
       aAlpha: single = 1; aLimit: single = 0); override;
     procedure GeluTanhGlu(gate, up: PSingleArray; aCount: PtrInt); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-      aCos, aSin: PSingleArray); override;
+      aCos, aSin: PSingleArray; aRotDim: PtrInt = 0); override;
     /// the items on the pool, unless it is busy with another caller
     procedure RunItems(const aJob: TOnInferItem; aCount: integer); override;
     /// the threads computing, the calling one included
@@ -1693,13 +1694,17 @@ begin
 end;
 
 procedure TInferCpuBackend.Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-  aCos, aSin: PSingleArray);
+  aCos, aSin: PSingleArray; aRotDim: PtrInt);
 var
   r, h, i, half: PtrInt;
   c, s, a, b: double;
   v: PSingleArray;
 begin
-  half := aHeadDim shr 1;
+  // the pairs of rotate_half within the rotated part of every head
+  if aRotDim > 0 then
+    half := aRotDim shr 1
+  else
+    half := aHeadDim shr 1;
   for r := 0 to aRows - 1 do
     for i := 0 to half - 1 do
     begin
@@ -2572,17 +2577,20 @@ var
 begin
   // the reference arithmetic, each row on one thread: bit-identical
   first := PtrInt(aItem) * ROPE_ROWS;
-  half := fHeadDim shr 1;
+  if fRotDim > 0 then
+    half := fRotDim shr 1
+  else
+    half := fHeadDim shr 1;
   inherited Rope(@fX^[first * fWidth * fHeadDim], MinPtrInt(ROPE_ROWS, fRows - first),
-    fWidth, fHeadDim, @fGamma^[first * half], @fBeta^[first * half]);
+    fWidth, fHeadDim, @fGamma^[first * half], @fBeta^[first * half], fRotDim);
 end;
 
 procedure TInferCpuFastBackend.Rope(x: PSingleArray; aRows, aHeads,
-  aHeadDim: PtrInt; aCos, aSin: PSingleArray);
+  aHeadDim: PtrInt; aCos, aSin: PSingleArray; aRotDim: PtrInt);
 begin
   if (aRows < 2 * ROPE_ROWS) or not fBusy.TryLock then
   begin
-    inherited Rope(x, aRows, aHeads, aHeadDim, aCos, aSin);
+    inherited Rope(x, aRows, aHeads, aHeadDim, aCos, aSin, aRotDim);
     exit;
   end;
   try
@@ -2590,6 +2598,7 @@ begin
     fRows := aRows;
     fWidth := aHeads;
     fHeadDim := aHeadDim;
+    fRotDim := aRotDim;
     fGamma := aCos;
     fBeta := aSin;
     RunParallel(RopeRows, (aRows + ROPE_ROWS - 1) div ROPE_ROWS);

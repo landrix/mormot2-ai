@@ -1,0 +1,66 @@
+{
+ "architectures": [
+  "Qwen3_5ForConditionalGeneration"
+ ],
+ "model_type": "qwen3_5",
+ "text_config": {
+  "vocab_size": 96,
+  "hidden_size": 64,
+  "intermediate_size": 96,
+  "num_hidden_layers": 4,
+  "num_attention_heads": 4,
+  "num_key_value_heads": 2,
+  "head_dim": 32,
+  "linear_conv_kernel_dim": 4,
+  "linear_key_head_dim": 16,
+  "linear_value_head_dim": 16,
+  "linear_num_key_heads": 2,
+  "linear_num_value_heads": 2,
+  "full_attention_interval": 4,
+  "hidden_act": "silu",
+  "rms_norm_eps": 1e-06,
+  "max_position_embeddings": 512,
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "attn_output_gate": true,
+  "mlp_only_layers": [],
+  "tie_word_embeddings": true,
+  "rope_parameters": {
+   "rope_type": "default",
+   "rope_theta": 10000000.0,
+   "partial_rotary_factor": 0.25,
+   "mrope_interleaved": true,
+   "mrope_section": [
+    2,
+    1,
+    1
+   ]
+  },
+  "bos_token_id": null,
+  "eos_token_id": 1,
+  "pad_token_id": null,
+  "use_cache": true,
+  "initializer_range": 0.02,
+  "model_type": "qwen3_5_text",
+  "dtype": "bfloat16"
+ },
+ "vision_config": {
+  "depth": 1,
+  "hidden_size": 32,
+  "intermediate_size": 64,
+  "num_heads": 2,
+  "out_hidden_size": 64,
+  "patch_size": 16,
+  "spatial_merge_size": 2,
+  "temporal_patch_size": 2,
+  "num_position_embeddings": 64,
+  "hidden_act": "gelu_pytorch_tanh",
+  "in_channels": 3,
+  "model_type": "qwen3_5"
+ },
+ "image_token_id": 90,
+ "video_token_id": 91,
+ "vision_start_token_id": 92,
+ "vision_end_token_id": 93,
+ "tie_word_embeddings": true
+}

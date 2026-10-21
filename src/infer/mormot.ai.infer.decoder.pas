@@ -24,6 +24,12 @@
 //   positions (RopeFactor: frequencies between interpolation and extrapolation,
 //   cos and sin scaled by an attention factor), computed in Rotary for every
 //   executor
+// - what Qwen3.5 adds: the Gated DeltaNet mixer (dmDeltaNet - a linear
+//   attention whose state per value head is a matrix carried from token to
+//   token, behind a depthwise causal convolution: TDecoderContext keeps both
+//   per layer), an output gate on the attention (Spec.OutputGate) and a partial
+//   rotary factor (Config.RopeDims); a context with such a layer can go back to
+//   its start only, or stay where it is (no restore points of the state yet)
 // - a sliding-window layer keeps the keys a next token may see, not the whole
 //   sequence: its cache rows start at a base position that moves on when the
 //   buffer is full (FullCache keeps every key and only masks, the reference);
@@ -86,8 +92,15 @@ uses
 type
   /// how a layer mixes the tokens of the sequence
   // - dmAttention: causal grouped-query attention over every cached token
+  // - dmDeltaNet: the Gated DeltaNet of Qwen3.5 - Q, K and V through a
+  // depthwise causal convolution with silu, Q and K L2-normed per head (Q also
+  // times 1 / sqrt(key dim)), per value head a state S [key dim, value dim]
+  // decayed by exp(g) and updated by the delta rule at the rate beta, read by
+  // Q; an RMSNorm per value head times silu(z), an output projection - the
+  // shapes in Config.Lin*
   TDecoderMixer = (
-    dmAttention);
+    dmAttention,
+    dmDeltaNet);
 
   /// the feed-forward block of a layer
   // - dfDense: one SwiGLU block (gate, up, down)
@@ -132,6 +145,10 @@ type
     /// V is the K projection (no V matrix): the raw keys before their norm
     // and rotary positions (Gemma 4 attention_k_eq_v)
     KIsV: boolean;
+    /// the Q projection gives per head the query, then as many gate values:
+    // the attention output is multiplied by sigmoid(gate) before the output
+    // projection (Qwen3.5)
+    OutputGate: boolean;
   end;
   TDecoderLayerSpecDynArray = array of TDecoderLayerSpec;
 
@@ -191,6 +208,14 @@ type
     // of each head that rotates (the "proportional" RoPE of Gemma 4: the
     // frequencies over the whole head dimension, those beyond the share 0)
     Rope2Theta, Rope2Partial: double;
+    /// the values at the start of every head that rotate in the first rotary
+    // set: 0 (CheckConfig fills in HeadDim) for all of them, fewer for a
+    // partial rotary factor (Qwen3.5: a quarter) - rotate_half within them
+    RopeDims: PtrInt;
+    /// the dmDeltaNet layers: key and value heads (a key head is read by
+    // LinValueHeads div LinKeyHeads neighbouring value heads), their widths,
+    // the kernel of the causal convolution - 0 without such a layer
+    LinKeyHeads, LinValueHeads, LinKeyDim, LinValueDim, LinConv: PtrInt;
   end;
 
   /// weights by expert
@@ -213,6 +238,12 @@ type
   // and ExpertScale ([Experts], times the renormed top-k weights); Scalar
   // ([1]) multiplies the whole state after the layer, whatever its value
   // (nil: none)
+  // - a dmDeltaNet layer: LinQkv ([2 key + value width, Hidden]: the Q, K
+  // and V rows), LinZ ([value width, Hidden], the gates of the norm), LinB and
+  // LinA ([value heads, Hidden]: beta and the decay), LinOut ([Hidden, value
+  // width]); LinConvW ([channels, LinConv], the convolution), LinDtBias and
+  // LinNegA ([value heads]: -exp(A_log)), LinNorm ([LinValueDim], the weight
+  // of the gated RMSNorm); Q, K, V and O stay empty
   TDecoderLayer = record
     Q, K, V, O, Gate, Up, Down: TInferWeight;
     QNorm, KNorm, InputNorm, PostNorm: PSingleArray;
@@ -225,6 +256,8 @@ type
     RouterBias: PSingleArray;
     ExpertGate, ExpertUp, ExpertDown: TInferWeightDynArray;
     ExpertGateBias, ExpertUpBias, ExpertDownBias: PSingleArray;
+    LinQkv, LinZ, LinB, LinA, LinOut: TInferWeight;
+    LinConvW, LinDtBias, LinNegA, LinNorm: PSingleArray;
   end;
   TDecoderLayerDynArray = array of TDecoderLayer;
 
@@ -237,6 +270,8 @@ type
   // layers), dxAttentionScale, dxGeluTanh, dxSandwichNorm, dxValueNorm,
   // dxSharedKv (Spec.KIsV), dxEmbedScale, dxLogitSoftcap, dxLayerScalar,
   // dxSecondRope, dxDenseMoe
+  // - Qwen3.5: dxOutputGate (Spec.OutputGate), dxPartialRope (RopeDims below
+  // HeadDim); its dmDeltaNet layers a device refuses by their mixer
   TDecoderExtra = (
     dxSinks,
     dxOutputBias,
@@ -253,7 +288,9 @@ type
     dxLogitSoftcap,
     dxLayerScalar,
     dxSecondRope,
-    dxDenseMoe);
+    dxDenseMoe,
+    dxOutputGate,
+    dxPartialRope);
   TDecoderExtras = set of TDecoderExtra;
 
 const
@@ -335,6 +372,10 @@ type
   // - a layer with a sliding window keeps the rows from Base[layer] on, enough
   // for the next token (FullCache: all of them); going back is only possible
   // to a length whose window is still there (Restorable)
+  // - a dmDeltaNet layer keeps no rows but a state of the whole sequence (the
+  // convolution inputs and the delta-rule matrices): such a context can only
+  // stay where it is or start again (Restorable 0 and Length); a Forward that
+  // failed leaves its state undone - only 0 is then restorable
   TDecoderContext = class
   protected
     fDevice: TDecoderDevice; // nil: the keys and values are in the arrays below
@@ -357,6 +398,17 @@ type
     // (gathered input, output, row index, weight)
     fRoute, fChosenW, fGather, fExpertOut, fRowW: TSingleDynArray;
     fChosen, fRow: TIntegerDynArray;
+    // per dmDeltaNet layer (nil for the others): the last LinConv - 1 inputs
+    // of every convolution channel [channels, LinConv - 1], oldest first, and
+    // the states [value heads, value dim, key dim] (a column of S per row)
+    fConv, fState: array of TSingleDynArray;
+    fRecurrent: boolean; // a layer carries a state
+    fStateOk: boolean; // the states hold exactly the fLength tokens
+    // an output gate: the Q rows with their gates, the gates alone
+    fQg, fGateQ: TSingleDynArray;
+    // a dmDeltaNet layer: the convolved Q, K, V rows, z, beta, the decay, the
+    // output before its projection
+    fQkv, fZ, fBeta, fDecay, fCore: TSingleDynArray;
     function GetId(aPosition: PtrInt): integer;
     procedure SetFullCache(aValue: boolean);
   public
@@ -367,7 +419,8 @@ type
     procedure Truncate(aLength: PtrInt);
     /// true when the cache can go back to its first aLength tokens: every
     // sliding window still holds the keys position aLength sees (always for 0
-    // and Length, and without a sliding window)
+    // and Length, and without a sliding window); with a dmDeltaNet layer only
+    // 0, and Length after a Forward that went through
     function Restorable(aLength: PtrInt): boolean;
     /// how many of the first tokens of aIds[0..aCount-1] the cache holds:
     // the length of the common prefix
@@ -511,6 +564,8 @@ type
     /// raise unless every FP16 scale of the blocks of aTensor is finite
     procedure CheckBlockScales(aTensor: PInferTensor; const aName: RawUtf8);
     procedure Grow(aCtx: TDecoderContext; aTokens, aNew: PtrInt);
+    /// the channels of the convolution of a dmDeltaNet layer: Q, K and V
+    function LinChannels: PtrInt;
     /// room in the rows of sliding-window layer aLayer for aRows new tokens
     // at aPast: older keys than the window of aPast moved out first
     procedure Slide(aCtx: TDecoderContext; aLayer, aPast, aRows: PtrInt);
@@ -519,6 +574,10 @@ type
     /// the dmAttention mixer of layer aLayer over aRows new tokens, its output
     // added to fX
     procedure AttentionBlock(aCtx: TDecoderContext; aLayer, aRows, aPast: PtrInt;
+      const aOnState: TOnDecoderState);
+    /// the dmDeltaNet mixer of layer aLayer over aRows new tokens after aPast
+    // ones (0: its state starts again), its output added to fX
+    procedure DeltaNetBlock(aCtx: TDecoderContext; aLayer, aRows, aPast: PtrInt;
       const aOnState: TOnDecoderState);
     /// the dfDense block of layer aLayer, its output added to fX
     procedure DenseBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
@@ -640,7 +699,7 @@ type
     // - raises EInferError for an id outside the vocabulary
     procedure Embed(aIds: PIntegerArray; aCount: PtrInt; aDest: PSingleArray);
     /// the rotary factors of aRows positions from aFirstPos into aCos and aSin
-    // ([aRows, HeadDim / 2] each), as Forward computes them
+    // ([aRows, Config.RopeDims / 2] each), as Forward computes them
     procedure Rotary(aFirstPos, aRows: PtrInt; aCos, aSin: PSingleArray);
     /// the factors of the second rotary set (Config.Rope2Theta): [aRows,
     // Rope2HeadDim / 2] each - nothing without one
@@ -784,7 +843,8 @@ begin
     EInferError.RaiseUtf8('%.Truncate(%) of % tokens', [self, aLength, fLength]);
   if not Restorable(aLength) then
     EInferError.RaiseUtf8('%.Truncate(%): a sliding window no longer holds ' +
-      'the keys of that position', [self, aLength]);
+      'the keys of that position, or a recurrent state cannot go back there',
+      [self, aLength]);
   if aLength = 0 then
     Reset
   else
@@ -801,6 +861,12 @@ begin
   result := true;
   if aLength = 0 then
     exit; // a new sequence: every window starts again
+  // a recurrent state holds the whole sequence: no way back but to 0
+  if fRecurrent and ((aLength <> fLength) or not fStateOk) then
+  begin
+    result := false;
+    exit;
+  end;
   for i := 0 to high(fWindow) do
     if fWindow[i] > 0 then
     begin
@@ -1079,7 +1145,7 @@ end;
 procedure TDecoderModel.CheckConfig(const aSource: TFileName);
 var
   i, rot: PtrInt;
-  moe: boolean;
+  moe, lin: boolean;
   sp: ^TDecoderLayerSpec;
 begin
   // every dimension bounded on its own before any product: a product of
@@ -1126,6 +1192,14 @@ begin
     if not sp^.Rope2 and not sp^.NoRope and (sp^.HeadDim <> fConfig.HeadDim) then
       EInferError.RaiseUtf8('%: % has heads of % with the rotary set of %',
         [self, aSource, sp^.HeadDim, fConfig.HeadDim]);
+    if sp^.Mixer = dmDeltaNet then
+    begin
+      // no heads of attention: only the settings of a DeltaNet
+      if sp^.NoRope or sp^.Rope2 or sp^.KIsV or sp^.OutputGate then
+        EInferError.RaiseUtf8('%: % has attention settings in the DeltaNet layer %',
+          [self, aSource, i]);
+      continue;
+    end;
     if sp^.Rope2 then
       if fRope2HeadDim = 0 then
         fRope2HeadDim := sp^.HeadDim
@@ -1136,6 +1210,36 @@ begin
     fMaxKvw := MaxPtrInt(fMaxKvw, sp^.KvHeads * sp^.HeadDim);
     fMaxHeadDim := MaxPtrInt(fMaxHeadDim, sp^.HeadDim);
   end;
+  // the shapes of the DeltaNet layers, bounded on their own
+  lin := false;
+  for i := 0 to high(fConfig.Spec) do
+    if fConfig.Spec[i].Mixer = dmDeltaNet then
+      lin := true;
+  if lin then
+  begin
+    if (fConfig.LinKeyHeads <= 0) or (fConfig.LinKeyHeads > 1 shl 10) or
+       (fConfig.LinValueHeads <= 0) or (fConfig.LinValueHeads > 1 shl 10) or
+       (fConfig.LinValueHeads mod fConfig.LinKeyHeads <> 0) or
+       (fConfig.LinKeyDim <= 0) or (fConfig.LinKeyDim > 1024) or
+       (fConfig.LinValueDim <= 0) or (fConfig.LinValueDim > 1024) or
+       (fConfig.LinConv <= 0) or (fConfig.LinConv > 64) then
+      EInferError.RaiseUtf8('%: % has DeltaNet heads of % x % (keys) and % x % ' +
+        '(values) with a convolution of %', [self, aSource, fConfig.LinKeyHeads,
+        fConfig.LinKeyDim, fConfig.LinValueHeads, fConfig.LinValueDim,
+        fConfig.LinConv]);
+  end
+  else if (fConfig.LinKeyHeads <> 0) or (fConfig.LinValueHeads <> 0) or
+          (fConfig.LinKeyDim <> 0) or (fConfig.LinValueDim <> 0) or
+          (fConfig.LinConv <> 0) then
+    EInferError.RaiseUtf8('%: % has DeltaNet shapes but no layer uses them',
+      [self, aSource]);
+  // the rotating part of the first set: the whole head unless given
+  if fConfig.RopeDims = 0 then
+    fConfig.RopeDims := fConfig.HeadDim;
+  if (fConfig.RopeDims < 0) or (fConfig.RopeDims > fConfig.HeadDim) or
+     odd(fConfig.RopeDims) then
+    EInferError.RaiseUtf8('%: % rotates % values of a head of %',
+      [self, aSource, fConfig.RopeDims, fConfig.HeadDim]);
   if not (fConfig.AttentionScale >= 0) or (fConfig.AttentionScale > 1e3) or
      not (fConfig.EmbedScale >= 0) or (fConfig.EmbedScale > 1e6) or
      not (fConfig.LogitSoftcap >= 0) or (fConfig.LogitSoftcap > 1e6) then
@@ -1182,11 +1286,11 @@ begin
     EInferError.RaiseUtf8('%: % has invalid YaRN settings (factor %)',
       [self, aSource, fConfig.RopeFactor]);
   // inverse rotary frequencies as the reference forms them in float32:
-  // 1 / theta ^ (2i / d), each step rounded to single
-  SetLength(fInvFreq, fConfig.HeadDim shr 1);
+  // 1 / theta ^ (2i / d), each step rounded to single - d the rotating part
+  SetLength(fInvFreq, fConfig.RopeDims shr 1);
   for i := 0 to high(fInvFreq) do
     fInvFreq[i] := 1 / RoundToSingle(Exp(Ln(fConfig.RopeTheta) *
-      RoundToSingle((2 * i) / fConfig.HeadDim)));
+      RoundToSingle((2 * i) / fConfig.RopeDims)));
   fRopeScale := 1;
   if fConfig.RopeFactor <> 0 then
     YarnFrequencies;
@@ -1227,7 +1331,7 @@ begin
   // correction range keep their value (extrapolation), those above it are
   // divided by the factor (interpolation), a linear ramp between - every
   // tensor step in float32, the bounds in double as Python computes them
-  d := fConfig.HeadDim;
+  d := fConfig.RopeDims;
   pi2 := 2 * PI;
   lo := CorrectionDim(fConfig.RopeBetaFast);
   hi := CorrectionDim(fConfig.RopeBetaSlow);
@@ -1324,7 +1428,11 @@ begin
       include(result, dxSecondRope);
     if fConfig.Spec[i].Ffn = dfDenseMoe then
       include(result, dxDenseMoe);
+    if fConfig.Spec[i].OutputGate then
+      include(result, dxOutputGate);
   end;
+  if fConfig.RopeDims <> fConfig.HeadDim then
+    include(result, dxPartialRope);
   if fConfig.AttentionScale > 0 then
     include(result, dxAttentionScale);
   if fConfig.Activation = daGeluTanh then
@@ -1730,6 +1838,15 @@ begin
     SetLength(aBuffer, aCount);
 end;
 
+/// the width of the cache rows of layer aLayer: 0 for a layer without keys
+function KvWidth(const aConfig: TDecoderConfig; aLayer: PtrInt): PtrInt;
+begin
+  if aConfig.Spec[aLayer].Mixer = dmDeltaNet then
+    result := 0
+  else
+    result := aConfig.Spec[aLayer].KvHeads * aConfig.Spec[aLayer].HeadDim;
+end;
+
 function SameWidths(aCtx: TDecoderContext; const aConfig: TDecoderConfig): boolean;
 var
   i: PtrInt;
@@ -1738,7 +1855,7 @@ begin
   if length(aCtx.fKvW) <> aConfig.Layers then
     exit;
   for i := 0 to aConfig.Layers - 1 do
-    if aCtx.fKvW[i] <> aConfig.Spec[i].KvHeads * aConfig.Spec[i].HeadDim then
+    if aCtx.fKvW[i] <> KvWidth(aConfig, i) then
       exit;
   result := true;
 end;
@@ -1779,7 +1896,7 @@ begin
     end;
     SetLength(aCtx.fKvW, fConfig.Layers);
     for i := 0 to fConfig.Layers - 1 do
-      aCtx.fKvW[i] := fConfig.Spec[i].KvHeads * fConfig.Spec[i].HeadDim;
+      aCtx.fKvW[i] := KvWidth(fConfig, i);
     aCtx.fLayers := fConfig.Layers;
   end
   else
@@ -1809,7 +1926,7 @@ begin
     if cap > fConfig.MaxPositions then
       cap := fConfig.MaxPositions;
     // the byte size must fit PtrInt (a 32-bit process): SetLength would wrap
-    if cap > (High(PtrInt) div SizeOf(single)) div fMaxKvw then
+    if cap > (High(PtrInt) div SizeOf(single)) div MaxPtrInt(fMaxKvw, 1) then
       EInferError.RaiseUtf8('%.Forward: a KV cache of % tokens is too large for ' +
         'this process', [self, cap]);
     // a sliding window layer sizes its own rows (Slide)
@@ -1831,8 +1948,8 @@ begin
   Need(aCtx.fV, aNew * fMaxKvw);
   Need(aCtx.fGate, aNew * MaxPtrInt(fConfig.Intermediate, fConfig.ExpertIntermediate));
   Need(aCtx.fUp, aNew * MaxPtrInt(fConfig.Intermediate, fConfig.ExpertIntermediate));
-  Need(aCtx.fCos, aNew * (fConfig.HeadDim shr 1));
-  Need(aCtx.fSin, aNew * (fConfig.HeadDim shr 1));
+  Need(aCtx.fCos, aNew * (fConfig.RopeDims shr 1));
+  Need(aCtx.fSin, aNew * (fConfig.RopeDims shr 1));
   if fRope2HeadDim > 0 then
   begin
     Need(aCtx.fCos2, aNew * (fRope2HeadDim shr 1));
@@ -1851,6 +1968,47 @@ begin
     if length(aCtx.fRow) < aNew then
       SetLength(aCtx.fRow, aNew);
   end;
+  // an output gate: the doubled Q rows
+  for i := 0 to fConfig.Layers - 1 do
+    if fConfig.Spec[i].OutputGate then
+    begin
+      Need(aCtx.fQg, aNew * 2 * fMaxQw);
+      Need(aCtx.fGateQ, aNew * fMaxQw);
+      break;
+    end;
+  // the states and scratch of the DeltaNet layers
+  aCtx.fRecurrent := false;
+  for i := 0 to fConfig.Layers - 1 do
+    if fConfig.Spec[i].Mixer = dmDeltaNet then
+      aCtx.fRecurrent := true;
+  if aCtx.fRecurrent then
+  begin
+    if length(aCtx.fState) <> fConfig.Layers then
+    begin
+      aCtx.fConv := nil;
+      aCtx.fState := nil;
+      SetLength(aCtx.fConv, fConfig.Layers);
+      SetLength(aCtx.fState, fConfig.Layers);
+    end;
+    for i := 0 to fConfig.Layers - 1 do
+      if fConfig.Spec[i].Mixer = dmDeltaNet then
+      begin
+        Need(aCtx.fConv[i], LinChannels * (fConfig.LinConv - 1));
+        Need(aCtx.fState[i], fConfig.LinValueHeads * fConfig.LinValueDim *
+          fConfig.LinKeyDim);
+      end;
+    Need(aCtx.fQkv, aNew * LinChannels);
+    Need(aCtx.fZ, aNew * fConfig.LinValueHeads * fConfig.LinValueDim);
+    Need(aCtx.fCore, aNew * fConfig.LinValueHeads * fConfig.LinValueDim);
+    Need(aCtx.fBeta, aNew * fConfig.LinValueHeads);
+    Need(aCtx.fDecay, aNew * fConfig.LinValueHeads);
+  end;
+end;
+
+function TDecoderModel.LinChannels: PtrInt;
+begin
+  result := 2 * fConfig.LinKeyHeads * fConfig.LinKeyDim +
+    fConfig.LinValueHeads * fConfig.LinValueDim;
 end;
 
 procedure TDecoderModel.Slide(aCtx: TDecoderContext; aLayer, aPast, aRows: PtrInt);
@@ -1932,7 +2090,7 @@ var
   r, i, half: PtrInt;
   angle, c, s: single;
 begin
-  half := fConfig.HeadDim shr 1;
+  half := fConfig.RopeDims shr 1;
   for r := 0 to aRows - 1 do
     for i := 0 to half - 1 do
     begin
@@ -1982,10 +2140,41 @@ begin
     fLayer[aLayer].Sinks, fConfig.AttentionScale);
 end;
 
+/// a[i] := a[i] * sigmoid(gate[i]), the sigmoid rounded to single before the
+// product as the float32 reference computes it
+procedure GateBySigmoid(a, gate: PSingleArray; aCount: PtrInt);
+var
+  i: PtrInt;
+  d: double;
+  s: single;
+begin
+  for i := 0 to aCount - 1 do
+  begin
+    d := gate^[i];
+    if d < -100 then
+      s := 0 // exp would overflow; the sigmoid underflows to 0 in single
+    else
+      s := 1 / (1 + Exp(-d));
+    a^[i] := a^[i] * s;
+  end;
+end;
+
+/// silu(x) = x / (1 + exp(-x)) rounded to single
+function Silu(x: single): single;
+var
+  d: double;
+begin
+  d := x;
+  if d < -100 then
+    result := 0
+  else
+    result := d / (1 + Exp(-d));
+end;
+
 procedure TDecoderModel.AttentionBlock(aCtx: TDecoderContext;
   aLayer, aRows, aPast: PtrInt; const aOnState: TOnDecoderState);
 var
-  n, h, hd, kvh, qw, kvw: PtrInt;
+  n, h, hd, kvh, qw, kvw, r, rot: PtrInt;
   ly: ^TDecoderLayer;
   sp: ^TDecoderLayerSpec;
   cs, sn: PSingleArray;
@@ -2001,7 +2190,18 @@ begin
   // pre-norm, projections, per-head norms, rotary positions
   fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.InputNorm, fConfig.RmsEps,
     pointer(aCtx.fH));
-  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Q, qw, ly^.QBias, pointer(aCtx.fQ));
+  if sp^.OutputGate then
+  begin
+    // per head the query, then its gate: split into fQ and fGateQ
+    fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Q, 2 * qw, nil, pointer(aCtx.fQg));
+    for r := 0 to n * fConfig.Heads - 1 do
+    begin
+      MoveFast(aCtx.fQg[r * 2 * hd], aCtx.fQ[r * hd], hd * SizeOf(single));
+      MoveFast(aCtx.fQg[r * 2 * hd + hd], aCtx.fGateQ[r * hd], hd * SizeOf(single));
+    end;
+  end
+  else
+    fBackend.Linear(pointer(aCtx.fH), n, h, ly^.Q, qw, ly^.QBias, pointer(aCtx.fQ));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.K, kvw, ly^.KBias, pointer(aCtx.fK));
   if sp^.KIsV then
     // the values are the raw keys: normed (ValueNorm) but not rotated
@@ -2022,13 +2222,15 @@ begin
   begin
     cs := pointer(aCtx.fCos);
     sn := pointer(aCtx.fSin);
+    rot := fConfig.RopeDims; // the first set: maybe a part of the head
     if sp^.Rope2 then
     begin
       cs := pointer(aCtx.fCos2);
       sn := pointer(aCtx.fSin2);
+      rot := 0;
     end;
-    fBackend.Rope(pointer(aCtx.fQ), n, fConfig.Heads, hd, cs, sn);
-    fBackend.Rope(pointer(aCtx.fK), n, kvh, hd, cs, sn);
+    fBackend.Rope(pointer(aCtx.fQ), n, fConfig.Heads, hd, cs, sn, rot);
+    fBackend.Rope(pointer(aCtx.fK), n, kvh, hd, cs, sn, rot);
   end;
   if aCtx.fWindow[aLayer] > 0 then
     Slide(aCtx, aLayer, aPast, n);
@@ -2037,12 +2239,159 @@ begin
   MoveFast(pointer(aCtx.fV)^, aCtx.fValues[aLayer][(aPast - aCtx.fBase[aLayer]) * kvw],
     n * kvw * SizeOf(single));
   Attention(aCtx, aLayer, n);
+  if sp^.OutputGate then
+    GateBySigmoid(pointer(aCtx.fAttn), pointer(aCtx.fGateQ), n * qw);
   fBackend.Linear(pointer(aCtx.fAttn), n, qw, ly^.O, h, ly^.OBias, pointer(aCtx.fTmp));
   if Assigned(aOnState) and (aLayer = 0) then
     aOnState('layer00_attn', pointer(aCtx.fTmp), n, h);
   if fConfig.SandwichNorm then
     fBackend.RmsNorm(pointer(aCtx.fTmp), n, h, ly^.AttnNorm, fConfig.RmsEps,
       pointer(aCtx.fTmp));
+  fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
+end;
+
+procedure TDecoderModel.DeltaNetBlock(aCtx: TDecoderContext;
+  aLayer, aRows, aPast: PtrInt; const aOnState: TOnDecoderState);
+var
+  n, h, kh, vh, dk, dv, kd, vd, cd, kw, k1, rep, t, c, j, i, hv: PtrInt;
+  ly: ^TDecoderLayer;
+  conv, st, w, row, q, k, v, s, o, kk: PSingleArray;
+  acc, e: double;
+  a, scale, beta, decay, sp, delta, x: single;
+begin
+  ly := @fLayer[aLayer];
+  n := aRows;
+  h := fConfig.Hidden;
+  kh := fConfig.LinKeyHeads;
+  vh := fConfig.LinValueHeads;
+  dk := fConfig.LinKeyDim;
+  dv := fConfig.LinValueDim;
+  kd := kh * dk;
+  vd := vh * dv;
+  cd := LinChannels;
+  kw := fConfig.LinConv;
+  k1 := kw - 1;
+  rep := vh div kh;
+  // pre-norm and the four projections
+  fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.InputNorm, fConfig.RmsEps,
+    pointer(aCtx.fH));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.LinQkv, cd, nil, pointer(aCtx.fQkv));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.LinZ, vd, nil, pointer(aCtx.fZ));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.LinB, vh, nil, pointer(aCtx.fBeta));
+  fBackend.Linear(pointer(aCtx.fH), n, h, ly^.LinA, vh, nil, pointer(aCtx.fDecay));
+  conv := pointer(aCtx.fConv[aLayer]);
+  st := pointer(aCtx.fState[aLayer]);
+  if aPast = 0 then
+  begin
+    // a new sequence: the convolution sees zeros before it, the state is 0
+    FillCharFast(conv^, cd * k1 * SizeOf(single), 0);
+    FillCharFast(st^, vh * dv * dk * SizeOf(single), 0);
+  end;
+  // the causal convolution per channel, in place, then silu: weight kw - 1
+  // takes the new input, the others the last k1 inputs (oldest first)
+  w := ly^.LinConvW;
+  for c := 0 to cd - 1 do
+    for t := 0 to n - 1 do
+    begin
+      x := aCtx.fQkv[t * cd + c];
+      acc := w^[c * kw + k1];
+      acc := acc * x;
+      for j := 0 to k1 - 1 do
+      begin
+        e := w^[c * kw + j];
+        acc := acc + e * conv^[c * k1 + j];
+      end;
+      for j := 0 to k1 - 2 do
+        conv^[c * k1 + j] := conv^[c * k1 + j + 1]; // oldest out
+      if k1 > 0 then
+        conv^[c * k1 + k1 - 1] := x;
+      a := acc;
+      aCtx.fQkv[t * cd + c] := Silu(a);
+    end;
+  // the queries also times dk^-0.5, as a float32 factor
+  scale := 1 / Sqrt(1.0 * dk); // Delphi 7: no Sqrt of an Int64
+  for t := 0 to n - 1 do
+  begin
+    row := @aCtx.fQkv[t * cd];
+    q := row;
+    k := @row^[kd];
+    v := @row^[2 * kd];
+    // Q and K: every head L2-normed (x / sqrt(sum x^2 + 1e-6))
+    for j := 0 to 2 * kh - 1 do
+    begin
+      s := @row^[j * dk];
+      acc := 0;
+      for i := 0 to dk - 1 do
+      begin
+        e := s^[i];
+        acc := acc + e * e;
+      end;
+      a := 1 / Sqrt(acc + 1e-6);
+      for i := 0 to dk - 1 do
+        s^[i] := s^[i] * a;
+    end;
+    for i := 0 to kd - 1 do
+      q^[i] := q^[i] * scale;
+    for hv := 0 to vh - 1 do
+    begin
+      // beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias) (beyond 20
+      // softplus is its input, as torch computes it), the decay exp(g)
+      x := aCtx.fBeta[t * vh + hv];
+      if x < -100 then
+        beta := 0 // exp would overflow; the sigmoid underflows to 0 in single
+      else
+        beta := 1 / (1 + Exp(-x));
+      x := aCtx.fDecay[t * vh + hv] + ly^.LinDtBias^[hv];
+      if x > 20 then
+        sp := x
+      else
+      begin
+        e := Exp(x);
+        if e < 1e-6 then
+          sp := e - e * e / 2 // log1p: no digits lost
+        else
+          sp := Ln(1 + e);
+      end;
+      sp := ly^.LinNegA^[hv] * sp;
+      decay := Exp(sp);
+      // the key head of this value head (repeat_interleave), its value and
+      // output; column j of S [key dim] per row of st
+      s := @q^[(hv div rep) * dk];
+      kk := @k^[(hv div rep) * dk];
+      o := @aCtx.fCore[t * vd + hv * dv];
+      for j := 0 to dv - 1 do
+      begin
+        row := @st^[(hv * dv + j) * dk];
+        // decay, then what the state predicts for this key
+        acc := 0;
+        for i := 0 to dk - 1 do
+        begin
+          row^[i] := row^[i] * decay;
+          e := row^[i];
+          acc := acc + e * kk^[i];
+        end;
+        a := acc;
+        delta := (v^[hv * dv + j] - a) * beta;
+        // the correction written into the column, the column read by q
+        acc := 0;
+        for i := 0 to dk - 1 do
+        begin
+          row^[i] := row^[i] + kk^[i] * delta;
+          e := row^[i];
+          acc := acc + e * s^[i];
+        end;
+        o^[j] := acc;
+      end;
+    end;
+  end;
+  // RMSNorm per value head times silu(z), the output projection
+  fBackend.RmsNorm(pointer(aCtx.fCore), n * vh, dv, ly^.LinNorm, fConfig.RmsEps,
+    pointer(aCtx.fCore));
+  for i := 0 to n * vd - 1 do
+    aCtx.fCore[i] := aCtx.fCore[i] * Silu(aCtx.fZ[i]);
+  fBackend.Linear(pointer(aCtx.fCore), n, vd, ly^.LinOut, h, nil, pointer(aCtx.fTmp));
+  if Assigned(aOnState) and (aLayer = 0) then
+    aOnState('layer00_attn', pointer(aCtx.fTmp), n, h);
   fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
 end;
 
@@ -2402,7 +2751,8 @@ begin
   h := fConfig.Hidden;
   f := MaxPtrInt(fConfig.Intermediate,
     MaxPtrInt(fConfig.ExpertIntermediate, fConfig.Experts));
-  qw := MaxPtrInt(fMaxQw, fMaxKvw);
+  f := MaxPtrInt(f, LinChannels);
+  qw := MaxPtrInt(2 * fMaxQw, fMaxKvw);
   if n > (High(PtrInt) div SizeOf(single)) div MaxPtrInt(f, MaxPtrInt(h, qw)) then
     EInferError.RaiseUtf8('%.Forward: % tokens too many at once', [self, n]);
   if aIds <> nil then
@@ -2413,6 +2763,11 @@ begin
         EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary', [self, id]);
     end;
   Grow(aCtx, past + n, n);
+  // a recurrent state left undone by a failed Forward cannot go on
+  if aCtx.fRecurrent and (past > 0) and not aCtx.fStateOk then
+    EInferError.RaiseUtf8('%.Forward: the recurrent state of the context is ' +
+      'undone by an earlier failure - Reset it', [self]);
+  aCtx.fStateOk := false;
   RopeFactors(aCtx, n, past);
   // embeddings: of the ids, or the rows as given
   if aIds <> nil then
@@ -2433,6 +2788,8 @@ begin
     case fConfig.Spec[l].Mixer of
       dmAttention:
         AttentionBlock(aCtx, l, n, past, aOnState);
+      dmDeltaNet:
+        DeltaNetBlock(aCtx, l, n, past, aOnState);
     end;
     case fConfig.Spec[l].Ffn of
       dfDense:
@@ -2457,6 +2814,7 @@ begin
   else
     FillCharFast(aCtx.fIds[past], n * SizeOf(integer), $ff); // -1: no id
   aCtx.fLength := past + n;
+  aCtx.fStateOk := true;
   if (aLogits = nil) and (aNormed = nil) and not Assigned(aOnState) then
     exit;
   fBackend.RmsNorm(pointer(aCtx.fX), n, h, fNorm, fConfig.RmsEps, pointer(aCtx.fH));

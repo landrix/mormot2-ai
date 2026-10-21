@@ -1359,7 +1359,6 @@ end;
 function TGemma4OutputParser.Token(aId: integer): boolean;
 var
   b: RawUtf8;
-  i: PtrInt;
 begin
   result := (aId = fEos) or (aId = fTurnEnd) or (aId = fToolResponse);
   if result then

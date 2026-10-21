@@ -394,6 +394,23 @@ vollen Attention. Erst seriell auf der CPU, dann Chunk-Prefill, dann GPU. Prompt
 Zustands-Checkpoints. Erst **Qwen3.5-0.8B** (läuft auf allen Testrechnern), dann
 **Qwen3.8-27B** (volle Attention mit Kopfdimension 256). Gate: seriell und in Chunks gleich,
 Checkpoint-Restore und verzweigte Prompts gleich wie Neuberechnung.
+In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tokenizer mit
+`\p{M}`, Tool-Aufrufe im XML-Stil, ein multimodaler Checkpoint):
+- *D7a erledigt 2026-10-21* (`native-inference.md`, Phase D): die Rechnung auf der CPU, seriell
+  und aus safetensors - `dmDeltaNet` mit Convolution- und Delta-Regel-Zustand im Kontext, die
+  volle Attention mit Ausgangsgate, Teil-RoPE (`RopeDims`, `Rope` mit `aRotDim`), die Norms
+  mit (1 + w); Rücksetzpunkte nur 0 und `Length`. Gegen zwei Tiny-Modelle und
+  Qwen3.5-0.8B (Logits bis 4e-5, Greedy identisch).
+- *D7b:* Chunk-Prefill der Delta-Regel (die Form, die transformers für einen Prompt rechnet),
+  dazu Threads je Value-Kopf - nur übernommen, wenn gemessen schneller.
+- *D7c:* Qwen3.5 als Chat-Modell - der Pre-Tokenizer (`\p{M}` bei den Buchstaben), das
+  Template (Tool-Aufrufe als `<function=...><parameter=...>`, Thinking aus, Reasoning nach der
+  letzten Nutzer-Nachricht immer als `<think>`-Block), der Parser der XML-Aufrufe (ohne
+  `response_schema` als Referenz), die Familie hinter `ILlmClient`; dabei die zwei Prüfungen
+  aus dem lokalen Backlog in `TBpeTokenizer` (`truncation`/`padding`, doppelte Vokabeltexte).
+- *D7d:* Rücksetzpunkte des Zustands für den Prompt-Cache (Checkpoints an Turn-Grenzen),
+  Gate: Restore und verzweigte Prompts gleich wie Neuberechnung.
+- *D7e:* Vulkan und CUDA. Danach Qwen3.8-27B.
 
 **D8 — Kolibri-1.** FP8 E4M3 mit 128×128-Skalen (oder eine geprüfte Umwandlung nach Q4_K/Q8_0
 beim Laden; ein GGUF von Dritten nur nach Prüfung gegen die Referenz), Sigmoid-Router mit Bias-Korrektur nur für die Auswahl,

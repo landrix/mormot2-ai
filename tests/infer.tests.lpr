@@ -25,6 +25,7 @@ uses
   test.infer.harmony,
   test.infer.gemma4,
   test.infer.qwen3,
+  test.infer.qwen35,
   test.infer.llm,
   test.infer.vulkan,
   test.infer.cuda;
@@ -48,6 +49,7 @@ begin
     TTestInferHarmony,
     TTestInferGemma4,
     TTestInferQwen3,
+    TTestInferQwen35,
     TTestInferLlmNative,
     TTestInferVulkan,
     TTestInferCuda

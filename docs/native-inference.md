@@ -1814,6 +1814,74 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7a erledigt (2026-10-21): Qwen3.5 auf der CPU (Gated DeltaNet).** Die Rechnung von
+Qwen3.5 (dicht: 0.8B bis 27B) gegen `transformers` 5.19 (`modeling_qwen3_5.py`, nachgebaut, kein
+Code übernommen), zunächst auf der CPU, seriell und aus safetensors. Modell:
+`Qwen/Qwen3.5-0.8B` Revision `2fc06364715b967f1860aea9cf38778875588b17`.
+
+- *Gated DeltaNet* (`dmDeltaNet`, `TDecoderModel.DeltaNetBlock`): `in_proj_qkv` durch eine
+  kausale Depthwise-Convolution (`linear_conv_kernel_dim`, ohne Bias) mit silu; Q und K je Kopf
+  L2-normiert (eps 1e-6), Q mal key_dim^-0,5; beta = sigmoid(`in_proj_b`), der Zerfall
+  g = -exp(`A_log`) * softplus(`in_proj_a` + `dt_bias`); je Value-Kopf eine Matrix
+  S [key_dim, value_dim]: S mal exp(g), dann die Delta-Regel S += k (beta (v - S^T k))^T,
+  gelesen mit q; ein Key-Kopf dient mehreren benachbarten Value-Köpfen (`repeat_interleave`).
+  Danach RMSNorm je Value-Kopf mal silu(`in_proj_z`) und `out_proj`. Gerechnet wird Token für
+  Token (die rekurrente Form), auch im Prefill - transformers nimmt dort die Chunk-Form; beide
+  liegen bei den Tiny-Modellen unter 1e-5 auseinander. Chunk-Prefill folgt mit D7b.
+- *Zustand im Kontext:* je DeltaNet-Layer die letzten `kernel - 1` Eingaben der Convolution und
+  die Matrizen S; keine KV-Zeilen für diese Layer. Der Zustand steht für die ganze Sequenz:
+  `Restorable` nur 0 und `Length`, `Reuse` rechnet sonst von vorn. Ein `Forward`, der in den
+  Layern scheitert, lässt den Zustand halb fortgeschrieben - dann ist nur noch 0 erreichbar,
+  und ein weiteres `Forward` ohne `Reset` wird abgelehnt. Rücksetzpunkte (Checkpoints des
+  Zustands für den Prompt-Cache) kommen mit D7d.
+- *Volle Attention mit Ausgangsgate* (`Spec.OutputGate`): `q_proj` liefert je Kopf erst die
+  Query, dann ebenso viele Gate-Werte; die Attention-Ausgabe mal sigmoid(gate) vor `o_proj`.
+  *Teil-RoPE* (`Config.RopeDims`): nur die ersten int(head_dim * `partial_rotary_factor`) Werte
+  jedes Kopfes drehen (rotate_half innerhalb dieses Teils, die Frequenzen über diesen Teil);
+  `TInferBackend.Rope` hat dafür `aRotDim`. Die multimodalen Abschnitte (`mrope_section`)
+  ändern für Text nichts: alle drei Positionen eines Tokens sind gleich.
+- *Familie* (`mormot.ai.infer.model.qwen35`): `TQwen35Model` (`qwen3_5`, die Einstellungen in
+  `text_config`, die Tensoren unter `model.language_model.`; Bildteil und `mtp.*` bleiben
+  liegen) und `TQwen35TextModel` (`qwen3_5_text`, unter `model.`). Jede RMSNorm außer der
+  gegateten rechnet mal (1 + Gewicht): beim Laden in float32 eingefaltet, -exp(`A_log`)
+  ebenso. Der Head ist gebunden, wie das oberste `tie_word_embeddings` sagt (transformers
+  liest bei `qwen3_5` nur dieses, Vorgabe false; geprüft). Beim Quantisieren bleiben
+  `in_proj_b` und `in_proj_a` F32. Abgelehnt: eine andere Aktivierung als silu,
+  `attention_bias`, `attn_output_gate` false, `mlp_only_layers`, ein anderer `rope_type`, ein
+  unbekannter RoPE-Schlüssel, ein ungerader drehender Teil, kein `rope_theta`. Die RoPE-Werte
+  liest es wie transformers (`convert_rope_params_to_dict`): `rope_scaling` statt
+  `rope_parameters`, wenn gegeben und nicht leer; `type` statt `rope_type`; was dort fehlt, von
+  oben (`partial_rotary_factor`, `rope_theta`); ein Modell nur aus voller Attention ist
+  zulässig.
+  GPU-Geräte lehnen Qwen3.5 ab (Mixer, `dxOutputGate`, `dxPartialRope`).
+- *Referenz* (`make_reference_d7.py`): `tiny-qwen35` (Layout der veröffentlichten Checkpoints
+  mit Bildteil und einem `mtp`-Tensor daneben, drei DeltaNet-Layer und eine volle, BF16) und
+  `tiny-qwen35/text` (`Qwen3_5ForCausalLM`: eigener Head, zwei Value- je Key-Kopf, Kernel 3,
+  halber Kopf dreht) - je Fall alle Zustände, die Logits eines Durchgangs und Token für Token
+  mit Cache, Greedy mit und ohne Cache gleich, dazu der Beleg, dass Rekurrenz und Gate wirken;
+  `qwen35-0.8b` (vier Prompts, letzte Zeilen aller Zustände, Logits, Greedy).
+- *Tests* (`test.infer.qwen35`): Tiny alle Zustände bis 1e-4, Token für Token bitgleich zum
+  Prefill und in zwei Stücken, Embedding-Zeilen, Greedy; der Zustand (Rücksetzpunkte, Zweig,
+  Fortsetzen, gescheiterter `Forward`); schneller Pfad, Q8_0 und Q4_0; die Ablehnungen;
+  Qwen3.5-0.8B in F32: Logits gemessen bis 4e-5 genau (Schranke im Test 1e-3), Greedy in
+  allen vier Fällen identisch; in Q8_0 (beim Laden) Kosinus der Logits gemessen 0,9990 bis
+  0,9999 (Schranke 0,998), Greedy identisch. Die Hilfen der Decoder-Tests
+  stehen jetzt in `TTestInferDecoder` (`CheckLastRows` für die letzten Zeilen eines echten
+  Modells).
+  Grün in WSL (FPC 3.2.4), auf der RTX 5090 unter FPC und Delphi 13 (7814 Assertions) und
+  Delphi 7 (4900, das echte Modell braucht 64 Bit) und auf dem M2 Pro (5698).
+  Gegenprobe: 25 eingebaute Fehler (Convolution-Gewichte verkehrt, kein silu, keine L2-Norm,
+  Q nicht skaliert, kein Zerfall, kein beta, Köpfe gekachelt statt verschränkt, kein Gate,
+  Query und Gate vertauscht, Frequenzen über den ganzen Kopf, Norm ohne 1 +, Zustand oder
+  Convolution nicht genullt, beliebige Rücksetzpunkte, ein halb fortgeschriebener Zustand
+  angenommen, kein silu(z), Head immer gebunden, kein Schieben der Convolution, positiver
+  Zerfall, kein `dt_bias`, die gegatete Norm mit 1 +, RoPE über den ganzen Kopf, der Faktor
+  von oben übergangen, oben vor `rope_parameters`, die Bindung aus `text_config`) - alle
+  scheitern. Review: Claude-Finder und Codex in zwei Runden; behoben: `partial_rotary_factor`
+  und `rope_theta` von oben, `rope_scaling` (auch leer) und `type`, ein Modell nur mit voller
+  Attention, ein ungeschütztes `Exp` bei beta, ein überlappendes `MoveFast`, ein fehlender
+  Test der Bindungsregel, `.D[] :=` in einem Test (der AArch64-Fehler von FPC auf dem Mac).
+
 **D6c erledigt (2026-10-21): Gemma 4 als Chat-Modell (Tokenizer, Template, Parser).** Gemma 4
 hinter `ILlmClient`, zunächst auf der CPU und aus safetensors (die echten Gewichte kommen mit
 D6b). Quelle: `google/gemma-4-26B-A4B-it` Revision `4d7ae4984b7db7de8f8457170b3f1a419ee76d52`

@@ -38,24 +38,21 @@ uses
   test.infer.bpe;
 
 type
-  /// phase 2b and 2c: the Qwen3 decoder against the references
-  TTestInferQwen3 = class(TSynTestCase)
+  /// what the decoder tests share: both CPU backends, the states of a Forward
+  // kept by name, the comparisons against a reference
+  TTestInferDecoder = class(TSynTestCase)
   protected
     fCpu: TInferCpuBackend;
     fFast: TInferCpuFastBackend;
     fNames: TRawUtf8DynArray;
     fStates: array of TSingleDynArray;
-    fItemThread: array of TThreadID; // the thread of each item of ThreadItem
     procedure Setup; override;
-    procedure CheckArgMaxRandom;
     procedure CleanUp; override;
-    /// the four cases of the gpt-oss-20b reference on aModel: the last row of
-    // every state, the logits, greedy (a step may differ only where the
-    // reference itself was less than 1 sure)
-    procedure CheckGptOss20b(aModel: TDecoderModel; aRef: TInferRefSet;
-      const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double);
-    /// one item of RunItems in LoadOnAllCores: 1 ms, its thread noted
-    procedure ThreadItem(aItem: integer);
+    /// the cases of a real model's reference on aModel (case0 .. case<aCases
+    // - 1>, last rows): the last row of every state, the logits, greedy (a
+    // step may differ only where the reference itself was less than 1 sure)
+    procedure CheckLastRows(aModel: TDecoderModel; aRef: TInferRefSet;
+      const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double; aCases: PtrInt = 4);
     /// TOnQwen3State: copy every state, the model reuses its buffers
     procedure KeepState(const aName: RawUtf8; aValues: PSingleArray;
       aRows, aCols: PtrInt);
@@ -63,6 +60,15 @@ type
     /// forward <aPrefix>.ids from an empty cache and compare every kept state
     procedure CheckStates(aModel: TDecoderModel; aRef: TInferRefSet;
       const aPrefix: RawUtf8; aAtol, aRtol: double; aAllLogits: boolean);
+  end;
+
+  /// phase 2b and 2c: the Qwen3 decoder against the references
+  TTestInferQwen3 = class(TTestInferDecoder)
+  protected
+    fItemThread: array of TThreadID; // the thread of each item of ThreadItem
+    procedure CheckArgMaxRandom;
+    /// one item of RunItems in LoadOnAllCores: 1 ms, its thread noted
+    procedure ThreadItem(aItem: integer);
     /// the real model folder, '' (and SKIP or a failure) when absent
     function RealModel: TFileName;
     /// the tiny Qwen3 quantized to aType: Exact = the scalar reference bit for
@@ -227,24 +233,38 @@ function NewTtsPredictor(const aFolder: TFileName; aBackend: TInferBackend): TQw
 function TtsFilesMatch(const aFolder: TFileName; aRef: TInferRefSet;
   out aWhy: RawUtf8): boolean;
 
+/// the greedy tokens of aPrefix against the reference: the first differing
+// step, -1 when all agree; aMargin receives the reference top-2 margin there
+function GreedyDiff(const aMine: TIntegerDynArray; aRef: TInferRefSet;
+  const aPrefix: RawUtf8; out aMargin: double; out aDetail: RawUtf8): PtrInt;
+
+/// the rotary factors of positions 0..63 of aModel against <aName>.cos and
+// <aName>.sin of aRef: within one float32 step of the reference's cosf/sinf
+function RotaryMatches(aModel: TDecoderModel; aRef: TInferRefSet;
+  const aName: RawUtf8; out aWhy: RawUtf8): boolean;
+
+/// aDoc.D[aName] := aValue - which FPC 3.2.4 on aarch64-darwin compiles to
+// store 0 (TDocVariantData.SetDoubleByName): through a variant instead
+procedure SetFloat(var aDoc: TDocVariantData; const aName: RawUtf8; aValue: double);
+
 
 implementation
 
-{ TTestInferQwen3 }
+{ TTestInferDecoder }
 
-procedure TTestInferQwen3.Setup;
+procedure TTestInferDecoder.Setup;
 begin
   fCpu := TInferCpuBackend.Create;
   fFast := TInferCpuFastBackend.Create;
 end;
 
-procedure TTestInferQwen3.CleanUp;
+procedure TTestInferDecoder.CleanUp;
 begin
   FreeAndNil(fFast); // re-entrant, as mORMot requires
   FreeAndNil(fCpu);
 end;
 
-procedure TTestInferQwen3.KeepState(const aName: RawUtf8; aValues: PSingleArray;
+procedure TTestInferDecoder.KeepState(const aName: RawUtf8; aValues: PSingleArray;
   aRows, aCols: PtrInt);
 var
   n: PtrInt;
@@ -257,7 +277,7 @@ begin
   MoveFast(aValues^, fStates[n][0], aRows * aCols * SizeOf(single));
 end;
 
-function TTestInferQwen3.State(const aName: RawUtf8): PSingleArray;
+function TTestInferDecoder.State(const aName: RawUtf8): PSingleArray;
 var
   i: PtrInt;
 begin
@@ -270,7 +290,7 @@ begin
   result := nil;
 end;
 
-procedure TTestInferQwen3.CheckStates(aModel: TDecoderModel; aRef: TInferRefSet;
+procedure TTestInferDecoder.CheckStates(aModel: TDecoderModel; aRef: TInferRefSet;
   const aPrefix: RawUtf8; aAtol, aRtol: double; aAllLogits: boolean);
 var
   ctx: TQwen3Context;
@@ -303,7 +323,8 @@ begin
     if copy(t^.Name, 1, length(aPrefix) + 1) <> aPrefix + '.' then
       continue;
     name := copy(t^.Name, length(aPrefix) + 2, maxInt);
-    if (name = 'ids') or (name = 'greedy') or (name = 'greedy_margin') then
+    if (name = 'ids') or (name = 'greedy') or (name = 'greedy_margin') or
+       (name = 'logits_steps') then
       continue;
     ref := aRef.F32(t^.Name, n);
     if name = 'logits' then
@@ -414,8 +435,6 @@ begin
     result := result + Int32ToUtf8(aIds[i]) + ' ';
 end;
 
-/// the greedy tokens of aPrefix against the reference: the first differing
-// step, -1 when all agree; aMargin receives the reference top-2 margin there
 function GreedyDiff(const aMine: TIntegerDynArray; aRef: TInferRefSet;
   const aPrefix: RawUtf8; out aMargin: double; out aDetail: RawUtf8): PtrInt;
 var
@@ -3421,8 +3440,6 @@ end;
 
 { gpt-oss (D5) }
 
-/// aDoc.D[aName] := aValue - which FPC 3.2.4 on aarch64-darwin compiles to
-// store 0 (TDocVariantData.SetDoubleByName): through a variant instead
 procedure SetFloat(var aDoc: TDocVariantData; const aName: RawUtf8; aValue: double);
 var
   v: variant;
@@ -3431,8 +3448,6 @@ begin
   aDoc.AddOrUpdateValue(aName, v);
 end;
 
-/// the rotary factors of positions 0..63 of aModel against <aName>.cos and
-// <aName>.sin of aRef: within one float32 step of the reference's cosf/sinf
 function RotaryMatches(aModel: TDecoderModel; aRef: TInferRefSet;
   const aName: RawUtf8; out aWhy: RawUtf8): boolean;
 var
@@ -3440,7 +3455,7 @@ var
   half, n: PtrInt;
   cmp, cmp2: TInferCompare;
 begin
-  half := aModel.Config.HeadDim shr 1;
+  half := aModel.Config.RopeDims shr 1;
   SetLength(cs, 64 * half);
   SetLength(sn, 64 * half);
   aModel.Rotary(0, 64, pointer(cs), pointer(sn));
@@ -4342,8 +4357,8 @@ begin
     result := '0' + result;
 end;
 
-procedure TTestInferQwen3.CheckGptOss20b(aModel: TDecoderModel; aRef: TInferRefSet;
-  const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double);
+procedure TTestInferDecoder.CheckLastRows(aModel: TDecoderModel; aRef: TInferRefSet;
+  const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double; aCases: PtrInt);
 var
   ctx: TDecoderContext;
   ids, want: PIntegerArray;
@@ -4357,7 +4372,7 @@ var
   timer: TPrecisionTimer;
 begin
   h := aModel.Config.Hidden;
-  for k := 0 to 3 do
+  for k := 0 to aCases - 1 do
   begin
     ids := aRef.I32(FormatUtf8('case%.ids', [k]), n);
     SetLength(prompt, n);
@@ -4466,7 +4481,7 @@ begin
     // Harmony tokens) loses most there: transformers itself with Q8_0 expert
     // inputs gives logits at cosine 0.99258 / max 3.32 from float32 (measured
     // 2026-10-20), the engine 0.99327 / 3.27; the other cases 0.99999
-    CheckGptOss20b(model, ref, 'safetensors', 0.985, 0.99, 4);
+    CheckLastRows(model, ref, 'safetensors', 0.985, 0.99, 4);
     // the GGUF of the same revision (ggml-org/gpt-oss-20b-GGUF): its experts
     // byte for byte ours, its matrices and embedding in Q8_0
     gguf := FindVendorModel(GPTOSS20B_GGUF);
@@ -4497,7 +4512,7 @@ begin
           same := false;
     Check(same, 'GGUF: every expert byte for byte as repacked from safetensors');
     FreeAndNil(model);
-    CheckGptOss20b(g, ref, 'GGUF', 0.98, 0.99, 4);
+    CheckLastRows(g, ref, 'GGUF', 0.98, 0.99, 4);
   finally
     g.Free;
     model.Free;

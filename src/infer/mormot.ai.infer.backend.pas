@@ -126,10 +126,12 @@ type
     /// rotary positions in place, the halves of every head rotated together
     // (rotate_half): x[i], x[i + d/2] := x[i] c - x[i + d/2] s, x[i + d/2] c +
     // x[i] s, in double
-    // - x is [aRows, aHeads * aHeadDim]; aCos and aSin are [aRows, aHeadDim / 2],
+    // - x is [aRows, aHeads * aHeadDim]; aCos and aSin are [aRows, d / 2],
     // the factors of each row's position
+    // - d is aHeadDim, or aRotDim when > 0: only the first aRotDim values of
+    // every head rotate (Qwen3.5, a partial rotary factor), the others stay
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-      aCos, aSin: PSingleArray); virtual; abstract;
+      aCos, aSin: PSingleArray; aRotDim: PtrInt = 0); virtual; abstract;
     /// forget what the backend keeps of every weight whose host memory
     // overlaps aFrom .. aTo - 1: a GPU backend keeps a device copy, found
     // again by address, type and size, so memory freed and allocated anew at

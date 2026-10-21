@@ -149,6 +149,33 @@ pinned hashes, no weights needed) and loads no model:
 LAI_GEMMA4_DIR=/path/to/gemma-4-26B-A4B-it python tools/infer-ref/make_reference_d6c.py
 ```
 
+## Qwen3.5 and the Gated DeltaNet (phase D, D7a)
+
+`make_reference_d7.py` builds the tiny models from the modeling code of transformers alone
+and reads `Qwen/Qwen3.5-0.8B` only for its own target. Without the `flash-linear-attention`
+and `causal-conv1d` packages (not installed in this environment, on purpose) transformers
+takes its torch paths: the chunked delta rule for a prompt, the recurrent one for a cached
+step.
+
+- `tiny-qwen35` writes a seeded 4-layer Qwen3.5 in the layout of the published checkpoints
+  (`Qwen3_5ForConditionalGeneration`: `text_config`, the text tensors under
+  `model.language_model.`, a tiny vision tower and one `mtp` tensor beside them): three
+  DeltaNet layers, one gated full attention layer, a quarter of each head rotating. Per
+  case every state, the logits of one pass and of one token at a time with the cache,
+  greedy continuations (equal with and without the cache), and the proof that the state
+  and the output gate change the logits.
+- `tiny-qwen35-text` writes the same kind of model as `Qwen3_5ForCausalLM` under
+  `tiny-qwen35/text`: explicit layer types, an untied head, two value heads per key head, a
+  convolution of 3, half of each head rotating.
+- `qwen35-0.8b` writes four prompts of the real model (`$LAI_QWEN35_DIR`, else the Hugging
+  Face cache at the pinned revision; checked against the pinned hashes) in float32: ids,
+  the last logits, the last row of every state, greedy with the cache.
+
+```bash
+python tools/infer-ref/make_reference_d7.py                 # all three
+python tools/infer-ref/make_reference_d7.py tiny-qwen35     # one of them
+```
+
 ## Decoder stacks (backlog B14)
 
 `make_reference_b14.py` needs only Python: it creates `tiny-qwen3/stack/` - the weights of
