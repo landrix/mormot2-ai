@@ -58,6 +58,12 @@ type
   /// the float row kernels of the fast backend's attention (see InferDotsF32)
   TInferDotsF32 = procedure(a, b: PSingle; aStride, aCount, aDim: PtrInt;
     aOut: PSingleArray);
+  /// the rows of one value head of the gated delta rule for one token, in
+  // float lanes: for j in 0 .. aRows - 1, row r = s + j * aDim (aDim singles,
+  // a multiple of 16): r := r * aCoef[0] (the decay); delta := (v[j] - r . k)
+  // * aCoef[1] (beta); r := r + delta * k; aOut[j] := r . q
+  TInferDeltaRowsF32 = procedure(s, k, q, v: PSingle; aRows, aDim: PtrInt;
+    aCoef, aOut: PSingleArray);
   /// aOut[k] / aOut[4 + k] := the dot product of weight row w + k aStride with
   // activation row xA / xB, in float lanes: no bias, not the double reference
   TInferQ8DotF32x4x2 = procedure(w, xA, xB: PInferBlockQ8_0; aBlocks: PtrInt;
@@ -113,6 +119,9 @@ var
   /// float weighted value sum of the fast backend, nil without a kernel:
   // y += sum over j of p[j] * (v + j * aStride bytes), aDim a multiple of 16
   InferAxpyRowsF32: TInferDotsF32;
+  /// the float gated delta rule of the fast backend, nil without a kernel
+  // (see TInferDeltaRowsF32)
+  InferDeltaRowsF32: TInferDeltaRowsF32;
   /// the Q4_K sub-block sums of this CPU (see TInferKSums)
   InferQ4KSums: TInferKSums;
   /// the Q6_K group sums of this CPU (see TInferKSums)
@@ -752,6 +761,85 @@ asm
   subs x3, x3, #1
   b.ne .Lkeyaxpy
 .Ldoneaxpy:
+end;
+
+/// TInferDeltaRowsF32: per row two passes of 16 values, four float lanes per
+// accumulator, FMA, pairwise sums; the row stays in L1 between the passes
+procedure DeltaRowsF32Neon(s, k, q, v: PSingle; aRows, aDim: PtrInt;
+  aCoef, aOut: PSingleArray); assembler; nostackframe;
+asm
+  // x0 = s, x1 = k, x2 = q, x3 = v, x4 = aRows, x5 = aDim, x6 = aCoef,
+  // x7 = aOut; v30 = the decay in every lane, s29 = beta
+  cbz x4, .Ldonedelta
+  .long 0x4d40c8de // ld1r {v30.4s}, [x6]
+  .long 0xbd4004dd // ldr s29, [x6, #4]
+.Lrowdelta:
+  mov x10, x0
+  mov x11, x1
+  mov x12, x5
+  .long 0x4f000400 // movi v0.4s, #0
+  .long 0x4f000401 // movi v1.4s, #0
+  .long 0x4f000402 // movi v2.4s, #0
+  .long 0x4f000403 // movi v3.4s, #0
+.Ldecaydelta:
+  // r := r * decay, kept; v0..v3 += r * k
+  .long 0x4c402944 // ld1 {v4.4s-v7.4s}, [x10]
+  .long 0x4cdf2970 // ld1 {v16.4s-v19.4s}, [x11], #64
+  .long 0x6e3edc84 // fmul v4.4s, v4.4s, v30.4s
+  .long 0x6e3edca5 // fmul v5.4s, v5.4s, v30.4s
+  .long 0x6e3edcc6 // fmul v6.4s, v6.4s, v30.4s
+  .long 0x6e3edce7 // fmul v7.4s, v7.4s, v30.4s
+  .long 0x4c9f2944 // st1 {v4.4s-v7.4s}, [x10], #64
+  .long 0x4e30cc80 // fmla v0.4s, v4.4s, v16.4s
+  .long 0x4e31cca1 // fmla v1.4s, v5.4s, v17.4s
+  .long 0x4e32ccc2 // fmla v2.4s, v6.4s, v18.4s
+  .long 0x4e33cce3 // fmla v3.4s, v7.4s, v19.4s
+  subs x12, x12, #16
+  b.ne .Ldecaydelta
+  .long 0x4e21d400 // fadd v0.4s, v0.4s, v1.4s
+  .long 0x4e23d442 // fadd v2.4s, v2.4s, v3.4s
+  .long 0x4e22d400 // fadd v0.4s, v0.4s, v2.4s
+  .long 0x6e20d400 // faddp v0.4s, v0.4s, v0.4s
+  .long 0x7e30d800 // faddp s0, v0.2s
+  // delta := (v[j] - r . k) * beta in every lane of v20
+  .long 0xbc404461 // ldr s1, [x3], #4
+  .long 0x1e203821 // fsub s1, s1, s0
+  .long 0x1e3d0821 // fmul s1, s1, s29
+  .long 0x4e040434 // dup v20.4s, v1.s[0]
+  mov x10, x0
+  mov x11, x1
+  mov x13, x2
+  mov x12, x5
+  .long 0x4f000400 // movi v0.4s, #0
+  .long 0x4f000401 // movi v1.4s, #0
+  .long 0x4f000402 // movi v2.4s, #0
+  .long 0x4f000403 // movi v3.4s, #0
+.Lupdatedelta:
+  // r := r + delta * k, kept; v0..v3 += r * q
+  .long 0x4c402944 // ld1 {v4.4s-v7.4s}, [x10]
+  .long 0x4cdf2970 // ld1 {v16.4s-v19.4s}, [x11], #64
+  .long 0x4cdf29b8 // ld1 {v24.4s-v27.4s}, [x13], #64
+  .long 0x4e34ce04 // fmla v4.4s, v16.4s, v20.4s
+  .long 0x4e34ce25 // fmla v5.4s, v17.4s, v20.4s
+  .long 0x4e34ce46 // fmla v6.4s, v18.4s, v20.4s
+  .long 0x4e34ce67 // fmla v7.4s, v19.4s, v20.4s
+  .long 0x4c9f2944 // st1 {v4.4s-v7.4s}, [x10], #64
+  .long 0x4e38cc80 // fmla v0.4s, v4.4s, v24.4s
+  .long 0x4e39cca1 // fmla v1.4s, v5.4s, v25.4s
+  .long 0x4e3accc2 // fmla v2.4s, v6.4s, v26.4s
+  .long 0x4e3bcce3 // fmla v3.4s, v7.4s, v27.4s
+  subs x12, x12, #16
+  b.ne .Lupdatedelta
+  .long 0x4e21d400 // fadd v0.4s, v0.4s, v1.4s
+  .long 0x4e23d442 // fadd v2.4s, v2.4s, v3.4s
+  .long 0x4e22d400 // fadd v0.4s, v0.4s, v2.4s
+  .long 0x6e20d400 // faddp v0.4s, v0.4s, v0.4s
+  .long 0x7e30d800 // faddp s0, v0.2s
+  .long 0xbc0044e0 // str s0, [x7], #4
+  mov x0, x10 // the next row follows this one
+  subs x4, x4, #1
+  b.ne .Lrowdelta
+.Ldonedelta:
 end;
 
 /// quantize aBlocks blocks of 32 singles at x into Q8_0 blocks at y, exactly
@@ -1972,6 +2060,112 @@ begin
   AxpyRowsF32Avx2Asm(args);
 end;
 
+/// DeltaRowsF32Avx2 body: A = s, k, q, v, aRows, aDim, aCoef, aOut; G[7] is
+// the scratch of delta
+procedure DeltaRowsF32Avx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     qword ptr [r11 + 64], rbx
+        mov     qword ptr [r11 + 72], rsi
+        mov     qword ptr [r11 + 80], rdi
+        // r8 = the row, r9 = v, r10 = aOut, rcx = aRows, rdx = aDim,
+        // ymm4 = the decay in every lane
+        mov     r8, qword ptr [r11]
+        mov     r9, qword ptr [r11 + 24]
+        mov     rcx, qword ptr [r11 + 32]
+        mov     rdx, qword ptr [r11 + 40]
+        mov     r10, qword ptr [r11 + 56]
+        test    rcx, rcx
+        jz      @done
+        test    rdx, rdx
+        jz      @done
+        mov     rax, qword ptr [r11 + 48]
+        vbroadcastss ymm4, dword ptr [rax]
+@row:   mov     rax, r8
+        mov     rsi, qword ptr [r11 + 8]
+        mov     rbx, rdx
+        vxorps  ymm0, ymm0, ymm0
+        vxorps  ymm1, ymm1, ymm1
+        // r := r * decay, kept; ymm0/1 += r * k
+@decay: vmulps  ymm2, ymm4, yword ptr [rax]
+        vmulps  ymm3, ymm4, yword ptr [rax + 32]
+        vmovups yword ptr [rax], ymm2
+        vmovups yword ptr [rax + 32], ymm3
+        vfmadd231ps ymm0, ymm2, yword ptr [rsi]
+        vfmadd231ps ymm1, ymm3, yword ptr [rsi + 32]
+        add     rax, 64
+        add     rsi, 64
+        sub     rbx, 16
+        jnz     @decay
+        vaddps  ymm0, ymm0, ymm1
+        vextractf128 xmm1, ymm0, 1
+        vaddps  xmm0, xmm0, xmm1
+        vhaddps xmm0, xmm0, xmm0
+        vhaddps xmm0, xmm0, xmm0
+        // delta := (v[j] - r . k) * beta in every lane of ymm5
+        vmovss  xmm1, dword ptr [r9]
+        vsubss  xmm1, xmm1, xmm0
+        mov     rax, qword ptr [r11 + 48]
+        vmulss  xmm1, xmm1, dword ptr [rax + 4]
+        vmovss  dword ptr [r11 + 120], xmm1
+        vbroadcastss ymm5, dword ptr [r11 + 120]
+        add     r9, 4
+        mov     rax, r8
+        mov     rsi, qword ptr [r11 + 8]
+        mov     rdi, qword ptr [r11 + 16]
+        mov     rbx, rdx
+        vxorps  ymm0, ymm0, ymm0
+        vxorps  ymm1, ymm1, ymm1
+        // r := r + delta * k, kept; ymm0/1 += r * q
+@upd:   vmovups ymm2, yword ptr [rax]
+        vmovups ymm3, yword ptr [rax + 32]
+        vfmadd231ps ymm2, ymm5, yword ptr [rsi]
+        vfmadd231ps ymm3, ymm5, yword ptr [rsi + 32]
+        vmovups yword ptr [rax], ymm2
+        vmovups yword ptr [rax + 32], ymm3
+        vfmadd231ps ymm0, ymm2, yword ptr [rdi]
+        vfmadd231ps ymm1, ymm3, yword ptr [rdi + 32]
+        add     rax, 64
+        add     rsi, 64
+        add     rdi, 64
+        sub     rbx, 16
+        jnz     @upd
+        vaddps  ymm0, ymm0, ymm1
+        vextractf128 xmm1, ymm0, 1
+        vaddps  xmm0, xmm0, xmm1
+        vhaddps xmm0, xmm0, xmm0
+        vhaddps xmm0, xmm0, xmm0
+        vmovss  dword ptr [r10], xmm0
+        add     r10, 4
+        mov     r8, rax // the next row follows this one
+        sub     rcx, 1
+        jnz     @row
+@done:  vzeroupper
+        mov     rbx, qword ptr [r11 + 64]
+        mov     rsi, qword ptr [r11 + 72]
+        mov     rdi, qword ptr [r11 + 80]
+end;
+
+procedure DeltaRowsF32Avx2(s, k, q, v: PSingle; aRows, aDim: PtrInt;
+  aCoef, aOut: PSingleArray);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(s);
+  args.A[1] := PtrInt(k);
+  args.A[2] := PtrInt(q);
+  args.A[3] := PtrInt(v);
+  args.A[4] := aRows;
+  args.A[5] := aDim;
+  args.A[6] := PtrInt(aCoef);
+  args.A[7] := PtrInt(aOut);
+  DeltaRowsF32Avx2Asm(args);
+end;
+
 /// Q8QuantizeRowAvx2 body: A = x, aBlocks, y; A[3] receives the status
 // - the same bytes as InferQuantizeRowQ8_0Pascal: d = max|x| / 127 in single,
 // kept as FP16 rounded to nearest even (vcvtps2ph), +Inf written as bits from
@@ -3036,6 +3230,7 @@ begin
   // plain NEON (every aarch64 CPU): the float attention kernels
   InferDotsF32 := TInferDotsF32(@DotsF32Neon);
   InferAxpyRowsF32 := TInferDotsF32(@AxpyRowsF32Neon);
+  InferDeltaRowsF32 := TInferDeltaRowsF32(@DeltaRowsF32Neon);
   InferQ8QuantizeRow := TInferQ8QuantizeRow(@Q8QuantizeRowNeon);
   InferQ4Unpack := TInferQ4Unpack(@Q4UnpackNeon);
   InferMxfp4Unpack := TInferMxfp4Unpack(@Mxfp4UnpackNeon);
@@ -3064,6 +3259,7 @@ begin
   begin
     InferDotsF32 := DotsF32Avx2;
     InferAxpyRowsF32 := AxpyRowsF32Avx2;
+    InferDeltaRowsF32 := DeltaRowsF32Avx2;
     InferQ8QuantizeRow := Q8QuantizeRowAvx2;
     InferQ8BlockDots := Q8BlockDotsAvx2;
     InferQ8BlockDots4 := Q8BlockDots4Avx2;

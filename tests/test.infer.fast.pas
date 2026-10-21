@@ -87,6 +87,11 @@ type
     /// RmsNorm, SwiGlu and Rope: every mode bit-identical to the reference
     // (rows or slices over the pool), the reference against the definition
     procedure DecoderNormAndSwiGlu;
+    /// the gated delta rule (Qwen3.5): exact on all cores = the reference bit
+    // for bit (output and state), the reference against the definition, the
+    // float kernel within tolerance - shared key heads, rows wider than their
+    // heads, one value head, a key dim without whole lanes
+    procedure DeltaRuleMatchesReference;
     /// the thread pool: exactly once, bursts, exceptions
     procedure ThreadPoolRunsEveryItemOnce;
     /// RunWorkers: every item once, its index in 0..Workers, one index one
@@ -1625,6 +1630,160 @@ begin
     CheckUtf8(InferCompareOk(cmp), 'rope by definition, % rows: %',
       [rows, InferCompareText(cmp)]);
   end;
+end;
+
+/// the gated delta rule as written: S [key dim, value dim] per value head in
+// double - S := decay S; delta := beta (v - S^T k); S += k delta^T; y := S^T q
+procedure NaiveDeltaRule(const aQkv: TSingleDynArray; aRows, aStride, aKeyHeads,
+  aValueHeads, aKeyDim, aValueDim: PtrInt; const aBeta, aDecay: TSingleDynArray;
+  var aState, aY: TSingleDynArray);
+var
+  h, t, i, j, kq, kd: PtrInt;
+  s, dl: TDoubleDynArray;
+  acc: double;
+  row: PSingleArray;
+begin
+  SetLength(s, aKeyDim * aValueDim);
+  SetLength(dl, aValueDim);
+  kd := aKeyHeads * aKeyDim;
+  for h := 0 to aValueHeads - 1 do
+  begin
+    // the state layout: row j of the head is column j of S
+    for i := 0 to aKeyDim - 1 do
+      for j := 0 to aValueDim - 1 do
+        s[i * aValueDim + j] := aState[(h * aValueDim + j) * aKeyDim + i];
+    kq := (h div (aValueHeads div aKeyHeads)) * aKeyDim;
+    for t := 0 to aRows - 1 do
+    begin
+      row := @aQkv[t * aStride];
+      for i := 0 to aKeyDim * aValueDim - 1 do
+        s[i] := s[i] * aDecay[t * aValueHeads + h];
+      for j := 0 to aValueDim - 1 do
+      begin
+        acc := 0;
+        for i := 0 to aKeyDim - 1 do
+          acc := acc + s[i * aValueDim + j] * row^[kd + kq + i];
+        dl[j] := (row^[2 * kd + h * aValueDim + j] - acc) * aBeta[t * aValueHeads + h];
+      end;
+      for i := 0 to aKeyDim - 1 do
+        for j := 0 to aValueDim - 1 do
+          s[i * aValueDim + j] := s[i * aValueDim + j] + row^[kd + kq + i] * dl[j];
+      for j := 0 to aValueDim - 1 do
+      begin
+        acc := 0;
+        for i := 0 to aKeyDim - 1 do
+          acc := acc + s[i * aValueDim + j] * row^[kq + i];
+        aY[(t * aValueHeads + h) * aValueDim + j] := acc;
+      end;
+    end;
+    for i := 0 to aKeyDim - 1 do
+      for j := 0 to aValueDim - 1 do
+        aState[(h * aValueDim + j) * aKeyDim + i] := s[i * aValueDim + j];
+  end;
+end;
+
+procedure TTestInferFast.DeltaRuleMatchesReference;
+const
+  // rows, key heads, value heads, key dim, value dim - every row 5 values
+  // wider than its heads
+  CASES: array[0..6, 0..4] of integer = (
+    (1, 2, 2, 16, 16), (9, 2, 4, 32, 16), (5, 1, 3, 48, 8), (20, 2, 2, 128, 128),
+    (4, 1, 1, 16, 8), (3, 2, 2, 8, 4), (40, 1, 2, 64, 32));
+var
+  c, rows, kh, vh, dk, dv, stride, ns, ny, t, j, i: PtrInt;
+  qkv, beta, decay, st0, st1, st2, st3, st4, y1, y2, y3, y4: TSingleDynArray;
+  coef: array[0..1] of single;
+  cmp: TInferCompare;
+  a: double;
+  differs: boolean;
+begin
+  differs := false;
+  for c := 0 to high(CASES) do
+  begin
+    rows := CASES[c, 0];
+    kh := CASES[c, 1];
+    vh := CASES[c, 2];
+    dk := CASES[c, 3];
+    dv := CASES[c, 4];
+    stride := 2 * kh * dk + vh * dv + 5;
+    Fill(qkv, rows * stride, 700 + c, 1);
+    // Q and K L2-normed per head as the model feeds them: S stays bounded
+    for t := 0 to rows - 1 do
+      for j := 0 to 2 * kh - 1 do
+      begin
+        a := 0;
+        for i := 0 to dk - 1 do
+          a := a + Sqr(qkv[t * stride + j * dk + i]);
+        a := 1 / Sqrt(a + 1e-6);
+        for i := 0 to dk - 1 do
+          qkv[t * stride + j * dk + i] := qkv[t * stride + j * dk + i] * a;
+      end;
+    // beta in 0..1, the decay in 0.5..1
+    Fill(beta, rows * vh, 800 + c, 1);
+    Fill(decay, rows * vh, 900 + c, 1);
+    for i := 0 to rows * vh - 1 do
+    begin
+      beta[i] := Abs(beta[i]);
+      decay[i] := 0.75 + 0.25 * decay[i];
+    end;
+    // a state from earlier tokens
+    ns := vh * dv * dk;
+    Fill(st0, ns, 1000 + c, 0.5);
+    st1 := copy(st0);
+    st2 := copy(st0);
+    st3 := copy(st0);
+    st4 := copy(st0);
+    ny := rows * vh * dv;
+    SetLength(y1, ny);
+    SetLength(y2, ny);
+    SetLength(y3, ny);
+    SetLength(y4, ny);
+    fRef.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, pointer(beta),
+      pointer(decay), pointer(st1), pointer(y1));
+    fExact.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, pointer(beta),
+      pointer(decay), pointer(st2), pointer(y2));
+    fFast.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, pointer(beta),
+      pointer(decay), pointer(st3), pointer(y3));
+    NaiveDeltaRule(qkv, rows, stride, kh, vh, dk, dv, beta, decay, st4, y4);
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), ny) and
+      SameBits(pointer(st1), pointer(st2), ns), 'delta rule exact, case %', [c]);
+    cmp := InferCompare(pointer(y1), pointer(y4), ny, 1e-5, 1e-5);
+    CheckUtf8(InferCompareOk(cmp), 'delta rule by definition, case %: %',
+      [c, InferCompareText(cmp)]);
+    cmp := InferCompare(pointer(st1), pointer(st4), ns, 1e-5, 1e-5);
+    CheckUtf8(InferCompareOk(cmp), 'delta rule state by definition, case %: %',
+      [c, InferCompareText(cmp)]);
+    cmp := InferCompare(pointer(y3), pointer(y1), ny, 1e-5, 1e-4);
+    CheckUtf8(InferCompareOk(cmp), 'delta rule float, case %: %',
+      [c, InferCompareText(cmp)]);
+    cmp := InferCompare(pointer(st3), pointer(st1), ns, 1e-5, 1e-4);
+    CheckUtf8(InferCompareOk(cmp), 'delta rule float state, case %: %',
+      [c, InferCompareText(cmp)]);
+    if dk and 15 <> 0 then
+      // no whole lanes: the fast backend computes as the reference
+      CheckUtf8(SameBits(pointer(y1), pointer(y3), ny) and
+        SameBits(pointer(st1), pointer(st3), ns), 'delta rule, key dim %', [dk])
+    else if not SameBits(pointer(y1), pointer(y3), ny) then
+      differs := true;
+  end;
+  if not Assigned(InferDeltaRowsF32) then
+    exit;
+  Check(differs, 'the float path computes otherwise (a test that tests something)');
+  // the kernel writes its rows and outputs, nothing beyond them
+  Fill(qkv, 3 * 16, 1100, 1);
+  Fill(st1, 3 * 16 + 1, 1101, 1);
+  st2 := copy(st1);
+  SetLength(y1, 3);
+  y1[2] := 12345;
+  coef[0] := 0.9;
+  coef[1] := 0.5;
+  InferDeltaRowsF32(@st1[0], @qkv[0], @qkv[16], @qkv[32], 2, 16, @coef,
+    pointer(y1));
+  Check((y1[2] = 12345) and (st1[2 * 16] = st2[2 * 16]) and
+    (st1[3 * 16] = st2[3 * 16]), 'delta kernel: nothing beyond its rows');
+  InferDeltaRowsF32(@st1[0], @qkv[0], @qkv[16], @qkv[32], 0, 16, @coef,
+    @y1[2]);
+  Check(y1[2] = 12345, 'delta kernel: no row, nothing written');
 end;
 
 procedure TTestInferFast.ThreadPoolRunsEveryItemOnce;

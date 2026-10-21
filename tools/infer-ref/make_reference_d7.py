@@ -252,6 +252,7 @@ TINY_VISION = {
 TEXT_TEXT = dict(TINY_TEXT)
 TEXT_TEXT.update({
     "num_hidden_layers": 5, "linear_num_value_heads": 4, "linear_conv_kernel_dim": 3,
+    "linear_value_head_dim": 8,
     "tie_word_embeddings": False,
     "layer_types": ["linear_attention", "full_attention", "linear_attention",
                     "linear_attention", "full_attention"],
@@ -358,7 +359,8 @@ def tiny_qwen35_text():
                 "settings at the top of config.json, tensors under model., lm_head of "
                 "its own), 5 layers: linear, full, linear, linear, full; 2 key heads "
                 "read by 4 value heads (each key head by two neighbours: "
-                "repeat_interleave), a convolution of 3, half of each head rotating; "
+                "repeat_interleave), value heads of 8 values for keys of 16, a "
+                "convolution of 3, half of each head rotating; "
                 "otherwise as tiny-qwen35; the same kinds of cases",
         "config": json.load(open(os.path.join(folder, "config.json"), encoding="utf-8")),
         "safetensors_sha256": mr.sha256_file(st),

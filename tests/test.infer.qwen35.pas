@@ -655,9 +655,11 @@ begin
     model := TQwen35Model.Create(dir, fFast, idtQ8_0);
     AddConsole(FormatString('Qwen3.5-0.8B quantized to Q8_0 at load in %',
       [timer.Stop]));
-    // measured 2026-10-21: states cosine 0.99887, logits cosine 0.99912 and
-    // max 0.48 (the chat case), greedy identical
-    CheckLastRows(model, ref, 'Qwen3.5-0.8B Q8_0', 0.998, 0.998, 1);
+    // measured 2026-10-21 with the float delta rule (the chat case): states
+    // cosine 0.9984 (aarch64) / 0.9987 (x86_64), logits cosine 0.9988 / 0.9984
+    // and max 0.55 / 0.60, greedy identical - the error of Q8_0 activations,
+    // grown over the turn
+    CheckLastRows(model, ref, 'Qwen3.5-0.8B Q8_0', 0.997, 0.997, 1);
   finally
     model.Free;
     ref.Free;

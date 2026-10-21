@@ -154,6 +154,17 @@ type
     procedure GeluTanhGlu(gate, up: PSingleArray; aCount: PtrInt); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray; aRotDim: PtrInt = 0); override;
+    procedure DeltaRule(qkv: PSingleArray; aRows, aStride, aKeyHeads,
+      aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+      y: PSingleArray); override;
+  end;
+
+  /// one DeltaRule: its operands and the arithmetic to use
+  TInferDeltaJob = record
+    Qkv, Beta, Decay, State, Y: PSingleArray;
+    Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim: PtrInt;
+    /// true: float lanes (InferDeltaRowsF32), false: the double reference
+    Fast: boolean;
   end;
 
   /// one CausalAttention: its operands and the arithmetic to use
@@ -218,7 +229,9 @@ type
     fCols: PtrInt;
     fAlpha, fLimit: single; // of the running SwiGlu
     fCausal: TInferCausalJob;
+    fDelta: TInferDeltaJob;
     procedure CausalItem(aItem: integer);
+    procedure DeltaItem(aItem: integer);
     procedure LinearTile(aItem: integer);
     procedure QuantizeRow(aItem: integer);
     procedure AttentionItem(aItem: integer);
@@ -256,6 +269,10 @@ type
     procedure GeluTanhGlu(gate, up: PSingleArray; aCount: PtrInt); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray; aRotDim: PtrInt = 0); override;
+    /// one value head per item; float lanes unless Exact
+    procedure DeltaRule(qkv: PSingleArray; aRows, aStride, aKeyHeads,
+      aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+      y: PSingleArray); override;
     /// the items on the pool, unless it is busy with another caller
     procedure RunItems(const aJob: TOnInferItem; aCount: integer); override;
     /// the threads computing, the calling one included
@@ -1721,6 +1738,88 @@ begin
     end;
 end;
 
+/// value head aHead of a DeltaRule over all its tokens: the state of one
+// head stays in the cache from token to token
+procedure DeltaRuleHead(const aJob: TInferDeltaJob; aHead: PtrInt);
+var
+  dk, dv, kd, vd, off, t, j, i: PtrInt;
+  st, row, q, k, v, o: PSingleArray;
+  coef: array[0..1] of single;
+  acc, e: double;
+  a, beta, decay, delta: single;
+begin
+  dk := aJob.KeyDim;
+  dv := aJob.ValueDim;
+  kd := aJob.KeyHeads * dk;
+  vd := aJob.ValueHeads * dv;
+  off := (aHead div (aJob.ValueHeads div aJob.KeyHeads)) * dk;
+  st := @aJob.State^[aHead * dv * dk];
+  for t := 0 to aJob.Rows - 1 do
+  begin
+    row := @aJob.Qkv^[t * aJob.Stride];
+    q := @row^[off];
+    k := @row^[kd + off];
+    v := @row^[2 * kd + aHead * dv];
+    o := @aJob.Y^[t * vd + aHead * dv];
+    decay := aJob.Decay^[t * aJob.ValueHeads + aHead];
+    beta := aJob.Beta^[t * aJob.ValueHeads + aHead];
+    if aJob.Fast then
+    begin
+      coef[0] := decay;
+      coef[1] := beta;
+      InferDeltaRowsF32(pointer(st), pointer(k), pointer(q), pointer(v), dv, dk,
+        @coef, o);
+      continue;
+    end;
+    for j := 0 to dv - 1 do
+    begin
+      // column j of S: decayed, then what it predicts for this key
+      row := @st^[j * dk];
+      acc := 0;
+      for i := 0 to dk - 1 do
+      begin
+        row^[i] := row^[i] * decay;
+        e := row^[i];
+        acc := acc + e * k^[i];
+      end;
+      a := acc;
+      delta := (v^[j] - a) * beta;
+      // the correction written into the column, the column read by q
+      acc := 0;
+      for i := 0 to dk - 1 do
+      begin
+        row^[i] := row^[i] + k^[i] * delta;
+        e := row^[i];
+        acc := acc + e * q^[i];
+      end;
+      o^[j] := acc;
+    end;
+  end;
+end;
+
+procedure TInferCpuBackend.DeltaRule(qkv: PSingleArray; aRows, aStride,
+  aKeyHeads, aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+  y: PSingleArray);
+var
+  job: TInferDeltaJob;
+  h: PtrInt;
+begin
+  job.Qkv := qkv;
+  job.Beta := beta;
+  job.Decay := decay;
+  job.State := state;
+  job.Y := y;
+  job.Rows := aRows;
+  job.Stride := aStride;
+  job.KeyHeads := aKeyHeads;
+  job.ValueHeads := aValueHeads;
+  job.KeyDim := aKeyDim;
+  job.ValueDim := aValueDim;
+  job.Fast := false;
+  for h := 0 to aValueHeads - 1 do
+    DeltaRuleHead(job, h);
+end;
+
 { TInferCpuFastBackend }
 
 const
@@ -2602,6 +2701,46 @@ begin
     fGamma := aCos;
     fBeta := aSin;
     RunParallel(RopeRows, (aRows + ROPE_ROWS - 1) div ROPE_ROWS);
+  finally
+    fBusy.UnLock;
+  end;
+end;
+
+procedure TInferCpuFastBackend.DeltaItem(aItem: integer);
+begin
+  DeltaRuleHead(fDelta, aItem);
+end;
+
+procedure TInferCpuFastBackend.DeltaRule(qkv: PSingleArray; aRows, aStride,
+  aKeyHeads, aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+  y: PSingleArray);
+var
+  job: TInferDeltaJob;
+  h: PtrInt;
+begin
+  job.Qkv := qkv;
+  job.Beta := beta;
+  job.Decay := decay;
+  job.State := state;
+  job.Y := y;
+  job.Rows := aRows;
+  job.Stride := aStride;
+  job.KeyHeads := aKeyHeads;
+  job.ValueHeads := aValueHeads;
+  job.KeyDim := aKeyDim;
+  job.ValueDim := aValueDim;
+  // the kernel takes rows of a multiple of 16 values
+  job.Fast := not fExact and Assigned(InferDeltaRowsF32) and (aKeyDim > 0) and
+    (aKeyDim and 15 = 0);
+  if (aValueHeads < 2) or not fBusy.TryLock then
+  begin
+    for h := 0 to aValueHeads - 1 do
+      DeltaRuleHead(job, h);
+    exit;
+  end;
+  try
+    fDelta := job;
+    RunParallel(DeltaItem, aValueHeads);
   finally
     fBusy.UnLock;
   end;

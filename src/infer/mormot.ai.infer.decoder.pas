@@ -309,6 +309,7 @@ type
     aRows, aCols: PtrInt) of object;
 
   TDecoderDevice = class;
+  TDecoderModel = class;
 
   /// what TDecoderModel.Route does with its TDecoderRouteTape
   // - drmOff: routes from the logits; drmRecord: routes from the logits and
@@ -406,9 +407,15 @@ type
     fStateOk: boolean; // the states hold exactly the fLength tokens
     // an output gate: the Q rows with their gates, the gates alone
     fQg, fGateQ: TSingleDynArray;
-    // a dmDeltaNet layer: the convolved Q, K, V rows, z, beta, the decay, the
-    // output before its projection
+    // a dmDeltaNet layer: the convolved Q, K, V rows, z, beta and the decay
+    // (their projections first, then silu(z), the factors), the output before
+    // its projection
     fQkv, fZ, fBeta, fDecay, fCore: TSingleDynArray;
+    // the running dmDeltaNet layer, read by its items on the backend's threads
+    // (here, not in the model: a model serves several contexts at once)
+    fDnModel: TDecoderModel;
+    fDnLayer, fDnRows: PtrInt;
+    procedure DeltaPrepItem(aItem: integer);
     function GetId(aPosition: PtrInt): integer;
     procedure SetFullCache(aValue: boolean);
   public
@@ -579,6 +586,11 @@ type
     // ones (0: its state starts again), its output added to fX
     procedure DeltaNetBlock(aCtx: TDecoderContext; aLayer, aRows, aPast: PtrInt;
       const aOnState: TOnDecoderState);
+    /// item aItem of what a dmDeltaNet layer computes before its recurrence,
+    // over aRows tokens: Q or K head aItem (convolved, then L2-normed), past
+    // them value head aItem - 2 * LinKeyHeads (its V convolved, beta and the
+    // decay in place of their projections, silu(z))
+    procedure DeltaPrep(aCtx: TDecoderContext; aLayer, aRows, aItem: PtrInt);
     /// the dfDense block of layer aLayer, its output added to fX
     procedure DenseBlock(aCtx: TDecoderContext; aLayer, aRows: PtrInt;
       const aOnState: TOnDecoderState);
@@ -912,6 +924,11 @@ begin
     EInferError.RaiseUtf8('%.FullCache on % cached tokens', [self, fLength]);
   fFullCache := aValue;
   fLayers := 0; // the next Forward lays the rows out again
+end;
+
+procedure TDecoderContext.DeltaPrepItem(aItem: integer);
+begin
+  fDnModel.DeltaPrep(self, fDnLayer, fDnRows, aItem);
 end;
 
 function TDecoderContext.Common(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
@@ -2253,11 +2270,8 @@ end;
 procedure TDecoderModel.DeltaNetBlock(aCtx: TDecoderContext;
   aLayer, aRows, aPast: PtrInt; const aOnState: TOnDecoderState);
 var
-  n, h, kh, vh, dk, dv, kd, vd, cd, kw, k1, rep, t, c, j, i, hv: PtrInt;
+  n, h, kh, vh, dk, dv, vd, cd, i: PtrInt;
   ly: ^TDecoderLayer;
-  conv, st, w, row, q, k, v, s, o, kk: PSingleArray;
-  acc, e: double;
-  a, scale, beta, decay, sp, delta, x: single;
 begin
   ly := @fLayer[aLayer];
   n := aRows;
@@ -2266,12 +2280,8 @@ begin
   vh := fConfig.LinValueHeads;
   dk := fConfig.LinKeyDim;
   dv := fConfig.LinValueDim;
-  kd := kh * dk;
   vd := vh * dv;
   cd := LinChannels;
-  kw := fConfig.LinConv;
-  k1 := kw - 1;
-  rep := vh div kh;
   // pre-norm and the four projections
   fBackend.RmsNorm(pointer(aCtx.fX), n, h, ly^.InputNorm, fConfig.RmsEps,
     pointer(aCtx.fH));
@@ -2279,19 +2289,75 @@ begin
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.LinZ, vd, nil, pointer(aCtx.fZ));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.LinB, vh, nil, pointer(aCtx.fBeta));
   fBackend.Linear(pointer(aCtx.fH), n, h, ly^.LinA, vh, nil, pointer(aCtx.fDecay));
-  conv := pointer(aCtx.fConv[aLayer]);
-  st := pointer(aCtx.fState[aLayer]);
   if aPast = 0 then
   begin
     // a new sequence: the convolution sees zeros before it, the state is 0
-    FillCharFast(conv^, cd * k1 * SizeOf(single), 0);
-    FillCharFast(st^, vh * dv * dk * SizeOf(single), 0);
+    FillCharFast(pointer(aCtx.fConv[aLayer])^,
+      cd * (fConfig.LinConv - 1) * SizeOf(single), 0);
+    FillCharFast(pointer(aCtx.fState[aLayer])^, vh * dv * dk * SizeOf(single), 0);
   end;
-  // the causal convolution per channel, in place, then silu: weight kw - 1
-  // takes the new input, the others the last k1 inputs (oldest first)
+  // the convolved and normed Q, K, V, and the factors of every value head, on
+  // the backend's threads: every item computes as a serial loop would, so the
+  // result does not depend on the threads
+  aCtx.fDnModel := self;
+  aCtx.fDnLayer := aLayer;
+  aCtx.fDnRows := n;
+  fBackend.RunItems(aCtx.DeltaPrepItem, 2 * kh + vh);
+  // the recurrence, then RMSNorm per value head times silu(z) (fZ holds it),
+  // the output projection
+  fBackend.DeltaRule(pointer(aCtx.fQkv), n, cd, kh, vh, dk, dv,
+    pointer(aCtx.fBeta), pointer(aCtx.fDecay), pointer(aCtx.fState[aLayer]),
+    pointer(aCtx.fCore));
+  fBackend.RmsNorm(pointer(aCtx.fCore), n * vh, dv, ly^.LinNorm, fConfig.RmsEps,
+    pointer(aCtx.fCore));
+  for i := 0 to n * vd - 1 do
+    aCtx.fCore[i] := aCtx.fCore[i] * aCtx.fZ[i];
+  fBackend.Linear(pointer(aCtx.fCore), n, vd, ly^.LinOut, h, nil, pointer(aCtx.fTmp));
+  if Assigned(aOnState) and (aLayer = 0) then
+    aOnState('layer00_attn', pointer(aCtx.fTmp), n, h);
+  fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
+end;
+
+procedure TDecoderModel.DeltaPrep(aCtx: TDecoderContext;
+  aLayer, aRows, aItem: PtrInt);
+var
+  kh, vh, dk, dv, vd, cd, kw, k1, first, last, t, c, j, i: PtrInt;
+  ly: ^TDecoderLayer;
+  conv, w, s: PSingleArray;
+  acc, e: double;
+  a, scale, x, sp: single;
+begin
+  ly := @fLayer[aLayer];
+  kh := fConfig.LinKeyHeads;
+  vh := fConfig.LinValueHeads;
+  dk := fConfig.LinKeyDim;
+  dv := fConfig.LinValueDim;
+  vd := vh * dv;
+  cd := LinChannels;
+  // Q and K heads first ([q all | k all | v all]), then value head i
+  i := aItem - 2 * kh;
+  if i < 0 then
+  begin
+    first := aItem * dk;
+    last := first + dk - 1;
+  end
+  else
+  begin
+    first := 2 * kh * dk + i * dv;
+    last := first + dv - 1;
+  end;
+  kw := fConfig.LinConv;
+  k1 := kw - 1;
+  conv := pointer(aCtx.fConv[aLayer]);
   w := ly^.LinConvW;
-  for c := 0 to cd - 1 do
-    for t := 0 to n - 1 do
+  scale := 1 / Sqrt(1.0 * dk); // Delphi 7: no Sqrt of an Int64
+  // token by token, along the rows in memory
+  for t := 0 to aRows - 1 do
+  begin
+    // the causal convolution per channel of the item, in place, then silu:
+    // weight kw - 1 takes the new input, the others the last k1 inputs
+    // (oldest first)
+    for c := first to last do
     begin
       x := aCtx.fQkv[t * cd + c];
       acc := w^[c * kw + k1];
@@ -2308,40 +2374,17 @@ begin
       a := acc;
       aCtx.fQkv[t * cd + c] := Silu(a);
     end;
-  // the queries also times dk^-0.5, as a float32 factor
-  scale := 1 / Sqrt(1.0 * dk); // Delphi 7: no Sqrt of an Int64
-  for t := 0 to n - 1 do
-  begin
-    row := @aCtx.fQkv[t * cd];
-    q := row;
-    k := @row^[kd];
-    v := @row^[2 * kd];
-    // Q and K: every head L2-normed (x / sqrt(sum x^2 + 1e-6))
-    for j := 0 to 2 * kh - 1 do
+    if i >= 0 then
     begin
-      s := @row^[j * dk];
-      acc := 0;
-      for i := 0 to dk - 1 do
-      begin
-        e := s^[i];
-        acc := acc + e * e;
-      end;
-      a := 1 / Sqrt(acc + 1e-6);
-      for i := 0 to dk - 1 do
-        s^[i] := s^[i] * a;
-    end;
-    for i := 0 to kd - 1 do
-      q^[i] := q^[i] * scale;
-    for hv := 0 to vh - 1 do
-    begin
-      // beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias) (beyond 20
-      // softplus is its input, as torch computes it), the decay exp(g)
-      x := aCtx.fBeta[t * vh + hv];
+      // value head i: beta = sigmoid(b); g = -exp(A_log) * softplus(a +
+      // dt_bias) (beyond 20 softplus is its input, as torch computes it), the
+      // decay exp(g); silu(z) of its gate, applied after the gated RMSNorm
+      x := aCtx.fBeta[t * vh + i];
       if x < -100 then
-        beta := 0 // exp would overflow; the sigmoid underflows to 0 in single
+        aCtx.fBeta[t * vh + i] := 0 // exp would overflow; 0 in single anyway
       else
-        beta := 1 / (1 + Exp(-x));
-      x := aCtx.fDecay[t * vh + hv] + ly^.LinDtBias^[hv];
+        aCtx.fBeta[t * vh + i] := 1 / (1 + Exp(-x));
+      x := aCtx.fDecay[t * vh + i] + ly^.LinDtBias^[i];
       if x > 20 then
         sp := x
       else
@@ -2352,47 +2395,29 @@ begin
         else
           sp := Ln(1 + e);
       end;
-      sp := ly^.LinNegA^[hv] * sp;
-      decay := Exp(sp);
-      // the key head of this value head (repeat_interleave), its value and
-      // output; column j of S [key dim] per row of st
-      s := @q^[(hv div rep) * dk];
-      kk := @k^[(hv div rep) * dk];
-      o := @aCtx.fCore[t * vd + hv * dv];
+      sp := ly^.LinNegA^[i] * sp;
+      aCtx.fDecay[t * vh + i] := Exp(sp);
+      s := @aCtx.fZ[t * vd + i * dv];
       for j := 0 to dv - 1 do
-      begin
-        row := @st^[(hv * dv + j) * dk];
-        // decay, then what the state predicts for this key
-        acc := 0;
-        for i := 0 to dk - 1 do
-        begin
-          row^[i] := row^[i] * decay;
-          e := row^[i];
-          acc := acc + e * kk^[i];
-        end;
-        a := acc;
-        delta := (v^[hv * dv + j] - a) * beta;
-        // the correction written into the column, the column read by q
-        acc := 0;
-        for i := 0 to dk - 1 do
-        begin
-          row^[i] := row^[i] + kk^[i] * delta;
-          e := row^[i];
-          acc := acc + e * s^[i];
-        end;
-        o^[j] := acc;
-      end;
+        s^[j] := Silu(s^[j]);
+      continue;
     end;
+    // a Q or K head: L2-normed (x / sqrt(sum x^2 + 1e-6)), the queries also
+    // times dk^-0.5, as a float32 factor
+    s := @aCtx.fQkv[t * cd + first];
+    acc := 0;
+    for j := 0 to dk - 1 do
+    begin
+      e := s^[j];
+      acc := acc + e * e;
+    end;
+    a := 1 / Sqrt(acc + 1e-6);
+    for j := 0 to dk - 1 do
+      s^[j] := s^[j] * a;
+    if aItem < kh then
+      for j := 0 to dk - 1 do
+        s^[j] := s^[j] * scale;
   end;
-  // RMSNorm per value head times silu(z), the output projection
-  fBackend.RmsNorm(pointer(aCtx.fCore), n * vh, dv, ly^.LinNorm, fConfig.RmsEps,
-    pointer(aCtx.fCore));
-  for i := 0 to n * vd - 1 do
-    aCtx.fCore[i] := aCtx.fCore[i] * Silu(aCtx.fZ[i]);
-  fBackend.Linear(pointer(aCtx.fCore), n, vd, ly^.LinOut, h, nil, pointer(aCtx.fTmp));
-  if Assigned(aOnState) and (aLayer = 0) then
-    aOnState('layer00_attn', pointer(aCtx.fTmp), n, h);
-  fBackend.Add(pointer(aCtx.fX), pointer(aCtx.fTmp), n * h);
 end;
 
 procedure TDecoderModel.Activate(gate, up: PSingleArray; aCount: PtrInt);

@@ -165,8 +165,8 @@ step.
   greedy continuations (equal with and without the cache), and the proof that the state
   and the output gate change the logits.
 - `tiny-qwen35-text` writes the same kind of model as `Qwen3_5ForCausalLM` under
-  `tiny-qwen35/text`: explicit layer types, an untied head, two value heads per key head, a
-  convolution of 3, half of each head rotating.
+  `tiny-qwen35/text`: explicit layer types, an untied head, two value heads per key head,
+  value heads of 8 values for keys of 16, a convolution of 3, half of each head rotating.
 - `qwen35-0.8b` writes four prompts of the real model (`$LAI_QWEN35_DIR`, else the Hugging
   Face cache at the pinned revision; checked against the pinned hashes) in float32: ids,
   the last logits, the last row of every state, greedy with the cache.

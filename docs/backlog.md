@@ -390,9 +390,9 @@ In Scheiben:
   Reihenfolge vom 2026-10-20 kommt zuerst D7.
 
 **D7 — Gated DeltaNet.** Rekurrenz, Convolution-Zustand, Gates, Normierung, Ausgangsgate der
-vollen Attention. Erst seriell auf der CPU, dann Chunk-Prefill, dann GPU. Prompt-Cache mit
+vollen Attention. Erst seriell auf der CPU, dann der Prefill auf allen Kernen, dann GPU. Prompt-Cache mit
 Zustands-Checkpoints. Erst **Qwen3.5-0.8B** (läuft auf allen Testrechnern), dann
-**Qwen3.8-27B** (volle Attention mit Kopfdimension 256). Gate: seriell und in Chunks gleich,
+**Qwen3.8-27B** (volle Attention mit Kopfdimension 256). Gate: Prefill und Token für Token gleich,
 Checkpoint-Restore und verzweigte Prompts gleich wie Neuberechnung.
 In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tokenizer mit
 `\p{M}`, Tool-Aufrufe im XML-Stil, ein multimodaler Checkpoint):
@@ -401,8 +401,13 @@ In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tok
   volle Attention mit Ausgangsgate, Teil-RoPE (`RopeDims`, `Rope` mit `aRotDim`), die Norms
   mit (1 + w); Rücksetzpunkte nur 0 und `Length`. Gegen zwei Tiny-Modelle und
   Qwen3.5-0.8B (Logits bis 4e-5, Greedy identisch).
-- *D7b:* Chunk-Prefill der Delta-Regel (die Form, die transformers für einen Prompt rechnet),
-  dazu Threads je Value-Kopf - nur übernommen, wenn gemessen schneller.
+- *D7b erledigt 2026-10-21* (`native-inference.md`, Phase D): der Prefill auf allen Kernen -
+  die Delta-Regel als Operation des Backends (`DeltaRule`, je Value-Kopf ein Thread, Float-Kern
+  NEON/AVX2), die Vorbereitung (Convolution, Norm, Gates) als Items entlang der Zeilen;
+  512 Tokens von Qwen3.5-0.8B in 1,1 statt 9,4 s (22 Threads). Die Chunk-Form nicht
+  übernommen: Die Rekurrenz ist danach 3-4 % des Prefills; Option für D7e.
+  *Idee, nicht eingeplant:* ein schnelleres `exp` für silu (SwiGLU aller Modelle, hier die
+  Vorbereitung) - nur mit Messung und Toleranz gegen die Referenz.
 - *D7c:* Qwen3.5 als Chat-Modell - der Pre-Tokenizer (`\p{M}` bei den Buchstaben), das
   Template (Tool-Aufrufe als `<function=...><parameter=...>`, Thinking aus, Reasoning nach der
   letzten Nutzer-Nachricht immer als `<think>`-Block), der Parser der XML-Aufrufe (ohne

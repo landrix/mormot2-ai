@@ -1814,6 +1814,60 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7b erledigt (2026-10-21): der Prefill von Qwen3.5 auf allen Kernen.** Erst gemessen: Nach
+D7a lagen im Prefill von 512 Tokens (Qwen3.5-0.8B, F32, RTX-Rechner) 5,8 s von 9,4 s in der
+Rekurrenz und 1,6 s in der Convolution - beide seriell, der Rest lief schon auf allen Kernen.
+
+- *Delta-Regel als Operation des Backends* (`TInferBackend.DeltaRule`): die Referenz in
+  `TInferCpuBackend` rechnet Kopf für Kopf über alle Tokens (der Zustand eines Kopfes, 64 KB
+  bei 128 x 128, bleibt im Cache, statt je Token alle 16 Köpfe zu durchlaufen) mit
+  double-Summen wie D7a. `TInferCpuFastBackend` gibt jedem Value-Kopf ein Item auf dem Pool;
+  mit `Exact` bitgleich zur Referenz, sonst der Float-Kern `InferDeltaRowsF32` (NEON und AVX2;
+  je Zeile von S zwei Durchgänge: Zerfall und Vorhersage `S^T k`, dann Korrektur und Ausgabe
+  `S^T q`). Eine key_dim, die kein Vielfaches von 16 ist, rechnet die Referenz.
+- *Vorbereitung als Items* (`TDecoderModel.DeltaPrep`): je Q- oder K-Kopf (Convolution, silu,
+  L2-Norm) und je Value-Kopf (seine V-Kanäle, beta, Zerfall, silu(z)) ein Item auf
+  `Backend.RunItems`, jedes rechnet wie die serielle Schleife (bitgleich). Die Convolution läuft
+  jetzt Token für Token entlang der Zeilen; vorher Kanal für Kanal quer über alle Zeilen, mit
+  einem Sprung von 24 KB je Token. Der Zustand der Items liegt im Kontext, nicht im Modell:
+  ein Modell bedient mehrere Kontexte zugleich.
+- *Die Chunk-Form ist nicht übernommen.* Danach macht die Rekurrenz 3-4 % des Prefills aus.
+  Die Chunk-Form von transformers (Matrixprodukte je Block von 64 Tokens) rechnet mehr und
+  lohnt sich erst mit Tensor-Kernen - eine Option für D7e.
+- *Messung* (RTX-Rechner, i9-14900K, 22 Threads, FPC 3.2.2, Bestwert aus drei Läufen,
+  512 Tokens):
+
+  | | D7a | D7b ohne Float-Kern | D7b |
+  |---|---|---|---|
+  | Prefill F32 | 9,36 s (55 tok/s) | 1,32 s | 1,10 s (465 tok/s) |
+  | Prefill Q8_0 | 9,78 s (52 tok/s) | 2,05 s | 1,81 s (282 tok/s) |
+  | davon Rekurrenz (F32) | 5,8 s | 0,26 s | 0,04 s |
+  | Decode Q8_0 | 57,8 ms/Token | 39,9 ms/Token | 37,4 ms/Token |
+
+  Auf dem Snapdragon X (WSL, 8 Threads) Q8_0 von 18,0 s auf 1,86 s. Die Werte dort streuen
+  stark (Energiesteuerung des Laptops), deshalb gilt die Tabelle des RTX-Rechners.
+- *Tests:* `TTestInferFast.DeltaRuleMatchesReference` (die Referenz gegen die ausgeschriebene
+  Definition mit S in double; der exakte Fast-Backend bitgleich für Ausgabe und Zustand; der
+  Float-Kern innerhalb 1e-5 + 1e-4 relativ; geteilte Key-Köpfe, Zeilen breiter als ihre Köpfe,
+  ein einziger Value-Kopf, eine key_dim ohne volle Lanes; der Kern schreibt nichts über seine
+  Zeilen hinaus). Das Tiny-Modell `tiny-qwen35/text` hat jetzt Value-Köpfe von 8 Werten für
+  Keys von 16: Vorher hatten alle Testmodelle (auch Qwen3.5-0.8B) dk = dv, eine Verwechslung
+  der beiden fiel nicht auf. Qwen3.5-0.8B bleibt in F32 bei 4e-5 (Logits); in Q8_0 sinkt der
+  Kosinus der Logits im Chat-Fall auf 0,9984 (x86_64) bzw. 0,9988 (aarch64), Greedy
+  identisch - die Schranke im Test jetzt 0,997 statt 0,998, damit sie nicht auf der Kante
+  steht.
+  Grün in WSL (FPC 3.2.4, 6156 Assertions; vier weitere scheitern nur an
+  `LAI_REQUIRE_MODEL=1` ohne gpt-oss-20b auf dem Laptop), auf dem RTX-Rechner unter FPC und
+  Delphi 13 (7853) und Delphi 7 (4936, das echte Modell braucht 64 Bit), auf dem M2 Pro
+  (Infer 5737, LLM 730).
+  Gegenprobe: 23 eingebaute Fehler (beta und Zerfall im Kern vertauscht, kein Zerfall in der
+  Referenz, `Exact` übergangen, Köpfe gekachelt, kein silu(z), K skaliert, keine Items der
+  Value-Köpfe, der letzte Kopf fehlt, die Zeilenbreite übergangen, V-, z- und Ausgabe-Offsets
+  mit dk statt dv, beta und Zerfall roh, dazu acht Fehler aus D7a am umgebauten Code) - alle
+  scheitern; drei davon erst mit dem neuen Tiny-Modell. Review: Claude-Finder und Codex in
+  zwei Runden; behoben: ein Index auf ein leeres Feld bei Kernel 1, die Q8_0-Schranke auf der
+  Kante, veraltete Angaben in README und Unit-Kopf.
+
 **D7a erledigt (2026-10-21): Qwen3.5 auf der CPU (Gated DeltaNet).** Die Rechnung von
 Qwen3.5 (dicht: 0.8B bis 27B) gegen `transformers` 5.19 (`modeling_qwen3_5.py`, nachgebaut, kein
 Code übernommen), zunächst auf der CPU, seriell und aus safetensors. Modell:
@@ -1827,7 +1881,8 @@ Code übernommen), zunächst auf der CPU, seriell und aus safetensors. Modell:
   gelesen mit q; ein Key-Kopf dient mehreren benachbarten Value-Köpfen (`repeat_interleave`).
   Danach RMSNorm je Value-Kopf mal silu(`in_proj_z`) und `out_proj`. Gerechnet wird Token für
   Token (die rekurrente Form), auch im Prefill - transformers nimmt dort die Chunk-Form; beide
-  liegen bei den Tiny-Modellen unter 1e-5 auseinander. Chunk-Prefill folgt mit D7b.
+  liegen bei den Tiny-Modellen unter 1e-5 auseinander. (D7b hat die Chunk-Form nicht
+  übernommen, siehe dort.)
 - *Zustand im Kontext:* je DeltaNet-Layer die letzten `kernel - 1` Eingaben der Convolution und
   die Matrizen S; keine KV-Zeilen für diese Layer. Der Zustand steht für die ganze Sequenz:
   `Restorable` nur 0 und `Length`, `Reuse` rechnet sonst von vorn. Ein `Forward`, der in den
