@@ -128,6 +128,27 @@ pinned hashes, no weights needed) and loads no model:
 LAI_GPTOSS_DIR=/path/to/gpt-oss-20b python tools/infer-ref/make_reference_d5c.py
 ```
 
+## The tokenizer and chat format of Gemma 4 (phase D, D6c)
+
+`make_reference_d6c.py` reads only the tokenizer files of `google/gemma-4-26B-A4B-it`
+(`$LAI_GEMMA4_DIR`, by default `vendor/models/gemma-4-26B-A4B-it`; checked against the
+pinned hashes, no weights needed) and loads no model:
+
+- `gemma4-tokens` writes the tokenizer gate: the texts of `qwen3-tokens` and
+  `gpt-oss-tokens`, Gemma cases (runs of spaces, tabs and newlines, byte fallback, the
+  added tokens as text) and 1200 generated mixtures; per case the ids of `tokenizer.json`
+  without its added tokens, and the decoded text where it is not the input (U+2581).
+- `gemma4-chat` writes the template gate: conversations and tool schemas through the
+  `chat_template.jinja` of the revision, rendered by transformers (the template kwargs
+  `enable_thinking` and `preserve_thinking`, a message's reasoning as `reasoning`), and
+  their ids; 400 schemas generated over the branches of `format_parameters`. A case with
+  an added-token literal in its text is marked `literal`: the HF ids read it as a control
+  token, the native ones as text.
+
+```bash
+LAI_GEMMA4_DIR=/path/to/gemma-4-26B-A4B-it python tools/infer-ref/make_reference_d6c.py
+```
+
 ## Decoder stacks (backlog B14)
 
 `make_reference_b14.py` needs only Python: it creates `tiny-qwen3/stack/` - the weights of

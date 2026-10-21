@@ -381,8 +381,13 @@ In Scheiben:
   safetensors - Köpfe zweier Formen je Layer, K=V, die proportionale RoPE, die Norms um beide
   Blöcke, GeGLU, dichter Block neben den Experten mit dem Router von Gemma, Layer-Skalare,
   Softcap; `per_layer_config`; gegen zwei Tiny-Modelle aus transformers 5.19.
-- *Offen:* D6c Tokenizer, Template und Parser (als Nächstes), D6b die echten Modelle (31B,
-  26B-A4B), D6d GGUF, D6e Vulkan und CUDA (Kopfdimension 512); E2B/E4B danach.
+- *D6c erledigt 2026-10-21* (`native-inference.md`, Phase D): Gemma 4 als Chat-Modell - der
+  Tokenizer (BPE im Stil von SentencePiece mit Byte-Fallback, 3197 Fälle idgleich), das
+  Chat-Template (452 Gespräche und Schemas textgleich, 391 davon idgleich mit transformers), der Parser
+  (Thought-Channel, Aufrufe im Dialekt von transformers), die Familie hinter `ILlmClient`.
+- *Offen:* D6b die echten Modelle (31B, 26B-A4B; `gemma-4-12B-it` mit prüfen), D6d GGUF
+  (auch der Tokenizer), D6e Vulkan und CUDA (Kopfdimension 512); E2B/E4B danach. Nach der
+  Reihenfolge vom 2026-10-20 kommt zuerst D7.
 
 **D7 — Gated DeltaNet.** Rekurrenz, Convolution-Zustand, Gates, Normierung, Ausgangsgate der
 vollen Attention. Erst seriell auf der CPU, dann Chunk-Prefill, dann GPU. Prompt-Cache mit
@@ -912,5 +917,18 @@ Eingabe des Code-Predictors, der je Schritt einen anderen seiner 15 Köpfe nimmt
 *Erledigt 2026-10-20* (D5e, `native-inference.md`, Phase D): `ForwardEmbeds(..., aNormed)` auf
 CPU, Vulkan und CUDA; `CreateStack` mit `aHead = ''` (`HasHead`, Logits abgelehnt);
 `TInferBackend.RunItems`, über den das Laden konvertiert (Q8_0 beider Stapel auf dem
-RTX-Rechner 0,37 s statt 5,3-6,4 s, Byte für Byte gleich). *Rückmeldung an flydev* im Issue,
-sobald gepusht.
+RTX-Rechner 0,37 s statt 5,3-6,4 s, Byte für Byte gleich). *Rückmeldung* im Issue gegeben;
+flydev bestätigt (1228 Tests grün, eigener Vulkan-Durchlauf entfernt, Q8_0-Laden 0,46 s statt
+6,1 s); der verbliebene Wunsch steht als B18.
+
+## B18 — Mehrere Köpfe auf dem Gerät, Kopf-Index je Aufruf (aufgenommen 2026-10-21)
+
+Anlass: <https://github.com/landrix/mormot2-ai/issues/1#issuecomment-6297975507>. Der
+Code-Predictor von Qwen3-TTS nimmt je Schritt einen anderen seiner 15 Köpfe (16 kleine Produkte
+je Frame). `TInferVulkanBackend.Linear` schickt jedes Produkt einzeln auf die GPU und wartet -
+rund 2 ms je Frame; flydev rechnet die Köpfe deshalb auf einem `TInferCpuFastBackend` mit
+8 Threads (11,3 ms je Talker-Frame gegen 10,9 ms im alten eigenen Durchlauf).
+
+*Vorschlag:* ein Stapel mit mehreren Köpfen auf dem Gerät (Vulkan und CUDA), `ForwardEmbeds`
+oder ein eigener Aufruf mit Kopf-Index, das Produkt im selben Durchlauf wie die Layer. Nach den
+Gemma-4-Scheiben (D6); nicht dringend (flydev). Rückmeldung im Issue, sobald es steht.

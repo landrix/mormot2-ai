@@ -233,5 +233,22 @@ never a build input.
     transformers 5.19.0 and the rest of tools/infer-ref/requirements.txt, created
     with uv 0.11.18 - the model needs more memory than the WSL reference has.
 
+  Model:     google/gemma-4-26B-A4B-it (Apache-2.0) -
+             https://huggingface.co/google/gemma-4-26B-A4B-it
+  Revision:  4d7ae4984b7db7de8f8457170b3f1a419ee76d52
+  Files (sha256), in vendor/models/gemma-4-26B-A4B-it (gitignored; the tokenizer
+  files only, no weights yet):
+    tokenizer.json                    cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f
+    tokenizer_config.json             9f4fec4b1dc6ecddf8f4a92e9caea5971c0e67d81309f3f9066a2bee8c362633
+    chat_template.jinja               ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4
+    generation_config.json            d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de
+  google/gemma-4-31B-it (842da3794eaa0b77d5f08bae87a17459d91ff475) and
+  google/gemma-4-12B-it (707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7) ship the same
+  tokenizer.json and chat_template.jinja.
+  Datasets from it: gemma4-tokens and gemma4-chat (tools/infer-ref/make_reference_d6c.py,
+    the tokenizer files and the template only); tiny-gemma4 (make_reference_d6.py) uses
+    the modeling code of transformers only, no file of the model. Generated in the WSL
+    reference (Linux aarch64): Python 3.12.13, transformers 5.19.0, tokenizers 0.23.3.
+
   Rule: a new revision, model or environment means regenerating every dataset and
         updating this section in the same commit.

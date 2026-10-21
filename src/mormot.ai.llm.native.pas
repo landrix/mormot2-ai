@@ -7,14 +7,16 @@
 // - a decoder family registers its model, tokenizer, chat template and output
 //   parser classes (RegisterNativeFamily); the client picks them by the
 //   model_type of config.json or the architecture of a GGUF file - Qwen3,
-//   Qwen2.5 and gpt-oss are registered here
+//   Qwen2.5, gpt-oss and Gemma 4 are registered here
 // - the prompt is the model's chat template (TChatTemplate); the answer is
 //   parsed token by token (TNativeOutputParser) - for Qwen3 a leading <think>
 //   block becomes reasoning (returned like vLLM does, as reasoning_content in
 //   Raw, never in Content), every <tool_call> block a TLlmToolCall, the rest
 //   the content; for gpt-oss the Harmony messages (THarmonyOutputParser):
 //   the analysis channel becomes reasoning, a message to functions.NAME a tool
-//   call, the final channel the content
+//   call, the final channel the content; for Gemma 4 the thought channel
+//   becomes reasoning, every <|tool_call> block a tool call
+//   (TGemma4OutputParser)
 // - ChatComplete and ChatStream share one decoding path, so a streamed answer
 //   is the complete answer cut into pieces - nothing else
 // - only the ids the tokenizer knows are drawn: a padded embedding (gpt-oss
@@ -35,6 +37,7 @@ unit mormot.ai.llm.native;
     - TQwen3OutputParser: the parser of Qwen3
     - TQwen2OutputParser: the parser of Qwen2.5 (no reasoning)
     - THarmonyOutputParser: the parser of gpt-oss (Harmony)
+    - TGemma4OutputParser: the parser of Gemma 4
     - NativeChatPrompt: a TLlmChatRequest as prompt ids
     - RegisterNativeFamily: the classes of a decoder family
     - TNativeLlmClient: ILlmClient over a model folder or a GGUF file
@@ -62,12 +65,14 @@ uses
   mormot.ai.infer.unicode,
   mormot.ai.infer.tokenizer,
   mormot.ai.infer.tokenizer.bpe,
+  mormot.ai.infer.tokenizer.spbpe,
   mormot.ai.infer.chat,
   mormot.ai.infer.backend,
   mormot.ai.infer.backend.cpu,
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.gptoss,
+  mormot.ai.infer.model.gemma4,
   mormot.ai.infer.sampler;
 
 const
@@ -134,6 +139,10 @@ type
     // raises EInferError when one is missing
     constructor Create(aTokenizer: TInferTokenizer;
       const aOnDelta: TLlmStreamDeltaEvent = nil); virtual;
+    /// the prompt the answer follows, before the first Push (NativeDecode
+    // calls it) - nothing by default; a family whose prompt may end inside a
+    // block (Gemma 4: an open thought channel) starts there
+    procedure Prompt(const aIds: TIntegerDynArray); virtual;
     /// one generated id; returns true for a stop token, which adds no text
     // - raises ELlmClient for an id outside the tokenizer, or after Finish
     function Push(aId: integer): boolean;
@@ -260,6 +269,51 @@ type
       out aChannel, aRecipient: RawUtf8);
   end;
 
+  /// where the Gemma 4 parser is inside the generated answer
+  TGemma4ParserState = (
+    gpsContent,
+    gpsChannelHeader,
+    gpsReasoning,
+    gpsToolCall);
+
+  /// turns the token ids Gemma 4 generates into a TLlmChatResponse
+  // - <|channel>thought and a newline open the reasoning (the line is
+  // dropped), the text up to <channel|> is the reasoning (the trailing newline
+  // is the template's); another or a cut channel line stays content, as
+  // transformers reads only the thought channel; a
+  // prompt that ends in an open channel (the template's generation prompt
+  // after tool results with thinking on) starts in the reasoning (Prompt)
+  // - <|tool_call>call:NAME{...}<tool_call|> becomes a tool call when the
+  // arguments parse as transformers' gemma4 dialect does (ParseGemma4ToolCall);
+  // any other block stays in the content as text
+  // - <turn|>, <|tool_response> (the model waits for the results) and <eos>
+  // stop; control tokens anywhere else are text, their content verbatim
+  // - newlines: dropped at the start of reasoning and content, at the end of
+  // the reasoning and before a tool call (TNativeTextChannel) - only newlines,
+  // where transformers strips all white space around them (the template trims
+  // them anyway when the answer comes back)
+  TGemma4OutputParser = class(TNativeOutputParser)
+  protected
+    fEos, fTurnEnd, fChannel, fChannelEnd, fToolCall, fToolCallEnd,
+    fToolResponse, fQuote: integer;
+    fState: TGemma4ParserState;
+    fHeader: RawUtf8;
+    /// the call body with #1 for each <|"|> token, and as text
+    fBody, fBodyText: RawUtf8;
+    /// a #1 or #2 byte in the text of the body: no call (the markers)
+    fBodyBad: boolean;
+    procedure EndToolCall;
+    function Token(aId: integer): boolean; override;
+    procedure FlushOpen; override;
+  public
+    /// aTokenizer (not owned) must know the control tokens of Gemma 4 -
+    // raises EInferError otherwise
+    constructor Create(aTokenizer: TInferTokenizer;
+      const aOnDelta: TLlmStreamDeltaEvent = nil); override;
+    /// start in the reasoning when aIds ends in an open <|channel>
+    procedure Prompt(const aIds: TIntegerDynArray); override;
+  end;
+
 /// the enable_thinking switch of a request: Extra.chat_template_kwargs.
 // enable_thinking as vLLM and SGLang read it, else aDefault
 // - raises ELlmClient when the value is there but no boolean
@@ -270,8 +324,10 @@ function NativeEnableThinking(const aRequest: TLlmChatRequest;
 // reasoning_effort as OpenAI sends it (a field of the request: Extra) or as
 // vLLM reads it (Extra.chat_template_kwargs), else aDefaultEffort;
 // model_identity of chat_template_kwargs; an empty string is no value (the
-// default stays - transformers would write it as it is)
-// - raises ELlmClient for a value that is no string, or two efforts that differ,
+// default stays - transformers would write it as it is); preserve_thinking of
+// chat_template_kwargs (Gemma 4), a boolean
+// - raises ELlmClient for a value that is no string (no boolean for
+// preserve_thinking), or two efforts that differ,
 // whatever the family (Qwen ignores both options, but refuses such a request
 // too, as vLLM does)
 function NativeTemplateOptions(const aRequest: TLlmChatRequest;
@@ -292,6 +348,19 @@ function NativeChatPrompt(aTemplate: TChatTemplate;
 // float of more than 15 digits or beyond the double range: kept verbatim, so
 // a tool that reads its arguments as doubles rounds or refuses that value
 function ParseQwen3ToolCall(const aBody: RawUtf8;
+  out aName, aArguments: RawUtf8): boolean;
+
+/// parse the body of a Gemma 4 tool call (between <|tool_call> and
+// <tool_call|>), each <|"|> token as a #1 byte
+// - as transformers' gemma4 dialect reads it: "call:" NAME (\w+), then the
+// arguments - the strings between the #1 pairs taken out, a \w+ key right
+// after "{" or "," quoted, then strict JSON (see PythonJson) that must be an
+// object; aArguments is that object as Python json.dumps writes it, a float
+// of more than 15 digits or beyond the double range kept verbatim
+// - stricter than transformers, never laxer: a duplicate key, NaN or Infinity
+// (json.loads takes them) and a \w outside the subset of IsRegexWord make no
+// call - the block then stays text
+function ParseGemma4ToolCall(const aBody: RawUtf8;
   out aName, aArguments: RawUtf8): boolean;
 
 /// parse the body of a Harmony message to functions.NAME
@@ -472,8 +541,8 @@ type
     property MaxContext: integer
       read fMaxContext write fMaxContext;
     /// whether the model reasons before it answers when a request does not
-    // say (Qwen3: a <think> block)
-    // (default true, the model's own default)
+    // say (Qwen3: a <think> block, Gemma 4: the thought channel)
+    // (default: the template's own - true for Qwen3, false for Gemma 4)
     property EnableThinking: boolean
       read fEnableThinking write fEnableThinking;
     /// the reasoning effort of a request that does not say (gpt-oss: 'low',
@@ -659,6 +728,10 @@ begin
 end;
 
 procedure TNativeOutputParser.FlushOpen;
+begin
+end;
+
+procedure TNativeOutputParser.Prompt(const aIds: TIntegerDynArray);
 begin
 end;
 
@@ -1086,6 +1159,304 @@ begin
 end;
 
 
+{ TGemma4OutputParser }
+
+/// true when the code point at p is in \w as taken here: a subset of \w of the
+// Python regex module - letters, marks, ASCII digits, connector punctuation
+// ("_" and the like) and the two join controls; a non-ASCII digit, a letter
+// number or another alphabetic symbol is no \w here (the regex module takes
+// them), so a call is never accepted that transformers refuses - such a call
+// stays text; aLen is the UTF-8 length
+function IsRegexWord(p: PUtf8Char; aEnd: PUtf8Char; out aLen: PtrInt): boolean;
+var
+  cp: TCardinalDynArray;
+  n: PtrInt;
+  c: AnsiChar;
+begin
+  c := p^;
+  if ord(c) < $80 then
+  begin
+    aLen := 1;
+    result := (c in ['a'..'z', 'A'..'Z', '0'..'9', '_']);
+    exit;
+  end;
+  if ord(c) >= $f0 then
+    aLen := 4
+  else if ord(c) >= $e0 then
+    aLen := 3
+  else
+    aLen := 2;
+  if p + aLen > aEnd then
+    aLen := aEnd - p;
+  n := Utf8ToCodePoints(p, aLen, cp);
+  result := false;
+  if n <> 1 then
+    exit;
+  case cp[0] of
+    $200c, $200d, $203f, $2040, $2054, $fe33, $fe34, $fe4d..$fe4f, $ff3f:
+      result := true; // join controls and connector punctuation
+  else
+    result := (UnicodeClassOf(cp[0]) = ucLetter) or (O200kClassOf(cp[0]) = ocMark);
+  end;
+end;
+
+/// the end of a \w+ run from p, p itself when there is none
+function RegexWordEnd(p, aEnd: PUtf8Char): PUtf8Char;
+var
+  len: PtrInt;
+begin
+  result := p;
+  while (result < aEnd) and IsRegexWord(result, aEnd, len) do
+    inc(result, len);
+end;
+
+function ParseGemma4ToolCall(const aBody: RawUtf8;
+  out aName, aArguments: RawUtf8): boolean;
+var
+  p, e, s, w: PUtf8Char;
+  json, text: RawUtf8;
+begin
+  result := false;
+  aName := '';
+  aArguments := '';
+  // call:NAME then the arguments
+  if copy(aBody, 1, 5) <> 'call:' then
+    exit;
+  p := @PUtf8Char(pointer(aBody))[5];
+  e := @PUtf8Char(pointer(aBody))[length(aBody)];
+  w := RegexWordEnd(p, e);
+  if w = p then
+    exit;
+  FastSetString(aName, p, w - p);
+  // transformers: the <|"|> strings out first, then (?<=[{,])(\w+): quoted,
+  // then json.loads
+  json := '';
+  p := w;
+  try
+    while p < e do
+      if p^ = #1 then
+      begin
+        s := p + 1;
+        while (s < e) and (s^ <> #1) do
+          inc(s);
+        if s >= e then
+          exit; // an open string
+        FastSetString(text, p + 1, s - p - 1);
+        json := json + PythonJsonString(text);
+        p := s + 1;
+      end
+      else
+      begin
+        // a run up to the next string, "{" or ","
+        s := p;
+        while (s < e) and (s^ <> #1) and (s^ <> '{') and (s^ <> ',') do
+          inc(s);
+        if s = p then
+          inc(s); // the "{" or "," itself
+        FastSetString(text, p, s - p);
+        json := json + text;
+        p := s;
+        if (p[-1] = '{') or (p[-1] = ',') then
+        begin
+          w := RegexWordEnd(p, e);
+          if (w > p) and (w < e) and (w^ = ':') then
+          begin
+            FastSetString(text, p, w - p);
+            json := json + '"' + text + '"';
+            p := w;
+          end;
+        end;
+      end;
+    // strict JSON, a float json.dumps would round kept as written
+    json := PythonJson(json, {keepinexactfloats=}true);
+  except
+    on EInferError do
+      exit;
+  end;
+  if (json = '') or (json[1] <> '{') then
+    exit;
+  aArguments := json;
+  result := true;
+end;
+
+function NeedGemma4Token(aTokenizer: TInferTokenizer; const aContent: RawUtf8): integer;
+begin
+  result := aTokenizer.TokenId(aContent);
+  if result < 0 then
+    EInferError.RaiseUtf8('TGemma4OutputParser: no % token', [aContent]);
+end;
+
+constructor TGemma4OutputParser.Create(aTokenizer: TInferTokenizer;
+  const aOnDelta: TLlmStreamDeltaEvent);
+begin
+  inherited Create(aTokenizer, aOnDelta);
+  fEos := NeedGemma4Token(aTokenizer, '<eos>');
+  fTurnEnd := NeedGemma4Token(aTokenizer, '<turn|>');
+  fChannel := NeedGemma4Token(aTokenizer, '<|channel>');
+  fChannelEnd := NeedGemma4Token(aTokenizer, '<channel|>');
+  fToolCall := NeedGemma4Token(aTokenizer, '<|tool_call>');
+  fToolCallEnd := NeedGemma4Token(aTokenizer, '<tool_call|>');
+  fToolResponse := NeedGemma4Token(aTokenizer, '<|tool_response>');
+  fQuote := NeedGemma4Token(aTokenizer, '<|"|>');
+end;
+
+const
+  GEMMA4_THOUGHT: RawUtf8 = 'thought'#10;
+
+/// where aText stands to "thought\n": 1 it starts with it, 0 it may still
+// become it (a prefix), -1 it cannot
+function Gemma4Thought(const aText: RawUtf8): integer;
+begin
+  if copy(aText, 1, length(GEMMA4_THOUGHT)) = GEMMA4_THOUGHT then
+    result := 1
+  else if copy(GEMMA4_THOUGHT, 1, length(aText)) = aText then
+    result := 0
+  else
+    result := -1;
+end;
+
+procedure TGemma4OutputParser.Prompt(const aIds: TIntegerDynArray);
+var
+  i, j: PtrInt;
+  header: RawUtf8;
+begin
+  for i := high(aIds) downto 0 do
+    if aIds[i] = fChannelEnd then
+      exit
+    else if aIds[i] = fChannel then
+    begin
+      // the channel line the prompt already holds
+      header := '';
+      for j := i + 1 to high(aIds) do
+        header := header + Bytes(aIds[j]);
+      case Gemma4Thought(header) of
+        1:
+          fState := gpsReasoning;
+        0:
+          begin
+            // the line goes on in the answer
+            fState := gpsChannelHeader;
+            fHeader := header;
+          end;
+      else
+        fState := gpsContent; // another channel: its text is content
+      end;
+      exit;
+    end;
+end;
+
+procedure TGemma4OutputParser.EndToolCall;
+var
+  name, args: RawUtf8;
+begin
+  if not fBodyBad and ParseGemma4ToolCall(fBody, name, args) then
+    AddToolCall(name, args)
+  else
+    // not a call the agent could run: keep it visible as text
+    SendContent(fContent.Add(Bytes(fToolCall) + fBodyText + Bytes(fToolCallEnd)));
+end;
+
+function TGemma4OutputParser.Token(aId: integer): boolean;
+var
+  b: RawUtf8;
+  i: PtrInt;
+begin
+  result := (aId = fEos) or (aId = fTurnEnd) or (aId = fToolResponse);
+  if result then
+    exit;
+  case fState of
+    gpsContent:
+      if aId = fChannel then
+      begin
+        fHeader := '';
+        fState := gpsChannelHeader;
+      end
+      else if aId = fToolCall then
+      begin
+        fBody := '';
+        fBodyText := '';
+        fBodyBad := false;
+        fState := gpsToolCall;
+      end
+      else
+        SendContent(fContent.Add(Bytes(aId)));
+    gpsChannelHeader:
+      if (aId = fChannelEnd) or (aId = fChannel) or (aId = fToolCall) or
+         (aId = fToolCallEnd) or (aId = fQuote) then
+      begin
+        // a control token before the line is "thought\n": no thought channel
+        // (transformers reads only that one) - the line is content, the token
+        // goes on as in the content
+        SendContent(fContent.Add(Bytes(fChannel) + fHeader));
+        fHeader := '';
+        fState := gpsContent;
+        result := Token(aId);
+      end
+      else
+      begin
+        fHeader := fHeader + Bytes(aId);
+        case Gemma4Thought(fHeader) of
+          1:
+            begin
+              // the line is dropped, the rest is reasoning
+              fState := gpsReasoning;
+              SendReasoning(fReasoning.Add(copy(fHeader, length(GEMMA4_THOUGHT) + 1,
+                maxInt)));
+              fHeader := '';
+            end;
+          -1:
+            begin
+              SendContent(fContent.Add(Bytes(fChannel) + fHeader));
+              fHeader := '';
+              fState := gpsContent;
+            end;
+        end;
+      end;
+    gpsReasoning:
+      if aId = fChannelEnd then
+      begin
+        SendReasoning(fReasoning.Flush(true));
+        fState := gpsContent;
+      end
+      else
+        SendReasoning(fReasoning.Add(Bytes(aId)));
+    gpsToolCall:
+      if aId = fToolCallEnd then
+      begin
+        EndToolCall;
+        fState := gpsContent;
+      end
+      else if aId = fQuote then
+      begin
+        fBody := fBody + #1;
+        fBodyText := fBodyText + Bytes(aId);
+      end
+      else
+      begin
+        b := Bytes(aId);
+        if (PosEx(#1, b) > 0) or (PosEx(#2, b) > 0) then
+          fBodyBad := true;
+        fBody := fBody + b;
+        fBodyText := fBodyText + b;
+      end;
+  end;
+end;
+
+procedure TGemma4OutputParser.FlushOpen;
+begin
+  case fState of
+    gpsChannelHeader:
+      // cut inside the channel line: kept as text
+      SendContent(fContent.Add(Bytes(fChannel) + fHeader));
+    gpsReasoning:
+      SendReasoning(fReasoning.Flush(true));
+    gpsToolCall:
+      // cut before <tool_call|>: no call, the text stays
+      SendContent(fContent.Add(Bytes(fToolCall) + fBodyText));
+  end;
+end;
+
+
 { request helpers }
 
 function NativeEnableThinking(const aRequest: TLlmChatRequest;
@@ -1111,6 +1482,7 @@ var
   x, kw: PDocVariantData;
   top, inner: RawUtf8;
   hasTop, hasInner: boolean;
+  i: integer;
 
   function Text(aDoc: PDocVariantData; const aName, aWhere: RawUtf8;
     out aValue: RawUtf8): boolean;
@@ -1146,6 +1518,13 @@ begin
   else
     result.ReasoningEffort := aDefaultEffort;
   Text(kw, 'model_identity', 'chat_template_kwargs.', result.ModelIdentity);
+  i := kw^.GetValueIndex('preserve_thinking');
+  if (i >= 0) and not VarIsEmptyOrNull(kw^.Values[i]) then
+    if TVarData(kw^.Values[i]).VType <> varBoolean then
+      ELlmClient.RaiseUtf8('chat_template_kwargs.preserve_thinking: % is no ' +
+        'boolean', [VariantSaveJson(kw^.Values[i])])
+    else
+      result.PreserveThinking := kw^.Values[i];
 end;
 
 function NativeChatPrompt(aTemplate: TChatTemplate;
@@ -1329,6 +1708,7 @@ begin
     limit := aMaxContext;
   if aPrompt = nil then
     ELlmClient.RaiseUtf8('NativeDecode: empty prompt', []);
+  aParser.Prompt(aPrompt);
   if length(aPrompt) > limit then
     ELlmClient.RaiseUtf8('NativeDecode: a prompt of % tokens exceeds the ' +
       'context of %', [length(aPrompt), limit]);
@@ -1555,6 +1935,7 @@ begin
   end;
   // the family of config.json: its tokenizer and template before the weights
   SetFamily(DecoderModelClassOfFolder(dir), dir + 'config.json');
+  fEnableThinking := fFamily.Template.DefaultEnableThinking;
   fTokenizer := fFamily.Tokenizer.Create(dir + 'tokenizer.json');
   fTemplate := fFamily.Template.Create(fTokenizer);
   fModel := fFamily.Model.Create(dir, fBackend, aWeights);
@@ -1582,6 +1963,7 @@ begin
   end;
   fModel := NewDecoderModelFromGguf(aFileName, fBackend);
   SetFamily(TDecoderModelClass(fModel.ClassType), aFileName);
+  fEnableThinking := fFamily.Template.DefaultEnableThinking;
   fTokenizer := fFamily.Tokenizer.CreateFromGguf(fModel.Gguf);
   if fTokenizer.VocabSize > fModel.Config.VocabSize then
     ELlmClient.RaiseUtf8('%: % tokens but % embedding rows in %',
@@ -1771,5 +2153,9 @@ initialization
     TQwen2OutputParser);
   RegisterNativeFamily(TGptOssModel, TBpeTokenizer, THarmonyChatTemplate,
     THarmonyOutputParser);
+  RegisterNativeFamily(TGemma4Model, TSpBpeTokenizer, TGemma4ChatTemplate,
+    TGemma4OutputParser);
+  RegisterNativeFamily(TGemma4TextModel, TSpBpeTokenizer, TGemma4ChatTemplate,
+    TGemma4OutputParser);
 
 end.

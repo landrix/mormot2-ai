@@ -1814,6 +1814,78 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D6c erledigt (2026-10-21): Gemma 4 als Chat-Modell (Tokenizer, Template, Parser).** Gemma 4
+hinter `ILlmClient`, zunächst auf der CPU und aus safetensors (die echten Gewichte kommen mit
+D6b). Quelle: `google/gemma-4-26B-A4B-it` Revision `4d7ae4984b7db7de8f8457170b3f1a419ee76d52`
+(`tokenizer.json`, `chat_template.jinja`); `gemma-4-31B-it` und `gemma-4-12B-it` haben dieselben
+Dateien (gleiche SHA-256). Nachgebaut, kein Code übernommen.
+
+- *Tokenizer* (`mormot.ai.infer.tokenizer.spbpe`, `TSpBpeTokenizer`): BPE im Stil von
+  SentencePiece - jedes Leerzeichen wird U+2581 (Replace-Normalizer), kein Schnitt vor dem BPE
+  (der Split auf " " findet danach keins mehr), der ganze Text ist ein Wort; die Symbole sind die
+  Zeichen des Vokabulars, ein fremdes Zeichen seine UTF-8-Bytes als `<0xNN>` (Byte-Fallback,
+  alle 256 Byte-Tokens Pflicht, also nie `<unk>`); Merges nach Rang, bei Gleichstand links
+  zuerst. Decodieren: U+2581 als Leerzeichen, `<0xNN>` als Byte. Abgelehnt: eine andere
+  Pipeline, `truncation`/`padding` (die Bibliothek würde damit kürzen), ein Vokabeltext mit
+  zwei Ids, ein Merge außerhalb des Vokabulars oder doppelt. Ungültiges UTF-8 wird je Byte
+  U+FFFD. GGUF folgt mit D6d.
+- *Template* (`TGemma4ChatTemplate` in `mormot.ai.infer.chat`): `<bos>`, ein System-Turn bei
+  Thinking, Tools oder einer ersten System-Nachricht (`<|think|>`, die getrimmten Anweisungen,
+  jedes Tool als `<|tool>declaration:NAME{...}<tool|>`), dann die Turns. Ein Assistenten-Turn
+  schreibt sein Reasoning als `<|channel>thought ... <channel|>` (nur nach der letzten
+  Nutzer-Nachricht, mit `preserve_thinking` auch vor Aufrufen), die Aufrufe als
+  `<|tool_call>call:NAME{key:value}<tool_call|>`, die Ergebnisse der folgenden Tool-Nachrichten
+  als `<|tool_response>response:NAME{value:...}<tool_response|>`, danach den Inhalt ohne
+  Channel-Blöcke; der Modell-Turn läuft nach den Ergebnissen weiter. Strings stehen zwischen
+  `<|"|>`-Tokens, Schlüssel in der Reihenfolge von Jinjas `dictsort` (Python `lower()` für
+  ASCII, Latin-1, Latin Extended-A, Griechisch, Kyrillisch - ein anderer Großbuchstabe im
+  Schlüssel wird abgelehnt statt geraten, ebenso ein großes Sigma, dessen Kleinbuchstabe vom
+  Wortende abhängt), Typnamen groß (nur ASCII), Zahlen wie Python.
+  Thinking ist aus, solange eine Anfrage es nicht verlangt (`TChatTemplate.DefaultEnableThinking`,
+  für Gemma false; der Client übernimmt es als Vorgabe). Abweichungen mit Absicht:
+  Steuer-Tokens als Ids, jeder Text bleibt Text; eine Tool-Nachricht ohne Aufruf davor wird
+  abgelehnt (das Template lässt sie still fallen); was das Template als Python-repr schriebe
+  (Liste als Beschreibung oder Typ) oder nicht nehmen könnte, wird abgelehnt.
+- *Parser* (`TGemma4OutputParser` in `mormot.ai.llm.native`): der Thought-Channel wird
+  Reasoning (die Zeile `thought` fällt weg; ein anderer, leerer oder abgeschnittener Kanal
+  bleibt Inhalt, wie bei transformers, und ein Steuer-Token danach wirkt wie im Inhalt), jeder `<|tool_call>`-Block ein Aufruf, wenn seine Argumente
+  im Dialekt von transformers lesbar sind (`ParseGemma4ToolCall`: Strings zwischen den
+  `<|"|>`-Tokens, ein `\w+`-Schlüssel direkt nach `{` oder `,` in Anführungszeichen, dann
+  striktes JSON, ein Objekt; `\w` als Teilmenge des regex-Moduls - eine Nicht-ASCII-Ziffer
+  etwa nicht -, so wird nie ein Aufruf angenommen, den transformers ablehnt), sonst bleibt
+  er Text; `<turn|>`, `<|tool_response>` und `<eos>`
+  halten an. Neu `TNativeOutputParser.Prompt`: `NativeDecode` gibt dem Parser den Prompt, denn
+  nach Tool-Ergebnissen mit Thinking endet der Prompt in einem offenen Thought-Channel.
+- *Client:* `TGemma4Model` und `TGemma4TextModel` sind als Familie registriert
+  (`TSpBpeTokenizer`, `TGemma4ChatTemplate`, `TGemma4OutputParser`); `preserve_thinking` aus
+  `chat_template_kwargs` (`TChatTemplateOptions.PreserveThinking`).
+- *Referenz* (`make_reference_d6c.py`): `gemma4-tokens` - 3197 Fälle (Korpus, die Fälle der
+  früheren Tokenizer, eigene für Leerzeichenläufe, Byte-Fallback, Literale, 1200 erzeugte),
+  Ids der tokenizers-Bibliothek ohne Added Tokens; `gemma4-chat` - 452 Gespräche und
+  Tool-Schemas (52 entworfen, 400 erzeugt über die Zweige von `format_parameters`), Text und Ids
+  von transformers 5.19.
+- *Tests* (`test.infer.gemma4`): die Pipeline mit Tiny-Tokenizern (Merges über das Leerzeichen,
+  Byte-Fallback, Merges von Byte-Tokens, ungültiges UTF-8, die Ablehnungen), alle
+  Tokenizer-Fälle id- und textgleich, alle Chat-Fälle textgleich (Tiny-Tokenizer, ohne Modell)
+  und idgleich (61 Fälle mit einem Steuer-Token-Literal im Text nur textgleich: dort liest der
+  HF-Tokenizer ein Steuer-Token, wir Text - geprüft, dass unsere Ids den Text ergeben und
+  weniger Steuer-Tokens enthalten), die Ablehnungen und die `dictsort`-Tabelle, der
+  Argument-Dialekt, der Parser (Kanal, Aufrufe, Stopps, Schnitte, offener Kanal im Prompt), die
+  Optionen und die registrierte Familie.
+  Gegenprobe: 24 eingebaute Fehler (Leerzeichen nicht ersetzt, Byte-Fallback falsch,
+  U+2581 nicht decodiert, falsche Position in der Merge-Queue, `dictsort` mit Großschreibung,
+  kein Trim, Generation-Prompt ohne leeren Kanal, kein fortgesetzter Modell-Turn, Tool-Name
+  immer `unknown`, Reasoning vor der letzten Nutzer-Nachricht, Komma vorn, `preserve_thinking`
+  aus, Schlüssel ohne Anführungszeichen, `<|tool_response>` hält nicht, Prompt-Kanal
+  übersehen, Kanalzeile im Reasoning, Thinking-Vorgabe an, Option verloren, verwaiste
+  Tool-Nachricht geschluckt, jeder Kanal als Reasoning, großes Sigma geraten, Zahlen als
+  `\w`, Literal als Steuer-Token) - 23 scheitern; der übrige (Zahlen über `json.dumps` statt
+  `str()`) ist gleichwertig, Python schreibt beide gleich. Review: Claude-Finder und Codex in
+  vier Runden; gefunden und behoben u. a. Byte-Literale, die unter Unicode-Delphi falsch
+  kodieren, `truncation`/`padding` und doppelte Vokabeltexte, ein anderer oder leerer Kanal
+  als Reasoning, ein ungültiger Kanal-Kopf, der einen Aufruf verschluckte, `\w` laxer als
+  transformers, das Schluss-Sigma, ungeprüfte Literal-Fälle.
+
 **D6a erledigt (2026-10-20): Gemma 4 auf der CPU.** Die Rechnung von Gemma 4 (26B-A4B, 31B)
 gegen `transformers` 5.19 (`modeling_gemma4.py`, nachgebaut, kein Code übernommen), zunächst auf
 der CPU und aus safetensors.

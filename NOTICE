@@ -139,3 +139,19 @@ gpt-oss  (OpenAI)  (MODEL INTERFACE, NOT CODE)
   rendered by transformers with that template, and their token ids.
   License: Apache-2.0.
   https://huggingface.co/openai/gpt-oss-20b
+
+Gemma 4  (Google)  (MODEL INTERFACE, NOT CODE)
+  The native decoder implements the Gemma 4 architecture after the modeling
+  code of transformers 5.19 (read, not copied); tests/data/infer-ref/tiny-gemma4
+  holds seeded models of that architecture. Its tokenizer is read at runtime
+  from the tokenizer.json of google/gemma-4-26B-A4B-it (revision
+  4d7ae4984b7db7de8f8457170b3f1a419ee76d52), which is not part of this
+  repository (vendor/models/, gitignored); tests/data/infer-ref/gemma4-tokens
+  holds token ids computed with it. The Gemma 4 chat template of
+  mormot.ai.infer.chat is written in Pascal after the chat_template.jinja of
+  that revision; its fixed prompt strings (the declaration format of tools,
+  the turn and channel markers) are reproduced because the model only works
+  with them. tests/data/infer-ref/gemma4-chat holds conversations rendered by
+  transformers with that template, and their token ids.
+  License: Apache-2.0.
+  https://huggingface.co/google/gemma-4-26B-A4B-it

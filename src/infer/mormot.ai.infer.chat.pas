@@ -10,7 +10,10 @@
 //   7ae557604adf67be50417f59c2c2f167def9a775), gate tests/data/infer-ref/qwen25-chat;
 //   THarmonyChatTemplate that of gpt-oss (openai/gpt-oss-20b revision
 //   6cee5e81ee83917806bbde320786a8fb61efebee, chat_template.jinja), gate
-//   tests/data/infer-ref/gpt-oss-chat
+//   tests/data/infer-ref/gpt-oss-chat; TGemma4ChatTemplate that of Gemma 4
+//   (google/gemma-4-26B-A4B-it revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52,
+//   chat_template.jinja - the same file in gemma-4-31B-it and gemma-4-12B-it),
+//   gate tests/data/infer-ref/gemma4-chat
 // - one difference by design: the template emits the control tokens
 //   (<|im_start|> <|im_end|> <think> </think> <tool_call> </tool_call>
 //   <tool_response> </tool_response>) as ids, and every message text is text.
@@ -29,6 +32,7 @@ unit mormot.ai.infer.chat;
     - TQwen3ChatTemplate: the template of Qwen3
     - TQwen2ChatTemplate: the template of Qwen2.5
     - THarmonyChatTemplate: the template of gpt-oss (Harmony)
+    - TGemma4ChatTemplate: the template of Gemma 4
 
   *****************************************************************************
 }
@@ -66,6 +70,9 @@ type
     /// gpt-oss: the date of the system message as yyyy-mm-dd - '' for today
     // (local time, as the template's strftime_now)
     CurrentDate: RawUtf8;
+    /// Gemma 4: the reasoning of an assistant turn with tool calls is written
+    // back also before the last user message (preserve_thinking)
+    PreserveThinking: boolean;
   end;
 
   /// the output of one template run: text is buffered and encoded in one
@@ -99,6 +106,9 @@ type
   public
     /// keep aTokenizer (not owned) - raises EInferError when nil
     constructor Create(aTokenizer: TInferTokenizer); virtual;
+    /// whether the family thinks when a request does not say (enable_thinking)
+    // - true by default; false for a template that thinks only on request
+    class function DefaultEnableThinking: boolean; virtual;
     /// the token ids of a conversation
     // - aAddGenerationPrompt opens the assistant turn; aEnableThinking = false
     // asks the model to answer without reasoning first (Qwen3: an empty
@@ -210,6 +220,48 @@ type
     /// look up the Harmony control tokens in aTokenizer (not owned) - raises
     // EInferError when one is missing
     constructor Create(aTokenizer: TInferTokenizer); override;
+  end;
+
+  /// the chat template of Gemma 4: its chat_template.jinja - <bos>, a system
+  // turn when thinking is on, tools are given or the first message is a
+  // system one (<|think|>, the trimmed instructions, each tool as
+  // <|tool>declaration:NAME{...}<tool|>), then <|turn>user / <|turn>model
+  // turns up to <turn|>; an assistant turn writes its Reasoning as
+  // <|channel>thought ... <channel|> (only after the last user message, or
+  // with PreserveThinking before calls), its calls as
+  // <|tool_call>call:NAME{key:value}<tool_call|>, the results of the tool
+  // messages after it as <|tool_response>response:NAME{value:...}
+  // <tool_response|>, then its content without <|channel> blocks; the model
+  // turn goes on after the results (no <turn|>), and the next assistant
+  // message continues it
+  // - EnableThinking is off unless a request sets it (the template's default);
+  // off, the generation prompt closes an empty thought channel
+  // - strings of the tool schemas and arguments sit between <|"|> tokens; the
+  // schema keys in the order of Jinja's dictsort (Python lower(): ASCII,
+  // Latin-1, Latin Extended-A, Greek and Cyrillic - another upper case
+  // letter or a capital sigma in a key raises), the type names upper case
+  // (ASCII only), numbers
+  // as Python writes them; what the template would write as a Python repr (a
+  // list or object as a description or type, outside an item type list) or
+  // could not take (parameters or properties that are truthy but no object,
+  // a "required" that is no array of scalars) raises EInferError
+  // - differences by design: control tokens come as ids and every text is
+  // text; a tool message that answers no assistant turn with calls raises
+  // (the template drops it); a system message after the first is rendered as
+  // a system turn, as the template does
+  TGemma4ChatTemplate = class(TChatTemplate)
+  protected
+    fBos, fTurn, fTurnEnd, fThink, fChannel, fChannelEnd, fTool, fToolEnd,
+    fToolCall, fToolCallEnd, fToolResponse, fToolResponseEnd, fQuote: integer;
+    procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+      const aOptions: TChatTemplateOptions); override;
+  public
+    /// look up the control tokens of Gemma 4 in aTokenizer (not owned) -
+    // raises EInferError when one is missing
+    constructor Create(aTokenizer: TInferTokenizer); override;
+    /// false: the template thinks only when a request asks for it
+    class function DefaultEnableThinking: boolean; override;
   end;
 
 /// the options of a request that only sets EnableThinking
@@ -806,6 +858,11 @@ begin
   fTokenizer := aTokenizer;
 end;
 
+class function TChatTemplate.DefaultEnableThinking: boolean;
+begin
+  result := true;
+end;
+
 function TChatTemplate.Need(const aContent: RawUtf8): integer;
 begin
   result := fTokenizer.TokenId(aContent);
@@ -1299,7 +1356,7 @@ begin
     hjNumber, hjString:
       result := Nodes[aNode].Text;
   else
-    EInferError.RaiseUtf8('THarmonyChatTemplate: % is an array or object, ' +
+    EInferError.RaiseUtf8('chat template: % is an array or object, ' +
       'which the template writes as a Python repr', [aWhat]);
   end;
 end;
@@ -1307,7 +1364,7 @@ end;
 function THarmonyJson.TextOf(aNode: integer; const aWhat: RawUtf8): RawUtf8;
 begin
   if Nodes[aNode].Kind <> hjString then
-    EInferError.RaiseUtf8('THarmonyChatTemplate: % is no string', [aWhat]);
+    EInferError.RaiseUtf8('chat template: % is no string', [aWhat]);
   result := Nodes[aNode].Text;
 end;
 
@@ -1319,7 +1376,7 @@ begin
   if not Truthy(aList) then
     exit;
   if Nodes[aList].Kind <> hjArray then
-    EInferError.RaiseUtf8('THarmonyChatTemplate: "required" is no array', []);
+    EInferError.RaiseUtf8('chat template: "required" is no array', []);
   for i := 0 to Nodes[aList].Count - 1 do
   begin
     v := Item(aList, i);
@@ -1724,6 +1781,667 @@ begin
     aOut.Control(fStart, '<|start|>');
     aOut.Add('assistant');
   end;
+  aOut.Flush;
+end;
+
+{ TGemma4ChatTemplate }
+
+const
+  GEMMA4_QUOTE = '<|"|>';
+
+/// true for the code points of Python's str.isspace()
+function IsPythonSpace(c: cardinal): boolean;
+begin
+  case c of
+    9..13, $1c..$20, $85, $a0, $1680, $2000..$200a, $2028, $2029, $202f,
+    $205f, $3000:
+      result := true;
+  else
+    result := false;
+  end;
+end;
+
+/// Python str.strip() - the trim filter of Jinja
+function PythonStrip(const s: RawUtf8): RawUtf8;
+var
+  cp: TCardinalDynArray;
+  n, a, b: PtrInt;
+begin
+  n := Utf8ToCodePoints(pointer(s), length(s), cp);
+  a := 0;
+  while (a < n) and IsPythonSpace(cp[a]) do
+    inc(a);
+  b := n;
+  while (b > a) and IsPythonSpace(cp[b - 1]) do
+    dec(b);
+  if a = b then
+    result := ''
+  else
+    result := CodePointsToUtf8(@cp[a], b - a);
+end;
+
+/// the strip_thinking macro: split at "<channel|>", of a part holding
+// "<|channel>" only what is before it, the rest joined and trimmed
+function Gemma4StripThinking(const s: RawUtf8): RawUtf8;
+var
+  rest, part: RawUtf8;
+  i: PtrInt;
+begin
+  result := '';
+  rest := s;
+  repeat
+    i := PosEx('<channel|>', rest);
+    if i = 0 then
+      part := rest
+    else
+      part := copy(rest, 1, i - 1);
+    result := result + SplitFirst(part, '<|channel>');
+    if i = 0 then
+      break;
+    rest := copy(rest, i + length('<channel|>'), maxInt);
+  until false;
+  result := PythonStrip(result);
+end;
+
+/// Python str.lower() of a key, for the order of the dictsort filter -
+// ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic; another upper case
+// letter raises (its order is not guessed), as do a Roman numeral or a
+// circled capital (upper case symbols) and the capital sigma (final or not by
+// its context)
+function Gemma4KeyLower(const s: RawUtf8): RawUtf8;
+var
+  cp: TCardinalDynArray;
+  n, i: PtrInt;
+  c: cardinal;
+begin
+  n := Utf8ToCodePoints(pointer(s), length(s), cp);
+  for i := 0 to n - 1 do
+  begin
+    c := cp[i];
+    case c of
+      ord('A')..ord('Z'), $c0..$d6, $d8..$de, $391..$3a1, $3a4..$3ab, $410..$42f:
+        inc(c, 32);
+      $400..$40f:
+        inc(c, 80);
+      $100..$12f, $132..$137, $14a..$177:
+        c := c or 1;
+      $139..$148, $179..$17e:
+        if c and 1 <> 0 then
+          inc(c);
+      $178:
+        c := $ff;
+      $386:
+        c := $3ac;
+      $2160..$216f, $24b6..$24cf:
+        // Roman numerals and circled capitals: no letters, but lower() maps them
+        EInferError.RaiseUtf8('TGemma4ChatTemplate: the key "%" has an upper ' +
+          'case symbol whose Python lower() is not implemented', [s]);
+      $3a3:
+        // Python's lower() writes a final sigma at the end of a word
+        EInferError.RaiseUtf8('TGemma4ChatTemplate: the key "%" has a capital ' +
+          'sigma, whose Python lower() depends on its place in the word', [s]);
+      $388..$38a:
+        inc(c, 37);
+      $38c:
+        c := $3cc;
+      $38e, $38f:
+        inc(c, 63);
+    else
+      if (c >= $80) and (O200kClassOf(c) = ocUpper) then
+        EInferError.RaiseUtf8('TGemma4ChatTemplate: the key "%" has an upper ' +
+          'case letter whose Python lower() is not implemented', [s]);
+    end;
+    cp[i] := c;
+  end;
+  result := CodePointsToUtf8(pointer(cp), n);
+end;
+
+/// Python str.upper() of a type name - ASCII only
+function Gemma4Upper(const s, aWhat: RawUtf8): RawUtf8;
+var
+  i: PtrInt;
+begin
+  for i := 1 to length(s) do
+    if ord(s[i]) >= $80 then
+      EInferError.RaiseUtf8('TGemma4ChatTemplate: % "%" is not ASCII', [aWhat, s]);
+  result := UpperCase(s);
+end;
+
+type
+  /// the macros of the Gemma 4 template over a parsed JSON value
+  TGemma4Writer = object
+    Out: ^TChatSegments;
+    T: THarmonyJson;
+    Quote: integer;
+    /// <|"|>aText<|"|>
+    procedure Quoted(const aText: RawUtf8);
+    /// the members of an object (indexes into T.Child) in dictsort order
+    function Sorted(aNode: integer): TIntegerDynArray;
+    /// value | upper - undefined is '', a list or object raises
+    function Upper(aNode: integer; const aWhat: RawUtf8): RawUtf8;
+    /// the format_argument macro
+    procedure Argument(aNode: integer; aEscapeKeys: boolean);
+    /// the elements of a "required" list as <|"|>a<|"|>,<|"|>b<|"|>
+    procedure Required(aNode: integer);
+    /// an item type that is no string: value | map('upper') | list, written
+    // by format_argument
+    procedure TypeList(aNode: integer);
+    /// the format_parameters macro over the object aNode
+    procedure Parameters(aNode: integer; aFilterKeys: boolean);
+    /// the format_function_declaration macro
+    procedure Declaration(const aTool: TLlmTool);
+  end;
+
+procedure TGemma4Writer.Quoted(const aText: RawUtf8);
+begin
+  Out^.Control(Quote, GEMMA4_QUOTE);
+  Out^.Add(aText);
+  Out^.Control(Quote, GEMMA4_QUOTE);
+end;
+
+function TGemma4Writer.Sorted(aNode: integer): TIntegerDynArray;
+var
+  n, i, j, k: integer;
+  lower: TRawUtf8DynArray;
+  l: RawUtf8;
+begin
+  // Jinja's dictsort: by the key in lower case, stable (Python's sorted)
+  n := T.Nodes[aNode].Count;
+  SetLength(result, n);
+  SetLength(lower, n);
+  for i := 0 to n - 1 do
+  begin
+    k := T.Nodes[aNode].First + i;
+    l := Gemma4KeyLower(T.Keys[k]);
+    j := i;
+    // UTF-8 bytes compare as the code points Python compares
+    while (j > 0) and (SortDynArrayRawByteString(lower[j - 1], l) > 0) do
+    begin
+      result[j] := result[j - 1];
+      lower[j] := lower[j - 1];
+      dec(j);
+    end;
+    result[j] := k;
+    lower[j] := l;
+  end;
+end;
+
+function TGemma4Writer.Upper(aNode: integer; const aWhat: RawUtf8): RawUtf8;
+begin
+  if aNode < 0 then
+    result := '' // undefined renders as ''
+  else
+    result := Gemma4Upper(T.Str(aNode, aWhat), aWhat);
+end;
+
+procedure TGemma4Writer.Argument(aNode: integer; aEscapeKeys: boolean);
+var
+  kids: TIntegerDynArray;
+  i: integer;
+begin
+  case T.Nodes[aNode].Kind of
+    hjNull:
+      Out^.Add('null');
+    hjString:
+      Quoted(T.Nodes[aNode].Text);
+    hjFalse:
+      Out^.Add('false');
+    hjTrue:
+      Out^.Add('true');
+    hjNumber:
+      Out^.Add(T.Nodes[aNode].Text);
+    hjObject:
+      begin
+        Out^.Add('{');
+        kids := Sorted(aNode);
+        for i := 0 to high(kids) do
+        begin
+          if i > 0 then
+            Out^.Add(',');
+          if aEscapeKeys then
+            Quoted(T.Keys[kids[i]])
+          else
+            Out^.Add(T.Keys[kids[i]]);
+          Out^.Add(':');
+          Argument(T.Child[kids[i]], aEscapeKeys);
+        end;
+        Out^.Add('}');
+      end;
+    hjArray:
+      begin
+        Out^.Add('[');
+        for i := 0 to T.Nodes[aNode].Count - 1 do
+        begin
+          if i > 0 then
+            Out^.Add(',');
+          Argument(T.Item(aNode, i), aEscapeKeys);
+        end;
+        Out^.Add(']');
+      end;
+  end;
+end;
+
+procedure TGemma4Writer.Required(aNode: integer);
+var
+  i: integer;
+begin
+  // a for loop over the value: a string would give its characters, an object
+  // its keys - only an array is taken
+  if T.Nodes[aNode].Kind <> hjArray then
+    EInferError.RaiseUtf8('TGemma4ChatTemplate: "required" is no array', []);
+  for i := 0 to T.Nodes[aNode].Count - 1 do
+  begin
+    if i > 0 then
+      Out^.Add(',');
+    Quoted(T.Str(T.Item(aNode, i), 'an element of "required"'));
+  end;
+end;
+
+procedure TGemma4Writer.TypeList(aNode: integer);
+var
+  i: integer;
+begin
+  if T.Nodes[aNode].Kind <> hjArray then
+    EInferError.RaiseUtf8('TGemma4ChatTemplate: an item type is neither a ' +
+      'string nor an array', []);
+  Out^.Add('[');
+  for i := 0 to T.Nodes[aNode].Count - 1 do
+  begin
+    if i > 0 then
+      Out^.Add(',');
+    Quoted(Upper(T.Item(aNode, i), 'an item type'));
+  end;
+  Out^.Add(']');
+end;
+
+procedure TGemma4Writer.Parameters(aNode: integer; aFilterKeys: boolean);
+var
+  kids, items: TIntegerDynArray;
+  i, j, v, sub, iv: integer;
+  first, firstItem, addComma: boolean;
+  key, typ: RawUtf8;
+
+  procedure Comma;
+  begin
+    // {% if add_comma %},{% else %}{% set add_comma = true %}{% endif %}
+    if addComma then
+      Out^.Add(',')
+    else
+      addComma := true;
+  end;
+
+begin
+  first := true;
+  kids := Sorted(aNode);
+  for i := 0 to high(kids) do
+  begin
+    key := T.Keys[kids[i]];
+    if aFilterKeys and ((key = 'description') or (key = 'type') or
+       (key = 'properties') or (key = 'required') or (key = 'nullable')) then
+      continue;
+    if not first then
+      Out^.Add(',');
+    first := false;
+    v := T.Child[kids[i]];
+    Out^.Add(key);
+    Out^.Add(':{');
+    addComma := false;
+    sub := T.Member(v, 'description');
+    if T.Truthy(sub) then
+    begin
+      Out^.Add('description:');
+      Quoted(T.Str(sub, 'a description'));
+      addComma := true;
+    end;
+    typ := Upper(T.Member(v, 'type'), 'a type');
+    if typ = 'STRING' then
+    begin
+      sub := T.Member(v, 'enum');
+      if T.Truthy(sub) then
+      begin
+        Comma;
+        Out^.Add('enum:');
+        Argument(sub, true);
+      end;
+    end
+    else if typ = 'ARRAY' then
+    begin
+      sub := T.Member(v, 'items');
+      if (sub >= 0) and (T.Nodes[sub].Kind = hjObject) and T.Truthy(sub) then
+      begin
+        Comma;
+        Out^.Add('items:{');
+        firstItem := true;
+        items := Sorted(sub);
+        for j := 0 to high(items) do
+        begin
+          iv := T.Child[items[j]];
+          if T.Nodes[iv].Kind = hjNull then
+            continue;
+          if not firstItem then
+            Out^.Add(',');
+          firstItem := false;
+          if T.Keys[items[j]] = 'properties' then
+          begin
+            Out^.Add('properties:{');
+            if T.Nodes[iv].Kind = hjObject then
+              Parameters(iv, false);
+            Out^.Add('}');
+          end
+          else if T.Keys[items[j]] = 'required' then
+          begin
+            Out^.Add('required:[');
+            Required(iv);
+            Out^.Add(']');
+          end
+          else if T.Keys[items[j]] = 'type' then
+          begin
+            Out^.Add('type:');
+            if T.Nodes[iv].Kind = hjString then
+              Quoted(Upper(iv, 'an item type'))
+            else
+              TypeList(iv);
+          end
+          else
+          begin
+            Out^.Add(T.Keys[items[j]]);
+            Out^.Add(':');
+            Argument(iv, true);
+          end;
+        end;
+        Out^.Add('}');
+      end;
+    end;
+    if T.Truthy(T.Member(v, 'nullable')) then
+    begin
+      Comma;
+      Out^.Add('nullable:true');
+    end;
+    if typ = 'OBJECT' then
+    begin
+      Comma;
+      Out^.Add('properties:{');
+      sub := T.Member(v, 'properties');
+      if (sub >= 0) and (T.Nodes[sub].Kind = hjObject) then
+        Parameters(sub, false)
+      else
+        // the other keys of the property taken as its parameters
+        Parameters(v, true);
+      Out^.Add('}');
+      sub := T.Member(v, 'required');
+      if T.Truthy(sub) then
+      begin
+        Comma;
+        Out^.Add('required:[');
+        Required(sub);
+        Out^.Add(']');
+      end;
+    end;
+    Comma;
+    Out^.Add('type:');
+    Quoted(typ);
+    Out^.Add('}');
+  end;
+end;
+
+procedure TGemma4Writer.Declaration(const aTool: TLlmTool);
+var
+  sub: integer;
+begin
+  Out^.Add('declaration:' + aTool.Name + '{description:');
+  Quoted(aTool.Description);
+  if aTool.ParametersJson <> '' then
+  begin
+    T.Parse(aTool.ParametersJson);
+    if T.Truthy(0) then
+    begin
+      if T.Nodes[0].Kind <> hjObject then
+        EInferError.RaiseUtf8('TGemma4ChatTemplate: the parameters of % are ' +
+          'no object', [aTool.Name]);
+      Out^.Add(',parameters:{');
+      sub := T.Member(0, 'properties');
+      if T.Truthy(sub) then
+      begin
+        if T.Nodes[sub].Kind <> hjObject then
+          EInferError.RaiseUtf8('TGemma4ChatTemplate: the properties of % are ' +
+            'no object', [aTool.Name]);
+        Out^.Add('properties:{');
+        Parameters(sub, false);
+        Out^.Add('},');
+      end;
+      sub := T.Member(0, 'required');
+      if T.Truthy(sub) then
+      begin
+        Out^.Add('required:[');
+        Required(sub);
+        Out^.Add('],');
+      end;
+      sub := T.Member(0, 'type');
+      if T.Truthy(sub) then
+      begin
+        // the template closes the parameters only here
+        Out^.Add('type:');
+        Quoted(Upper(sub, 'the type of the parameters'));
+        Out^.Add('}');
+      end;
+    end;
+  end;
+  Out^.Add('}');
+end;
+
+constructor TGemma4ChatTemplate.Create(aTokenizer: TInferTokenizer);
+begin
+  inherited Create(aTokenizer);
+  fBos := Need('<bos>');
+  fTurn := Need('<|turn>');
+  fTurnEnd := Need('<turn|>');
+  fThink := Need('<|think|>');
+  fChannel := Need('<|channel>');
+  fChannelEnd := Need('<channel|>');
+  fTool := Need('<|tool>');
+  fToolEnd := Need('<tool|>');
+  fToolCall := Need('<|tool_call>');
+  fToolCallEnd := Need('<tool_call|>');
+  fToolResponse := Need('<|tool_response>');
+  fToolResponseEnd := Need('<tool_response|>');
+  fQuote := Need(GEMMA4_QUOTE);
+end;
+
+class function TGemma4ChatTemplate.DefaultEnableThinking: boolean;
+begin
+  result := false;
+end;
+
+const
+  // ns.prev_message_type of the template
+  G4_NONE = 0;
+  G4_THINK = 1;
+  G4_TOOL = 2;
+  G4_TOOL_CALL = 3;
+  G4_TOOL_RESPONSE = 4;
+
+procedure TGemma4ChatTemplate.Build(var aOut: TChatSegments;
+  const aMessages: TLlmMessageDynArray; const aTools: TLlmToolDynArray;
+  aAddGenerationPrompt: boolean; const aOptions: TChatTemplateOptions);
+var
+  n, first, i, j, k, lastUser: PtrInt;
+  prev: integer;
+  prevRole, nextRole: TLlmRole;
+  hasPrevRole, nextFound, trOut, hasContent: boolean;
+  w: TGemma4Writer;
+  m: ^TLlmMessage;
+  text, name: RawUtf8;
+  answered: TBooleanDynArray;
+  kids: TIntegerDynArray;
+begin
+  w.Out := @aOut;
+  w.Quote := fQuote;
+  n := length(aMessages);
+  first := 0;
+  prev := G4_NONE;
+  aOut.Control(fBos, '<bos>');
+  if aOptions.EnableThinking or (aTools <> nil) or
+     ((n > 0) and (aMessages[0].Role = lrSystem)) then
+  begin
+    aOut.Control(fTurn, '<|turn>');
+    aOut.Add('system'#10);
+    if aOptions.EnableThinking then
+    begin
+      aOut.Control(fThink, '<|think|>');
+      aOut.Add(#10);
+      prev := G4_THINK;
+    end;
+    if (n > 0) and (aMessages[0].Role = lrSystem) then
+    begin
+      aOut.Add(PythonStrip(aMessages[0].Content));
+      first := 1;
+    end;
+    for i := 0 to high(aTools) do
+    begin
+      aOut.Control(fTool, '<|tool>');
+      w.Declaration(aTools[i]);
+      aOut.Control(fToolEnd, '<tool|>');
+      prev := G4_TOOL;
+    end;
+    aOut.Control(fTurnEnd, '<turn|>');
+    aOut.Add(#10);
+  end;
+  // the last user message: reasoning before it is dropped
+  lastUser := -1;
+  for i := first to n - 1 do
+    if aMessages[i].Role = lrUser then
+      lastUser := i;
+  SetLength(answered, n);
+  hasPrevRole := false;
+  prevRole := lrUser;
+  for i := first to n - 1 do
+  begin
+    m := @aMessages[i];
+    if m^.Role = lrTool then
+      if answered[i] then
+        continue
+      else
+        EInferError.RaiseUtf8('%: message % answers a tool call, but no ' +
+          'assistant turn with calls is before it', [self, i]);
+    prev := G4_NONE;
+    // a model turn goes on in the next assistant message
+    if not ((m^.Role = lrAssistant) and hasPrevRole and (prevRole = lrAssistant)) then
+    begin
+      aOut.Control(fTurn, '<|turn>');
+      case m^.Role of
+        lrAssistant:
+          aOut.Add('model'#10);
+        lrUser:
+          aOut.Add('user'#10);
+      else
+        aOut.Add('system'#10);
+      end;
+    end;
+    if (m^.Reasoning <> '') and ((i > lastUser) or
+       (aOptions.PreserveThinking and (m^.ToolCalls <> nil))) then
+    begin
+      aOut.Control(fChannel, '<|channel>');
+      aOut.Add('thought'#10 + m^.Reasoning + #10);
+      aOut.Control(fChannelEnd, '<channel|>');
+    end;
+    trOut := false;
+    if m^.ToolCalls <> nil then
+    begin
+      for j := 0 to high(m^.ToolCalls) do
+      begin
+        aOut.Control(fToolCall, '<|tool_call>');
+        aOut.Add('call:' + m^.ToolCalls[j].Name + '{');
+        if m^.ToolCalls[j].ArgumentsJson <> '' then
+        begin
+          w.T.Parse(m^.ToolCalls[j].ArgumentsJson);
+          // null is the template's none: nothing between the braces
+          if w.T.Nodes[0].Kind = hjNull then
+            SetLength(kids, 0)
+          else if w.T.Nodes[0].Kind <> hjObject then
+            EInferError.RaiseUtf8('%: the arguments of call % are no JSON object',
+              [self, m^.ToolCalls[j].Name])
+          else
+            kids := w.Sorted(0);
+          for k := 0 to high(kids) do
+          begin
+            if k > 0 then
+              aOut.Add(',');
+            aOut.Add(w.T.Keys[kids[k]] + ':');
+            w.Argument(w.T.Child[kids[k]], false);
+          end;
+        end;
+        aOut.Add('}');
+        aOut.Control(fToolCallEnd, '<tool_call|>');
+      end;
+      prev := G4_TOOL_CALL;
+      // the tool messages that follow: their results, named by the call they
+      // answer (the last call with that id, as the template loops)
+      k := i + 1;
+      while (k < n) and (aMessages[k].Role = lrTool) do
+      begin
+        name := aMessages[k].Name;
+        if name = '' then
+          name := 'unknown';
+        for j := 0 to high(m^.ToolCalls) do
+          if m^.ToolCalls[j].Id = aMessages[k].ToolCallId then
+            name := m^.ToolCalls[j].Name;
+        aOut.Control(fToolResponse, '<|tool_response>');
+        aOut.Add('response:' + name + '{value:');
+        w.Quoted(aMessages[k].Content);
+        aOut.Add('}');
+        aOut.Control(fToolResponseEnd, '<tool_response|>');
+        answered[k] := true;
+        trOut := true;
+        prev := G4_TOOL_RESPONSE;
+        inc(k);
+      end;
+    end;
+    if m^.Role = lrAssistant then
+      text := Gemma4StripThinking(m^.Content)
+    else
+      text := PythonStrip(m^.Content);
+    aOut.Add(text);
+    hasContent := text <> '';
+    nextFound := false;
+    nextRole := lrUser;
+    for j := i + 1 to n - 1 do
+      if aMessages[j].Role <> lrTool then
+      begin
+        nextRole := aMessages[j].Role;
+        nextFound := true;
+        break;
+      end;
+    if (prev = G4_TOOL_CALL) and not trOut then
+      // calls without results: the model turn waits for them
+      aOut.Control(fToolResponse, '<|tool_response>')
+    else if (m^.Role = lrAssistant) and nextFound and (nextRole = lrAssistant) and
+            ((m^.ToolCalls = nil) or trOut) then
+      // continued by the next assistant message
+    else if not (trOut and not hasContent and not nextFound) then
+    begin
+      aOut.Control(fTurnEnd, '<turn|>');
+      aOut.Add(#10);
+    end;
+    prevRole := m^.Role;
+    hasPrevRole := true;
+  end;
+  if aAddGenerationPrompt then
+    if (prev <> G4_TOOL_RESPONSE) and (prev <> G4_TOOL_CALL) then
+    begin
+      aOut.Control(fTurn, '<|turn>');
+      aOut.Add('model'#10);
+      if not aOptions.EnableThinking then
+      begin
+        aOut.Control(fChannel, '<|channel>');
+        aOut.Add('thought'#10);
+        aOut.Control(fChannelEnd, '<channel|>');
+      end;
+    end
+    else if (prev = G4_TOOL_RESPONSE) and aOptions.EnableThinking then
+    begin
+      aOut.Control(fChannel, '<|channel>');
+      aOut.Add('thought'#10);
+    end;
   aOut.Flush;
 end;
 
