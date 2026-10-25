@@ -23,8 +23,10 @@
 //   tensors under model.
 // - the family of mormot.ai.infer.decoder: this unit reads config.json and
 //   maps the tensors; the forward pass is TDecoderModel's
-// - not yet (backlog D7): restore points of the recurrent state, GGUF, the
-//   tokenizer and chat template, a device
+// - the tokenizer, chat template and parser: mormot.ai.infer.tokenizer.bpe,
+//   mormot.ai.infer.chat and mormot.ai.llm.native (D7c); restore points of
+//   the recurrent state: TDecoderContext.CheckpointId (D7d)
+// - not yet: GGUF, a device (backlog D7e)
 unit mormot.ai.infer.model.qwen35;
 
 {

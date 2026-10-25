@@ -7,7 +7,7 @@
 // - the pieces, pipeline, template text, parser and option tests need no
 //   model; the ids need vendor/models/qwen3.5-0.8b/tokenizer.json and say SKIP
 //   without it, LAI_REQUIRE_MODEL=1 makes that a failure; the chat test needs
-//   its weights too
+//   its weights too (with a conversation going on from a restore point, D7d)
 unit test.infer.qwen35chat;
 
 interface
@@ -853,6 +853,9 @@ var
   r: TLlmChatRequest;
   a: TLlmChatResponse;
   timer: TPrecisionTimer;
+  b: TLlmChatResponse;
+  reused: Int64;
+  slots: integer;
 begin
   {$ifdef CPU32}
   AddConsole('SKIP Qwen3.5-0.8B chat: the weights need a 64-bit process');
@@ -887,6 +890,26 @@ begin
     Check(a.FinishReason = lfrStop, 'stopped by itself');
     Check(PosEx('Paris', a.Content) > 0, 'the answer Paris');
     CheckEqual(a.Reasoning, '', 'no reasoning');
+    // the conversation goes on (D7d): the earlier turn loses its empty <think>
+    // block, so the state at the end of the first request is no use - the
+    // restore point before its last turn is; the same answer as without it
+    SetLength(r.Messages, 3);
+    r.Messages[1] := LlmMessage(lrAssistant, a.Content);
+    r.Messages[2] := LlmMessage(lrUser,
+      'And the capital of Germany? Answer with one word.');
+    reused := llm.Cache.ReusedTokens;
+    timer.Start;
+    a := llm.ChatComplete(r);
+    AddConsole(FormatString('next turn in %: "%" (% tokens reused)',
+      [timer.Stop, a.Content, llm.Cache.ReusedTokens - reused]));
+    Check(PosEx('Berlin', a.Content) > 0, 'the answer Berlin');
+    Check(llm.Cache.ReusedTokens - reused > 10, 'the first turns from a restore point');
+    slots := llm.Cache.Slots;
+    llm.Cache.Slots := 0;
+    b := llm.ChatComplete(r);
+    llm.Cache.Slots := slots;
+    CheckEqual(b.Content, a.Content, 'the same answer computed from the start');
+    SetLength(r.Messages, 1);
     // a tool: the call to get_weather
     SetLength(r.Tools, 1);
     r.Tools[0].Name := 'get_weather';
@@ -914,6 +937,28 @@ begin
       AddConsole(FormatString('answer in %: "%"', [timer.Stop, a.Content]));
       Check(a.FinishReason = lfrStop, 'answered');
       Check(PosEx('17', a.Content) > 0, 'with the temperature of the tool');
+      // a new question after the tool loop (D7d): the loop went on from the
+      // end of the cache and kept no restore points there; the one before
+      // its turn is still there, the answer as without the cache
+      SetLength(r.Messages, 5);
+      r.Messages[3] := LlmMessage(lrAssistant, a.Content);
+      r.Messages[4] := LlmMessage(lrUser, 'Thanks. And in Paris?');
+      reused := llm.Cache.ReusedTokens;
+      timer.Start;
+      a := llm.ChatComplete(r);
+      AddConsole(FormatString('after the tool loop in %: % calls, "%" (% tokens reused)',
+        [timer.Stop, length(a.ToolCalls), a.Content, llm.Cache.ReusedTokens - reused]));
+      Check(llm.Cache.ReusedTokens - reused > 100, 'the tools and the question reused');
+      slots := llm.Cache.Slots;
+      llm.Cache.Slots := 0;
+      b := llm.ChatComplete(r);
+      llm.Cache.Slots := slots;
+      CheckEqual(b.Content, a.Content, 'after the tool loop: as without the cache');
+      Check(length(b.ToolCalls) = length(a.ToolCalls),
+        'after the tool loop: the same calls');
+      if (a.ToolCalls <> nil) and (b.ToolCalls <> nil) then
+        CheckEqual(b.ToolCalls[0].ArgumentsJson, a.ToolCalls[0].ArgumentsJson,
+          'after the tool loop: the same arguments');
     end;
     // an integer parameter: typed by the schema the client gives the parser
     SetLength(r.Messages, 1);

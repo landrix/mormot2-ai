@@ -29,7 +29,8 @@
 //   token, behind a depthwise causal convolution: TDecoderContext keeps both
 //   per layer), an output gate on the attention (Spec.OutputGate) and a partial
 //   rotary factor (Config.RopeDims); a context with such a layer can go back to
-//   its start only, or stay where it is (no restore points of the state yet)
+//   its start, stay where it is, or go back to a restore point: a copy of the
+//   states before a chosen token (TDecoderContext.CheckpointId, a turn start)
 // - a sliding-window layer keeps the keys a next token may see, not the whole
 //   sequence: its cache rows start at a base position that moves on when the
 //   buffer is full (FullCache keeps every key and only masks, the reference);
@@ -294,6 +295,10 @@ type
   TDecoderExtras = set of TDecoderExtra;
 
 const
+  /// how many restore points of its states a context keeps by default
+  // (TDecoderContext.MaxCheckpoints)
+  DECODER_CHECKPOINTS = 4;
+
   /// the extras of gpt-oss, which the GPU devices compute
   DECODER_EXTRAS_GPTOSS = [dxSinks, dxOutputBias, dxRouterBias, dxExpertBias,
     dxSwiGluLimit];
@@ -362,6 +367,12 @@ type
       read fDiffersGap;
   end;
 
+  /// a copy of the recurrent states of a context at one length
+  TDecoderCheckpoint = record
+    Length: PtrInt;
+    Conv, State: array of TSingleDynArray; // per layer, as in the context
+  end;
+
   /// the KV cache and scratch buffers of one sequence
   // - one per concurrent sequence; may be reused for another sequence after
   // Reset, and for another model of the same shape
@@ -374,9 +385,11 @@ type
   // for the next token (FullCache: all of them); going back is only possible
   // to a length whose window is still there (Restorable)
   // - a dmDeltaNet layer keeps no rows but a state of the whole sequence (the
-  // convolution inputs and the delta-rule matrices): such a context can only
-  // stay where it is or start again (Restorable 0 and Length); a Forward that
-  // failed leaves its state undone - only 0 is then restorable
+  // convolution inputs and the delta-rule matrices): such a context can stay
+  // where it is, start again, or go back to a restore point - a copy of the
+  // state before a token CheckpointId (a chat template's turn start,
+  // TChatTemplate.TurnStart), the last MaxCheckpoints of them; a Forward that
+  // failed leaves its state undone - then only 0 and the restore points
   TDecoderContext = class
   protected
     fDevice: TDecoderDevice; // nil: the keys and values are in the arrays below
@@ -405,6 +418,15 @@ type
     fConv, fState: array of TSingleDynArray;
     fRecurrent: boolean; // a layer carries a state
     fStateOk: boolean; // the states hold exactly the fLength tokens
+    // the restore points of the states, the oldest first: [0, fCheckpointCount)
+    // in use, the others buffers to take again
+    fCheckpoints: array of TDecoderCheckpoint;
+    fCheckpointCount, fMaxCheckpoints: PtrInt;
+    fCheckpointId: integer;
+    // every part so far started at 0 or at a CheckpointId token, and none
+    // held one after its start: the rows are split as a fresh pass splits
+    // them - the restore points are kept only then
+    fAligned: boolean;
     // an output gate: the Q rows with their gates, the gates alone
     fQg, fGateQ: TSingleDynArray;
     // a dmDeltaNet layer: the convolved Q, K, V rows, z, beta and the decay
@@ -418,7 +440,19 @@ type
     procedure DeltaPrepItem(aItem: integer);
     function GetId(aPosition: PtrInt): integer;
     procedure SetFullCache(aValue: boolean);
+    procedure SetMaxCheckpoints(aValue: PtrInt);
+    procedure SetCheckpointId(aValue: integer);
+    /// keep the states as the restore point at Length (the oldest one goes
+    // beyond MaxCheckpoints) - not when a fresh pass would split the rows
+    // before it otherwise: Usable would never take it
+    procedure SaveCheckpoint;
+    /// the index of the restore point at aLength, -1 if none
+    function FindCheckpoint(aLength: PtrInt): PtrInt;
+    /// forget the restore points after aLength
+    procedure DropCheckpoints(aLength: PtrInt);
   public
+    /// an empty context: no restore points until CheckpointId is set
+    constructor Create;
     /// forget the cached tokens - the buffers stay allocated
     procedure Reset;
     /// keep the first aLength cached tokens, forget the others
@@ -427,13 +461,14 @@ type
     /// true when the cache can go back to its first aLength tokens: every
     // sliding window still holds the keys position aLength sees (always for 0
     // and Length, and without a sliding window); with a dmDeltaNet layer only
-    // 0, and Length after a Forward that went through
+    // 0, a restore point, and Length after a Forward that went through
     function Restorable(aLength: PtrInt): boolean;
     /// how many of the first tokens of aIds[0..aCount-1] the cache holds:
     // the length of the common prefix
     function Common(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
-    /// the longest common prefix with aIds[0..aCount-1] that the cache can go
-    // back to (Common, then 0 unless Restorable)
+    /// the longest start of aIds[0..aCount-1] that the cache holds and can go
+    // back to: Common, else the last restore point before its end (where aIds
+    // holds the CheckpointId too, see CheckpointId), else 0
     function Usable(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
     /// the cache rows layer aLayer holds allocated (0 before the first
     // Forward) - a sliding window keeps about twice its size
@@ -446,6 +481,27 @@ type
     // empty context; false by default
     property FullCache: boolean
       read fFullCache write SetFullCache;
+    /// a dmDeltaNet context keeps its states before every token of this id
+    // it is fed (TDecoderModel.Forward splits its rows there): the restore
+    // points - -1 (the default) for none
+    // - the rows are split by the ids alone: Usable only takes a restore point
+    // where the cache holds the CheckpointId and before which every part
+    // started at 0 or at such a token (not a prompt fed in two calls that
+    // split elsewhere, nor a token by token continuation) - a context with the
+    // same CheckpointId splits the rows before it alike from the start, so the
+    // state is the same bit for bit, on every backend
+    // - another id forgets the restore points: the rows cached are split by
+    // the old one
+    property CheckpointId: integer
+      read fCheckpointId write SetCheckpointId;
+    /// how many restore points are kept, the last ones (DECODER_CHECKPOINTS
+    // by default; 0: none) - each one is a copy of every state: about 19 MiB
+    // for Qwen3.5-0.8B
+    property MaxCheckpoints: PtrInt
+      read fMaxCheckpoints write SetMaxCheckpoints;
+    /// the restore points held
+    property Checkpoints: PtrInt
+      read fCheckpointCount;
     /// tokens in the KV cache = position of the next token
     property Length: PtrInt
       read fLength;
@@ -514,10 +570,18 @@ type
     function SourceName(const aName: RawUtf8): RawUtf8;
     /// the tensors of the file whose name starts with aPrefix
     function TensorCountOf(const aPrefix: RawUtf8): PtrInt;
-    /// Forward of aIds or of aEmbeds (the other one nil)
+    /// Forward of aIds or of aEmbeds (the other one nil): split before every
+    // CheckpointId token of a context with a dmDeltaNet layer, its restore
+    // points
     procedure ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
       aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
       aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
+    /// ForwardRows of one part of the rows
+    procedure ForwardPart(aCtx: TDecoderContext; aIds: PIntegerArray;
+      aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
+      aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
+    /// true when a layer is dmDeltaNet: a context carries states
+    function Recurrent: boolean;
     /// fConfig from a Hugging Face config.json - raises EInferError for a
     // setting the family does not support; ends with CheckConfig
     procedure LoadConfig(const aConfigFile: TFileName); virtual; abstract;
@@ -663,6 +727,10 @@ type
     // - their positions are aCtx.Length .. aCtx.Length + aCount - 1; their ids,
     // keys and values enter the KV cache - Length only grows once every layer
     // is computed, so an exception in the layers leaves the tokens it held
+    // - a context with restore points (TDecoderContext.CheckpointId) computes
+    // the tokens in parts, up to every CheckpointId token: an exception in the
+    // layers then leaves Length at the start of the part that failed - from
+    // the second part on a restore point, when one was kept there (aligned)
     // - aLogits: nil computes no logits; else it receives the logits of the
     // last token ([VocabSize]), or of every new token when aAllLogits
     // ([aCount, VocabSize])
@@ -840,16 +908,28 @@ end;
 
 { TDecoderContext }
 
+constructor TDecoderContext.Create;
+begin
+  inherited Create;
+  fCheckpointId := -1;
+  fMaxCheckpoints := DECODER_CHECKPOINTS;
+  fAligned := true;
+end;
+
 procedure TDecoderContext.Reset;
 var
   i: PtrInt;
 begin
   fLength := 0;
+  fCheckpointCount := 0;
+  fAligned := true;
   for i := 0 to high(fBase) do
     fBase[i] := 0;
 end;
 
 procedure TDecoderContext.Truncate(aLength: PtrInt);
+var
+  c, l: PtrInt;
 begin
   if (aLength < 0) or (aLength > fLength) then
     EInferError.RaiseUtf8('%.Truncate(%) of % tokens', [self, aLength, fLength]);
@@ -858,9 +938,135 @@ begin
       'the keys of that position, or a recurrent state cannot go back there',
       [self, aLength]);
   if aLength = 0 then
-    Reset
-  else
-    fLength := aLength;
+  begin
+    Reset;
+    exit;
+  end;
+  if fRecurrent and ((aLength <> fLength) or not fStateOk) then
+  begin
+    // back to a restore point: its states are the states of aLength tokens
+    c := FindCheckpoint(aLength);
+    for l := 0 to high(fState) do
+      if fState[l] <> nil then
+      begin
+        MoveFast(pointer(fCheckpoints[c].Conv[l])^, pointer(fConv[l])^,
+          system.length(fConv[l]) * SizeOf(single));
+        MoveFast(pointer(fCheckpoints[c].State[l])^, pointer(fState[l])^,
+          system.length(fState[l]) * SizeOf(single));
+      end;
+    fStateOk := true;
+    fAligned := true; // only aligned ones are kept
+  end;
+  fLength := aLength;
+  DropCheckpoints(aLength);
+end;
+
+procedure TDecoderContext.SetMaxCheckpoints(aValue: PtrInt);
+var
+  i, n: PtrInt;
+  keep: TDecoderCheckpoint;
+begin
+  if aValue < 0 then
+    EInferError.RaiseUtf8('%.MaxCheckpoints = %', [self, aValue]);
+  fMaxCheckpoints := aValue;
+  // the oldest go, their buffers stay behind the ones in use
+  while fCheckpointCount > aValue do
+  begin
+    n := system.length(fCheckpoints);
+    keep := fCheckpoints[0];
+    for i := 1 to n - 1 do
+      fCheckpoints[i - 1] := fCheckpoints[i];
+    fCheckpoints[n - 1] := keep;
+    dec(fCheckpointCount);
+  end;
+end;
+
+procedure TDecoderContext.SetCheckpointId(aValue: integer);
+begin
+  if aValue = fCheckpointId then
+    exit;
+  fCheckpointId := aValue;
+  fCheckpointCount := 0;
+  fAligned := fLength = 0; // the rows cached were split by the old id
+end;
+
+procedure TDecoderContext.SaveCheckpoint;
+var
+  i, n, l: PtrInt;
+  c: ^TDecoderCheckpoint;
+  keep: TDecoderCheckpoint;
+begin
+  // an unaligned one would only push out one Usable takes
+  if (fMaxCheckpoints <= 0) or (fLength = 0) or not fStateOk or not fAligned or
+     (FindCheckpoint(fLength) >= 0) then
+    exit;
+  if fCheckpointCount >= fMaxCheckpoints then
+  begin
+    // the oldest one goes: its buffers are taken again
+    n := fCheckpointCount;
+    keep := fCheckpoints[0];
+    for i := 1 to n - 1 do
+      fCheckpoints[i - 1] := fCheckpoints[i];
+    fCheckpoints[n - 1] := keep;
+    dec(fCheckpointCount);
+  end;
+  if fCheckpointCount >= system.length(fCheckpoints) then
+    SetLength(fCheckpoints, fCheckpointCount + 1);
+  c := @fCheckpoints[fCheckpointCount];
+  c^.Length := -1; // not in use until copied: an allocation may fail
+  if system.length(c^.State) <> system.length(fState) then
+  begin
+    c^.Conv := nil;
+    c^.State := nil;
+    SetLength(c^.Conv, system.length(fConv));
+    SetLength(c^.State, system.length(fState));
+  end;
+  for l := 0 to high(fState) do
+    if fState[l] = nil then
+    begin
+      c^.Conv[l] := nil;
+      c^.State[l] := nil;
+    end
+    else
+    begin
+      if system.length(c^.Conv[l]) <> system.length(fConv[l]) then
+      begin
+        c^.Conv[l] := nil;
+        SetLength(c^.Conv[l], system.length(fConv[l]));
+      end;
+      if system.length(c^.State[l]) <> system.length(fState[l]) then
+      begin
+        c^.State[l] := nil;
+        SetLength(c^.State[l], system.length(fState[l]));
+      end;
+      MoveFast(pointer(fConv[l])^, pointer(c^.Conv[l])^,
+        system.length(fConv[l]) * SizeOf(single));
+      MoveFast(pointer(fState[l])^, pointer(c^.State[l])^,
+        system.length(fState[l]) * SizeOf(single));
+    end;
+  c^.Length := fLength;
+  inc(fCheckpointCount);
+end;
+
+function TDecoderContext.FindCheckpoint(aLength: PtrInt): PtrInt;
+var
+  i: PtrInt;
+begin
+  result := -1;
+  for i := 0 to fCheckpointCount - 1 do
+    if fCheckpoints[i].Length = aLength then
+    begin
+      result := i;
+      exit;
+    end;
+end;
+
+procedure TDecoderContext.DropCheckpoints(aLength: PtrInt);
+begin
+  // the oldest first: the ones after aLength are the last ones
+  while (fCheckpointCount > 0) and
+        (fCheckpoints[fCheckpointCount - 1].Length > aLength) do
+    dec(fCheckpointCount);
 end;
 
 function TDecoderContext.Restorable(aLength: PtrInt): boolean;
@@ -873,8 +1079,10 @@ begin
   result := true;
   if aLength = 0 then
     exit; // a new sequence: every window starts again
-  // a recurrent state holds the whole sequence: no way back but to 0
-  if fRecurrent and ((aLength <> fLength) or not fStateOk) then
+  // a recurrent state holds the whole sequence: no way back but to 0 or to
+  // a restore point
+  if fRecurrent and ((aLength <> fLength) or not fStateOk) and
+     (FindCheckpoint(aLength) < 0) then
   begin
     result := false;
     exit;
@@ -895,10 +1103,24 @@ begin
 end;
 
 function TDecoderContext.Usable(aIds: PIntegerArray; aCount: PtrInt): PtrInt;
+var
+  prefix, i: PtrInt;
 begin
-  result := Common(aIds, aCount);
-  if not Restorable(result) then
-    result := 0;
+  prefix := Common(aIds, aCount);
+  result := prefix;
+  if Restorable(result) and (not fRecurrent or (result = 0) or
+     ((result = fLength) and fStateOk)) then
+    exit;
+  // the last restore point before the end of the common prefix: aIds holds
+  // the CheckpointId there too, so a fresh pass splits the rows before it
+  // as they were split - not one at the end, whose token aIds may replace
+  result := 0;
+  for i := 0 to fCheckpointCount - 1 do
+    if (fCheckpoints[i].Length < prefix) and
+       (fIds[fCheckpoints[i].Length] = fCheckpointId) and
+       (fCheckpoints[i].Length > result) and
+       Restorable(fCheckpoints[i].Length) then
+      result := fCheckpoints[i].Length;
 end;
 
 function TDecoderContext.CachedRows(aLayer: PtrInt): PtrInt;
@@ -2736,7 +2958,70 @@ begin
   ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits, aOnState, aNormed);
 end;
 
+function TDecoderModel.Recurrent: boolean;
+var
+  l: PtrInt;
+begin
+  result := true;
+  for l := 0 to fConfig.Layers - 1 do
+    if fConfig.Spec[l].Mixer = dmDeltaNet then
+      exit;
+  result := false;
+end;
+
 procedure TDecoderModel.ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
+  aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
+  aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
+var
+  i, start, past, vocab: PtrInt;
+  part: PSingleArray;
+begin
+  // the states of aOnState are of one pass: not split
+  if (aCtx = nil) or (aCtx.fDevice <> nil) or (aIds = nil) or (aCount <= 0) or
+     Assigned(aOnState) or (aCtx.fCheckpointId < 0) or
+     (aCtx.fMaxCheckpoints <= 0) or not Recurrent then
+  begin
+    ForwardPart(aCtx, aIds, aEmbeds, aCount, aLogits, aAllLogits, aOnState,
+      aNormed);
+    exit;
+  end;
+  // what a later part would refuse, refused before the first one runs
+  past := aCtx.fLength;
+  vocab := fConfig.VocabSize;
+  if (aLogits <> nil) and (fHead.Data = nil) then
+    EInferError.RaiseUtf8('%.Forward: no head for logits (the normed state only)',
+      [self]);
+  if aCount > fConfig.MaxPositions - past then
+    EInferError.RaiseUtf8('%.Forward: % + % tokens exceed the % positions',
+      [self, past, aCount, fConfig.MaxPositions]);
+  for i := 0 to aCount - 1 do
+    if (aIds^[i] < 0) or (aIds^[i] >= vocab) then
+      EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary',
+        [self, aIds^[i]]);
+  // a part up to every CheckpointId token, then the states kept: the parts
+  // depend on the ids alone
+  start := 0;
+  for i := 0 to aCount - 1 do
+    if (aIds^[i] = aCtx.fCheckpointId) and (past + i > 0) then
+    begin
+      if i > start then
+      begin
+        part := nil;
+        if aAllLogits and (aLogits <> nil) then
+          part := @aLogits^[start * vocab];
+        ForwardPart(aCtx, @aIds^[start], nil, i - start, part, aAllLogits, nil, nil);
+        start := i;
+      end;
+      aCtx.SaveCheckpoint;
+    end;
+  part := aLogits;
+  if aAllLogits and (aLogits <> nil) then
+    part := @aLogits^[start * vocab];
+  ForwardPart(aCtx, @aIds^[start], nil, aCount - start, part, aAllLogits, nil,
+    aNormed);
+end;
+
+procedure TDecoderModel.ForwardPart(aCtx: TDecoderContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
   aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
 var
@@ -2791,7 +3076,19 @@ begin
   // a recurrent state left undone by a failed Forward cannot go on
   if aCtx.fRecurrent and (past > 0) and not aCtx.fStateOk then
     EInferError.RaiseUtf8('%.Forward: the recurrent state of the context is ' +
-      'undone by an earlier failure - Reset it', [self]);
+      'undone by an earlier failure - Reset it, or Truncate it to a restore point',
+      [self]);
+  // a part a fresh pass would not make: one starting elsewhere than at 0 or
+  // at a CheckpointId token, or one holding such a token after its start
+  if (past > 0) and ((aIds = nil) or (aIds^[0] <> aCtx.fCheckpointId)) then
+    aCtx.fAligned := false;
+  if aIds <> nil then
+    for i := 1 to n - 1 do
+      if aIds^[i] = aCtx.fCheckpointId then
+      begin
+        aCtx.fAligned := false;
+        break;
+      end;
   aCtx.fStateOk := false;
   RopeFactors(aCtx, n, past);
   // embeddings: of the ids, or the rows as given

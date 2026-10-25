@@ -1,12 +1,13 @@
-/// tests for Qwen3.5 in the native inference engine (phase D, slice D7a)
+/// tests for Qwen3.5 in the native inference engine (phase D, slices D7a, D7d)
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - the Gated DeltaNet and the gated full attention against transformers:
 //   tests/data/infer-ref/tiny-qwen35 (the layout of the published checkpoints)
 //   and tiny-qwen35/text (Qwen3_5ForCausalLM), both BF16, from
 //   tools/infer-ref/make_reference_d7.py; the recurrent state of a context
-//   (restore points 0 and Length only, a failed Forward); the settings
-//   refused
+//   (restore points 0 and Length only, a failed Forward), its restore points
+//   before a CheckpointId token (D7d: a branch the bits of a fresh pass); the
+//   settings refused
 // - Qwen3.5-0.8B needs vendor/models/qwen3.5-0.8b and a 64-bit process; it
 //   says SKIP otherwise, LAI_REQUIRE_MODEL=1 makes that a failure
 unit test.infer.qwen35;
@@ -42,6 +43,9 @@ type
     /// KeepState that raises at layer01: a Forward failing inside the layers
     procedure FailAtLayer1(const aName: RawUtf8; aValues: PSingleArray;
       aRows, aCols: PtrInt);
+    /// the restore points of aModel's states (D7d)
+    procedure CheckCheckpoints(aModel: TDecoderModel; aExact: boolean;
+      const aLabel: RawUtf8);
   published
     /// tiny Qwen3.5 in the published layout: the layer kinds, the shapes, the
     // rotary part, every state, the recurrent and the chunked form, greedy
@@ -52,6 +56,10 @@ type
     /// the recurrent state: restorable at 0 and Length only, Reuse computes
     // again what it cannot keep, a failed Forward leaves only 0
     procedure RecurrentState;
+    /// restore points of the state (D7d): kept before every CheckpointId
+    // token, a branch goes on from the last one before it - the bits of a
+    // fresh pass, on the reference and the fast backend, in F32 and Q8_0
+    procedure Checkpoints;
     /// tiny Qwen3.5 on the fast backend and quantized to Q8_0 and Q4_0 at load
     procedure TinyQuantized;
     /// the settings of a Qwen3.5 config.json refused
@@ -334,6 +342,292 @@ begin
     ctx.Free;
     model.Free;
     ref.Free;
+  end;
+end;
+
+/// the logits of aIds in a new context of aModel with aCheckpointId
+function FreshLogits(aModel: TDecoderModel; const aIds: TIntegerDynArray;
+  aCheckpointId: integer; aAll: boolean = false): TSingleDynArray;
+var
+  ctx: TDecoderContext;
+begin
+  if aAll then
+    SetLength(result, length(aIds) * aModel.Config.VocabSize)
+  else
+    SetLength(result, aModel.Config.VocabSize);
+  ctx := aModel.NewContext;
+  try
+    ctx.CheckpointId := aCheckpointId;
+    aModel.Forward(ctx, pointer(aIds), length(aIds), pointer(result), aAll);
+  finally
+    ctx.Free;
+  end;
+end;
+
+function SameSingles(const a, b: TSingleDynArray): boolean;
+begin
+  result := (length(a) = length(b)) and
+    CompareMem(pointer(a), pointer(b), length(a) * SizeOf(single));
+end;
+
+function MaxGap(const a, b: TSingleDynArray): double;
+var
+  i: PtrInt;
+begin
+  result := 1e30;
+  if length(a) <> length(b) then
+    exit;
+  result := 0;
+  for i := 0 to high(a) do
+    if abs(a[i] - b[i]) > result then
+      result := abs(a[i] - b[i]);
+end;
+
+procedure TTestInferQwen35.CheckCheckpoints(aModel: TDecoderModel;
+  aExact: boolean; const aLabel: RawUtf8);
+const
+  LEN = 20;
+var
+  vocab, i, kept, m: PtrInt;
+  a, b: TIntegerDynArray;
+  ctx: TDecoderContext;
+  got, first, want: TSingleDynArray;
+  raised: boolean;
+begin
+  vocab := aModel.Config.VocabSize;
+  m := vocab - 1; // the turn start: at 5 and 12 only
+  SetLength(a, LEN);
+  for i := 0 to LEN - 1 do
+    a[i] := (i * 7 + 3) mod m;
+  a[5] := m;
+  a[12] := m;
+  SetLength(got, vocab);
+  SetLength(first, vocab);
+  ctx := aModel.NewContext;
+  try
+    CheckEqual(ctx.CheckpointId, -1, aLabel + ' no restore points by default');
+    aModel.Forward(ctx, pointer(a), LEN, nil);
+    CheckEqual(ctx.Checkpoints, 0, aLabel + ' none without CheckpointId');
+    ctx.Reset;
+    ctx.CheckpointId := m;
+    aModel.Forward(ctx, pointer(a), LEN, pointer(first));
+    CheckEqual(ctx.Checkpoints, 2, aLabel + ' two restore points');
+    CheckUtf8(ctx.Restorable(5) and ctx.Restorable(12) and ctx.Restorable(LEN) and
+      ctx.Restorable(0) and not ctx.Restorable(6) and not ctx.Restorable(11) and
+      not ctx.Restorable(13), '% restorable at the restore points', [aLabel]);
+    // the parts against one pass: equal where the backend computes every
+    // row as one of a larger batch
+    want := FreshLogits(aModel, a, -1);
+    if aExact then
+      CheckUtf8(SameSingles(first, want), '% the parts: the bits of one pass', [aLabel])
+    else
+      CheckUtf8(MaxGap(first, want) < 1e-3, '% the parts near one pass: %',
+        [aLabel, MaxGap(first, want)]);
+    // every row's logits at its place
+    want := FreshLogits(aModel, a, -1, true);
+    got := FreshLogits(aModel, a, m, true);
+    if aExact then
+      CheckUtf8(SameSingles(got, want), '% all logits: the bits of one pass', [aLabel])
+    else
+      CheckUtf8(MaxGap(got, want) < 1e-3, '% all logits near one pass: %',
+        [aLabel, MaxGap(got, want)]);
+    CheckUtf8(CompareMem(@got[(LEN - 1) * vocab], pointer(first), vocab * SizeOf(single)),
+      '% the last row of all logits', [aLabel]);
+    SetLength(got, vocab);
+    // a branch after the second turn start: on from the restore point at 12,
+    // the bits of a fresh pass of the branch
+    b := copy(a, 0, LEN);
+    b[14] := (b[14] + 1) mod m;
+    kept := aModel.Reuse(ctx, pointer(b), LEN);
+    CheckEqual(kept, 12, aLabel + ' the branch goes on from 12');
+    CheckEqual(ctx.Checkpoints, 2, aLabel + ' both restore points stay');
+    aModel.Forward(ctx, @b[kept], LEN - kept, pointer(got));
+    CheckUtf8(SameSingles(got, FreshLogits(aModel, b, m)),
+      '% the branch: the bits of a fresh pass', [aLabel]);
+    // back to the first restore point, on with the first prompt: its logits
+    ctx.Truncate(5);
+    CheckEqual(ctx.Checkpoints, 1, aLabel + ' the later one dropped');
+    aModel.Forward(ctx, @a[5], LEN - 5, pointer(got));
+    CheckUtf8(SameSingles(got, first), '% back at 5: the first logits', [aLabel]);
+    CheckEqual(ctx.Checkpoints, 2, aLabel + ' 12 kept again');
+    // a branch that replaces the turn start at 12: a fresh pass of it does not
+    // split there, so the rows before it go on from the restore point at 5
+    b := copy(a, 0, LEN);
+    b[12] := 1;
+    CheckEqual(ctx.Usable(pointer(b), LEN), 5, aLabel + ' not the replaced one');
+    b[12] := m;
+    b[13] := (b[13] + 1) mod m;
+    CheckEqual(ctx.Usable(pointer(b), LEN), 12, aLabel + ' a branch just after it');
+    b := copy(a, 0, LEN);
+    b[12] := 1;
+    kept := aModel.Reuse(ctx, pointer(b), LEN);
+    CheckEqual(kept, 5, aLabel + ' the replaced turn start: on from 5');
+    aModel.Forward(ctx, @b[kept], LEN - kept, pointer(got));
+    CheckUtf8(SameSingles(got, FreshLogits(aModel, b, m)),
+      '% the replaced turn start: the bits of a fresh pass', [aLabel]);
+    CheckEqual(ctx.Checkpoints, 1, aLabel + ' only 5 left');
+    // the first prompt again, from 5
+    kept := aModel.Reuse(ctx, pointer(a), LEN);
+    CheckEqual(kept, 5, aLabel + ' the first prompt from 5');
+    aModel.Forward(ctx, @a[kept], LEN - kept, pointer(got));
+    CheckUtf8(SameSingles(got, first), '% the first logits again', [aLabel]);
+    // a branch before the first turn start: from the start
+    b := copy(a, 0, LEN);
+    b[3] := (b[3] + 1) mod m;
+    kept := aModel.Reuse(ctx, pointer(b), LEN);
+    CheckEqual(kept, 0, aLabel + ' a branch before 5 starts again');
+    CheckEqual(ctx.Checkpoints, 0, aLabel + ' and keeps none');
+    aModel.Forward(ctx, pointer(b), LEN, pointer(got));
+    CheckUtf8(SameSingles(got, FreshLogits(aModel, b, m)),
+      '% started again: the bits of a fresh pass', [aLabel]);
+    // a prompt going on from the whole sequence, a turn start first: a
+    // restore point where the part starts
+    SetLength(b, LEN + 3);
+    b[LEN] := m;
+    b[LEN + 1] := 1;
+    b[LEN + 2] := 2;
+    kept := aModel.Reuse(ctx, pointer(b), LEN + 3);
+    CheckEqual(kept, LEN, aLabel + ' the whole sequence kept');
+    aModel.Forward(ctx, @b[LEN], 3, pointer(got));
+    CheckEqual(ctx.Checkpoints, 3, aLabel + ' a restore point at LEN');
+    CheckUtf8(ctx.Restorable(LEN) and ctx.Restorable(LEN + 3) and
+      not ctx.Restorable(LEN + 1), '% restorable at LEN', [aLabel]);
+    CheckUtf8(SameSingles(got, FreshLogits(aModel, b, m)),
+      '% gone on: the bits of a fresh pass', [aLabel]);
+    // the oldest go first
+    ctx.MaxCheckpoints := 1;
+    CheckEqual(ctx.Checkpoints, 1, aLabel + ' one kept');
+    CheckUtf8(ctx.Restorable(LEN) and not ctx.Restorable(12) and not ctx.Restorable(5),
+      '% the last one kept', [aLabel]);
+    ctx.MaxCheckpoints := 0;
+    CheckUtf8(not ctx.Restorable(LEN) and ctx.Restorable(LEN + 3), '% none', [aLabel]);
+    raised := false;
+    try
+      ctx.MaxCheckpoints := -1;
+    except
+      on EInferError do
+        raised := true;
+    end;
+    CheckUtf8(raised, '% MaxCheckpoints -1 refused', [aLabel]);
+    ctx.MaxCheckpoints := DECODER_CHECKPOINTS;
+    // a token outside the vocabulary: refused before the first part runs
+    ctx.Reset;
+    b := copy(a, 0, LEN);
+    b[LEN - 1] := vocab;
+    raised := false;
+    try
+      aModel.Forward(ctx, pointer(b), LEN, nil);
+    except
+      on EInferError do
+        raised := true;
+    end;
+    CheckUtf8(raised and (ctx.Length = 0) and (ctx.Checkpoints = 0),
+      '% a bad id: nothing computed', [aLabel]);
+    // more turn starts than kept: the oldest goes
+    ctx.Reset;
+    b := copy(a, 0, LEN);
+    b[16] := m;
+    ctx.MaxCheckpoints := 2;
+    aModel.Forward(ctx, pointer(b), LEN, nil);
+    CheckEqual(ctx.Checkpoints, 2, aLabel + ' two of three kept');
+    CheckUtf8(ctx.Restorable(12) and ctx.Restorable(16) and not ctx.Restorable(5),
+      '% the oldest one gone', [aLabel]);
+    ctx.MaxCheckpoints := DECODER_CHECKPOINTS;
+    // a prompt fed in two calls, the first ending inside a turn: the rows
+    // after 8 are split where a fresh pass does not split them - no restore
+    // point at 12, the one at 5 stays
+    ctx.Reset;
+    aModel.Forward(ctx, pointer(a), 8, nil);
+    aModel.Forward(ctx, @a[8], LEN - 8, nil);
+    CheckEqual(ctx.Checkpoints, 1, aLabel + ' two calls: none at 12');
+    b := copy(a, 0, LEN);
+    b[14] := (b[14] + 1) mod m;
+    CheckEqual(ctx.Usable(pointer(b), LEN), 5, aLabel + ' two calls: on from 5');
+    kept := aModel.Reuse(ctx, pointer(b), LEN);
+    aModel.Forward(ctx, @b[kept], LEN - kept, pointer(got));
+    CheckUtf8(SameSingles(got, FreshLogits(aModel, b, m)),
+      '% two calls: the bits of a fresh pass', [aLabel]);
+    // now split as a fresh pass: 12 is of use again
+    b[14] := (b[14] + 1) mod m;
+    CheckEqual(ctx.Usable(pointer(b), LEN), 12, aLabel + ' split again: on from 12');
+    // back to 12 by hand, on with another token there: that restore point
+    // holds no turn start any more
+    ctx.Truncate(12);
+    b := copy(a, 0, LEN);
+    b[12] := 1;
+    aModel.Forward(ctx, @b[12], LEN - 12, nil);
+    b[14] := (b[14] + 1) mod m;
+    CheckEqual(ctx.Usable(pointer(b), LEN), 5, aLabel + ' no turn start at 12: on from 5');
+    // an agent loop: a prompt going on from the end of the cache, after a
+    // generated token - split where a fresh pass would not split, so no
+    // restore point is kept there, and none pushes out the one at 5
+    ctx.Reset;
+    ctx.MaxCheckpoints := 3;
+    aModel.Forward(ctx, pointer(a), LEN, nil);
+    b := copy(a, 0, LEN);
+    SetLength(b, LEN + 4);
+    b[LEN] := 1; // a generated token
+    b[LEN + 1] := 2;
+    b[LEN + 2] := m; // the next turn
+    b[LEN + 3] := 3;
+    aModel.Forward(ctx, @b[LEN], 1, nil);
+    aModel.Forward(ctx, @b[LEN + 1], 3, nil);
+    CheckEqual(ctx.Checkpoints, 2, aLabel + ' no restore point after a continuation');
+    CheckUtf8(ctx.Restorable(5) and ctx.Restorable(12) and not ctx.Restorable(LEN + 2),
+      '% the aligned ones kept', [aLabel]);
+    b[14] := (b[14] + 1) mod m;
+    CheckEqual(ctx.Usable(pointer(b), LEN + 4), 12, aLabel + ' a branch: on from 12');
+    ctx.MaxCheckpoints := DECODER_CHECKPOINTS;
+    // another CheckpointId: the rows were split by the old one
+    ctx.Reset;
+    ctx.CheckpointId := -1;
+    aModel.Forward(ctx, pointer(a), 8, nil);
+    ctx.CheckpointId := m;
+    aModel.Forward(ctx, @a[8], LEN - 8, nil);
+    CheckEqual(ctx.Checkpoints, 0, aLabel + ' set after the first rows: none kept');
+    ctx.Reset;
+    CheckEqual(ctx.CheckpointId, m, aLabel + ' Reset keeps the id');
+    aModel.Forward(ctx, pointer(a), LEN, nil);
+    CheckEqual(ctx.Checkpoints, 2, aLabel + ' from the start: kept');
+    ctx.CheckpointId := 1;
+    CheckEqual(ctx.Checkpoints, 0, aLabel + ' another id forgets them');
+    ctx.CheckpointId := m;
+    // Reset forgets them
+    ctx.Reset;
+    aModel.Forward(ctx, pointer(a), LEN, nil);
+    CheckEqual(ctx.Checkpoints, 2, aLabel + ' computed again');
+    ctx.Reset;
+    CheckUtf8((ctx.Checkpoints = 0) and not ctx.Restorable(5), '% Reset', [aLabel]);
+  finally
+    ctx.Free;
+  end;
+end;
+
+procedure TTestInferQwen35.Checkpoints;
+var
+  dir: TFileName;
+  model: TDecoderModel;
+begin
+  dir := FindInferRefDir('tiny-qwen35');
+  if CheckFailed(dir <> '', 'tiny-qwen35 found') then
+    exit;
+  model := TQwen35Model.Create(dir, fCpu);
+  try
+    CheckCheckpoints(model, true, 'reference');
+  finally
+    model.Free;
+  end;
+  model := TQwen35Model.Create(dir, fFast);
+  try
+    CheckCheckpoints(model, false, 'fast');
+  finally
+    model.Free;
+  end;
+  model := TQwen35Model.Create(dir, fFast, idtQ8_0);
+  try
+    CheckCheckpoints(model, false, 'fast Q8_0');
+  finally
+    model.Free;
   end;
 end;
 

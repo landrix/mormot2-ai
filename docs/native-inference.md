@@ -1817,6 +1817,80 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7d erledigt (2026-10-25): Rücksetzpunkte des Zustands von Qwen3.5.** Ein Kontext mit
+DeltaNet-Layern hielt seinen Zustand nur für die ganze Sequenz (D7a: zurück nur auf 0 oder
+bleiben). Im Chat half der Prompt-Cache damit nie: Die nächste Anfrage eines Gesprächs
+schreibt den letzten Assistant-Turn ohne seinen `<think>`-Block, der gemeinsame Anfang endet
+also mitten in der Sequenz - Qwen3.5 rechnete jedes Mal den ganzen Verlauf neu.
+
+- *Rücksetzpunkte* (`TDecoderContext.CheckpointId`, `MaxCheckpoints`, `Checkpoints`): Vor
+  jedem Token mit der Id `CheckpointId` legt der Kontext eine Kopie seiner Zustände ab
+  (Convolution-Eingaben und Matrizen der Delta-Regel aller DeltaNet-Layer), die letzten
+  `MaxCheckpoints` (Vorgabe `DECODER_CHECKPOINTS` = 4, bei Qwen3.5-0.8B je etwa 19 MiB).
+  `Forward` rechnet die Tokens dafür in Teilen bis vor jedes solche Token; nicht geteilt wird
+  mit `aOnState` (Zustände eines Durchlaufs), für Embedding-Zeilen, auf einem Gerät und ohne
+  `CheckpointId` oder `MaxCheckpoints`. Was ein späterer Teil ablehnen würde (Ids, Länge,
+  Head), lehnt `Forward` vor dem ersten Teil ab; scheitert ein Teil in den Layern, steht
+  `Length` am Anfang dieses Teils - ab dem zweiten Teil ein Rücksetzpunkt, sofern dort einer
+  behalten wurde (siehe *Bitgleich*).
+- *Zurück* (`Restorable`, `Truncate`, `Usable`): Rücksetzbar sind jetzt auch die
+  Rücksetzpunkte; `Truncate` kopiert den Zustand zurück und vergisst die späteren Punkte;
+  `Usable` (und damit `Reuse` und der Prompt-Cache des Clients) nimmt den gemeinsamen Anfang,
+  sonst den letzten Rücksetzpunkt vor seinem Ende, sonst 0 - einen Punkt genau am Ende nicht:
+  Dort ersetzt der neue Prompt das Turn-Token. `Reset` vergisst alle; ihre Puffer
+  bleiben für die nächsten belegt, ein Kontext im Prompt-Cache hält also bis zu vier Kopien.
+- *Bitgleich:* Wie `Forward` teilt, hängt nur von den Ids ab - und davon, in welchen
+  Aufrufen die Tokens kamen. Der Kontext behält einen Rücksetzpunkt deshalb nur, wenn jeder
+  Teil vor ihm bei 0 oder an einem Turn-Token begann und keiner eines in sich trug - so teilt
+  auch ein frischer Durchlauf. Nach einem Prompt in zwei Aufrufen, deren erster mitten im
+  Turn endete, und nach Token für Token generierten Tokens entstehen keine Punkte mehr, bis
+  der Kontext zu einem zurückgeht oder neu beginnt; so verdrängen sie in einer Tool-Schleife
+  auch nicht die brauchbaren. Eine andere `CheckpointId` verwirft alle. `Usable` nimmt einen
+  Punkt nur, wo der Cache das Turn-Token hält und der neue Prompt danach noch übereinstimmt -
+  nicht genau am Ende des gemeinsamen Anfangs, wo der neue Prompt das Turn-Token ersetzt, und
+  nicht, wo nach einem `Truncate` ein anderes Token kam. Dann teilt ein frischer Kontext mit
+  derselben `CheckpointId` davor genau so, und die Logits sind bitgleich zu einer
+  Neuberechnung, auf jedem Backend. Im Chat geht die nächste Frage vom Punkt vor der
+  letzten Antwort im Verlauf aus und rechnet den Rest in einem Aufruf; eine Tool-Schleife
+  geht von `Length` weiter (der ganze Cache passt). Warum die Grenzen (Codex-Review und
+  Claude-Finder, drei Runden): Backends, die je nach Zeilenzahl anders rechnen (CUDA und
+  Vulkan ab 16 Zeilen), lägen sonst daneben. Auf der Referenz sind die Teile sogar bitgleich
+  zu einem einzigen Durchlauf. Ein Weitergehen von `Length` bleibt wie bisher: gleich nur
+  auf Backends, die jede Zeile unabhängig von den anderen rechnen.
+- *Turn-Grenzen* (`TChatTemplate.TurnStart`): das Steuertoken, das jeden Turn öffnet
+  (`<|im_start|>` bei Qwen2.5, Qwen3 und Qwen3.5, `<|start|>` bei Harmony, `<|turn>` bei
+  Gemma 4); `TNativeLlmClient` setzt es als `CheckpointId` jedes Kontexts. Für Modelle ohne
+  DeltaNet ändert das nichts: Sie teilen nicht.
+- *Tests* (`test.infer.qwen35`, `Checkpoints`, 145 Assertions): mit Tiny-Qwen3.5 auf der
+  Referenz, dem schnellen Backend und in Q8_0 - zwei Rücksetzpunkte, rücksetzbar genau
+  dort, alle Logits an ihrem Platz, eine Verzweigung nach dem zweiten Punkt geht von dort
+  weiter und ist bitgleich zu einem frischen Durchlauf, zurück zum ersten Punkt gibt die
+  ersten Logits, eine Verzweigung, die das Turn-Token am zweiten Punkt ersetzt, geht vom
+  ersten weiter, ein Prompt in zwei Aufrufen, ein ersetztes Turn-Token nach `Truncate`
+  und eine Tool-Schleife lassen nur brauchbare Punkte, eine andere `CheckpointId` verwirft
+  sie, eine Verzweigung davor beginnt neu, ein Punkt am Anfang eines Teils,
+  `MaxCheckpoints` behält die letzten (auch beim Verdrängen), eine falsche Id rechnet nichts, `Reset`. Mit dem
+  echten Qwen3.5-0.8B (`test.infer.qwen35chat`): die zweite Frage eines Gesprächs nimmt den
+  Verlauf aus dem Rücksetzpunkt vor ihrem letzten Turn und antwortet wie ohne Cache.
+- *Echtes Modell* (Qwen3.5-0.8B, Q8_0, greedy): Die zweite Frage eines Gesprächs nimmt 17
+  Tokens aus dem Rücksetzpunkt vor der ersten Antwort (vorher 0: der ganze Verlauf neu); eine
+  neue Frage nach einer Tool-Schleife nimmt 279 Tokens (Tools, Frage, Aufruf). Beide Antworten
+  gleich wie ohne Cache.
+- *Gegenprobe:* 16 eingebaute Fehler, alle scheitern - der Client ohne `CheckpointId`, kein
+  Speichern, kein Zurückkopieren des Zustands, ein Punkt genau am Ende des gemeinsamen
+  Anfangs, spätere Punkte nicht verworfen, `Reset` behält sie, falscher Logit-Versatz, keine
+  Teilung, kein `TurnStart` bei Qwen3.5, die neuesten statt der ältesten verdrängt, ungeeignete
+  Punkte gespeichert, das Turn-Token nicht geprüft, `Truncate` setzt die Teilung nicht zurück,
+  eine geänderte `CheckpointId` behält die Punkte, ein Teil mit anderem Anfang nicht erkannt,
+  falsche Ids erst im späteren Teil abgelehnt.
+- *Läufe:* WSL (FPC 3.2.4) Infer 6467 und LLM 741; RTX-Rechner FPC und Delphi 13 je 8160,
+  Delphi 7 5223 (ohne das echte Modell: es braucht 64 Bit); Mac M2 Infer 6024 und LLM 730
+  (ohne die Gewichte von Qwen3.5).
+- *Review:* Claude-Finder und Codex in vier Runden. Behoben: ein Punkt genau am Ende des
+  gemeinsamen Anfangs, ein Prompt in zwei Aufrufen, ein ersetztes Turn-Token nach `Truncate`,
+  ungeeignete Punkte, die in einer Tool-Schleife die brauchbaren verdrängten, eine geänderte
+  `CheckpointId`, ein Indexfehler im Test, ungenaue Doku-Stellen.
+
 **D7c erledigt (2026-10-25): Qwen3.5 als Chat-Modell (Tokenizer, Template, Parser).**
 Qwen3.5 hinter `ILlmClient`, auf der CPU und aus safetensors. Quelle: `Qwen/Qwen3.5-0.8B`
 Revision `2fc06364715b967f1860aea9cf38778875588b17` (`tokenizer.json`, `chat_template.jinja`),
@@ -1992,7 +2066,7 @@ Code übernommen), zunächst auf der CPU, seriell und aus safetensors. Modell:
   `Restorable` nur 0 und `Length`, `Reuse` rechnet sonst von vorn. Ein `Forward`, der in den
   Layern scheitert, lässt den Zustand halb fortgeschrieben - dann ist nur noch 0 erreichbar,
   und ein weiteres `Forward` ohne `Reset` wird abgelehnt. Rücksetzpunkte (Checkpoints des
-  Zustands für den Prompt-Cache) kommen mit D7d.
+  Zustands für den Prompt-Cache) kamen mit D7d.
 - *Volle Attention mit Ausgangsgate* (`Spec.OutputGate`): `q_proj` liefert je Kopf erst die
   Query, dann ebenso viele Gate-Werte; die Attention-Ausgabe mal sigmoid(gate) vor `o_proj`.
   *Teil-RoPE* (`Config.RopeDims`): nur die ersten int(head_dim * `partial_rotary_factor`) Werte

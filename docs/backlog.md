@@ -414,8 +414,11 @@ In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tok
   (`TQwen35OutputParser`, Werte nach dem Schema getypt wie vLLMs `qwen3_coder`), die Familie
   hinter `ILlmClient`; dazu `truncation`/`padding` und doppelte Vokabeltexte in
   `TBpeTokenizer` und `TUgmTokenizer` abgelehnt.
-- *D7d:* Rücksetzpunkte des Zustands für den Prompt-Cache (Checkpoints an Turn-Grenzen),
-  Gate: Restore und verzweigte Prompts gleich wie Neuberechnung.
+- *D7d erledigt 2026-10-25* (`native-inference.md`, Phase D): Rücksetzpunkte des Zustands
+  vor jedem Turn-Anfang (`TDecoderContext.CheckpointId` aus `TChatTemplate.TurnStart`, die
+  letzten vier), `Forward` rechnet dafür in Teilen; `Truncate`, `Usable` und der Prompt-Cache
+  gehen dorthin zurück. Eine Verzweigung ist bitgleich zu einer Neuberechnung; die zweite
+  Frage eines Gesprächs mit Qwen3.5-0.8B nimmt den Verlauf aus dem Cache.
 - *D7e:* Vulkan und CUDA. Danach Qwen3.8-27B.
 
 **D8 — Kolibri-1.** FP8 E4M3 mit 128×128-Skalen (oder eine geprüfte Umwandlung nach Q4_K/Q8_0

@@ -2346,6 +2346,9 @@ begin
     aParser.Tools := aRequest.Tools;
     ctx := fCache.Acquire(prompt);
     try
+      // a recurrent model keeps restore points at the turns: the next request
+      // of the conversation goes on from its last turn
+      ctx.CheckpointId := fTemplate.TurnStart;
       reused := NativeDecode(fModel, prompt, maxNew, aParser, sampling, ctx,
         fMaxContext);
     except

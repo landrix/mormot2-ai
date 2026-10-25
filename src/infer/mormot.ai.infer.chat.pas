@@ -98,6 +98,7 @@ type
   TChatTemplate = class
   protected
     fTokenizer: TInferTokenizer;
+    fTurnStart: integer;
     /// write the conversation into aOut: text with Add, control tokens with
     // Control
     procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
@@ -136,6 +137,12 @@ type
     /// the tokenizer the ids belong to
     property Tokenizer: TInferTokenizer
       read fTokenizer;
+    /// the control token that opens every turn (<|im_start|>), -1 if none:
+    // where a recurrent model keeps restore points of its state
+    // (TDecoderContext.CheckpointId) - a conversation that goes on shares its
+    // start up to a turn
+    property TurnStart: integer
+      read fTurnStart;
   end;
 
   /// a chat template class, as a decoder family registers it
@@ -888,6 +895,7 @@ begin
   if aTokenizer = nil then
     EInferError.RaiseUtf8('%.Create: no tokenizer', [self]);
   fTokenizer := aTokenizer;
+  fTurnStart := -1;
 end;
 
 class function TChatTemplate.DefaultEnableThinking: boolean;
@@ -909,6 +917,7 @@ constructor TQwen3ChatTemplate.Create(aTokenizer: TInferTokenizer);
 begin
   inherited Create(aTokenizer);
   fImStart := Need('<|im_start|>');
+  fTurnStart := fImStart;
   fImEnd := Need('<|im_end|>');
   fThink := Need('<think>');
   fThinkEnd := Need('</think>');
@@ -1164,6 +1173,7 @@ constructor TQwen2ChatTemplate.Create(aTokenizer: TInferTokenizer);
 begin
   inherited Create(aTokenizer);
   fImStart := Need('<|im_start|>');
+  fTurnStart := fImStart;
   fImEnd := Need('<|im_end|>');
   fToolCall := Need('<tool_call>');
   fToolCallEnd := Need('</tool_call>');
@@ -1659,6 +1669,7 @@ constructor THarmonyChatTemplate.Create(aTokenizer: TInferTokenizer);
 begin
   inherited Create(aTokenizer);
   fStart := Need('<|start|>');
+  fTurnStart := fStart;
   fChannel := Need('<|channel|>');
   fMessage := Need('<|message|>');
   fEnd := Need('<|end|>');
@@ -2266,6 +2277,7 @@ begin
   inherited Create(aTokenizer);
   fBos := Need('<bos>');
   fTurn := Need('<|turn>');
+  fTurnStart := fTurn;
   fTurnEnd := Need('<turn|>');
   fThink := Need('<|think|>');
   fChannel := Need('<|channel>');
@@ -2569,6 +2581,7 @@ constructor TQwen35ChatTemplate.Create(aTokenizer: TInferTokenizer);
 begin
   inherited Create(aTokenizer);
   fImStart := Need('<|im_start|>');
+  fTurnStart := fImStart;
   fImEnd := Need('<|im_end|>');
   fThink := Need('<think>');
   fThinkEnd := Need('</think>');
