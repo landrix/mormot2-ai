@@ -26,6 +26,7 @@ uses
   test.infer.gemma4,
   test.infer.qwen3,
   test.infer.qwen35,
+  test.infer.qwen35chat,
   test.infer.llm,
   test.infer.vulkan,
   test.infer.cuda;
@@ -50,6 +51,7 @@ begin
     TTestInferGemma4,
     TTestInferQwen3,
     TTestInferQwen35,
+    TTestInferQwen35Chat,
     TTestInferLlmNative,
     TTestInferVulkan,
     TTestInferCuda

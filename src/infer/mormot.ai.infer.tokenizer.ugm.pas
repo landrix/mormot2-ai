@@ -222,6 +222,10 @@ begin
     (step^.O['pattern']^.U['Regex'] = ' {2,}');
   if not replaceOk then
     EInferError.RaiseUtf8('%: second normalizer is not Replace(" {2,}", " ")', [self]);
+  // a saved truncation or padding would change what Encode returns
+  if not VarIsEmptyOrNull(doc.Value['truncation']) or
+     not VarIsEmptyOrNull(doc.Value['padding']) then
+    EInferError.RaiseUtf8('%: truncation or padding is set', [self]);
   if not doc.GetAsObject('pre_tokenizer', pre) or (pre^.U['type'] <> 'Metaspace') or
      (pre^.U['replacement'] <> ESCAPED_SPACE) or not pre^.B['add_prefix_space'] or
      ((pre^.GetValueIndex('prepend_scheme') >= 0) and
@@ -439,6 +443,9 @@ begin
       continue;
     if length(fPieces[i]) > fMaxPieceLen then
       fMaxPieceLen := length(fPieces[i]);
+    // a piece twice: the tokenizers library keeps the last id, refuse instead
+    if PieceId(pointer(fPieces[i]), length(fPieces[i])) >= 0 then
+      EInferError.RaiseUtf8('%: vocab piece "%" has two ids', [self, fPieces[i]]);
     h := crc32c(0, pointer(fPieces[i]), length(fPieces[i])) and fHashMask;
     fHashNext[i] := fHashHead[h];
     fHashHead[h] := i;

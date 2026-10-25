@@ -1,17 +1,22 @@
-/// native inference engine - byte-level BPE tokenizer (Qwen2 / Qwen3, gpt-oss)
+/// native inference engine - byte-level BPE tokenizer (Qwen2 / Qwen3, Qwen3.5,
+// gpt-oss)
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - clean-room implementation of the pipeline a Hugging Face tokenizer.json
 //   describes; the reference is the tokenizers library (Apache-2.0, read only
 //   for the documented behaviour) and the gates tests/data/infer-ref/qwen3-tokens
-//   and gpt-oss-tokens: an NFC normalizer or none, the Qwen2 or the o200k Split
-//   regex (isolated), ByteLevel without prefix space, BPE merges by rank
+//   gpt-oss-tokens and qwen35-tokens: an NFC normalizer or none, the Qwen2, the
+//   Qwen3.5 or the o200k Split regex (isolated), ByteLevel without prefix space,
+//   BPE merges by rank
 //   (leftmost first on equal rank), with ignore_merges a piece that is a token
 //   of the vocabulary taken as it is
 // - the split regexes are not run by a regex engine: TBpeTokenizer.Split is the
 //   leftmost-first match of their alternatives, written out by hand - Qwen2
 //     (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ | \p{N} |
 //      ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+//   Qwen3.5 (marks join the letters, and leave the other characters)
+//     (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N} |
+//      ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
 //   and o200k (gpt-oss; U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}], W = [\p{Ll}\p{Lm}
 //   \p{Lo}\p{M}], C = (?i:'s|'t|'re|'ve|'m|'ll|'d))
 //     [^\r\n\p{L}\p{N}]?U*W+C? | [^\r\n\p{L}\p{N}]?U+W*C? | \p{N}{1,3} |
@@ -30,8 +35,8 @@ unit mormot.ai.infer.tokenizer.bpe;
 
     - TBpeTokenizer: load a byte-level BPE tokenizer.json, the older pair
       vocab.json + merges.txt or the tokenizer of a GGUF file (the pipelines of
-      Qwen2 and of gpt-oss), Normalize, Split, Encode text to ids and Decode ids
-      to bytes
+      Qwen2, Qwen3.5 and gpt-oss), Normalize, Split, Encode text to ids and
+      Decode ids to bytes
 
   *****************************************************************************
 }
@@ -77,9 +82,11 @@ type
   /// the Split regex of a byte-level BPE tokenizer
   TBpePreTokenizer = (
     bptQwen2,
+    bptQwen35,
     bptO200k);
 
-  /// a byte-level BPE tokenizer with the Qwen2 or the o200k pre-tokenizer
+  /// a byte-level BPE tokenizer with the Qwen2, the Qwen3.5 or the o200k
+  // pre-tokenizer
   TBpeTokenizer = class(TInferTokenizer)
   protected
     fPre: TBpePreTokenizer;
@@ -205,6 +212,10 @@ const
   QWEN2_SPLIT_REGEX =
     '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|' +
     ' ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  /// the Split regex of Qwen3.5 (tokenizer.json pre_tokenizer), verbatim
+  QWEN35_SPLIT_REGEX =
+    '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|' +
+    ' ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
   /// the Split regex of gpt-oss (o200k), verbatim
   O200K_SPLIT_REGEX =
     '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+' +
@@ -294,6 +305,10 @@ begin
       EInferError.RaiseUtf8('%: normalizer is neither NFC nor none', [self])
   else if not VarIsEmptyOrNull(doc.Value['normalizer']) then
     EInferError.RaiseUtf8('%: normalizer is neither NFC nor none', [self]);
+  // a saved truncation or padding would change what Encode returns
+  if not VarIsEmptyOrNull(doc.Value['truncation']) or
+     not VarIsEmptyOrNull(doc.Value['padding']) then
+    EInferError.RaiseUtf8('%: truncation or padding is set', [self]);
   if not doc.GetAsObject('pre_tokenizer', pre) or (pre^.U['type'] <> 'Sequence') or
      not pre^.GetAsArray('pretokenizers', list) or (list^.Count <> 2) then
     EInferError.RaiseUtf8('%: pre_tokenizer is not Sequence[Split, ByteLevel]', [self]);
@@ -304,10 +319,12 @@ begin
   text := split^.O['pattern']^.U['Regex'];
   if text = QWEN2_SPLIT_REGEX then
     fPre := bptQwen2
+  else if text = QWEN35_SPLIT_REGEX then
+    fPre := bptQwen35
   else if text = O200K_SPLIT_REGEX then
     fPre := bptO200k
   else
-    EInferError.RaiseUtf8('%: the Split regex is neither that of Qwen2 nor o200k',
+    EInferError.RaiseUtf8('%: the Split regex is none of Qwen2, Qwen3.5, o200k',
       [self]);
   // trim_offsets only changes the offsets, not the tokens
   level := _Safe(list^.Values[1]);
@@ -722,6 +739,9 @@ begin
   SetLength(fHashNext, n);
   for i := 0 to n - 1 do
   begin
+    // a text twice: the tokenizers library keeps the last id, refuse instead
+    if BytesId(pointer(fTokens[i]), length(fTokens[i])) >= 0 then
+      EInferError.RaiseUtf8('%: vocab text "%" has two ids', [self, aVocab[i]]);
     h := crc32c(0, pointer(fTokens[i]), length(fTokens[i])) and fHashMask;
     fHashNext[i] := fHashHead[h];
     fHashHead[h] := i;
@@ -995,11 +1015,31 @@ begin
     result := aRunEnd;
 end;
 
+/// end of (?i:'s|'t|'re|'ve|'m|'ll|'d) at aPos (exclusive), -1 for no match
+function ContractionEnd(cp: PCardinalArray; aPos, aCount: PtrInt): PtrInt;
+var
+  c1, c2: cardinal;
+begin
+  result := -1;
+  if (cp^[aPos] <> ord('''')) or (aPos + 1 >= aCount) then
+    exit;
+  c1 := FoldContraction(cp^[aPos + 1]);
+  if (c1 = ord('s')) or (c1 = ord('t')) or (c1 = ord('m')) or (c1 = ord('d')) then
+    result := aPos + 2
+  else if aPos + 2 < aCount then
+  begin
+    c2 := FoldContraction(cp^[aPos + 2]);
+    if (((c1 = ord('r')) or (c1 = ord('v'))) and (c2 = ord('e'))) or
+       ((c1 = ord('l')) and (c2 = ord('l'))) then
+      result := aPos + 3;
+  end;
+end;
+
 /// end of the Qwen2 regex match starting at aPos (exclusive) - see the unit
 // header
 function SplitEnd(cp: PCardinalArray; aPos, aCount: PtrInt): PtrInt;
 var
-  c0, c1, c2: cardinal;
+  c0: cardinal;
   k0: TUnicodeClass;
   j, k: PtrInt;
 
@@ -1017,25 +1057,9 @@ begin
   c0 := cp^[aPos];
   k0 := UnicodeClassOf(c0);
   // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
-  if (c0 = ord('''')) and (aPos + 1 < aCount) then
-  begin
-    c1 := FoldContraction(cp^[aPos + 1]);
-    if (c1 = ord('s')) or (c1 = ord('t')) or (c1 = ord('m')) or (c1 = ord('d')) then
-    begin
-      result := aPos + 2;
-      exit;
-    end;
-    if aPos + 2 < aCount then
-    begin
-      c2 := FoldContraction(cp^[aPos + 2]);
-      if (((c1 = ord('r')) or (c1 = ord('v'))) and (c2 = ord('e'))) or
-         ((c1 = ord('l')) and (c2 = ord('l'))) then
-      begin
-        result := aPos + 3;
-        exit;
-      end;
-    end;
-  end;
+  result := ContractionEnd(cp, aPos, aCount);
+  if result >= 0 then
+    exit;
   // 2. [^\r\n\p{L}\p{N}]?\p{L}+
   j := -1;
   if k0 = ucLetter then
@@ -1218,6 +1242,71 @@ begin
   result := SpaceEnd(cp, aPos, j, aCount);
 end;
 
+/// end of the Qwen3.5 regex match starting at aPos (exclusive) - see the unit
+// header; aCls holds the TO200kClass of every code point (its letters, marks,
+// numbers and white space are those of \p{L}, \p{M}, \p{N} and \s)
+function Qwen35SplitEnd(cp: PCardinalArray; aCls: PByteArray;
+  aPos, aCount: PtrInt): PtrInt;
+var
+  j, k: PtrInt;
+
+  function InLM(i: PtrInt): boolean; // [\p{L}\p{M}]
+  begin
+    result := TO200kClass(aCls^[i]) in [ocUpper, ocLower, ocLetter, ocMark];
+  end;
+
+  function IsOther(i: PtrInt): boolean; // [^\s\p{L}\p{M}\p{N}]
+  begin
+    result := TO200kClass(aCls^[i]) = ocOther;
+  end;
+
+begin
+  // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+  result := ContractionEnd(cp, aPos, aCount);
+  if result >= 0 then
+    exit;
+  // 2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ - a mark may also be the prefix, which
+  // ends at the same place as the run starting with it
+  j := -1;
+  if InLM(aPos) then
+    j := aPos
+  else if (TO200kClass(aCls^[aPos]) <> ocNumber) and (cp^[aPos] <> 10) and
+          (cp^[aPos] <> 13) and (aPos + 1 < aCount) and InLM(aPos + 1) then
+    j := aPos + 1;
+  if j >= 0 then
+  begin
+    while (j < aCount) and InLM(j) do
+      inc(j);
+    result := j;
+    exit;
+  end;
+  // 3. \p{N}
+  if TO200kClass(aCls^[aPos]) = ocNumber then
+  begin
+    result := aPos + 1;
+    exit;
+  end;
+  // 4. ' '?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+  k := aPos;
+  if (cp^[aPos] = 32) and (aPos + 1 < aCount) and IsOther(aPos + 1) then
+    k := aPos + 1;
+  if IsOther(k) then
+  begin
+    j := k + 1;
+    while (j < aCount) and IsOther(j) do
+      inc(j);
+    while (j < aCount) and ((cp^[j] = 10) or (cp^[j] = 13)) do
+      inc(j);
+    result := j;
+    exit;
+  end;
+  // only white space is left: its run is aPos..j-1
+  j := aPos + 1;
+  while (j < aCount) and (TO200kClass(aCls^[j]) = ocSpace) do
+    inc(j);
+  result := SpaceEnd(cp, aPos, j, aCount);
+end;
+
 function TBpeTokenizer.Normalize(const aText: RawUtf8): RawUtf8;
 var
   cp: TCardinalDynArray;
@@ -1233,7 +1322,7 @@ begin
 end;
 
 /// the code points of aText as the pipeline sees them, and their o200k classes
-// when it needs them
+// when its regex needs them (o200k, Qwen3.5)
 procedure Prepare(aTokenizer: TBpeTokenizer; const aText: RawUtf8;
   var aCp: TCardinalDynArray; var aCls: TByteDynArray; out aCount: PtrInt);
 var
@@ -1242,7 +1331,7 @@ begin
   aCount := Utf8ToCodePoints(pointer(aText), length(aText), aCp);
   if aTokenizer.Nfc then
     NfcCodePoints(aCp, aCount);
-  if aTokenizer.PreTokenizer <> bptO200k then
+  if aTokenizer.PreTokenizer = bptQwen2 then
     exit;
   SetLength(aCls, aCount);
   for i := 0 to aCount - 1 do
@@ -1254,10 +1343,14 @@ function PieceEnd(aPre: TBpePreTokenizer; cp: PCardinalArray; aCls: PByteArray;
   aPos, aCount: PtrInt): PtrInt;
   {$ifdef HASINLINE}inline;{$endif}
 begin
-  if aPre = bptO200k then
-    result := O200kSplitEnd(cp, aCls, aPos, aCount)
+  case aPre of
+    bptO200k:
+      result := O200kSplitEnd(cp, aCls, aPos, aCount);
+    bptQwen35:
+      result := Qwen35SplitEnd(cp, aCls, aPos, aCount);
   else
     result := SplitEnd(cp, aPos, aCount);
+  end;
 end;
 
 function TBpeTokenizer.Split(const aText: RawUtf8): TRawUtf8DynArray;

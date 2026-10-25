@@ -354,7 +354,7 @@ begin
   t.Free;
   t := LoadBpe(StringReplaceAll(TinyO200kJson('null', VOCAB, MERGES, true),
     '\\p{N}{1,3}', '\\p{N}{1,4}'), err);
-  Check((t = nil) and (PosEx('neither that of Qwen2 nor o200k', err) > 0),
+  Check((t = nil) and (PosEx('none of Qwen2, Qwen3.5, o200k', err) > 0),
     'another regex refused');
   t.Free;
 end;

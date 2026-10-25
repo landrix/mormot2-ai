@@ -408,11 +408,12 @@ In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tok
   übernommen: Die Rekurrenz ist danach 3-4 % des Prefills; Option für D7e.
   *Idee, nicht eingeplant:* ein schnelleres `exp` für silu (SwiGLU aller Modelle, hier die
   Vorbereitung) - nur mit Messung und Toleranz gegen die Referenz.
-- *D7c:* Qwen3.5 als Chat-Modell - der Pre-Tokenizer (`\p{M}` bei den Buchstaben), das
-  Template (Tool-Aufrufe als `<function=...><parameter=...>`, Thinking aus, Reasoning nach der
-  letzten Nutzer-Nachricht immer als `<think>`-Block), der Parser der XML-Aufrufe (ohne
-  `response_schema` als Referenz), die Familie hinter `ILlmClient`; dabei die zwei Prüfungen
-  aus dem lokalen Backlog in `TBpeTokenizer` (`truncation`/`padding`, doppelte Vokabeltexte).
+- *D7c erledigt 2026-10-25* (`native-inference.md`, Phase D): Qwen3.5 als Chat-Modell - der
+  Pre-Tokenizer (`bptQwen35`: Marken bei den Buchstaben; 3181 Fälle gleich), das Template
+  (`TQwen35ChatTemplate`, 195 Fälle textgleich, 10 ebenso abgelehnt), der Parser der XML-Aufrufe
+  (`TQwen35OutputParser`, Werte nach dem Schema getypt wie vLLMs `qwen3_coder`), die Familie
+  hinter `ILlmClient`; dazu `truncation`/`padding` und doppelte Vokabeltexte in
+  `TBpeTokenizer` und `TUgmTokenizer` abgelehnt.
 - *D7d:* Rücksetzpunkte des Zustands für den Prompt-Cache (Checkpoints an Turn-Grenzen),
   Gate: Restore und verzweigte Prompts gleich wie Neuberechnung.
 - *D7e:* Vulkan und CUDA. Danach Qwen3.8-27B.

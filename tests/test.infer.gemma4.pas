@@ -81,6 +81,22 @@ function TinySpBpeJson(const aExtraVocab, aMerges: RawUtf8): RawUtf8;
 /// a TSpBpeTokenizer from aJson, nil and aError when it is refused
 function LoadSpBpe(const aJson: RawUtf8; out aError: RawUtf8): TSpBpeTokenizer;
 
+/// the ids of aText: every one of aControls the tokenizer knows as its id,
+// the rest encoded as text
+function ControlIds(aTokenizer: TInferTokenizer; const aText: RawUtf8;
+  const aControls: array of RawUtf8): TIntegerDynArray;
+
+/// how many of the ids are one of aControls
+function ControlCount(aTokenizer: TInferTokenizer; aIds: PIntegerArray;
+  aCount: PtrInt; const aControls: array of RawUtf8): PtrInt;
+
+/// the messages of a chat case of a reference (TLlmMessage as the generators
+// write it: role, content, tool_call_id, reasoning, name, tool_calls)
+function ChatCaseMessages(aCase: PDocVariantData): TLlmMessageDynArray;
+
+/// the tools of a chat case of a reference (name, description, parameters)
+function ChatCaseTools(aCase: PDocVariantData): TLlmToolDynArray;
+
 
 implementation
 
@@ -443,9 +459,8 @@ begin
     EInferError.RaiseUtf8('TinyGemma4Tokenizer: %', [err]);
 end;
 
-/// the ids of aText: every control token of Gemma 4 the tokenizer knows as
-// its id, the rest encoded as text
-function Gemma4Ids(aTokenizer: TInferTokenizer; const aText: RawUtf8): TIntegerDynArray;
+function ControlIds(aTokenizer: TInferTokenizer; const aText: RawUtf8;
+  const aControls: array of RawUtf8): TIntegerDynArray;
 var
   n, p, start, i, id, len: PtrInt;
   part: RawUtf8;
@@ -459,11 +474,11 @@ begin
   begin
     id := -1;
     if aText[p] = '<' then
-      for i := 0 to high(G4_TOKENS) do
-        if copy(aText, p, length(G4_TOKENS[i])) = G4_TOKENS[i] then
+      for i := 0 to high(aControls) do
+        if copy(aText, p, length(aControls[i])) = aControls[i] then
         begin
-          id := aTokenizer.TokenId(G4_TOKENS[i]);
-          len := length(G4_TOKENS[i]);
+          id := aTokenizer.TokenId(aControls[i]);
+          len := length(aControls[i]);
           break;
         end;
     if id < 0 then
@@ -491,20 +506,19 @@ begin
   SetLength(result, n);
 end;
 
-/// how many of the ids are control tokens of Gemma 4
 function ControlCount(aTokenizer: TInferTokenizer; aIds: PIntegerArray;
-  aCount: PtrInt): PtrInt;
+  aCount: PtrInt; const aControls: array of RawUtf8): PtrInt;
 var
   i, j: PtrInt;
 begin
   result := 0;
   for i := 0 to aCount - 1 do
-    for j := 0 to high(G4_TOKENS) do
-      if aIds^[i] = aTokenizer.TokenId(G4_TOKENS[j]) then
+    for j := 0 to high(aControls) do
+      if aIds^[i] = aTokenizer.TokenId(aControls[j]) then
         inc(result);
 end;
 
-function Gemma4Messages(aCase: PDocVariantData): TLlmMessageDynArray;
+function ChatCaseMessages(aCase: PDocVariantData): TLlmMessageDynArray;
 var
   list, m, calls, c: PDocVariantData;
   i, j: PtrInt;
@@ -533,7 +547,7 @@ begin
   end;
 end;
 
-function Gemma4Tools(aCase: PDocVariantData): TLlmToolDynArray;
+function ChatCaseTools(aCase: PDocVariantData): TLlmToolDynArray;
 var
   list, t: PDocVariantData;
   i: PtrInt;
@@ -594,10 +608,10 @@ begin
       mine := nil;
       try
         if aIds then
-          mine := tpl.EncodeWith(Gemma4Messages(c), Gemma4Tools(c),
+          mine := tpl.EncodeWith(ChatCaseMessages(c), ChatCaseTools(c),
             c^.B['add_generation_prompt'], Gemma4Options(c))
         else
-          text := tpl.RenderWith(Gemma4Messages(c), Gemma4Tools(c),
+          text := tpl.RenderWith(ChatCaseMessages(c), ChatCaseTools(c),
             c^.B['add_generation_prompt'], Gemma4Options(c));
       except
         on E: EInferError do
@@ -620,8 +634,10 @@ begin
         // and hold no more control tokens than the HF ids (fewer in all)
         first := offsets^[i];
         count := offsets^[i + 1] - first;
-        mineControls := ControlCount(aTokenizer, PIntegerArray(@mine[0]), length(mine));
-        hfControls := ControlCount(aTokenizer, PIntegerArray(@ids^[first]), count);
+        mineControls := ControlCount(aTokenizer, PIntegerArray(@mine[0]), length(mine),
+          G4_TOKENS);
+        hfControls := ControlCount(aTokenizer, PIntegerArray(@ids^[first]), count,
+          G4_TOKENS);
         same := (aTokenizer.Decode(mine) = c^.U['rendered']) and
           (mineControls <= hfControls);
         inc(literals);
@@ -818,8 +834,8 @@ begin
     result := TGemma4OutputParser.Create(aTokenizer)
   else
     result := TGemma4OutputParser.Create(aTokenizer, aLog.OnDelta);
-  result.Prompt(Gemma4Ids(aTokenizer, aPrompt));
-  ids := Gemma4Ids(aTokenizer, aText);
+  result.Prompt(ControlIds(aTokenizer, aPrompt, G4_TOKENS));
+  ids := ControlIds(aTokenizer, aText, G4_TOKENS);
   for i := 0 to high(ids) do
     if result.Push(ids[i]) then
       break;

@@ -13,7 +13,9 @@
 //   tests/data/infer-ref/gpt-oss-chat; TGemma4ChatTemplate that of Gemma 4
 //   (google/gemma-4-26B-A4B-it revision 4d7ae4984b7db7de8f8457170b3f1a419ee76d52,
 //   chat_template.jinja - the same file in gemma-4-31B-it and gemma-4-12B-it),
-//   gate tests/data/infer-ref/gemma4-chat
+//   gate tests/data/infer-ref/gemma4-chat; TQwen35ChatTemplate that of Qwen3.5
+//   (Qwen/Qwen3.5-0.8B revision 2fc06364715b967f1860aea9cf38778875588b17,
+//   chat_template.jinja), gate tests/data/infer-ref/qwen35-chat
 // - one difference by design: the template emits the control tokens
 //   (<|im_start|> <|im_end|> <think> </think> <tool_call> </tool_call>
 //   <tool_response> </tool_response>) as ids, and every message text is text.
@@ -33,6 +35,7 @@ unit mormot.ai.infer.chat;
     - TQwen2ChatTemplate: the template of Qwen2.5
     - THarmonyChatTemplate: the template of gpt-oss (Harmony)
     - TGemma4ChatTemplate: the template of Gemma 4
+    - TQwen35ChatTemplate: the template of Qwen3.5
 
   *****************************************************************************
 }
@@ -259,6 +262,34 @@ type
   public
     /// look up the control tokens of Gemma 4 in aTokenizer (not owned) -
     // raises EInferError when one is missing
+    constructor Create(aTokenizer: TInferTokenizer); override;
+    /// false: the template thinks only when a request asks for it
+    class function DefaultEnableThinking: boolean; override;
+  end;
+
+  /// the chat template of Qwen3.5: ChatML, every message text trimmed (Python
+  // strip), tool calls as <tool_call><function=name><parameter=key> blocks, a
+  // <think> block in every assistant turn after the last user query (empty
+  // without reasoning), thinking only when asked
+  // - the Reasoning of an assistant message is its reasoning_content; '' is
+  // none, and a </think> in its content then splits it as the template does
+  // - the arguments of a call must be a JSON object ('' is none): its members
+  // in their order, a string as it is, an object or array as tojson writes it,
+  // any other value as Python str() writes it (True, None, 100000.0)
+  // - refused as transformers refuses them: no message, no user query (a user
+  // turn that is no wrapped <tool_response>), a system message after the first,
+  // arguments that are no object; a tool message first gets no user turn
+  // opened before it, as the template writes it
+  TQwen35ChatTemplate = class(TChatTemplate)
+  protected
+    fImStart, fImEnd, fThink, fThinkEnd, fToolCall, fToolCallEnd,
+    fToolResponse, fToolResponseEnd: integer;
+    procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
+      const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
+      const aOptions: TChatTemplateOptions); override;
+  public
+    /// look up the control tokens in aTokenizer (not owned) - raises
+    // EInferError when one is missing
     constructor Create(aTokenizer: TInferTokenizer); override;
     /// false: the template thinks only when a request asks for it
     class function DefaultEnableThinking: boolean; override;
@@ -2504,6 +2535,222 @@ begin
     Finalize(o.Pending);
     Finalize(o.Text);
   end;
+end;
+
+
+{ TQwen35ChatTemplate }
+
+const
+  /// the tool instructions of the system turn, before and after the example
+  // call (whose <tool_call> and </tool_call> are control tokens)
+  QWEN35_TOOLS_INTRO =
+    '# Tools'#10#10'You have access to the following functions:'#10#10'<tools>';
+  QWEN35_TOOLS_FORMAT =
+    #10'</tools>'#10#10'If you choose to call a function ONLY reply in the ' +
+    'following format with NO suffix:'#10#10;
+  QWEN35_TOOLS_EXAMPLE =
+    #10'<function=example_function_name>'#10'<parameter=example_parameter_1>'#10 +
+    'value_1'#10'</parameter>'#10'<parameter=example_parameter_2>'#10'This is ' +
+    'the value for the second parameter'#10'that can span'#10'multiple lines'#10 +
+    '</parameter>'#10'</function>'#10;
+  QWEN35_TOOLS_REMINDER =
+    #10#10'<IMPORTANT>'#10'Reminder:'#10'- Function calls MUST follow the ' +
+    'specified format: an inner <function=...></function> block must be nested ' +
+    'within ';
+  QWEN35_TOOLS_RULES =
+    ' XML tags'#10'- Required parameters MUST be specified'#10'- You may ' +
+    'provide optional reasoning for your function call in natural language ' +
+    'BEFORE the function call, but NOT after'#10'- If there is no function call ' +
+    'available, answer the question like normal with your current knowledge ' +
+    'and do not tell the user about function calls'#10'</IMPORTANT>';
+
+constructor TQwen35ChatTemplate.Create(aTokenizer: TInferTokenizer);
+begin
+  inherited Create(aTokenizer);
+  fImStart := Need('<|im_start|>');
+  fImEnd := Need('<|im_end|>');
+  fThink := Need('<think>');
+  fThinkEnd := Need('</think>');
+  fToolCall := Need('<tool_call>');
+  fToolCallEnd := Need('</tool_call>');
+  fToolResponse := Need('<tool_response>');
+  fToolResponseEnd := Need('</tool_response>');
+end;
+
+class function TQwen35ChatTemplate.DefaultEnableThinking: boolean;
+begin
+  result := false;
+end;
+
+/// true for a user text the template takes as a wrapped tool response
+function IsQwen35ToolResponse(const aStripped: RawUtf8): boolean;
+begin
+  result := (PosEx('<tool_response>', aStripped) = 1) and
+    EndsWithExact(aStripped, '</tool_response>');
+end;
+
+procedure TQwen35ChatTemplate.Build(var aOut: TChatSegments;
+  const aMessages: TLlmMessageDynArray; const aTools: TLlmToolDynArray;
+  aAddGenerationPrompt: boolean; const aOptions: TChatTemplateOptions);
+var
+  n, i, j, k, lastQuery, v: PtrInt;
+  multiStep: boolean;
+  content, reasoning: RawUtf8;
+  m: ^TLlmMessage;
+  T: THarmonyJson;
+begin
+  n := length(aMessages);
+  if n = 0 then
+    EInferError.RaiseUtf8('%: no messages', [self]);
+  // the system turn, with the tool list and its instructions when there are
+  // tools
+  if aTools <> nil then
+  begin
+    aOut.Control(fImStart, '<|im_start|>');
+    aOut.Add('system'#10 + QWEN35_TOOLS_INTRO);
+    for i := 0 to high(aTools) do
+      aOut.Add(#10 + ToolJson(aTools[i]));
+    aOut.Add(QWEN35_TOOLS_FORMAT);
+    aOut.Control(fToolCall, '<tool_call>');
+    aOut.Add(QWEN35_TOOLS_EXAMPLE);
+    aOut.Control(fToolCallEnd, '</tool_call>');
+    aOut.Add(QWEN35_TOOLS_REMINDER);
+    aOut.Control(fToolCall, '<tool_call>');
+    aOut.Control(fToolCallEnd, '</tool_call>');
+    aOut.Add(QWEN35_TOOLS_RULES);
+    if aMessages[0].Role = lrSystem then
+    begin
+      content := PythonStrip(aMessages[0].Content);
+      if content <> '' then
+        aOut.Add(#10#10 + content);
+    end;
+    aOut.Control(fImEnd, '<|im_end|>');
+    aOut.Add(#10);
+  end
+  else if aMessages[0].Role = lrSystem then
+  begin
+    aOut.Control(fImStart, '<|im_start|>');
+    aOut.Add('system'#10 + PythonStrip(aMessages[0].Content));
+    aOut.Control(fImEnd, '<|im_end|>');
+    aOut.Add(#10);
+  end;
+  // the last real user query: a user turn that is no wrapped tool response
+  multiStep := true;
+  lastQuery := n - 1;
+  for i := n - 1 downto 0 do
+    if multiStep and (aMessages[i].Role = lrUser) and
+       not IsQwen35ToolResponse(PythonStrip(aMessages[i].Content)) then
+    begin
+      multiStep := false;
+      lastQuery := i;
+    end;
+  if multiStep then
+    EInferError.RaiseUtf8('%: no user query in the messages', [self]);
+  for i := 0 to n - 1 do
+  begin
+    m := @aMessages[i];
+    content := PythonStrip(m^.Content);
+    case m^.Role of
+      lrSystem:
+        if i > 0 then
+          EInferError.RaiseUtf8('%: a system message must be the first', [self]);
+      lrUser:
+        begin
+          aOut.Control(fImStart, '<|im_start|>');
+          aOut.Add('user'#10 + content);
+          aOut.Control(fImEnd, '<|im_end|>');
+          aOut.Add(#10);
+        end;
+      lrAssistant:
+        begin
+          // the reasoning of the message (reasoning_content) - else a <think>
+          // block its content still holds
+          reasoning := m^.Reasoning;
+          if (reasoning = '') and (PosEx('</think>', content) > 0) then
+          begin
+            reasoning := StripNewlines(SplitLast(StripNewlines(
+              SplitFirst(content, '</think>'), false, true), '<think>'), true, false);
+            content := StripNewlines(SplitLast(content, '</think>'), true, false);
+          end;
+          reasoning := PythonStrip(reasoning);
+          aOut.Control(fImStart, '<|im_start|>');
+          if i > lastQuery then
+          begin
+            aOut.Add('assistant'#10);
+            aOut.Control(fThink, '<think>');
+            aOut.Add(#10 + reasoning + #10);
+            aOut.Control(fThinkEnd, '</think>');
+            aOut.Add(#10#10 + content);
+          end
+          else
+            aOut.Add('assistant'#10 + content);
+          for j := 0 to high(m^.ToolCalls) do
+          begin
+            if j > 0 then
+              aOut.Add(#10)
+            else if PythonStrip(content) <> '' then
+              aOut.Add(#10#10);
+            aOut.Control(fToolCall, '<tool_call>');
+            aOut.Add(#10'<function=' + m^.ToolCalls[j].Name + '>'#10);
+            if m^.ToolCalls[j].ArgumentsJson <> '' then
+            begin
+              // the members of the object in their order (|items)
+              T.Parse(m^.ToolCalls[j].ArgumentsJson);
+              if T.Nodes[0].Kind <> hjObject then
+                EInferError.RaiseUtf8('%: the arguments of call % are no JSON ' +
+                  'object', [self, m^.ToolCalls[j].Name]);
+              for k := 0 to T.Nodes[0].Count - 1 do
+              begin
+                v := T.Item(0, k);
+                aOut.Add('<parameter=' + T.Keys[T.Nodes[0].First + k] + '>'#10);
+                if T.Nodes[v].Kind in [hjObject, hjArray] then
+                  aOut.Add(T.Json(v))
+                else
+                  aOut.Add(T.Str(v, 'an argument'));
+                aOut.Add(#10'</parameter>'#10);
+              end;
+            end;
+            aOut.Add('</function>'#10);
+            aOut.Control(fToolCallEnd, '</tool_call>');
+          end;
+          aOut.Control(fImEnd, '<|im_end|>');
+          aOut.Add(#10);
+        end;
+      lrTool:
+        begin
+          // a user turn opens after another role - not before a first message
+          if (i > 0) and (aMessages[i - 1].Role <> lrTool) then
+          begin
+            aOut.Control(fImStart, '<|im_start|>');
+            aOut.Add('user');
+          end;
+          aOut.Add(#10);
+          aOut.Control(fToolResponse, '<tool_response>');
+          aOut.Add(#10 + content + #10);
+          aOut.Control(fToolResponseEnd, '</tool_response>');
+          if (i = n - 1) or (aMessages[i + 1].Role <> lrTool) then
+          begin
+            aOut.Control(fImEnd, '<|im_end|>');
+            aOut.Add(#10);
+          end;
+        end;
+    end;
+  end;
+  if aAddGenerationPrompt then
+  begin
+    aOut.Control(fImStart, '<|im_start|>');
+    aOut.Add('assistant'#10);
+    aOut.Control(fThink, '<think>');
+    if aOptions.EnableThinking then
+      aOut.Add(#10)
+    else
+    begin
+      aOut.Add(#10#10);
+      aOut.Control(fThinkEnd, '</think>');
+      aOut.Add(#10#10);
+    end;
+  end;
+  aOut.Flush;
 end;
 
 end.

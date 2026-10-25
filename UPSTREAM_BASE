@@ -265,7 +265,9 @@ never a build input.
     script) uses the modeling code of transformers only, no file of the model. Generated
     in the WSL reference (Linux aarch64): Python 3.12.13, torch 2.14.1+cpu, transformers
     5.19.0, without flash-linear-attention and causal-conv1d (the torch paths of the
-    delta rule and the convolution).
+    delta rule and the convolution). qwen35-tokens and qwen35-chat
+    (tools/infer-ref/make_reference_d7c.py) read tokenizer.json, tokenizer_config.json
+    and chat_template.jinja (hashes above), tokenizers 0.23.3.
 
   Rule: a new revision, model or environment means regenerating every dataset and
         updating this section in the same commit.

@@ -40,6 +40,8 @@ type
     procedure InvalidUtf8IsReplaced;
     /// a tokenizer.json of another pipeline is refused
     procedure ForeignPipelineIsRefused;
+    /// the BGE-M3 file with a truncation, a padding or a piece twice refused
+    procedure ChangedFileIsRefused;
   end;
 
 /// the folder of the converted BGE-M3 files, '' when absent
@@ -240,6 +242,53 @@ begin
     DeleteFile(fn);
   end;
   CheckUtf8(refused, 'BPE tokenizer.json refused');
+end;
+
+/// true when TUgmTokenizer refuses aDoc with a message holding aWhy
+function UgmRefused(var aDoc: TDocVariantData; const aWhy: RawUtf8): boolean;
+var
+  fn: TFileName;
+  t: TUgmTokenizer;
+begin
+  result := false;
+  fn := TemporaryFileName;
+  FileFromString(aDoc.ToJson, fn);
+  try
+    try
+      t := TUgmTokenizer.Create(fn);
+      t.Free;
+    except
+      on E: EInferError do
+        result := PosEx(aWhy, StringToUtf8(E.Message)) > 0;
+    end;
+  finally
+    DeleteFile(fn);
+  end;
+end;
+
+procedure TTestInferTokenizer.ChangedFileIsRefused;
+var
+  fn: TFileName;
+  doc: TDocVariantData;
+  vocab: PDocVariantData;
+begin
+  if not Ready then
+    exit;
+  fn := FindBgeM3Folder('tokenizer.json') + 'tokenizer.json';
+  // a saved truncation or padding would change what Encode returns
+  doc.InitJsonFromFile(fn, JSON_FAST_FLOAT);
+  doc.AddOrUpdateValue('truncation', _ObjFast(['max_length', 8]));
+  Check(UgmRefused(doc, 'truncation'), 'truncation');
+  doc.Clear;
+  doc.InitJsonFromFile(fn, JSON_FAST_FLOAT);
+  doc.AddOrUpdateValue('padding', _ObjFast(['length', 8]));
+  Check(UgmRefused(doc, 'padding'), 'padding');
+  // a piece twice: the tokenizers library keeps the last id
+  doc.Clear;
+  doc.InitJsonFromFile(fn, JSON_FAST_FLOAT);
+  vocab := doc.O['model']^.A['vocab'];
+  vocab^.Values[1000] := vocab^.Values[1001];
+  Check(UgmRefused(doc, 'two ids'), 'a piece twice');
 end;
 
 end.

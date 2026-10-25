@@ -176,6 +176,25 @@ python tools/infer-ref/make_reference_d7.py                 # all three
 python tools/infer-ref/make_reference_d7.py tiny-qwen35     # one of them
 ```
 
+## Qwen3.5 as a chat model (phase D, D7c)
+
+`make_reference_d7c.py` reads the tokenizer files of `Qwen/Qwen3.5-0.8B` (`$LAI_QWEN35_DIR`,
+else `vendor/models/qwen3.5-0.8b`, checked against the pinned hashes); the weights are not
+needed.
+
+- `qwen35-tokens`: per case the ids of `tokenizer.json` without its added tokens, the NFC
+  text, and the pieces of its Split pre-tokenizer - the regex of Qwen3.5 joins the combining
+  marks to the letters, so the cases put marks in every position and add scripts that
+  write with them.
+- `qwen35-chat`: conversations and tool schemas through `chat_template.jinja`, rendered by
+  transformers, and their ids; the arguments of a call go in as their object (the template
+  iterates them), what transformers refuses is marked as an error.
+
+```bash
+python tools/infer-ref/make_reference_d7c.py                 # both
+python tools/infer-ref/make_reference_d7c.py qwen35-chat     # one of them
+```
+
 ## Decoder stacks (backlog B14)
 
 `make_reference_b14.py` needs only Python: it creates `tiny-qwen3/stack/` - the weights of

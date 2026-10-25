@@ -1814,6 +1814,98 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7c erledigt (2026-10-25): Qwen3.5 als Chat-Modell (Tokenizer, Template, Parser).**
+Qwen3.5 hinter `ILlmClient`, auf der CPU und aus safetensors. Quelle: `Qwen/Qwen3.5-0.8B`
+Revision `2fc06364715b967f1860aea9cf38778875588b17` (`tokenizer.json`, `chat_template.jinja`),
+nachgebaut, kein Code übernommen.
+
+- *Tokenizer* (`TBpeTokenizer`, `bptQwen35`): Byte-Level-BPE mit NFC wie Qwen3, aber mit eigenem
+  Regex. Die Buchstabenfolge nimmt die Kombinationszeichen mit (`[\p{L}\p{M}]+`), die
+  Satzzeichen-Klasse schließt sie aus. Von Hand als Leftmost-First-Match über die o200k-Klassen
+  geschrieben, `ContractionEnd` teilt es mit dem Split von Qwen2. Neu für alle Byte-Level- und
+  Unigram-Tokenizer (`TBpeTokenizer`, `TUgmTokenizer`): Eine `tokenizer.json` mit `truncation`
+  oder `padding` wird abgelehnt, ebenso ein Vokabeltext mit zwei Ids. Die tokenizers-Bibliothek
+  kürzt oder füllt sonst, beziehungsweise nimmt die letzte Id. Ein Export mit gesetzter
+  `truncation`, wie ihn manche BERT-artigen Modelle haben, lädt damit nicht mehr; die
+  veröffentlichten Dateien aller unterstützten Modelle haben beides auf `null`. Aus dem
+  lokalen Backlog. GGUF (`tokenizer.ggml.pre` von Qwen3.5) kommt später.
+- *Template* (`TQwen35ChatTemplate`):
+  - Jede Nachricht wird getrimmt (Pythons `strip`).
+  - Die Tools stehen im System-Turn. Ihr Anleitungstext enthält `<tool_call>` als
+    Kontrolltoken, dahinter steht der getrimmte System-Text.
+  - Nach der letzten echten Nutzer-Nachricht hat jede Antwort einen `<think>`-Block, auch einen
+    leeren. Das Reasoning kommt aus `Reasoning` oder aus einem `</think>` im Inhalt.
+  - Tool-Aufrufe stehen als `<function=NAME>` mit einem `<parameter=KEY>` je Argument. Die
+    Argumente müssen ein JSON-Objekt sein: ein String steht roh, ein Objekt oder Array als
+    `tojson`, jeder andere Wert als Pythons `str()` (`True`, `None`, `100000.0`).
+  - Tool-Antworten werden in einen Nutzer-Turn gefasst. Steht eine Tool-Nachricht ganz vorn,
+    öffnet das Template keinen Turn, und das bildet der Nachbau nach.
+  - Thinking ist aus, solange eine Anfrage es nicht verlangt.
+  - Abgelehnt wie bei transformers: keine Nachricht, keine echte Nutzer-Nachricht, ein
+    System-Turn nach dem ersten, Argumente, die kein Objekt sind.
+- *Parser* (`TQwen35OutputParser`, vom Parser von Qwen3 abgeleitet): Endet der Prompt in einem
+  offenen `<think>` (Thinking an), beginnt die Antwort im Reasoning, nach einem geschlossenen
+  im Inhalt (`Prompt`). Ein `<tool_call>`-Block wird zum Aufruf, wenn er dem Layout des
+  Templates folgt (`ParseQwen35ToolCall`). Ein Wert endet an einem `</parameter>`, dem ein
+  weiterer Parameter oder das Ende folgt; er darf diesen Text also selbst enthalten. Ein
+  Objekt oder Array endet an der ersten solchen Stelle, an der es gültiges JSON ist. Ein roher
+  String, der `</parameter>` und danach `<parameter=` enthält, wird dort geteilt, denn das
+  Format kennt dafür kein Escape.
+  Transformers hat für dieses Format kein `response_schema`. Die Werte werden deshalb nach dem
+  Schema des Tools getypt, angelehnt an vLLMs `qwen3_coder`-Parser, aber strenger: Bei einem
+  String-Typ bleibt „null“ ein String, und ein ungültiger Boolean wird nicht `false`.
+  - `integer` und `number` werden zu einer JSON-Zahl der jeweiligen Art, `boolean` zu `true`
+    oder `false` (beliebige Schreibung), `object` und `array` zu JSON-Text der jeweiligen
+    Art. Leerraum um den Wert zählt dabei nicht.
+  - `null` oder `None` wird `null`, wo das Schema `null` erlaubt oder einen Typ nennt, der
+    kein String ist.
+  - Alles andere bleibt ein String, so wie es geschrieben ist.
+  - Der Typ kommt aus `type` (bei einer Liste der erste außer `null`) oder aus den Varianten
+    von `anyOf` und `oneOf`. Die Tools der Anfrage reicht der Client an den Parser weiter
+    (`TNativeOutputParser.Tools`).
+- *Referenz* (`make_reference_d7c.py`):
+  - `qwen35-tokens`: 3181 Fälle, 2037 davon mit Marke; dazu kommen die Fälle von Qwen3, o200k
+    und Gemma 4. Je Fall stehen dort die Ids, der NFC-Text und die Stücke des Pre-Tokenizers.
+  - `qwen35-chat`: 205 Fälle, davon 10 abgelehnt. Es sind die 26 Gespräche von Qwen3, 45
+    eigene (Thinking an und aus, Trim, Reasoning zurück oder aus dem Inhalt, Tool-Flüsse, jede
+    Art von Argumentwert, gefasste Tool-Antworten, eine Tool-Nachricht zuerst) und 134 Schemas.
+- *Tests* (`test.infer.qwen35chat`):
+  - Die Stücke stimmen in allen 3181 Fällen, mit einem kleinen Tokenizer und ohne Modell. Die
+    Ids sind gleich, und das Dekodieren gibt den NFC-Text zurück.
+  - Das Template lehnt die 10 Fälle ab, die transformers ablehnt. Die übrigen 195 sind
+    textgleich, 185 davon idgleich; die anderen 10 halten ein Kontrolltoken als Literal im
+    Text, das hier Text bleibt.
+  - Die Aufrufe sind getestet, ebenso der Rückweg Template → Parser für jede Art von Wert, der
+    Parser selbst und die Anfrage-Optionen.
+  - Qwen3.5-0.8B hinter `ILlmClient` in Q8_0:
+    - Es antwortet „Paris“ (17 × 23 ist ihm zu schwer, auch in transformers: 331).
+    - Es ruft `get_weather` mit `{"city": "Berlin"}` auf und beantwortet das Ergebnis.
+    - Es ruft `set_heating` mit `{"celsius": 21}` als Zahl auf; das prüft, dass der Client die
+      Tools an den Parser gibt.
+    - Mit Thinking liefert es ein Reasoning.
+  - `TUgmTokenizer` lehnt ein verändertes BGE-M3-`tokenizer.json` ab: mit `truncation`, mit
+    `padding`, mit einem Stück zweimal.
+  - Grün in WSL (FPC 3.2.4: Infer 6309, LLM 741), auf dem RTX-Rechner unter FPC und Delphi 13
+    (je 8002) und Delphi 7 (5072; das echte Modell braucht 64 Bit) und auf dem M2 Pro (Infer
+    5874 mit den Ids von Qwen3.5, LLM 730).
+- *Gegenprobe:* 42 eingebaute Fehler, alle scheitern:
+  - im Tokenizer: Regex von Qwen2, Marken keine Buchstaben oder Sonstiges, Präfix nach CR/LF,
+    Ziffernfolgen, die Prüfungen auf `truncation` und doppelte Texte;
+  - im Template: Trim, Think-Block nur mit Reasoning, Zeilenumbrüche vor einem Aufruf, Strings
+    als JSON, ein Kontrolltoken als Text, die Tool-Nachricht zuerst, die Ablehnungen, Thinking
+    vertauscht oder an, ein leerer System-Text, gefasste Tool-Antworten als Anfrage;
+  - im Parser: der Prompt übergangen, Werte ungetypt, Zahl, `null`, Zeilenumbruch,
+    Schreibung, Typliste, `anyOf`, `None`, Trim, Name und Endregel, und der Client ohne Tools.
+- *Review:* Claude-Finder und Codex in drei Runden. Behoben:
+  - ein `</parameter>` im Wert;
+  - `anyOf`/`oneOf` und eine Typliste nur aus `null`;
+  - Booleans mit Leerraum;
+  - `None` aus dem Template;
+  - das Schema einmal je Aufruf;
+  - der Name bei einer Ablehnung;
+  - Tests, die bei einer fremden Ablehnung bestanden hätten;
+  - die Zählung der textgleichen Fälle.
+
 **D7b erledigt (2026-10-21): der Prefill von Qwen3.5 auf allen Kernen.** Erst gemessen: Nach
 D7a lagen im Prefill von 512 Tokens (Qwen3.5-0.8B, F32, RTX-Rechner) 5,8 s von 9,4 s in der
 Rekurrenz und 1,6 s in der Convolution - beide seriell, der Rest lief schon auf allen Kernen.

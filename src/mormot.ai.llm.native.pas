@@ -7,7 +7,7 @@
 // - a decoder family registers its model, tokenizer, chat template and output
 //   parser classes (RegisterNativeFamily); the client picks them by the
 //   model_type of config.json or the architecture of a GGUF file - Qwen3,
-//   Qwen2.5, gpt-oss and Gemma 4 are registered here
+//   Qwen2.5, gpt-oss, Gemma 4 and Qwen3.5 are registered here
 // - the prompt is the model's chat template (TChatTemplate); the answer is
 //   parsed token by token (TNativeOutputParser) - for Qwen3 a leading <think>
 //   block becomes reasoning (returned like vLLM does, as reasoning_content in
@@ -16,7 +16,8 @@
 //   the analysis channel becomes reasoning, a message to functions.NAME a tool
 //   call, the final channel the content; for Gemma 4 the thought channel
 //   becomes reasoning, every <|tool_call> block a tool call
-//   (TGemma4OutputParser)
+//   (TGemma4OutputParser); for Qwen3.5 the <think> block reasoning, every
+//   <tool_call><function=...> block a tool call (TQwen35OutputParser)
 // - ChatComplete and ChatStream share one decoding path, so a streamed answer
 //   is the complete answer cut into pieces - nothing else
 // - only the ids the tokenizer knows are drawn: a padded embedding (gpt-oss
@@ -38,6 +39,7 @@ unit mormot.ai.llm.native;
     - TQwen2OutputParser: the parser of Qwen2.5 (no reasoning)
     - THarmonyOutputParser: the parser of gpt-oss (Harmony)
     - TGemma4OutputParser: the parser of Gemma 4
+    - TQwen35OutputParser: the parser of Qwen3.5
     - NativeChatPrompt: a TLlmChatRequest as prompt ids
     - RegisterNativeFamily: the classes of a decoder family
     - TNativeLlmClient: ILlmClient over a model folder or a GGUF file
@@ -55,6 +57,7 @@ uses
   mormot.core.os,
   mormot.core.unicode,
   mormot.core.text,
+  mormot.core.data,
   mormot.core.variants,
   mormot.core.json,
   mormot.core.search,
@@ -73,6 +76,7 @@ uses
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.gptoss,
   mormot.ai.infer.model.gemma4,
+  mormot.ai.infer.model.qwen35,
   mormot.ai.infer.sampler;
 
 const
@@ -120,6 +124,7 @@ type
     fCount: integer;
     fRoleSent, fFinished: boolean;
     fResponse: TLlmChatResponse;
+    fTools: TLlmToolDynArray;
     procedure Send(var aDelta: TLlmStreamDelta);
     procedure SendContent(const aText: RawUtf8);
     procedure SendReasoning(const aText: RawUtf8);
@@ -153,6 +158,11 @@ type
     /// the answer, after Finish
     property Response: TLlmChatResponse
       read fResponse;
+    /// the tools of the request, set before the first Push (the client does
+    // it) - a family whose calls carry their values as text (Qwen3.5) reads
+    // their types from the schemas
+    property Tools: TLlmToolDynArray
+      read fTools write fTools;
     /// the reasoning text (also Response.Reasoning, and in Response.Raw as
     // reasoning_content)
     property Reasoning: RawUtf8
@@ -193,7 +203,8 @@ type
     fStop, fEndOfText, fThink, fThinkEnd, fToolCall, fToolCallEnd: integer;
     fState: TQwen3ParserState;
     fToolBody: RawUtf8;
-    procedure EndToolCall;
+    /// the block between <tool_call> and </tool_call> is complete
+    procedure EndToolCall; virtual;
     /// stop on <|im_end|> or <|endoftext|>
     function Token(aId: integer): boolean; override;
     procedure FlushOpen; override;
@@ -205,6 +216,22 @@ type
     // otherwise
     constructor Create(aTokenizer: TInferTokenizer;
       const aOnDelta: TLlmStreamDeltaEvent = nil); override;
+  end;
+
+  /// the output parser of Qwen3.5: that of Qwen3 with its own calls - a
+  // <tool_call> block holds <function=NAME> with one <parameter=KEY> block per
+  // argument, its value as text (ParseQwen35ToolCall, typed by the schemas of
+  // the request's Tools)
+  // - the prompt opens the <think> block itself: an answer after a prompt that
+  // ends in an open one (thinking on) starts in the reasoning, after a closed
+  // one (thinking off) in the content (Prompt)
+  TQwen35OutputParser = class(TQwen3OutputParser)
+  protected
+    procedure EndToolCall; override;
+  public
+    /// start in the reasoning when the last <think> or </think> of the last
+    // turn of aIds is an open <think>
+    procedure Prompt(const aIds: TIntegerDynArray); override;
   end;
 
   /// the output parser of Qwen2.5: that of Qwen3 without reasoning - the same
@@ -348,6 +375,32 @@ function NativeChatPrompt(aTemplate: TChatTemplate;
 // float of more than 15 digits or beyond the double range: kept verbatim, so
 // a tool that reads its arguments as doubles rounds or refuses that value
 function ParseQwen3ToolCall(const aBody: RawUtf8;
+  out aName, aArguments: RawUtf8): boolean;
+
+/// parse the body of a Qwen3.5 tool call (between <tool_call> and
+// </tool_call>): <function=NAME> (no white space or "<" in NAME), then
+// <parameter=KEY> VALUE </parameter> blocks, then </function>, white space
+// between them; one newline at both ends of a VALUE is the template's
+// - the values typed by the schema of tool NAME in aTools, modelled on vLLM's
+// qwen3_coder parser (stricter: a "null" of a string and an invalid boolean
+// stay strings): "integer" and "number" a JSON number of that
+// kind, "boolean" true or false (any case), "object" and "array" a JSON text
+// of that kind - white space around them ignored; null or None (any case,
+// None as the template writes it) is null where the schema allows "null" or
+// names a type that is no "string"; a value
+// that is no such text, a "string", an unknown type and a key or tool without
+// schema stay a string, as written; the type is "type" (of a list the first
+// that is not "null") or that of the "anyOf" / "oneOf" variants
+// - a value ends at a </parameter> that another <parameter= or the end
+// follows, so it may hold that text itself: of an "object" or "array" the
+// first such end where the value is that JSON, else the first such end (a
+// string value that holds "</parameter>" and then "<parameter=" is cut there:
+// the format has no escape for it)
+// - aArguments is the object as Python json.dumps writes it, a float of more
+// than 15 digits or beyond the double range kept verbatim
+// - false (the block stays text) for any other layout, an empty name or key,
+// white space or "<" in one, or a key twice
+function ParseQwen35ToolCall(const aBody: RawUtf8; const aTools: TLlmToolDynArray;
   out aName, aArguments: RawUtf8): boolean;
 
 /// parse the body of a Gemma 4 tool call (between <|tool_call> and
@@ -960,6 +1013,40 @@ begin
       // cut before </tool_call>: no call, the text stays
       SendContent(fContent.Add(Bytes(fToolCall) + fToolBody));
   end;
+end;
+
+
+{ TQwen35OutputParser }
+
+procedure TQwen35OutputParser.Prompt(const aIds: TIntegerDynArray);
+var
+  i: PtrInt;
+begin
+  // the last <think> / </think> of the generation prompt, not before its turn
+  for i := high(aIds) downto 0 do
+    if aIds[i] = fThink then
+    begin
+      fState := qpsReasoning;
+      exit;
+    end
+    else if aIds[i] = fThinkEnd then
+    begin
+      fState := qpsContent;
+      exit;
+    end
+    else if aIds[i] = fStop then
+      exit;
+end;
+
+procedure TQwen35OutputParser.EndToolCall;
+var
+  name, args: RawUtf8;
+begin
+  if ParseQwen35ToolCall(fToolBody, fTools, name, args) then
+    AddToolCall(name, args)
+  else
+    // not a call the agent could run: keep it visible as text
+    SendContent(fContent.Add(Bytes(fToolCall) + fToolBody + Bytes(fToolCallEnd)));
 end;
 
 
@@ -1619,6 +1706,243 @@ begin
 end;
 
 
+/// the types of a JSON schema of a property, lowercase: its "type" (a name or
+// a list of them), else those of the variants of "anyOf" / "oneOf"; aType the
+// first that is not "null" ('' without one), aNullable true when "null" is
+// one of them
+procedure Qwen35SchemaTypes(aProp: PDocVariantData; var aType: RawUtf8;
+  var aNullable: boolean);
+var
+  j: PtrInt;
+  list: PDocVariantData;
+  v: RawUtf8;
+
+  procedure One(const aValue: variant);
+  begin
+    if not VarIsString(aValue) then
+      exit;
+    VariantToUtf8(aValue, v);
+    v := LowerCase(v);
+    if v = 'null' then
+      aNullable := true
+    else if aType = '' then
+      aType := v;
+  end;
+
+begin
+  if aProp = nil then
+    exit;
+  if aProp^.GetAsArray('type', list) then
+    for j := 0 to list^.Count - 1 do
+      One(list^.Values[j])
+  else if aProp^.GetValueIndex('type') >= 0 then
+    One(aProp^.Value['type'])
+  else if aProp^.GetAsArray('anyOf', list) or aProp^.GetAsArray('oneOf', list) then
+    for j := 0 to list^.Count - 1 do
+      if _Safe(list^.Values[j])^.IsObject then
+        Qwen35SchemaTypes(_Safe(list^.Values[j]), aType, aNullable);
+end;
+
+/// the JSON of the text aValue of a parameter with the schema aProp (nil:
+// none)
+function Qwen35Value(const aValue: RawUtf8; aProp: PDocVariantData): RawUtf8;
+var
+  typ, trimmed, lower, canon: RawUtf8;
+  nullable: boolean;
+begin
+  result := QuotedStrJson(aValue);
+  typ := '';
+  nullable := false;
+  Qwen35SchemaTypes(aProp, typ, nullable);
+  trimmed := TrimU(aValue);
+  lower := LowerCase(trimmed);
+  // null (or None, as the template writes it) where the schema allows it, or
+  // for a type that is no string
+  if ((lower = 'null') or (lower = 'none')) and
+     (nullable or ((typ <> '') and (typ <> 'string'))) then
+  begin
+    result := 'null';
+    exit;
+  end;
+  if typ = 'boolean' then
+  begin
+    if (lower = 'true') or (lower = 'false') then
+      result := lower;
+    exit;
+  end;
+  if (typ <> 'integer') and (typ <> 'number') and (typ <> 'object') and
+     (typ <> 'array') then
+    exit; // a string, an unknown type or none: the text as it is
+  try
+    canon := PythonJson(trimmed, {keepinexactfloats=}true);
+  except
+    on EInferError do
+      exit; // no JSON text: a string
+  end;
+  if canon = '' then
+    exit;
+  if typ = 'object' then
+  begin
+    if canon[1] = '{' then
+      result := canon;
+  end
+  else if typ = 'array' then
+  begin
+    if canon[1] = '[' then
+      result := canon;
+  end
+  else if (canon[1] = '-') or (canon[1] in ['0'..'9']) then
+    // a number; an integer without fraction or exponent
+    if (typ = 'number') or
+       ((PosEx('.', canon) = 0) and (PosEx('e', canon) = 0) and
+        (PosEx('E', canon) = 0)) then
+      result := canon;
+end;
+
+/// a value without the newline the template writes on both sides of it
+function Qwen35Unwrap(const aValue: RawUtf8): RawUtf8;
+begin
+  result := aValue;
+  if (result <> '') and (result[1] = #10) then
+    delete(result, 1, 1);
+  if (result <> '') and (result[length(result)] = #10) then
+    SetLength(result, length(result) - 1);
+end;
+
+/// true when aValue is a JSON object (aObject) or array
+function Qwen35IsJson(const aValue: RawUtf8; aObject: boolean): boolean;
+var
+  canon: RawUtf8;
+begin
+  result := false;
+  try
+    canon := PythonJson(TrimU(aValue), {keepinexactfloats=}true);
+  except
+    on EInferError do
+      exit;
+  end;
+  result := (canon <> '') and ((aObject and (canon[1] = '{')) or
+    (not aObject and (canon[1] = '[')));
+end;
+
+/// a name or key of a Qwen3.5 call: not empty, no white space, no "<"
+function Qwen35Word(const aText: RawUtf8): boolean;
+var
+  i: PtrInt;
+begin
+  result := false;
+  if aText = '' then
+    exit;
+  for i := 1 to length(aText) do
+    if (aText[i] <= ' ') or (aText[i] = '<') then
+      exit;
+  result := true;
+end;
+
+function ParseQwen35ToolCall(const aBody: RawUtf8; const aTools: TLlmToolDynArray;
+  out aName, aArguments: RawUtf8): boolean;
+const
+  FUNC = '<function=';
+  FUNC_END = '</function>';
+  PARAM = '<parameter=';
+  PARAM_END = '</parameter>';
+var
+  body, rest, key, value, json, name, after, typ: RawUtf8;
+  p, e, n, i, first: PtrInt;
+  nullable: boolean;
+  schema: TDocVariantData;
+  props, prop: PDocVariantData;
+begin
+  result := false;
+  aName := '';
+  aArguments := '';
+  body := TrimU(aBody);
+  n := length(body);
+  if (copy(body, 1, length(FUNC)) <> FUNC) or (n < length(FUNC) + length(FUNC_END)) or
+     (copy(body, n - length(FUNC_END) + 1, length(FUNC_END)) <> FUNC_END) then
+    exit;
+  p := PosEx('>', body, length(FUNC) + 1);
+  if p = 0 then
+    exit;
+  name := copy(body, length(FUNC) + 1, p - length(FUNC) - 1);
+  if not Qwen35Word(name) then
+    exit;
+  // the properties of the tool's schema, read once; names are case-sensitive,
+  // as the model writes them
+  props := nil;
+  for i := 0 to high(aTools) do
+    if aTools[i].Name = name then
+    begin
+      if schema.InitJson(aTools[i].ParametersJson, JSON_FAST +
+           [dvoNameCaseSensitive]) and not schema.GetAsObject('properties', props) then
+        props := nil;
+      break;
+    end;
+  rest := copy(body, p + 1, n - length(FUNC_END) - p);
+  json := '{';
+  repeat
+    rest := TrimU(rest);
+    if rest = '' then
+      break;
+    if copy(rest, 1, length(PARAM)) <> PARAM then
+      exit;
+    p := PosEx('>', rest, length(PARAM) + 1);
+    if p = 0 then
+      exit;
+    key := copy(rest, length(PARAM) + 1, p - length(PARAM) - 1);
+    if not Qwen35Word(key) then
+      exit;
+    prop := nil;
+    if (props = nil) or not props^.GetAsObject(key, prop) then
+      prop := nil;
+    typ := '';
+    nullable := false;
+    Qwen35SchemaTypes(prop, typ, nullable);
+    // the value ends at a </parameter> another parameter or the end follows:
+    // a value may hold that text itself, as the template writes it - of an
+    // object or array the first such end where it is that JSON, else the
+    // first such end
+    first := 0;
+    e := PosEx(PARAM_END, rest, p + 1);
+    while e > 0 do
+    begin
+      after := TrimU(copy(rest, e + length(PARAM_END), maxInt));
+      if (after = '') or (copy(after, 1, length(PARAM)) = PARAM) then
+      begin
+        if first = 0 then
+          first := e;
+        if ((typ <> 'object') and (typ <> 'array')) or
+           Qwen35IsJson(Qwen35Unwrap(copy(rest, p + 1, e - p - 1)),
+             typ = 'object') then
+          break;
+      end;
+      e := PosEx(PARAM_END, rest, e + 1);
+    end;
+    if e = 0 then
+      e := first;
+    if e = 0 then
+      exit;
+    value := Qwen35Unwrap(copy(rest, p + 1, e - p - 1));
+    if json <> '{' then
+      json := json + ', ';
+    json := json + QuotedStrJson(key) + ': ' + Qwen35Value(value, prop);
+    rest := copy(rest, e + length(PARAM_END), maxInt);
+  until false;
+  try
+    // a key twice is refused here
+    aArguments := PythonJson(json + '}', {keepinexactfloats=}true);
+  except
+    on EInferError do
+    begin
+      aArguments := '';
+      exit;
+    end;
+  end;
+  aName := name;
+  result := true;
+end;
+
+
 { NativeSampling }
 
 function NativeSampling(const aRequest: TLlmChatRequest;
@@ -2019,6 +2343,7 @@ begin
   inc(fActive);
   fSafe.UnLock;
   try
+    aParser.Tools := aRequest.Tools;
     ctx := fCache.Acquire(prompt);
     try
       reused := NativeDecode(fModel, prompt, maxNew, aParser, sampling, ctx,
@@ -2154,6 +2479,10 @@ initialization
     THarmonyOutputParser);
   RegisterNativeFamily(TGemma4Model, TSpBpeTokenizer, TGemma4ChatTemplate,
     TGemma4OutputParser);
+  RegisterNativeFamily(TQwen35Model, TBpeTokenizer, TQwen35ChatTemplate,
+    TQwen35OutputParser);
+  RegisterNativeFamily(TQwen35TextModel, TBpeTokenizer, TQwen35ChatTemplate,
+    TQwen35OutputParser);
   RegisterNativeFamily(TGemma4TextModel, TSpBpeTokenizer, TGemma4ChatTemplate,
     TGemma4OutputParser);
 
