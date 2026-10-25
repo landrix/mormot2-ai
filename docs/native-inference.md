@@ -1817,6 +1817,58 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7e2 erledigt (2026-10-25): Qwen3.5 auf Vulkan.** `TQwen3Vulkan` nimmt Qwen3.5 an wie
+`TQwen3Cuda` seit D7e1.
+
+- *Shader* (`tools/vk/`): `dnconv.comp`, `dnprep.comp`, `deltarule.comp`, `gatednorm.comp`,
+  `splitgate.comp`, `gatemul.comp` - die Formen der CUDA-Kernel. `deltarule.comp` hält eine
+  Spalte von S in 32 Invocations zu je acht Werten über alle Tokens des Chunks; die beiden
+  Summen je Token laufen über Shared Memory (keine Subgroups: jedes Gerät nimmt es).
+  `qkrope.comp` bekommt `Rot` im Push; im Build mit Half-Float-Cache (`-DKVF16`, zwei Werte je
+  Wort) entsteht jedes Wort aus seinen zwei Positionen, jede für sich gedreht oder durchgereicht -
+  so darf `rot / 2` auch ungerade sein (Codex-Review: die erste Fassung packte Paare je Hälfte
+  und verschob sie dann).
+- *Gerät:* `RecordDeltaNet` (die vier Projektionen ohne Barriere nebeneinander, dann
+  Convolution, Vorbereitung, Delta-Regel, gegatete Norm, Ausgang); die Zustände je
+  DeltaNet-Layer genullt im Batch des ersten Chunks; der KV-Cache nur für die
+  Attention-Layer; `SaveStates`/`LoadStates` als eigener Batch von Kopien unter `GpuLock`;
+  `Reuse` nimmt `Usable`, `CheckPart` am Eingang. Flash- und Decode-Attention bleiben bei
+  Kopfdimension 256 aus (sie nehmen höchstens 128); `attention.comp` rechnet.
+- *Genauigkeit:* Qwen3.5-0.8B in F32 gegen transformers: Kosinus 0,99999999999, alle
+  Greedy-Tokens gleich - auf der RTX 5090 (NVIDIA-Treiber) und dem M2 (MoltenVK).
+- *Tempo (RTX 5090, Qwen3.5-0.8B):*
+
+  | | Prefill 512 | Decode |
+  |---|---|---|
+  | Vulkan F32 | 43,0 ms | 4,09 ms/Token |
+  | Vulkan Q8_0 | 42,0 ms | 3,14 ms/Token |
+  | CUDA Q8_0 (D7e1) | 42,3 ms | 2,47 ms/Token |
+
+  Mit 2000 Tokens Prompt: Prefill 167 ms, Decode 2,76 ms/Token. CUDA startet einen
+  Decode-Schritt als Graphen, Vulkan als Batch. Auf dem M2: „Paris“ in 132 ms, die nächste
+  Frage in 139 ms.
+- *Tests* (`test.infer.vulkan`): `DeltaRuleMatchesCpu` (`deltarule.comp` gegen
+  `TInferCpuBackend.DeltaRule`, Key-Dim 16, 48, 128, 256), `Qwen35MatchesCpu` (wie auf
+  CUDA, ohne Graphen: zwei Kontexte bitgleich; dazu - auch auf CUDA - das Text-Layout mit 6
+  gedrehten Werten je Kopf und Half-Float-Cache), `Qwen35OnDevice` (auf einer
+  CPU-Implementierung wie Lavapipe übersprungen).
+- *Gegenprobe:* 25 eingebaute Fehler unter WSL (Lavapipe), alle scheitern - in `dnconv`
+  Gewicht, Verschieben, silu; in `dnprep` L2-Norm, Skala, -exp(A_log), beta; in `deltarule`
+  Zerfall, beta, Key-Kopf, Zurückschreiben, die Summe über 16 statt 32 Invocations (erst
+  mit `DeltaRuleMatchesCpu` gefangen: die Tiny-Modelle haben Key-Dim 16); `gatednorm` ohne z;
+  `qkrope` den ganzen Kopf gedreht, den letzten Wert des Anteils nicht gedreht, die alte
+  Paar-Fassung des F16-Zweigs; `splitgate` vertauscht; `gatemul` ohne sigmoid; im Gerät
+  kein Nullen, kein Laden und kein Sichern der Rücksetzpunkte, `Reuse` mit `Common`, `Rot`
+  über den ganzen Kopf, `fStateOk` nie gesetzt, kein Ausgangsgate.
+- *Review:* Claude-Finder und Codex in zwei Runden. Behoben: der F16-Zweig von `qkrope.comp`
+  bei ungeradem `rot / 2` (siehe oben, mit Testfall und Gegenprobe der alten Fassung); das
+  Nullen der Zustände reservierte Platz im Batch für alle Layer auf einmal, die erste Norm
+  danach gar keinen (jetzt je Layer und vor der Norm); der Temp-Ordner des neuen Testfalls
+  bleibt bei einer Ausnahme nicht liegen.
+- *Läufe:* RTX-Rechner FPC und Delphi 13 je 8586 Assertions, Delphi 7 5338 (Vulkan auch im
+  32-Bit-Prozess: Tiny-Qwen3.5 gegen die CPU); WSL Infer 6582 und LLM 741 (Lavapipe); Mac M2
+  Infer 6628 und LLM 730 (MoltenVK, mit Qwen3.5-0.8B).
+
 **D7e1 erledigt (2026-10-25): Qwen3.5 auf CUDA.** `TQwen3Cuda` nimmt Qwen3.5 an: die Gated
 DeltaNet-Layer, das Ausgangsgate der vollen Attention und die Teil-RoPE.
 

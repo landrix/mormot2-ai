@@ -1,0 +1,48 @@
+// LandrixAI - the causal depthwise convolution of a Gated DeltaNet layer
+// (Qwen3.5, phase D slice D7e2; dnconv of tools/cuda/deltanet.cu) over the
+// token rows of a chunk, in place, then silu - one invocation per channel:
+// weight kw - 1 takes the new input, the others the last kw - 1 inputs kept
+// in conv ([channels, kw - 1], oldest first), which move on; kw <= 8
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer BufQkv { float qkv[]; };
+layout(std430, binding = 1) readonly buffer BufW { float w[]; };
+layout(std430, binding = 2) buffer BufConv { float conv[]; };
+
+layout(push_constant) uniform Push {
+  uint rows, channels, kw;
+} p;
+
+// silu as the CPU: 0 below -100 (exp would overflow there)
+float silu(float x)
+{
+  return x < -100.0 ? 0.0 : x / (1.0 + exp(-x));
+}
+
+void main()
+{
+  uint c = gl_GlobalInvocationID.x;
+  if (c >= p.channels)
+    return;
+  uint k1 = p.kw - 1u;
+  float st[8];
+  for (uint j = 0u; j < k1; j++)
+    st[j] = conv[c * k1 + j];
+  for (uint r = 0u; r < p.rows; r++)
+  {
+    uint i = r * p.channels + c;
+    float x = qkv[i];
+    float acc = w[c * p.kw + k1] * x;
+    for (uint j = 0u; j < k1; j++)
+      acc += w[c * p.kw + j] * st[j];
+    for (uint j = 0u; j + 1u < k1; j++)
+      st[j] = st[j + 1u];
+    if (k1 > 0u)
+      st[k1 - 1u] = x;
+    qkv[i] = silu(acc);
+  }
+  for (uint j = 0u; j < k1; j++)
+    conv[c * k1 + j] = st[j];
+}

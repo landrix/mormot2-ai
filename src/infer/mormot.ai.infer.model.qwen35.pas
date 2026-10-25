@@ -26,7 +26,8 @@
 // - the tokenizer, chat template and parser: mormot.ai.infer.tokenizer.bpe,
 //   mormot.ai.infer.chat and mormot.ai.llm.native (D7c); restore points of
 //   the recurrent state: TDecoderContext.CheckpointId (D7d)
-// - not yet: GGUF, a device (backlog D7e)
+// - on a device: TQwen3Cuda (D7e1) and TQwen3Vulkan (D7e2)
+// - not yet: GGUF
 unit mormot.ai.infer.model.qwen35;
 
 {

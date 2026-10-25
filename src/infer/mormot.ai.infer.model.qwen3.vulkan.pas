@@ -39,6 +39,12 @@
 //   and expert biases (an expert's row as an index in the push constants),
 //   the clamped SwiGLU (swiglu.comp with alpha and limit) and its MXFP4
 //   experts through linear8.comp and gemm8.comp
+// - Qwen3.5 (phase D, slice D7e2): the Gated DeltaNet layers (dnconv.comp,
+//   dnprep.comp, deltarule.comp, gatednorm.comp) with their states on the
+//   device - zeroed when a sequence starts, copied to and from the restore
+//   points of TDecoderContext (SaveStates, LoadStates) -, the output gate of
+//   the full attention (splitgate.comp, gatemul.comp) and the partial rotary
+//   share (qkrope.comp with rot); the KV cache only for the attention layers
 unit mormot.ai.infer.model.qwen3.vulkan;
 
 {
@@ -106,8 +112,21 @@ type
     fHeadTemp: TInferVkBuffer;
     // host-visible: the inputs of a batch, and the logits it returns
     fIn, fOut: TInferVkBuffer;
+    // Qwen3.5: the Q rows with their gates and the gates alone; the
+    // convolved Q, K, V rows, z, beta, the decay and the output of a DeltaNet
+    // layer; per DeltaNet layer its states (nil for the others), and their
+    // copies per restore point slot
+    fDevQg, fDevGateQ, fDevQkv, fDevZ, fDevBeta, fDevDecay,
+      fDevCore: TInferVkBuffer;
+    fDevConv, fDevState: TInferVkBufferDynArray;
+    fDevSlotConv, fDevSlotState: array of TInferVkBufferDynArray;
     procedure FreeScratch;
     procedure FreeCache;
+    procedure FreeStates;
+    /// the states into restore point slot aSlot, on the device
+    procedure SaveStates(aSlot: PtrInt); override;
+    /// the states of slot aSlot back, on the device
+    procedure LoadStates(aSlot: PtrInt); override;
   public
     destructor Destroy; override;
     /// true when the cache holds half floats (TQwen3Vulkan.KvF16 when it was
@@ -127,6 +146,11 @@ type
       fFlash: TInferVkPipeline;
     fFill0, fGather, fScatter: TInferVkPipeline; // a mixture of experts
     fRouteP, fCombine: TInferVkPipeline; // routed on the device (D3c)
+    // Qwen3.5 (D7e2): a Gated DeltaNet and an output gate; a layer is
+    // dmDeltaNet
+    fDnConv, fDnPrep, fDeltaRule, fGatedNorm, fSplitGate,
+      fGateMul: TInferVkPipeline;
+    fRecurrent: boolean;
     fMoe: boolean; // a layer with experts
     // every layer with experts can route on the device (one buffer each,
     // bound whole)
@@ -189,6 +213,9 @@ type
     /// submit the batch being recorded and begin the next one when it has
     // room for fewer than aSets dispatches (TInferVulkan.BatchRoom)
     procedure NeedRoom(aSets: PtrInt);
+    /// the dmDeltaNet mixer of layer aLayer: fDevH in, fDevTmp out, its
+    // states moved on
+    procedure RecordDeltaNet(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
   public
     /// upload every weight of aModel to the device of aBackend; raises
     // EInferError when a matrix type has no shader (F32, Q8_0, Q5_0, Q4_K and
@@ -325,6 +352,27 @@ type
     Eps: single;
     Norm: cardinal; // 1: RMSNorm of every Q and K head (QNorm, KNorm)
     Rope: cardinal; // 0: no rotary positions (a NoPE layer)
+    Rot: cardinal; // the rotated share of a head (Qwen3.5), 0: all of it
+  end;
+
+  /// dnconv.comp
+  TDnConvPush = record
+    Rows, Channels, Kw: cardinal;
+  end;
+
+  /// dnprep.comp
+  TDnPrepPush = record
+    KeyHeads, ValueHeads, KeyDim, ValueDim, Channels: cardinal;
+  end;
+
+  /// deltarule.comp
+  TDeltaRulePush = record
+    Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim: cardinal;
+  end;
+
+  /// splitgate.comp
+  TSplitGatePush = record
+    N, D: cardinal;
   end;
 
   /// gatherrows.comp and scatteradd.comp
@@ -372,6 +420,16 @@ begin
   aBuffer := TInferVkBuffer.Create(aVk, aBytes, true);
 end;
 
+/// a device buffer of exactly aBytes: a copy of a state takes its size
+procedure NeedDeviceOf(aVk: TInferVulkan; var aBuffer: TInferVkBuffer;
+  aBytes: Int64);
+begin
+  if (aBuffer <> nil) and (aBuffer.Size = aBytes) then
+    exit;
+  FreeAndNil(aBuffer);
+  aBuffer := TInferVkBuffer.Create(aVk, aBytes, true);
+end;
+
 
 { TQwen3VkContext }
 
@@ -379,6 +437,7 @@ destructor TQwen3VkContext.Destroy;
 begin
   FreeScratch;
   FreeCache;
+  FreeStates;
   inherited Destroy;
 end;
 
@@ -408,6 +467,13 @@ begin
   FreeAndNil(fDevKUp);
   FreeAndNil(fDevKDown);
   FreeAndNil(fKOut);
+  FreeAndNil(fDevQg);
+  FreeAndNil(fDevGateQ);
+  FreeAndNil(fDevQkv);
+  FreeAndNil(fDevZ);
+  FreeAndNil(fDevBeta);
+  FreeAndNil(fDevDecay);
+  FreeAndNil(fDevCore);
   fRows := 0;
 end;
 
@@ -429,6 +495,103 @@ begin
   fCapacity := 0;
 end;
 
+procedure FreeBuffers(var aBuffers: TInferVkBufferDynArray);
+var
+  i: PtrInt;
+begin
+  for i := 0 to high(aBuffers) do
+    FreeAndNil(aBuffers[i]);
+  aBuffers := nil;
+end;
+
+procedure TQwen3VkContext.FreeStates;
+var
+  i: PtrInt;
+begin
+  FreeBuffers(fDevConv);
+  FreeBuffers(fDevState);
+  for i := 0 to high(fDevSlotConv) do
+  begin
+    FreeBuffers(fDevSlotConv[i]);
+    FreeBuffers(fDevSlotState[i]);
+  end;
+  fDevSlotConv := nil;
+  fDevSlotState := nil;
+end;
+
+procedure TQwen3VkContext.SaveStates(aSlot: PtrInt);
+var
+  l: PtrInt;
+  dev: TQwen3Vulkan;
+begin
+  dev := TQwen3Vulkan(fDevice);
+  dev.fBackend.GpuLock;
+  try
+    if aSlot >= system.length(fDevSlotState) then
+    begin
+      SetLength(fDevSlotConv, aSlot + 1);
+      SetLength(fDevSlotState, aSlot + 1);
+    end;
+    if system.length(fDevSlotState[aSlot]) <> system.length(fDevState) then
+    begin
+      FreeBuffers(fDevSlotConv[aSlot]);
+      FreeBuffers(fDevSlotState[aSlot]);
+      SetLength(fDevSlotConv[aSlot], system.length(fDevConv));
+      SetLength(fDevSlotState[aSlot], system.length(fDevState));
+    end;
+    for l := 0 to high(fDevState) do
+      if fDevState[l] <> nil then
+      begin
+        NeedDeviceOf(dev.fVk, fDevSlotConv[aSlot][l], fDevConv[l].Size);
+        NeedDeviceOf(dev.fVk, fDevSlotState[aSlot][l], fDevState[l].Size);
+      end;
+    // one batch of copies, waited for
+    dev.fVk.BatchBegin;
+    try
+      for l := 0 to high(fDevState) do
+        if fDevState[l] <> nil then
+        begin
+          dev.fVk.BatchCopy(fDevConv[l], 0, fDevSlotConv[aSlot][l], 0, fDevConv[l].Size);
+          dev.fVk.BatchCopy(fDevState[l], 0, fDevSlotState[aSlot][l], 0,
+            fDevState[l].Size);
+        end;
+    except
+      dev.fVk.BatchAbort;
+      raise;
+    end;
+    dev.fVk.BatchSubmit;
+  finally
+    dev.fBackend.GpuUnLock;
+  end;
+end;
+
+procedure TQwen3VkContext.LoadStates(aSlot: PtrInt);
+var
+  l: PtrInt;
+  dev: TQwen3Vulkan;
+begin
+  dev := TQwen3Vulkan(fDevice);
+  dev.fBackend.GpuLock;
+  try
+    dev.fVk.BatchBegin;
+    try
+      for l := 0 to high(fDevState) do
+        if fDevState[l] <> nil then
+        begin
+          dev.fVk.BatchCopy(fDevSlotConv[aSlot][l], 0, fDevConv[l], 0, fDevConv[l].Size);
+          dev.fVk.BatchCopy(fDevSlotState[aSlot][l], 0, fDevState[l], 0,
+            fDevState[l].Size);
+        end;
+    except
+      dev.fVk.BatchAbort;
+      raise;
+    end;
+    dev.fVk.BatchSubmit;
+  finally
+    dev.fBackend.GpuUnLock;
+  end;
+end;
+
 
 { TQwen3Vulkan }
 
@@ -439,16 +602,35 @@ begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
     EInferError.RaiseUtf8('%.Create: no model or no backend', [self]);
-  // the layers it runs: attention, and a dense SwiGLU block or experts
+  // the layers it runs: attention or a Gated DeltaNet (Qwen3.5, slice D7e2),
+  // and a dense SwiGLU block or experts
+  fRecurrent := false;
   for l := 0 to high(aModel.Config.Spec) do
-    if aModel.Config.Spec[l].Mixer <> dmAttention then
+    case aModel.Config.Spec[l].Mixer of
+      dmAttention:
+        ;
+      dmDeltaNet:
+        fRecurrent := true;
+    else
       EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
+    end;
   // attention sinks, the output, router and expert biases and the clamped
   // SwiGLU of gpt-oss run here too (slice D5d2)
-  fMoe := not aModel.HasOnly(dmAttention, dfDense);
-  // what Gemma 4 computes beyond gpt-oss is not here yet (slice D6e)
-  if aModel.Extras - DECODER_EXTRAS_GPTOSS <> [] then
+  fMoe := false;
+  for l := 0 to high(aModel.Config.Spec) do
+    if aModel.Config.Spec[l].Ffn <> dfDense then
+      fMoe := true;
+  // what Gemma 4 computes beyond gpt-oss and Qwen3.5 is not here yet (slice
+  // D6e)
+  if aModel.Extras - DECODER_EXTRAS_GPTOSS - [dxOutputGate, dxPartialRope] <> [] then
     EInferError.RaiseUtf8('%: % computes what this device does not', [self, aModel]);
+  // deltarule.comp keeps a column of S in 32 invocations of 8 values each,
+  // dnconv.comp the inputs of a channel in one
+  if fRecurrent and ((aModel.Config.LinKeyDim > 256) or
+     (aModel.Config.LinConv < 1) or (aModel.Config.LinConv > 8) or
+     (aModel.Config.LinValueHeads mod aModel.Config.LinKeyHeads <> 0)) then
+    EInferError.RaiseUtf8('%: a Gated DeltaNet of key dim % and kernel % not ' +
+      'supported', [self, aModel.Config.LinKeyDim, aModel.Config.LinConv]);
   // qkrope.comp keeps one normalized head in shared memory
   // and attention.comp reads it as vec4
   if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
@@ -507,6 +689,23 @@ begin
   fRouteP.Name := 'route';
   fCombine.Name := 'moecombine';
   fRouteOnDevice := true;
+  fDnConv := TInferVkPipeline.Create(fVk, @SPV_DNCONV, length(SPV_DNCONV), 3,
+    SizeOf(TDnConvPush));
+  fDnPrep := TInferVkPipeline.Create(fVk, @SPV_DNPREP, length(SPV_DNPREP), 6,
+    SizeOf(TDnPrepPush));
+  fDeltaRule := TInferVkPipeline.Create(fVk, @SPV_DELTARULE, length(SPV_DELTARULE), 5,
+    SizeOf(TDeltaRulePush));
+  fGatedNorm := TInferVkPipeline.Create(fVk, @SPV_GATEDNORM, length(SPV_GATEDNORM), 4,
+    SizeOf(TNormPush));
+  fSplitGate := TInferVkPipeline.Create(fVk, @SPV_SPLITGATE, length(SPV_SPLITGATE), 3,
+    SizeOf(TSplitGatePush));
+  fGateMul := TInferVkPipeline.Create(fVk, @SPV_GATEMUL, length(SPV_GATEMUL), 2, 4);
+  fDnConv.Name := 'dnconv';
+  fDnPrep.Name := 'dnprep';
+  fDeltaRule.Name := 'deltarule';
+  fGatedNorm.Name := 'gatednorm';
+  fSplitGate.Name := 'splitgate';
+  fGateMul.Name := 'gatemul';
   fFill0.Name := 'fill0';
   fGather.Name := 'gatherrows';
   fScatter.Name := 'scatteradd';
@@ -572,6 +771,12 @@ begin
   // frees later may come back at the same address with other weights
   if (fModel <> nil) and (fBackend <> nil) then
     fModel.ForgetWeights(fBackend);
+  fGateMul.Free;
+  fSplitGate.Free;
+  fGatedNorm.Free;
+  fDeltaRule.Free;
+  fDnPrep.Free;
+  fDnConv.Free;
   fCombine.Free;
   fRouteP.Free;
   fScatter.Free;
@@ -619,7 +824,7 @@ end;
 procedure TQwen3Vulkan.UploadWeights;
 var
   c: TQwen3Config;
-  l, qw, kvw: PtrInt;
+  l, qw, kvw, cd, vd: PtrInt;
   ly: ^TQwen3Layer;
 
   // a layer matrix in one binding; the head (aParts) also in several
@@ -722,10 +927,32 @@ begin
   for l := 0 to c.Layers - 1 do
   begin
     ly := @fModel.Layers[l];
-    Matrix(ly^.Q, qw, c.Hidden);
-    Matrix(ly^.K, kvw, c.Hidden);
-    Matrix(ly^.V, kvw, c.Hidden);
-    Matrix(ly^.O, c.Hidden, qw);
+    if c.Spec[l].Mixer = dmDeltaNet then
+    begin
+      // the four projections, the output, the convolution and the factors
+      cd := fModel.LinChannels;
+      vd := c.LinValueHeads * c.LinValueDim;
+      Matrix(ly^.LinQkv, cd, c.Hidden);
+      Matrix(ly^.LinZ, vd, c.Hidden);
+      Matrix(ly^.LinB, c.LinValueHeads, c.Hidden);
+      Matrix(ly^.LinA, c.LinValueHeads, c.Hidden);
+      Matrix(ly^.LinOut, c.Hidden, vd);
+      Vector(ly^.LinConvW, cd * c.LinConv);
+      Vector(ly^.LinDtBias, c.LinValueHeads);
+      Vector(ly^.LinNegA, c.LinValueHeads);
+      Vector(ly^.LinNorm, c.LinValueDim);
+    end
+    else
+    begin
+      // an output gate: per head the query, then its gate
+      if c.Spec[l].OutputGate then
+        Matrix(ly^.Q, 2 * qw, c.Hidden)
+      else
+        Matrix(ly^.Q, qw, c.Hidden);
+      Matrix(ly^.K, kvw, c.Hidden);
+      Matrix(ly^.V, kvw, c.Hidden);
+      Matrix(ly^.O, c.Hidden, qw);
+    end;
     if c.Spec[l].Ffn = dfMoe then
     begin
       Matrix(ly^.Router, c.Experts, c.Hidden);
@@ -809,11 +1036,17 @@ begin
     widest := c.Hidden;
   if Int64(c.Heads) * (c.HeadDim shr 1) > widest then
     widest := Int64(c.Heads) * (c.HeadDim shr 1);
+  // the output gate: splitgate.comp and gatemul.comp per value of the queries
+  if (dxOutputGate in fModel.Extras) and (Int64(c.Heads) * c.HeadDim > widest) then
+    widest := Int64(c.Heads) * c.HeadDim;
   if Int64(result) * widest > Int64(65535) * 128 then
     result := (Int64(65535) * 128) div widest;
   // the per-head norms take one work group per row and head
   if Int64(result) * c.Heads > 65535 then
     result := 65535 div c.Heads;
+  // gatednorm.comp: one per row and value head of a DeltaNet layer
+  if fRecurrent and (Int64(result) * c.LinValueHeads > 65535) then
+    result := 65535 div c.LinValueHeads;
   // the logits of every row of the chunk in one buffer
   if aAllLogits then
     while (result > 1) and (Int64(result) * c.VocabSize * 4 > fVk.MaxStorageRange) do
@@ -830,7 +1063,29 @@ var
 begin
   c := fModel.Config;
   kvw := c.KvHeads * c.HeadDim;
-  half := c.HeadDim shr 1;
+  half := c.RopeDims shr 1; // the rotary factors of a row
+  // the states of the DeltaNet layers: each one that is not there yet (an
+  // allocation that failed is tried again)
+  if fRecurrent then
+  begin
+    if length(aCtx.fDevState) <> c.Layers then
+    begin
+      aCtx.FreeStates;
+      SetLength(aCtx.fDevConv, c.Layers);
+      SetLength(aCtx.fDevState, c.Layers);
+    end;
+    for l := 0 to c.Layers - 1 do
+      if c.Spec[l].Mixer = dmDeltaNet then
+      begin
+        if aCtx.fDevConv[l] = nil then
+          aCtx.fDevConv[l] := TInferVkBuffer.Create(fVk,
+            Int64(fModel.LinChannels) * MaxPtrInt(c.LinConv - 1, 1) * 4, true);
+        if aCtx.fDevState[l] = nil then
+          aCtx.fDevState[l] := TInferVkBuffer.Create(fVk, Int64(c.LinValueHeads) *
+            c.LinValueDim * c.LinKeyDim * 4, true);
+      end;
+  end;
+  aCtx.fRecurrent := fRecurrent;
   // an empty context takes the cache format of KvF16
   if (aCtx.fLength = 0) and (aCtx.fCapacity > 0) and (aCtx.fKvF16 <> fKvF16) then
     aCtx.FreeCache;
@@ -860,21 +1115,23 @@ begin
     SetLength(values, c.Layers);
     try
       for l := 0 to c.Layers - 1 do
-      begin
-        keys[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * es, true);
-        values[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * es, true);
-      end;
+        if c.Spec[l].Mixer = dmAttention then // a DeltaNet layer: its state
+        begin
+          keys[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * es, true);
+          values[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * es, true);
+        end;
       if aCtx.fLength > 0 then
       begin
         fVk.BatchBegin;
         try
           for l := 0 to c.Layers - 1 do
-          begin
-            fVk.BatchCopy(aCtx.fDevKeys[l], 0, keys[l], 0,
-              Int64(aCtx.fLength) * kvw * es);
-            fVk.BatchCopy(aCtx.fDevValues[l], 0, values[l], 0,
-              Int64(aCtx.fLength) * kvw * es);
-          end;
+            if keys[l] <> nil then
+            begin
+              fVk.BatchCopy(aCtx.fDevKeys[l], 0, keys[l], 0,
+                Int64(aCtx.fLength) * kvw * es);
+              fVk.BatchCopy(aCtx.fDevValues[l], 0, values[l], 0,
+                Int64(aCtx.fLength) * kvw * es);
+            end;
         except
           fVk.BatchAbort;
           raise;
@@ -917,6 +1174,20 @@ begin
     NeedDevice(fVk, aCtx.fDevCos, Int64(aRows) * half * 2 * 4); // cos, then sin
     // host-visible: embeddings, then cos, then sin
     aCtx.fIn := TInferVkBuffer.Create(fVk, Int64(aRows) * (c.Hidden + 2 * half) * 4);
+    if dxOutputGate in fModel.Extras then
+    begin
+      NeedDevice(fVk, aCtx.fDevQg, Int64(aRows) * 2 * c.Heads * c.HeadDim * 4);
+      NeedDevice(fVk, aCtx.fDevGateQ, Int64(aRows) * c.Heads * c.HeadDim * 4);
+    end;
+    if fRecurrent then
+    begin
+      NeedDevice(fVk, aCtx.fDevQkv, Int64(aRows) * fModel.LinChannels * 4);
+      NeedDevice(fVk, aCtx.fDevZ, Int64(aRows) * c.LinValueHeads * c.LinValueDim * 4);
+      NeedDevice(fVk, aCtx.fDevCore, Int64(aRows) * c.LinValueHeads *
+        c.LinValueDim * 4);
+      NeedDevice(fVk, aCtx.fDevBeta, Int64(aRows) * c.LinValueHeads * 4);
+      NeedDevice(fVk, aCtx.fDevDecay, Int64(aRows) * c.LinValueHeads * 4);
+    end;
     if fMoe then
     begin
       NeedDevice(fVk, aCtx.fDevRoute, Int64(aRows) * c.Experts * 4);
@@ -1178,6 +1449,59 @@ begin
   end;
 end;
 
+procedure TQwen3Vulkan.RecordDeltaNet(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
+var
+  c: TQwen3Config;
+  ly: ^TQwen3Layer;
+  h, cd, vd: PtrInt;
+  conv: TDnConvPush;
+  prep: TDnPrepPush;
+  rule: TDeltaRulePush;
+  norm: TNormPush;
+begin
+  c := fModel.Config;
+  ly := @fModel.Layers[aLayer];
+  h := c.Hidden;
+  cd := fModel.LinChannels;
+  vd := c.LinValueHeads * c.LinValueDim;
+  // the four projections of the normed rows side by side
+  fBackend.RecordLinear(aCtx.fDevH, aRows, h, ly^.LinQkv, cd, aCtx.fDevQkv, false);
+  fBackend.RecordLinear(aCtx.fDevH, aRows, h, ly^.LinZ, vd, aCtx.fDevZ, false);
+  fBackend.RecordLinear(aCtx.fDevH, aRows, h, ly^.LinB, c.LinValueHeads,
+    aCtx.fDevBeta, false);
+  fBackend.RecordLinear(aCtx.fDevH, aRows, h, ly^.LinA, c.LinValueHeads,
+    aCtx.fDevDecay);
+  conv.Rows := aRows;
+  conv.Channels := cd;
+  conv.Kw := c.LinConv;
+  fVk.BatchDispatch(fDnConv, [aCtx.fDevQkv, Vector(ly^.LinConvW, cd * c.LinConv),
+    aCtx.fDevConv[aLayer]], @conv, (cd + 127) div 128);
+  prep.KeyHeads := c.LinKeyHeads;
+  prep.ValueHeads := c.LinValueHeads;
+  prep.KeyDim := c.LinKeyDim;
+  prep.ValueDim := c.LinValueDim;
+  prep.Channels := cd;
+  fVk.BatchDispatch(fDnPrep, [aCtx.fDevQkv, aCtx.fDevBeta, aCtx.fDevDecay, aCtx.fDevZ,
+    Vector(ly^.LinDtBias, c.LinValueHeads), Vector(ly^.LinNegA, c.LinValueHeads)],
+    @prep, 2 * c.LinKeyHeads + c.LinValueHeads, aRows);
+  rule.Rows := aRows;
+  rule.Stride := cd;
+  rule.KeyHeads := c.LinKeyHeads;
+  rule.ValueHeads := c.LinValueHeads;
+  rule.KeyDim := c.LinKeyDim;
+  rule.ValueDim := c.LinValueDim;
+  fVk.BatchDispatch(fDeltaRule, [aCtx.fDevQkv, aCtx.fDevBeta, aCtx.fDevDecay,
+    aCtx.fDevState[aLayer], aCtx.fDevCore], @rule, c.LinValueHeads,
+    (c.LinValueDim + 3) div 4);
+  // RMSNorm per value head times silu(z), the output projection
+  norm.Rows := aRows * c.LinValueHeads;
+  norm.Cols := c.LinValueDim;
+  norm.Eps := c.RmsEps;
+  fVk.BatchDispatch(fGatedNorm, [aCtx.fDevCore, Vector(ly^.LinNorm, c.LinValueDim),
+    aCtx.fDevZ, aCtx.fDevCore], @norm, aRows * c.LinValueHeads);
+  fBackend.RecordLinear(aCtx.fDevCore, aRows, vd, ly^.LinOut, h, aCtx.fDevTmp);
+end;
+
 procedure TQwen3Vulkan.Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
   aNormed: PSingleArray);
@@ -1193,6 +1517,7 @@ var
   norm: TNormPush;
   att: TAttentionPush;
   merge: TMergePush;
+  split: TSplitGatePush;
   sinks: TInferVkBuffer;
   part: TInferVkBuffer;
 begin
@@ -1202,7 +1527,7 @@ begin
   f := c.Intermediate;
   qw := c.Heads * c.HeadDim;
   kvw := c.KvHeads * c.HeadDim;
-  half := c.HeadDim shr 1;
+  half := c.RopeDims shr 1; // the rotary factors of a row
   past := aCtx.fLength;
   outRows := 0;
   if aLogits <> nil then
@@ -1296,16 +1621,30 @@ begin
   else
     MoveFast(aEmbeds^[0], p^[0], n * h * SizeOf(single));
   fModel.Rotary(past, n, @p^[n * h], @p^[n * h + n * half]);
+  // the states move on from here: undone until the batch went through
+  aCtx.fStateOk := false;
   fVk.BatchBegin;
   try
     fVk.BatchCopy(aCtx.fIn, 0, aCtx.fDevX, 0, Int64(n) * h * 4);
     fVk.BatchCopy(aCtx.fIn, Int64(n) * h * 4, aCtx.fDevCos, 0, Int64(n) * half * 2 * 4);
+    // a new sequence: the states of the DeltaNet layers start at 0
+    if fRecurrent and (past = 0) then
+      for l := 0 to c.Layers - 1 do
+        if aCtx.fDevState[l] <> nil then
+        begin
+          NeedRoom(2);
+          RecordElementwise(fFill0, [aCtx.fDevConv[l]], aCtx.fDevConv[l].Size div 4);
+          RecordElementwise(fFill0, [aCtx.fDevState[l]], aCtx.fDevState[l].Size div 4);
+        end;
     qk.Rows := n;
     qk.Heads := c.Heads;
     qk.KvHeads := c.KvHeads;
     qk.HeadDim := c.HeadDim;
     qk.Past := past;
     qk.Eps := c.RmsEps;
+    qk.Rot := c.RopeDims; // the whole head unless Qwen3.5 rotates a share
+    split.N := n * c.Heads;
+    split.D := c.HeadDim;
     norm.Rows := n;
     norm.Cols := h;
     norm.Eps := c.RmsEps;
@@ -1322,66 +1661,81 @@ begin
     merge.HeadDim := c.HeadDim;
     merge.Splits := splits;
     // the input norm of layer 0; every later one comes with the residual of
-    // the layer before (addnorm)
+    // the layer before (addnorm) - the zeroing may have filled the batch
+    NeedRoom(1);
     RecordNorm(aCtx.fDevX, n, h, fModel.Layers[0].InputNorm, aCtx.fDevH);
     for l := 0 to c.Layers - 1 do
     begin
       NeedRoom(LAYER_ROOM);
       ly := @fModel.Layers[l];
-      // attention block: the three projections side by side (no barrier
-      // between them: they only read fDevH), then per head the norms, rotary
-      // positions and the store of k and v into the cache
-      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, false, nil,
-        ly^.QBias);
-      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, false, nil,
-        ly^.KBias);
-      fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, true, nil,
-        ly^.VBias);
-      // without head norms (Qwen2) the shader reads no qn or kn: bound to
-      // the rotary factors, any buffer would do
-      qk.Norm := ord(ly^.QNorm <> nil);
-      qk.Rope := ord(not c.Spec[l].NoRope);
-      att.Window := c.Spec[l].Window;
-      layerAtt := attention;
-      att.Splits := splits;
-      att.HeadBlock := hb;
-      att.RowBlock := rb;
-      merge.Splits := splits;
-      if c.Spec[l].Window > 0 then
-      begin
-        layerAtt := wattention;
-        att.Splits := wsplits;
-        att.HeadBlock := whb;
-        att.RowBlock := 1;
-        merge.Splits := wsplits;
-      end;
-      if ly^.QNorm <> nil then
-      begin
-        qn := Vector(ly^.QNorm, c.HeadDim);
-        kn := Vector(ly^.KNorm, c.HeadDim);
-      end
+      if c.Spec[l].Mixer = dmDeltaNet then
+        RecordDeltaNet(aCtx, l, n)
       else
       begin
-        qn := aCtx.fDevCos;
-        kn := aCtx.fDevCos;
+        // attention block: the three projections side by side (no barrier
+        // between them: they only read fDevH), then per head the norms, rotary
+        // positions and the store of k and v into the cache
+        if c.Spec[l].OutputGate then
+          // per head the query, then its gate - apart after the projections
+          fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Q, 2 * qw, aCtx.fDevQg, false)
+        else
+          fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, false, nil,
+            ly^.QBias);
+        fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, false, nil,
+          ly^.KBias);
+        fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, true, nil,
+          ly^.VBias);
+        if c.Spec[l].OutputGate then
+          fVk.BatchDispatch(fSplitGate, [aCtx.fDevQg, aCtx.fDevQ, aCtx.fDevGateQ], @split,
+            (n * qw + 127) div 128);
+        // without head norms (Qwen2) the shader reads no qn or kn: bound to
+        // the rotary factors, any buffer would do
+        qk.Norm := ord(ly^.QNorm <> nil);
+        qk.Rope := ord(not c.Spec[l].NoRope);
+        att.Window := c.Spec[l].Window;
+        layerAtt := attention;
+        att.Splits := splits;
+        att.HeadBlock := hb;
+        att.RowBlock := rb;
+        merge.Splits := splits;
+        if c.Spec[l].Window > 0 then
+        begin
+          layerAtt := wattention;
+          att.Splits := wsplits;
+          att.HeadBlock := whb;
+          att.RowBlock := 1;
+          merge.Splits := wsplits;
+        end;
+        if ly^.QNorm <> nil then
+        begin
+          qn := Vector(ly^.QNorm, c.HeadDim);
+          kn := Vector(ly^.KNorm, c.HeadDim);
+        end
+        else
+        begin
+          qn := aCtx.fDevCos;
+          kn := aCtx.fDevCos;
+        end;
+        fVk.BatchDispatch(qkrope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV, qn, kn,
+          aCtx.fDevCos, aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk,
+          c.Heads + c.KvHeads, n);
+        // the attention sinks of gpt-oss; without, any buffer is bound
+        att.HasSinks := ord(ly^.Sinks <> nil);
+        merge.HasSinks := att.HasSinks;
+        if ly^.Sinks <> nil then
+          sinks := Vector(ly^.Sinks, c.Heads)
+        else
+          sinks := aCtx.fDevCos;
+        fVk.BatchDispatch(layerAtt, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
+          aCtx.fDevAttn, part, sinks], @att, c.Heads div PtrInt(att.HeadBlock),
+          (n + PtrInt(att.RowBlock) - 1) div PtrInt(att.RowBlock), att.Splits);
+        if att.Splits > 1 then
+          fVk.BatchDispatch(fMerge, [part, aCtx.fDevAttn, sinks], @merge, c.Heads, n);
+        if c.Spec[l].OutputGate then
+          RecordElementwise(fGateMul, [aCtx.fDevAttn, aCtx.fDevGateQ], n * qw);
+        fBackend.RecordLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp, true, nil,
+          ly^.OBias);
       end;
-      fVk.BatchDispatch(qkrope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV, qn, kn,
-        aCtx.fDevCos, aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk,
-        c.Heads + c.KvHeads, n);
-      // the attention sinks of gpt-oss; without, any buffer is bound
-      att.HasSinks := ord(ly^.Sinks <> nil);
-      merge.HasSinks := att.HasSinks;
-      if ly^.Sinks <> nil then
-        sinks := Vector(ly^.Sinks, c.Heads)
-      else
-        sinks := aCtx.fDevCos;
-      fVk.BatchDispatch(layerAtt, [aCtx.fDevQ, aCtx.fDevKeys[l], aCtx.fDevValues[l],
-        aCtx.fDevAttn, part, sinks], @att, c.Heads div PtrInt(att.HeadBlock),
-        (n + PtrInt(att.RowBlock) - 1) div PtrInt(att.RowBlock), att.Splits);
-      if att.Splits > 1 then
-        fVk.BatchDispatch(fMerge, [part, aCtx.fDevAttn, sinks], @merge, c.Heads, n);
-      fBackend.RecordLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp, true, nil,
-        ly^.OBias);
       // residual and the feed-forward pre-norm, gate and up side by side,
       // SwiGLU, down
       fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp, Vector(ly^.PostNorm, h),
@@ -1457,6 +1811,7 @@ begin
   else
     FillCharFast(aCtx.fIds[past], n * SizeOf(integer), $ff); // -1: no id
   aCtx.fLength := past + n;
+  aCtx.fStateOk := true;
 end;
 
 procedure TQwen3Vulkan.ForwardRows(aCtx: TQwen3Context; aIds: PIntegerArray;
@@ -1487,6 +1842,9 @@ begin
       if (aIds^[i] < 0) or (aIds^[i] >= vocab) then
         EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary',
           [self, aIds^[i]]);
+  // an undone recurrent state refused, a part noted that a fresh pass would
+  // not make (as TDecoderModel.Forward)
+  ctx.CheckPart(aIds, aCount);
   fBackend.GpuLock;
   try
     // the backend forgot the weights (ClearWeights): up again, before a batch
@@ -1542,9 +1900,11 @@ function TQwen3Vulkan.Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
 begin
   if (aCtx = nil) or (aCtx.Device <> self) then
     EInferError.RaiseUtf8('%.Reuse: no context of this instance', [self]);
+  // the cache keeps every row: the common prefix, or a restore point of the
+  // states of a DeltaNet layer before it
   result := 0;
   if aCount > 0 then
-    result := aCtx.Common(aIds, aCount - 1);
+    result := aCtx.Usable(aIds, aCount - 1);
   aCtx.Truncate(result);
 end;
 

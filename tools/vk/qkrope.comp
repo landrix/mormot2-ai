@@ -7,6 +7,9 @@
 // (two norms, two RoPE, two copies); arithmetic as rmsnorm.comp and rope.comp
 // - one work group of 128 per (row, head): heads first, then the KV heads
 // (which also store v); headDim <= 256, even
+// - rot: the first rot values of a head rotate (rotate_half within them, cs
+//   holds rot / 2 per row), the others pass as normed (Qwen3.5, slice D7e2);
+//   0: all of them
 // - -DKVF16 (SPV_QKROPE_F16): the cache holds k and v as half floats, two to
 //   a word (packHalf2x16: core GLSL, no 16-bit storage extension), each
 //   invocation storing whole words; headDim then a multiple of 4
@@ -33,6 +36,7 @@ layout(push_constant) uniform Push {
   float eps;
   uint norm;
   uint rope; // 0: no rotary positions in this layer (NoPE), q and k as they are
+  uint rot; // the rotated share of a head, 0: all of it
 } p;
 
 shared float partial[128];
@@ -44,7 +48,7 @@ void main()
   uint r = gl_WorkGroupID.y;
   uint hh = gl_WorkGroupID.x; // 0 .. heads + kvHeads - 1
   uint d = p.headDim;
-  uint half_ = d >> 1;
+  uint half_ = (p.rot == 0u ? d : p.rot) >> 1;
   bool isQ = hh < p.heads;
   uint h = isQ ? hh : hh - p.heads;
   uint src = isQ ? (r * p.heads + h) * d : (r * p.kvHeads + h) * d;
@@ -78,21 +82,27 @@ void main()
 #ifdef KVF16
   if (!isQ)
   {
-    // the dimensions i and i + 1 of both halves, each pair one word
-    for (uint i = 2u * t; i < half_; i += 256u)
+    // a word of two values each (the cache words of a head start at an even
+    // index): every value rotated within the share on its own, so that rot / 2
+    // may be odd too
+    for (uint c = 2u * t; c < d; c += 256u)
     {
-      vec2 a = vec2(normed[i], normed[i + 1u]);
-      vec2 b = vec2(normed[i + half_], normed[i + half_ + 1u]);
-      if (p.rope != 0u)
+      vec2 o;
+      for (uint e = 0u; e < 2u; e++)
       {
-        vec2 c = vec2(cs[cbase + i], cs[cbase + i + 1u]);
-        vec2 sn = vec2(cs[sbase + i], cs[sbase + i + 1u]);
-        vec2 a0 = a;
-        a = a0 * c - b * sn;
-        b = b * c + a0 * sn;
+        uint j = c + e;
+        float x = normed[j];
+        if ((p.rope != 0u) && (j < 2u * half_))
+        {
+          uint i = j < half_ ? j : j - half_;
+          float cv = cs[cbase + i];
+          float sv = cs[sbase + i];
+          x = j < half_ ? normed[j] * cv - normed[j + half_] * sv
+                        : normed[j] * cv + normed[i] * sv;
+        }
+        o[e] = x;
       }
-      kc[(dst + i) >> 1] = packHalf2x16(a);
-      kc[(dst + i + half_) >> 1] = packHalf2x16(b);
+      kc[(dst + c) >> 1] = packHalf2x16(o);
     }
     for (uint c = 2u * t; c < d; c += 256u)
       vc[(dst + c) >> 1] = packHalf2x16(vec2(v[src + c], v[src + c + 1u]));
@@ -125,7 +135,13 @@ void main()
     }
 #endif
   }
+  // beyond the rotated share: as normed
+  for (uint c = 2u * half_ + t; c < d; c += 128u)
+    if (isQ)
+      q[src + c] = normed[c];
 #ifndef KVF16
+    else
+      kc[dst + c] = normed[c];
   if (!isQ)
     for (uint c = t; c < d; c += 128u)
       vc[dst + c] = v[src + c];

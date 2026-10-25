@@ -1,0 +1,75 @@
+// LandrixAI - the factors of a Gated DeltaNet layer (Qwen3.5, phase D slice
+// D7e2; dnprep of tools/cuda/deltanet.cu): one work group of 128 per item (x)
+// and token row (y) - a Q or K head L2-normed (x / sqrt(sum x^2 + 1e-6)), a
+// query also times dk^-0.5; a value head: beta = sigmoid(b), the decay
+// exp(-exp(A_log) * softplus(a + dt_bias)) (negA holds -exp(A_log); beyond 20
+// softplus is its input) and silu of its z
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer BufQkv { float qkv[]; };
+layout(std430, binding = 1) buffer BufBeta { float beta[]; };
+layout(std430, binding = 2) buffer BufDecay { float decay[]; };
+layout(std430, binding = 3) buffer BufZ { float z[]; };
+layout(std430, binding = 4) readonly buffer BufDt { float dtBias[]; };
+layout(std430, binding = 5) readonly buffer BufNegA { float negA[]; };
+
+layout(push_constant) uniform Push {
+  uint keyHeads, valueHeads, keyDim, valueDim, channels;
+} p;
+
+shared float partial[128];
+
+float silu(float x)
+{
+  return x < -100.0 ? 0.0 : x / (1.0 + exp(-x));
+}
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint item = gl_WorkGroupID.x;
+  uint r = gl_WorkGroupID.y;
+  if (item < 2u * p.keyHeads)
+  {
+    uint base = r * p.channels + item * p.keyDim;
+    float acc = 0.0;
+    for (uint j = t; j < p.keyDim; j += 128u)
+      acc += qkv[base + j] * qkv[base + j];
+    partial[t] = acc;
+    barrier();
+    for (uint h = 64u; h > 0u; h >>= 1)
+    {
+      if (t < h)
+        partial[t] += partial[t + h];
+      barrier();
+    }
+    float a = 1.0 / sqrt(partial[0] + 1e-6);
+    float scale = 1.0 / sqrt(float(p.keyDim));
+    for (uint j = t; j < p.keyDim; j += 128u)
+    {
+      float v = qkv[base + j] * a;
+      if (item < p.keyHeads)
+        v = v * scale;
+      qkv[base + j] = v;
+    }
+    return;
+  }
+  uint i = item - 2u * p.keyHeads;
+  if (t == 0u)
+  {
+    uint f = r * p.valueHeads + i;
+    float b = beta[f];
+    beta[f] = b < -100.0 ? 0.0 : 1.0 / (1.0 + exp(-b));
+    float x = decay[f] + dtBias[i];
+    // log(1 + e^x): exact enough in float where e^x is small (softplus of
+    // torch computes log1p)
+    float e = exp(x);
+    float sp = x > 20.0 ? x : (e < 1e-6 ? e - e * e * 0.5 : log(1.0 + e));
+    decay[f] = exp(negA[i] * sp);
+  }
+  uint zb = (r * p.valueHeads + i) * p.valueDim;
+  for (uint j = t; j < p.valueDim; j += 128u)
+    z[zb + j] = silu(z[zb + j]);
+}

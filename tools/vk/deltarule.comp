@@ -1,0 +1,101 @@
+// LandrixAI - the delta rule of a Gated DeltaNet layer (Qwen3.5) over the
+// token rows of a chunk (phase D, slice D7e2; the Vulkan form of deltarule in
+// tools/cuda/deltanet.cu, TInferCpuBackend.DeltaRule in float)
+// - one work group of 128 per value head (x) and four columns of its state S
+//   (y): 32 invocations per column j, which keep S[j] (key dim <= 256) in
+//   registers over all the tokens; per token S[j] decayed, what it predicts
+//   for the key, the correction written in, the column read by the query -
+//   the two sums over the 32 invocations through shared memory
+// - qkv rows at stride: [q all | k all | v all]; a key head serves
+//   valueHeads / keyHeads neighbouring value heads; y [rows, valueHeads *
+//   valueDim]; state [valueHeads, valueDim, keyDim], moved on
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufQkv { float qkv[]; };
+layout(std430, binding = 1) readonly buffer BufBeta { float beta[]; };
+layout(std430, binding = 2) readonly buffer BufDecay { float decay[]; };
+layout(std430, binding = 3) buffer BufState { float state[]; };
+layout(std430, binding = 4) writeonly buffer BufY { float y[]; };
+
+layout(push_constant) uniform Push {
+  uint rows, stride, keyHeads, valueHeads, keyDim, valueDim;
+} p;
+
+shared float red[128];
+
+// the sum of v over the 32 invocations of a column (every invocation of the
+// work group calls it)
+float columnSum(float v, uint t)
+{
+  red[t] = v;
+  barrier();
+  for (uint h = 16u; h > 0u; h >>= 1)
+  {
+    if ((t & 31u) < h)
+      red[t] += red[t + h];
+    barrier();
+  }
+  float s = red[t & ~31u];
+  barrier(); // read by all before the next sum writes
+  return s;
+}
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint head = gl_WorkGroupID.x;
+  uint j = gl_WorkGroupID.y * 4u + (t >> 5);
+  uint lane = t & 31u;
+  // a column beyond the value dim still takes part in the sums (barriers)
+  bool live = j < p.valueDim;
+  uint kd = p.keyHeads * p.keyDim;
+  uint vd = p.valueHeads * p.valueDim;
+  uint off = (head / (p.valueHeads / p.keyHeads)) * p.keyDim;
+  uint row = (head * p.valueDim + j) * p.keyDim;
+  float s[8];
+  for (uint m = 0u; m < 8u; m++)
+  {
+    uint i = lane + 32u * m;
+    s[m] = live && i < p.keyDim ? state[row + i] : 0.0;
+  }
+  for (uint r = 0u; r < p.rows; r++)
+  {
+    uint base = r * p.stride;
+    float g = decay[r * p.valueHeads + head];
+    float b = beta[r * p.valueHeads + head];
+    float a = 0.0;
+    for (uint m = 0u; m < 8u; m++)
+    {
+      uint i = lane + 32u * m;
+      if (live && i < p.keyDim)
+      {
+        s[m] = s[m] * g;
+        a += s[m] * qkv[base + kd + off + i];
+      }
+    }
+    a = columnSum(a, t);
+    float v = live ? qkv[base + 2u * kd + head * p.valueDim + j] : 0.0;
+    float delta = (v - a) * b;
+    float o = 0.0;
+    for (uint m = 0u; m < 8u; m++)
+    {
+      uint i = lane + 32u * m;
+      if (live && i < p.keyDim)
+      {
+        s[m] = s[m] + qkv[base + kd + off + i] * delta;
+        o += s[m] * qkv[base + off + i];
+      }
+    }
+    o = columnSum(o, t);
+    if (live && lane == 0u)
+      y[r * vd + head * p.valueDim + j] = o;
+  }
+  for (uint m = 0u; m < 8u; m++)
+  {
+    uint i = lane + 32u * m;
+    if (live && i < p.keyDim)
+      state[row + i] = s[m];
+  }
+}

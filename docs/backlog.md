@@ -423,7 +423,11 @@ In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tok
   DeltaNet-Layer als Kernel (`tools/cuda/deltanet.cu`), ihr Zustand und die Rücksetzpunkte auf
   dem Gerät, Ausgangsgate und Teil-RoPE; Qwen3.5-0.8B auf der RTX 5090 Prefill 512 in 42 statt
   1801 ms, Decode 2,5 statt 37 ms/Token (Q8_0), gegen transformers Kosinus 0,99999999999.
-- *D7e2:* Vulkan. Danach Qwen3.8-27B.
+- *D7e2 erledigt 2026-10-25* (`native-inference.md`, Phase D): Qwen3.5 auf Vulkan - die
+  DeltaNet-Layer als Shader (`tools/vk/`), Zustand und Rücksetzpunkte auf dem Gerät; auf der
+  RTX 5090 Prefill 512 in 42 ms, Decode 3,1 ms/Token (Q8_0), auf dem M2 über MoltenVK
+  ebenso gegen transformers geprüft.
+- *Offen:* Qwen3.8-27B (volle Attention mit Kopfdimension 256), GGUF für Qwen3.5.
 
 **D8 — Kolibri-1.** FP8 E4M3 mit 128×128-Skalen (oder eine geprüfte Umwandlung nach Q4_K/Q8_0
 beim Laden; ein GGUF von Dritten nur nach Prüfung gegen die Referenz), Sigmoid-Router mit Bias-Korrektur nur für die Auswahl,

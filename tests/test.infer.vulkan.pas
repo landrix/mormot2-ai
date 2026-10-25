@@ -16,6 +16,7 @@ uses
   mormot.core.os,
   mormot.core.unicode,
   mormot.core.text,
+  mormot.core.variants,
   mormot.core.perf,
   mormot.core.test,
   mormot.ai.infer.tensor,
@@ -27,6 +28,7 @@ uses
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.gptoss,
+  mormot.ai.infer.model.qwen35,
   mormot.ai.infer.model.qwen3.vulkan,
   mormot.ai.llm.types,
   mormot.ai.llm,
@@ -160,6 +162,20 @@ type
     // written out, as in TTestInferCuda): random logits and ties, with and
     // without renorming
     procedure RouteMatchesHost;
+    /// D7e2: deltarule.comp against TInferCpuBackend.DeltaRule - key dims 16,
+    // 48, 128 and 256 (the models' 16 leave half of a column's 32 invocations
+    // idle), two value heads per key head
+    procedure DeltaRuleMatchesCpu;
+    /// D7e2: tiny Qwen3.5 on the device against the CPU - F32 with a cache of
+    // floats and of half floats, Q8_0, the Qwen3_5ForCausalLM layout; a
+    // prompt over two chunks, decode steps; restore points on the device: a
+    // branch the bits of a fresh pass there
+    procedure Qwen35MatchesCpu;
+    /// D7e2: Qwen3.5-0.8B on the device against transformers (the reference
+    // of TTestInferQwen35: last logits, greedy), then through
+    // TNativeLlmClient: an answer, a tool call, the next turn from a restore
+    // point as without the cache - skipped on a CPU implementation
+    procedure Qwen35OnDevice;
   end;
 
 
@@ -2715,5 +2731,426 @@ begin
     gpu.Free;
   end;
 end;
+
+type
+  TDeltaRuleTestPush = record
+    Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim: cardinal;
+  end;
+
+procedure TTestInferVulkan.DeltaRuleMatchesCpu;
+var
+  pipe: TInferVkPipeline;
+  ref: TInferCpuBackend;
+
+  // a host-visible copy of v (aCount floats when v is empty)
+  function Buf(const v: TSingleDynArray; aCount: PtrInt): TInferVkBuffer;
+  begin
+    result := TInferVkBuffer.Create(fVk, aCount * 4 + 4);
+    if v <> nil then
+      MoveFast(pointer(v)^, result.Mapped^, aCount * 4);
+  end;
+
+  procedure DeltaCase(aRows, aKh, aVh, aDk, aDv: PtrInt);
+  var
+    qkv, beta, decay, state, y: TSingleDynArray;
+    b: array[0..4] of TInferVkBuffer;
+    push: TDeltaRuleTestPush;
+    cd, i: PtrInt;
+    e: double;
+  begin
+    cd := 2 * aKh * aDk + aVh * aDv;
+    Fill(qkv, aRows * cd, 61 + aDk, 0.3);
+    Fill(beta, aRows * aVh, 62, 0.5);
+    Fill(decay, aRows * aVh, 63, 0.5);
+    for i := 0 to high(beta) do
+    begin
+      beta[i] := beta[i] + 0.5; // in (0, 1), as a sigmoid
+      decay[i] := decay[i] + 0.5;
+    end;
+    Fill(state, aVh * aDv * aDk, 64, 0.5);
+    SetLength(y, aRows * aVh * aDv);
+    FillCharFast(b, SizeOf(b), 0);
+    try
+      b[0] := Buf(qkv, length(qkv));
+      b[1] := Buf(beta, length(beta));
+      b[2] := Buf(decay, length(decay));
+      b[3] := Buf(state, length(state));
+      b[4] := Buf(nil, length(y));
+      push.Rows := aRows;
+      push.Stride := cd;
+      push.KeyHeads := aKh;
+      push.ValueHeads := aVh;
+      push.KeyDim := aDk;
+      push.ValueDim := aDv;
+      fVk.Run(pipe, [b[0], b[1], b[2], b[3], b[4]], @push, aVh, (aDv + 3) div 4);
+      ref.DeltaRule(pointer(qkv), aRows, cd, aKh, aVh, aDk, aDv, pointer(beta),
+        pointer(decay), pointer(state), pointer(y));
+      e := RelError(b[4].Mapped, pointer(y), length(y));
+      CheckUtf8(e <= 2e-5, 'deltarule.comp % rows, % / % heads of % / %: relative ' +
+        'error %', [aRows, aKh, aVh, aDk, aDv, e]);
+      e := RelError(b[3].Mapped, pointer(state), length(state));
+      CheckUtf8(e <= 2e-5, 'deltarule.comp state, key dim %: relative error %',
+        [aDk, e]);
+    finally
+      for i := 0 to high(b) do
+        b[i].Free;
+    end;
+  end;
+
+begin
+  if not HasDevice then
+    exit;
+  ref := TInferCpuBackend.Create;
+  pipe := TInferVkPipeline.Create(fVk, @SPV_DELTARULE, length(SPV_DELTARULE), 5,
+    SizeOf(TDeltaRuleTestPush));
+  try
+    DeltaCase(5, 2, 4, 16, 8);     // the tiny models
+    DeltaCase(7, 2, 4, 128, 128);  // Qwen3.5-0.8B's heads
+    DeltaCase(1, 1, 2, 256, 64);   // the widest key, one decode row
+    DeltaCase(3, 2, 2, 48, 20);    // no multiple of 32, columns beyond the last
+  finally
+    pipe.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferVulkan.Qwen35MatchesCpu;
+const
+  PROMPT = 300; // more than one chunk of the device forward pass (256)
+  /// the relative error of the F32 logits: a cache of floats, of half floats
+  TOL: array[boolean] of double = (1e-4, 6e-3);
+var
+  dir, tmp: TFileName;
+  cfg: TDocVariantData;
+  gpu: TInferVulkanBackend;
+  ref: TInferCpuFastBackend;
+  model: TDecoderModel;
+  dev: TQwen3Vulkan;
+  c1: TQwen3Context;
+  c2, c3, c4: TQwen3VkContext;
+  ids, a, b: TIntegerDynArray;
+  l1, l2, l3, want: TSingleDynArray;
+  i, k, v, m, kept: PtrInt;
+  seed: cardinal;
+  e: double;
+  cmp: TInferCompare;
+  id: integer;
+  quant: boolean;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen35');
+  if CheckFailed(dir <> '', 'tiny-qwen35 found') then
+    exit;
+  // the Qwen3_5ForCausalLM layout with 6 of 32 values of a head rotating:
+  // rot / 2 odd, the words of a half-float cache then mix both shares
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-d7e-' + Int64ToUtf8(GetTickCount64)],
+    true);
+  ForceDirectories(tmp);
+  try
+    CopyFile(MakePath([dir, 'text', 'model.safetensors']), tmp + 'model.safetensors',
+      false);
+    cfg.InitJsonFromFile(MakePath([dir, 'text', 'config.json']), JSON_FAST_FLOAT);
+    cfg.O['rope_parameters']^.AddOrUpdateValue('partial_rotary_factor', 0.1875);
+    FileFromString(cfg.ToJson, tmp + 'config.json');
+    // 0: F32, 1: F32 with the cache in half floats, 2: Q8_0 at load, 3: the
+    // Qwen3_5ForCausalLM layout (an untied head, a convolution of 3), 4: that
+    // layout rotating 6 values of a head, the cache in half floats
+    for k := 0 to 4 do
+    begin
+      gpu := TInferVulkanBackend.Create;
+      ref := TInferCpuFastBackend.Create;
+      model := nil;
+      dev := nil;
+      c1 := nil;
+      c2 := nil;
+      c3 := nil;
+      c4 := nil;
+      try
+        case k of
+          2:
+            model := TQwen35Model.Create(dir, ref, idtQ8_0);
+          3:
+            model := NewDecoderModel(MakePath([dir, 'text']), ref);
+          4:
+            model := NewDecoderModel(tmp, ref);
+        else
+          model := NewDecoderModel(dir, ref);
+        end;
+        Check(dxOutputGate in model.Extras, 'an output gate');
+        CheckUtf8((k <> 4) or (model.Config.RopeDims = 6), 'case 4 rotates %',
+          [model.Config.RopeDims]);
+        v := model.Config.VocabSize;
+        SetLength(ids, PROMPT);
+        seed := 23 + k;
+        for i := 0 to PROMPT - 1 do
+        begin
+          seed := seed * 1103515245 + 12345;
+          ids[i] := 3 + PtrInt(seed shr 16) mod (v - 4);
+        end;
+        // the CPU computes Q8_0 matrices with Q8_0 activations, the device in
+        // float: compared by cosine
+        quant := k = 2;
+        dev := TQwen3Vulkan.Create(model, gpu);
+        dev.KvF16 := k in [1, 4];
+        c1 := model.NewContext;
+        c2 := dev.NewContext;
+        SetLength(l1, PROMPT * v);
+        SetLength(l2, PROMPT * v);
+        SetLength(l3, v);
+        model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+        dev.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+        if quant then
+        begin
+          cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
+          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
+            'Qwen3.5 % prompt logits: %', [k, InferCompareText(cmp)]);
+        end
+        else
+        begin
+          e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+          CheckUtf8(e <= TOL[dev.KvF16], 'Qwen3.5 % prompt logits (KvF16 %): ' +
+            'relative error %', [k, dev.KvF16, e]);
+        end;
+        // decoding: two contexts of the same prompt, one range and ranges of
+        // 64 keys - the same bits
+        c3 := dev.NewContext;
+        dev.Forward(c3, pointer(ids), PROMPT, nil);
+        for i := 0 to 5 do
+        begin
+          id := ids[i];
+          dev.SplitKeys := (i and 1) * 64;
+          model.Forward(c1, @id, 1, pointer(l1));
+          dev.Forward(c3, @id, 1, pointer(l3));
+          dev.Forward(c2, @id, 1, pointer(l2));
+          CheckUtf8(CompareMem(pointer(l2), pointer(l3), v * 4),
+            'Qwen3.5 % decode step %: two contexts, the same bits', [k, i]);
+          if quant then
+          begin
+            cmp := InferCompare(pointer(l2), pointer(l1), v, 0.5, 0.5);
+            CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
+              'Qwen3.5 % decode step %: %', [k, i, InferCompareText(cmp)]);
+          end
+          else
+          begin
+            e := RelError(pointer(l2), pointer(l1), v);
+            CheckUtf8(e <= TOL[dev.KvF16], 'Qwen3.5 % decode step % (KvF16 %): ' +
+              'relative error %', [k, i, dev.KvF16, e]);
+          end;
+        end;
+        // restore points on the device (through the model: it splits the rows)
+        m := v - 1; // the turn start, at 5 and 40
+        a := copy(ids, 0, 60);
+        for i := 0 to high(a) do
+          if a[i] = m then
+            a[i] := 3;
+        a[5] := m;
+        a[40] := m;
+        c4 := dev.NewContext;
+        c4.CheckpointId := m;
+        model.Forward(c4, pointer(a), 60, pointer(l3));
+        CheckEqual(c4.Checkpoints, 2, 'two restore points on the device');
+        b := copy(a);
+        b[45] := 4;
+        kept := model.Reuse(c4, pointer(b), 60);
+        CheckEqual(kept, 40, 'the branch goes on from 40');
+        model.Forward(c4, @b[kept], 60 - kept, pointer(l3));
+        FreeAndNil(c3);
+        c3 := dev.NewContext;
+        c3.CheckpointId := m;
+        SetLength(want, v);
+        model.Forward(c3, pointer(b), 60, pointer(want));
+        CheckUtf8(CompareMem(pointer(l3), pointer(want), v * 4),
+          'Qwen3.5 % branch on the device: the bits of a fresh pass', [k]);
+        // the first prompt again: it shares 45 tokens with the branch, so on
+        // from the restore point at 40 - its logits a fresh pass's
+        kept := model.Reuse(c4, pointer(a), 60);
+        CheckEqual(kept, 40, 'the first prompt from 40');
+        model.Forward(c4, @a[kept], 60 - kept, pointer(l3));
+        FreeAndNil(c3);
+        c3 := dev.NewContext;
+        c3.CheckpointId := m;
+        model.Forward(c3, pointer(a), 60, pointer(want));
+        CheckUtf8(CompareMem(pointer(l3), pointer(want), v * 4),
+          'Qwen3.5 % the first prompt again on the device: the bits of a fresh pass',
+          [k]);
+      finally
+        c4.Free;
+        c3.Free;
+        c2.Free;
+        c1.Free;
+        dev.Free;
+        model.Free;
+        ref.Free;
+        gpu.Free;
+      end;
+    end;
+  finally
+    DirectoryDeleteAll(tmp);
+  end;
+end;
+
+procedure TTestInferVulkan.Qwen35OnDevice;
+var
+  dir, refdir: TFileName;
+  gpu: TInferVulkanBackend;
+  cpu: TInferCpuFastBackend;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  dev: TQwen3Vulkan;
+  ctx: TQwen3Context;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  msgs: TLlmMessageDynArray;
+  req: TLlmChatRequest;
+  r, r2: TLlmChatResponse;
+  ids, want: PIntegerArray;
+  margins: PSingleArray;
+  prompt, mine: TIntegerDynArray;
+  logits: TSingleDynArray;
+  cmp: TInferCompare;
+  k, n, m, diff: PtrInt;
+  margin: double;
+  timer: TPrecisionTimer;
+  calls, reused: Int64;
+begin
+  if not HasDevice then
+    exit;
+  if fVk.DeviceType = VK_PHYSICAL_DEVICE_TYPE_CPU then
+  begin
+    AddConsole('SKIP Qwen3.5-0.8B on the device: % is a CPU implementation',
+      [fVk.DeviceName]);
+    exit;
+  end;
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3.5-0.8B on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  dir := FindVendorModel('qwen3.5-0.8b' + PathDelim + 'model.safetensors.index.json');
+  if dir = '' then
+  begin
+    Check(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3.5-0.8b');
+    AddConsole('SKIP Qwen3.5-0.8B on the device: no vendor/models/qwen3.5-0.8b');
+    exit;
+  end;
+  dir := ExtractFilePath(dir);
+  refdir := FindInferRefDir('qwen35-0.8b');
+  if CheckFailed(refdir <> '', 'qwen35-0.8b reference found') then
+    exit;
+  gpu := TInferVulkanBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  model := nil;
+  dev := nil;
+  try
+    // F32 against transformers in float32: the last logits and the greedy
+    // tokens of the cases of TTestInferQwen35.Qwen35Real
+    timer.Start;
+    model := NewDecoderModel(dir, cpu);
+    dev := TQwen3Vulkan.Create(model, gpu);
+    dev.KvF16 := false; // compared with a reference
+    AddConsole(FormatString('Qwen3.5-0.8B loaded and on % in %', [fVk.DeviceName,
+      timer.Stop]));
+    model.Device := dev;
+    SetLength(logits, model.Config.VocabSize);
+    for k := 0 to 3 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        Check(ctx is TQwen3VkContext, 'a context on the device');
+        model.Forward(ctx, pointer(prompt), n, pointer(logits));
+      finally
+        ctx.Free;
+      end;
+      cmp := InferCompare(pointer(logits), ref.F32(FormatUtf8('case%.logits_last',
+        [k]), m), model.Config.VocabSize, 1, 0);
+      want := ref.I32(FormatUtf8('case%.greedy', [k]), m);
+      margins := ref.F32(FormatUtf8('case%.greedy_margin', [k]), m);
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, m, []);
+      finally
+        ctx.Free;
+      end;
+      diff := 0;
+      while (diff < m) and (diff < length(mine)) and (mine[diff] = want^[diff]) do
+        inc(diff);
+      margin := 0;
+      if diff < m then
+        margin := margins^[diff];
+      AddConsole(FormatString('device case %: logits cos % maxabs %, greedy equal ' +
+        'for % of % tokens (reference margin there %)', [k, cmp.Cosine,
+        cmp.MaxAbs, diff, m, margin]));
+      CheckUtf8(cmp.NonFinite = 0, 'device case % logits finite', [k]);
+      CheckUtf8(cmp.Cosine >= 0.99999, 'device case % logits cosine %', [k, cmp.Cosine]);
+      CheckUtf8(cmp.MaxAbs <= 1e-2, 'device case % logits max error %', [k, cmp.MaxAbs]);
+      CheckUtf8((diff >= m) or (margin < 0.1), 'device case % greedy leaves the ' +
+        'reference at step % where it was % sure', [k, diff, margin]);
+    end;
+    model.Device := nil;
+    FreeAndNil(dev);
+    FreeAndNil(model);
+    // the client on the device (Q8_0, the default): an answer, a tool call,
+    // the next question of the conversation from a restore point
+    timer.Start;
+    client := TNativeLlmClient.Create(dir, '', gpu);
+    llm := client; // the interface frees the client, and with it its Device
+    client.Device := TQwen3Vulkan.Create(client.Model, gpu);
+    AddConsole(FormatString('Qwen3.5-0.8B client loaded and on the device in %',
+      [timer.Stop]));
+    calls := gpu.GpuLinears;
+    SetLength(msgs, 1);
+    msgs[0] := LlmMessage(lrUser, 'What is the capital of France? Answer with one word.');
+    req := LlmChatRequest('', msgs);
+    req.Temperature := 0;
+    req.MaxTokens := 100;
+    timer.Start;
+    r := llm.ChatComplete(req);
+    AddConsole(FormatString('capital on the device in %: "%"', [timer.Stop, r.Content]));
+    Check(gpu.GpuLinears = calls, 'the device computed it, not the backend');
+    Check(PosEx('Paris', r.Content) > 0, 'the answer Paris');
+    SetLength(req.Messages, 3);
+    req.Messages[1] := LlmMessage(lrAssistant, r.Content);
+    req.Messages[2] := LlmMessage(lrUser,
+      'And the capital of Germany? Answer with one word.');
+    reused := client.Cache.ReusedTokens;
+    timer.Start;
+    r := llm.ChatComplete(req);
+    AddConsole(FormatString('next turn on the device in %: "%" (% tokens reused)',
+      [timer.Stop, r.Content, client.Cache.ReusedTokens - reused]));
+    Check(PosEx('Berlin', r.Content) > 0, 'the answer Berlin');
+    Check(client.Cache.ReusedTokens - reused > 10, 'from a restore point');
+    client.Cache.Slots := 0;
+    r2 := llm.ChatComplete(req);
+    CheckEqual(r2.Content, r.Content, 'the same answer computed from the start');
+    client.Cache.Slots := NATIVE_LLM_DEFAULT_CACHE_SLOTS;
+    // a tool call, typed by the schema
+    SetLength(req.Messages, 1);
+    req.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
+    SetLength(req.Tools, 1);
+    req.Tools[0].Name := 'get_weather';
+    req.Tools[0].Description := 'The current weather of a city';
+    req.Tools[0].ParametersJson := '{"type":"object","properties":{"city":{"type":' +
+      '"string","description":"The city"}},"required":["city"]}';
+    timer.Start;
+    r := llm.ChatComplete(req);
+    AddConsole(FormatString('weather on the device in %: % calls', [timer.Stop,
+      length(r.ToolCalls)]));
+    if not CheckFailed(length(r.ToolCalls) = 1, 'one tool call') then
+      CheckEqual(r.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
+    llm := nil; // the client and its device before the backend they compute with
+  finally
+    dev.Free;
+    model.Free;
+    ref.Free;
+    cpu.Free;
+    gpu.Free;
+  end;
+end;
+
 
 end.

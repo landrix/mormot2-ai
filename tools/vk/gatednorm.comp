@@ -1,0 +1,42 @@
+// LandrixAI - y[r] = w * x[r] / sqrt(mean(x[r]^2) + eps) * z[r], row by row:
+// the gated RMSNorm of a value head of a Gated DeltaNet layer (Qwen3.5, phase
+// D slice D7e2; z holds silu(z) already) - one work group of 128 per row; y
+// may be x (in place)
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer BufX { float x[]; };
+layout(std430, binding = 1) readonly buffer BufW { float w[]; };
+layout(std430, binding = 2) readonly buffer BufZ { float z[]; };
+layout(std430, binding = 3) buffer BufY { float y[]; };
+
+layout(push_constant) uniform Push {
+  uint rows, cols;
+  float eps;
+} p;
+
+shared float partial[128];
+
+void main()
+{
+  uint t = gl_LocalInvocationID.x;
+  uint base = gl_WorkGroupID.x * p.cols;
+  float s = 0.0;
+  for (uint c = t; c < p.cols; c += 128u)
+  {
+    float a = x[base + c];
+    s += a * a;
+  }
+  partial[t] = s;
+  barrier();
+  for (uint h = 64u; h > 0u; h >>= 1)
+  {
+    if (t < h)
+      partial[t] += partial[t + h];
+    barrier();
+  }
+  float inv = inversesqrt(partial[0] / float(p.cols) + p.eps);
+  for (uint c = t; c < p.cols; c += 128u)
+    y[base + c] = (w[c] * (x[base + c] * inv)) * z[base + c];
+}

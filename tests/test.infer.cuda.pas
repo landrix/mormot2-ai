@@ -14,6 +14,7 @@ uses
   mormot.core.os,
   mormot.core.unicode,
   mormot.core.text,
+  mormot.core.variants,
   mormot.core.perf,
   mormot.core.test,
   mormot.ai.infer.tensor,
@@ -3407,7 +3408,8 @@ const
   /// the relative error of the F32 logits: a cache of floats, of half floats
   TOL: array[boolean] of double = (1e-4, 6e-3);
 var
-  dir: TFileName;
+  dir, tmp: TFileName;
+  cfg: TDocVariantData;
   gpu: TInferCudaBackend;
   ref: TInferCpuFastBackend;
   model: TDecoderModel;
@@ -3428,134 +3430,153 @@ begin
   dir := FindInferRefDir('tiny-qwen35');
   if CheckFailed(dir <> '', 'tiny-qwen35 found') then
     exit;
-  // 0: F32, 1: F32 with the cache in half floats, 2: Q8_0 at load, 3: the
-  // Qwen3_5ForCausalLM layout (an untied head, a convolution of 3)
-  for k := 0 to 3 do
-  begin
-    gpu := TInferCudaBackend.Create;
-    ref := TInferCpuFastBackend.Create;
-    model := nil;
-    dev := nil;
-    c1 := nil;
-    c2 := nil;
-    c3 := nil;
-    c4 := nil;
-    try
-      case k of
-        2:
-          model := TQwen35Model.Create(dir, ref, idtQ8_0);
-        3:
-          model := NewDecoderModel(MakePath([dir, 'text']), ref);
-      else
-        model := NewDecoderModel(dir, ref);
-      end;
-      Check(dxOutputGate in model.Extras, 'an output gate');
-      v := model.Config.VocabSize;
-      SetLength(ids, PROMPT);
-      seed := 23 + k;
-      for i := 0 to PROMPT - 1 do
-      begin
-        seed := seed * 1103515245 + 12345;
-        ids[i] := 3 + PtrInt(seed shr 16) mod (v - 4);
-      end;
-      // the CPU computes Q8_0 matrices with Q8_0 activations, the device in
-      // float: compared by cosine
-      quant := k = 2;
-      dev := TQwen3Cuda.Create(model, gpu);
-      dev.KvF16 := k = 1;
-      c1 := model.NewContext;
-      c2 := dev.NewContext;
-      SetLength(l1, PROMPT * v);
-      SetLength(l2, PROMPT * v);
-      SetLength(l3, v);
-      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
-      dev.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
-      if quant then
-      begin
-        cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
-        CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
-          'Qwen3.5 % prompt logits: %', [k, InferCompareText(cmp)]);
-      end
-      else
-      begin
-        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
-        CheckUtf8(e <= TOL[dev.KvF16], 'Qwen3.5 % prompt logits (KvF16 %): ' +
-          'relative error %', [k, dev.KvF16, e]);
-      end;
-      // decoding: graphs (c2) against launches (c3, the same prompt first),
-      // one range and ranges of 64 keys
-      c3 := dev.NewContext;
-      dev.Forward(c3, pointer(ids), PROMPT, nil);
-      for i := 0 to 5 do
-      begin
-        id := ids[i];
-        dev.SplitKeys := (i and 1) * 64;
-        model.Forward(c1, @id, 1, pointer(l1));
-        dev.UseGraphs := false;
-        dev.Forward(c3, @id, 1, pointer(l3));
-        dev.UseGraphs := true;
-        dev.Forward(c2, @id, 1, pointer(l2));
-        CheckUtf8(CompareMem(pointer(l2), pointer(l3), v * 4),
-          'Qwen3.5 % decode step %: a graph the bits of the launches', [k, i]);
+  // the Qwen3_5ForCausalLM layout with 6 of 32 values of a head rotating:
+  // rot / 2 odd, the words of a half-float cache then mix both shares
+  tmp := MakePath([GetSystemPath(spTemp), 'lai-d7e-' + Int64ToUtf8(GetTickCount64)],
+    true);
+  ForceDirectories(tmp);
+  try
+    CopyFile(MakePath([dir, 'text', 'model.safetensors']), tmp + 'model.safetensors',
+      false);
+    cfg.InitJsonFromFile(MakePath([dir, 'text', 'config.json']), JSON_FAST_FLOAT);
+    cfg.O['rope_parameters']^.AddOrUpdateValue('partial_rotary_factor', 0.1875);
+    FileFromString(cfg.ToJson, tmp + 'config.json');
+    // 0: F32, 1: F32 with the cache in half floats, 2: Q8_0 at load, 3: the
+    // Qwen3_5ForCausalLM layout (an untied head, a convolution of 3), 4: that
+    // layout rotating 6 values of a head, the cache in half floats
+    for k := 0 to 4 do
+    begin
+      gpu := TInferCudaBackend.Create;
+      ref := TInferCpuFastBackend.Create;
+      model := nil;
+      dev := nil;
+      c1 := nil;
+      c2 := nil;
+      c3 := nil;
+      c4 := nil;
+      try
+        case k of
+          2:
+            model := TQwen35Model.Create(dir, ref, idtQ8_0);
+          3:
+            model := NewDecoderModel(MakePath([dir, 'text']), ref);
+          4:
+            model := NewDecoderModel(tmp, ref);
+        else
+          model := NewDecoderModel(dir, ref);
+        end;
+        Check(dxOutputGate in model.Extras, 'an output gate');
+        CheckUtf8((k <> 4) or (model.Config.RopeDims = 6), 'case 4 rotates %',
+          [model.Config.RopeDims]);
+        v := model.Config.VocabSize;
+        SetLength(ids, PROMPT);
+        seed := 23 + k;
+        for i := 0 to PROMPT - 1 do
+        begin
+          seed := seed * 1103515245 + 12345;
+          ids[i] := 3 + PtrInt(seed shr 16) mod (v - 4);
+        end;
+        // the CPU computes Q8_0 matrices with Q8_0 activations, the device in
+        // float: compared by cosine
+        quant := k = 2;
+        dev := TQwen3Cuda.Create(model, gpu);
+        dev.KvF16 := k in [1, 4];
+        c1 := model.NewContext;
+        c2 := dev.NewContext;
+        SetLength(l1, PROMPT * v);
+        SetLength(l2, PROMPT * v);
+        SetLength(l3, v);
+        model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+        dev.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
         if quant then
         begin
-          cmp := InferCompare(pointer(l2), pointer(l1), v, 0.5, 0.5);
+          cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
           CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
-            'Qwen3.5 % decode step %: %', [k, i, InferCompareText(cmp)]);
+            'Qwen3.5 % prompt logits: %', [k, InferCompareText(cmp)]);
         end
         else
         begin
-          e := RelError(pointer(l2), pointer(l1), v);
-          CheckUtf8(e <= TOL[dev.KvF16], 'Qwen3.5 % decode step % (KvF16 %): ' +
-            'relative error %', [k, i, dev.KvF16, e]);
+          e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+          CheckUtf8(e <= TOL[dev.KvF16], 'Qwen3.5 % prompt logits (KvF16 %): ' +
+            'relative error %', [k, dev.KvF16, e]);
         end;
+        // decoding: graphs (c2) against launches (c3, the same prompt first),
+        // one range and ranges of 64 keys
+        c3 := dev.NewContext;
+        dev.Forward(c3, pointer(ids), PROMPT, nil);
+        for i := 0 to 5 do
+        begin
+          id := ids[i];
+          dev.SplitKeys := (i and 1) * 64;
+          model.Forward(c1, @id, 1, pointer(l1));
+          dev.UseGraphs := false;
+          dev.Forward(c3, @id, 1, pointer(l3));
+          dev.UseGraphs := true;
+          dev.Forward(c2, @id, 1, pointer(l2));
+          CheckUtf8(CompareMem(pointer(l2), pointer(l3), v * 4),
+            'Qwen3.5 % decode step %: a graph the bits of the launches', [k, i]);
+          if quant then
+          begin
+            cmp := InferCompare(pointer(l2), pointer(l1), v, 0.5, 0.5);
+            CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
+              'Qwen3.5 % decode step %: %', [k, i, InferCompareText(cmp)]);
+          end
+          else
+          begin
+            e := RelError(pointer(l2), pointer(l1), v);
+            CheckUtf8(e <= TOL[dev.KvF16], 'Qwen3.5 % decode step % (KvF16 %): ' +
+              'relative error %', [k, i, dev.KvF16, e]);
+          end;
+        end;
+        // restore points on the device (through the model: it splits the rows)
+        m := v - 1; // the turn start, at 5 and 40
+        a := copy(ids, 0, 60);
+        for i := 0 to high(a) do
+          if a[i] = m then
+            a[i] := 3;
+        a[5] := m;
+        a[40] := m;
+        c4 := dev.NewContext;
+        c4.CheckpointId := m;
+        model.Forward(c4, pointer(a), 60, pointer(l3));
+        CheckEqual(c4.Checkpoints, 2, 'two restore points on the device');
+        b := copy(a);
+        b[45] := 4;
+        kept := model.Reuse(c4, pointer(b), 60);
+        CheckEqual(kept, 40, 'the branch goes on from 40');
+        model.Forward(c4, @b[kept], 60 - kept, pointer(l3));
+        FreeAndNil(c3);
+        c3 := dev.NewContext;
+        c3.CheckpointId := m;
+        SetLength(want, v);
+        model.Forward(c3, pointer(b), 60, pointer(want));
+        CheckUtf8(CompareMem(pointer(l3), pointer(want), v * 4),
+          'Qwen3.5 % branch on the device: the bits of a fresh pass', [k]);
+        // the first prompt again: it shares 45 tokens with the branch, so on
+        // from the restore point at 40 - its logits a fresh pass's
+        kept := model.Reuse(c4, pointer(a), 60);
+        CheckEqual(kept, 40, 'the first prompt from 40');
+        model.Forward(c4, @a[kept], 60 - kept, pointer(l3));
+        FreeAndNil(c3);
+        c3 := dev.NewContext;
+        c3.CheckpointId := m;
+        model.Forward(c3, pointer(a), 60, pointer(want));
+        CheckUtf8(CompareMem(pointer(l3), pointer(want), v * 4),
+          'Qwen3.5 % the first prompt again on the device: the bits of a fresh pass',
+          [k]);
+      finally
+        c4.Free;
+        c3.Free;
+        c2.Free;
+        c1.Free;
+        dev.Free;
+        model.Free;
+        ref.Free;
+        gpu.Free;
       end;
-      // restore points on the device (through the model: it splits the rows)
-      m := v - 1; // the turn start, at 5 and 40
-      a := copy(ids, 0, 60);
-      for i := 0 to high(a) do
-        if a[i] = m then
-          a[i] := 3;
-      a[5] := m;
-      a[40] := m;
-      c4 := dev.NewContext;
-      c4.CheckpointId := m;
-      model.Forward(c4, pointer(a), 60, pointer(l3));
-      CheckEqual(c4.Checkpoints, 2, 'two restore points on the device');
-      b := copy(a);
-      b[45] := 4;
-      kept := model.Reuse(c4, pointer(b), 60);
-      CheckEqual(kept, 40, 'the branch goes on from 40');
-      model.Forward(c4, @b[kept], 60 - kept, pointer(l3));
-      FreeAndNil(c3);
-      c3 := dev.NewContext;
-      c3.CheckpointId := m;
-      SetLength(want, v);
-      model.Forward(c3, pointer(b), 60, pointer(want));
-      CheckUtf8(CompareMem(pointer(l3), pointer(want), v * 4),
-        'Qwen3.5 % branch on the device: the bits of a fresh pass', [k]);
-      // the first prompt again: it shares 45 tokens with the branch, so on
-      // from the restore point at 40 - its logits a fresh pass's
-      kept := model.Reuse(c4, pointer(a), 60);
-      CheckEqual(kept, 40, 'the first prompt from 40');
-      model.Forward(c4, @a[kept], 60 - kept, pointer(l3));
-      FreeAndNil(c3);
-      c3 := dev.NewContext;
-      c3.CheckpointId := m;
-      model.Forward(c3, pointer(a), 60, pointer(want));
-      CheckUtf8(CompareMem(pointer(l3), pointer(want), v * 4),
-        'Qwen3.5 % the first prompt again on the device: the bits of a fresh pass',
-        [k]);
-    finally
-      c4.Free;
-      c3.Free;
-      c2.Free;
-      c1.Free;
-      dev.Free;
-      model.Free;
-      ref.Free;
-      gpu.Free;
     end;
+  finally
+    DirectoryDeleteAll(tmp);
   end;
 end;
 
