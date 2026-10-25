@@ -157,13 +157,15 @@ extern "C" __global__ void swiglu(float* g, const float* u, unsigned int n,
 // and kn are not read), rotary positions unless rope is 0 (a NoPE layer,
 // backlog D4b) (cs: the cos of every row, then the
 // sin), q in place, k and v stored into the cache at past + row
+// - rot: the first rot values of a head rotate (rotate_half within them, cs
+//   holds rot / 2 per row), the others pass (Qwen3.5, slice D7e1); 0: all
 // - headDim <= 256, even; T: the type of the cache (float or half float)
 template <typename T>
 __device__ __forceinline__ void qkropeT(float* q, const float* k,
   const float* v, const float* qn, const float* kn, const float* cs, T* kc,
   T* vc, unsigned int rows, unsigned int heads, unsigned int kvHeads,
   unsigned int headDim, unsigned int past, float eps, unsigned int norm,
-  unsigned int rope)
+  unsigned int rope, unsigned int rot)
 {
   __shared__ float part[4];
   __shared__ float normed[256];
@@ -171,7 +173,7 @@ __device__ __forceinline__ void qkropeT(float* q, const float* k,
   unsigned int r = blockIdx.y;
   unsigned int hh = blockIdx.x;
   unsigned int d = headDim;
-  unsigned int half = d >> 1;
+  unsigned int half = (rot == 0u ? d : rot) >> 1;
   bool isQ = hh < heads;
   unsigned int h = isQ ? hh : hh - heads;
   unsigned long long src = isQ ? ((unsigned long long)r * heads + h) * d
@@ -217,6 +219,12 @@ __device__ __forceinline__ void qkropeT(float* q, const float* k,
       store(kc, dst + i + half, x1);
     }
   }
+  // beyond the rotated share: as normed
+  for (unsigned int c = 2u * half + t; c < d; c += BLOCK)
+    if (isQ)
+      q[src + c] = normed[c];
+    else
+      store(kc, dst + c, normed[c]);
   if (!isQ)
     for (unsigned int c = t; c < d; c += BLOCK)
       store(vc, dst + c, v[src + c]);
@@ -226,20 +234,20 @@ extern "C" __global__ void qkrope(float* q, const float* k, const float* v,
   const float* qn, const float* kn, const float* cs, float* kc, float* vc,
   unsigned int rows, unsigned int heads, unsigned int kvHeads,
   unsigned int headDim, unsigned int past, float eps, unsigned int norm,
-  unsigned int rope)
+  unsigned int rope, unsigned int rot)
 {
   qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
-    eps, norm, rope);
+    eps, norm, rope, rot);
 }
 
 extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
   const float* qn, const float* kn, const float* cs, unsigned short* kc,
   unsigned short* vc, unsigned int rows, unsigned int heads,
   unsigned int kvHeads, unsigned int headDim, unsigned int past, float eps,
-  unsigned int norm, unsigned int rope)
+  unsigned int norm, unsigned int rope, unsigned int rot)
 {
   qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
-    eps, norm, rope);
+    eps, norm, rope, rot);
 }
 
 // causal attention with grouped-query heads - the CUDA form of

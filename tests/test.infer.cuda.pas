@@ -25,6 +25,7 @@ uses
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.gptoss,
+  mormot.ai.infer.model.qwen35,
   mormot.ai.infer.model.qwen3.cuda,
   mormot.ai.llm.types,
   mormot.ai.llm,
@@ -138,6 +139,20 @@ type
     // the reference below checked against it): random logits and ties, with
     // and without renorming, 8 of 128 and 2 of 8 experts
     procedure RouteMatchesHost;
+    /// D7e1: the kernels of tools/cuda/deltanet.cu against the CPU -
+    // dnconv, dnprep, deltarule (key dims 16, 128 and 256, two value heads
+    // per key head), gatednorm, splitgate and gatemul
+    procedure DeltaNetOpsMatchCpu;
+    /// D7e1: tiny Qwen3.5 on the device against the CPU - F32 with a cache of
+    // floats and of half floats, Q8_0, the Qwen3_5ForCausalLM layout; a
+    // prompt over two chunks, decode steps as graphs and without; restore
+    // points on the device: a branch the bits of a fresh pass there
+    procedure Qwen35MatchesCpu;
+    /// D7e1: Qwen3.5-0.8B on the device against transformers (the reference
+    // of TTestInferQwen35: last logits, greedy), then through
+    // TNativeLlmClient: an answer, a tool call, the next turn from a restore
+    // point as without the cache
+    procedure Qwen35OnDevice;
   end;
 
 
@@ -952,19 +967,23 @@ var
   // aSinks: attention sinks (gpt-oss), the first one far above every score;
   // aHuge: every sink more than 88 above the scores (exp(sink - score)
   // beyond the single range) and values of 1e30 - the outputs stay finite
+  // aRot: only the first aRot values of a head rotate (Qwen3.5), 0: all
   procedure AttentionCase(aRows, aHeads, aKvHeads, aHeadDim, aPast, aHeadBlock,
     aSplits: PtrInt; aNorm: boolean = true; aWindow: PtrInt = 0;
-    aRope: boolean = true; aSinks: boolean = false; aHuge: boolean = false);
+    aRope: boolean = true; aSinks: boolean = false; aHuge: boolean = false;
+    aRot: PtrInt = 0);
   var
     q, k, v, qn, kn, cs, cosv, sinv, keys, values, y, kc, vc, qc, yc,
       part, sk: TSingleDynArray;
     pq, pk, pv, pqn, pkn, pcs, pkc, pvc, py, ppart, psk: TCuDevicePtr;
     rows, heads, kvHeads, headDim, past, splits, hb, rb, norm, rope,
-      window: cardinal;
+      window, rot: cardinal;
     eps: single;
     half, kvw, cp, r, i: PtrInt;
   begin
     half := aHeadDim shr 1;
+    if aRot > 0 then
+      half := aRot shr 1;
     kvw := aKvHeads * aHeadDim;
     cp := aPast + aRows + 3; // a cache larger than used
     Fill(q, aRows * aHeads * aHeadDim, 31, 2);
@@ -1020,6 +1039,7 @@ var
     norm := ord(aNorm);
     rope := ord(aRope);
     window := aWindow;
+    rot := aRot;
     // every buffer up first: the two kernels then run back to back, with no
     // copy (which waits for the stream) between them
     SetLength(y, aRows * aHeads * aHeadDim);
@@ -1038,7 +1058,8 @@ var
       psk := Up(sk);
     end;
     fCu.Enqueue(kQk, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows, @heads,
-      @kvHeads, @headDim, @past, @eps, @norm, @rope], aHeads + aKvHeads, 128, aRows);
+      @kvHeads, @headDim, @past, @eps, @norm, @rope, @rot], aHeads + aKvHeads, 128,
+      aRows);
     fCu.Enqueue(kAtt, [@pq, @pkc, @pvc, @py, @ppart, @rows, @heads, @headDim,
       @kvHeads, @past, @splits, @hb, @rb, @window, @psk], aHeads div aHeadBlock, 128,
       (aRows + PtrInt(rb) - 1) div PtrInt(rb), aSplits);
@@ -1061,8 +1082,9 @@ var
     end;
     if aRope then
     begin
-      ref.Rope(pointer(q), aRows, aHeads, aHeadDim, pointer(cosv), pointer(sinv));
-      ref.Rope(pointer(k), aRows, aKvHeads, aHeadDim, pointer(cosv), pointer(sinv));
+      ref.Rope(pointer(q), aRows, aHeads, aHeadDim, pointer(cosv), pointer(sinv), aRot);
+      ref.Rope(pointer(k), aRows, aKvHeads, aHeadDim, pointer(cosv), pointer(sinv),
+        aRot);
     end;
     MoveFast(pointer(k)^, keys[aPast * kvw], aRows * kvw * 4);
     MoveFast(pointer(v)^, values[aPast * kvw], aRows * kvw * 4);
@@ -1129,6 +1151,10 @@ begin
     AttentionCase(9, 8, 1, 64, 130, 8, 4, false, 5, true, true);
     AttentionCase(7, 4, 2, 64, 0, 2, 1, false, 0, true, true, true);
     AttentionCase(1, 16, 8, 128, 300, 2, 5, false, 0, true, true, true);
+    // D7e1: a partial rotary share (Qwen3.5-0.8B: 64 of 256)
+    AttentionCase(7, 8, 2, 256, 0, 4, 1, true, 0, true, false, false, 64);
+    AttentionCase(1, 8, 2, 256, 300, 4, 5, true, 0, true, false, false, 64);
+    AttentionCase(3, 4, 2, 64, 20, 2, 1, true, 0, true, false, false, 16);
   finally
     for i := 0 to high(bufs) do
       bufs[i].Free;
@@ -3147,5 +3173,547 @@ begin
     gpu.Free;
   end;
 end;
+
+
+procedure TTestInferCuda.DeltaNetOpsMatchCpu;
+var
+  dn: TInferCuModule;
+  ref: TInferCpuBackend;
+  kConv, kPrep, kRule, kNorm, kSplit, kMul: TCuHandle;
+  bufs: array of TInferCuBuffer;
+
+  function Up(const v: TSingleDynArray): TCuDevicePtr;
+  var
+    b: TInferCuBuffer;
+  begin
+    b := TInferCuBuffer.Create(fCu, length(v) * 4 + 4);
+    SetLength(bufs, length(bufs) + 1);
+    bufs[high(bufs)] := b;
+    if v <> nil then
+      b.Upload(0, pointer(v), length(v) * 4);
+    result := b.Ptr;
+  end;
+
+  procedure Down(aPtr: TCuDevicePtr; var v: TSingleDynArray);
+  var
+    i: PtrInt;
+  begin
+    fCu.Synchronize;
+    for i := 0 to high(bufs) do
+      if bufs[i].Ptr = aPtr then
+      begin
+        bufs[i].Download(0, pointer(v), length(v) * 4);
+        exit;
+      end;
+  end;
+
+  procedure Near(const a, b: TSingleDynArray; aTol: double; const aWhat: RawUtf8);
+  var
+    e: double;
+  begin
+    e := RelError(pointer(a), pointer(b), length(b));
+    CheckUtf8(e <= aTol, '%: relative error %', [aWhat, e]);
+  end;
+
+  function Silu(x: double): double;
+  begin
+    if x < -100 then
+      result := 0
+    else
+      result := x / (1 + Exp(-x));
+  end;
+
+  // aRows token rows of a layer with aKh key heads of aDk and aVh value heads
+  // of aDv, a convolution of aKw: every kernel against its CPU steps
+  procedure DeltaCase(aRows, aKh, aVh, aDk, aDv, aKw: PtrInt);
+  var
+    qkv, w, conv, beta, decay, z, dt, na, state, y, nw, qc, cc, bc, dc, zc, sc,
+      yc, q2, c2: TSingleDynArray;
+    pq, pw, pc, pb, pd, pz, pdt, pna, ps, py, pn: TCuDevicePtr;
+    rows, channels, kw, kh, vh, dk, dv, cols: cardinal;
+    cd, vd, t, c, j, i, k1: PtrInt;
+    acc, a, sp: double;
+    eps: single;
+  begin
+    cd := 2 * aKh * aDk + aVh * aDv;
+    vd := aVh * aDv;
+    k1 := aKw - 1;
+    Fill(qkv, aRows * cd, 41 + aDk, 1);
+    Fill(w, cd * aKw, 42 + aDk, 0.7);
+    Fill(conv, cd * MaxPtrInt(k1, 1), 43 + aDk, 1);
+    Fill(beta, aRows * aVh, 44, 3);
+    Fill(decay, aRows * aVh, 45, 4);
+    Fill(z, aRows * vd, 46, 3);
+    Fill(dt, aVh, 47, 1);
+    Fill(na, aVh, 48, 1);
+    for i := 0 to aVh - 1 do
+      na[i] := -Abs(na[i]) - 0.1; // -exp(A_log) < 0
+    Fill(state, aVh * aDv * aDk, 49, 0.5);
+    Fill(nw, aDv, 50, 1);
+    SetLength(y, aRows * vd);
+    pq := Up(qkv);
+    pw := Up(w);
+    pc := Up(conv);
+    pb := Up(beta);
+    pd := Up(decay);
+    pz := Up(z);
+    pdt := Up(dt);
+    pna := Up(na);
+    ps := Up(state);
+    py := Up(y);
+    pn := Up(nw);
+    rows := aRows;
+    channels := cd;
+    kw := aKw;
+    kh := aKh;
+    vh := aVh;
+    dk := aDk;
+    dv := aDv;
+    cols := aDv;
+    eps := 1e-6;
+    fCu.Enqueue(kConv, [@pq, @pw, @pc, @rows, @channels, @kw], (cd + 127) div 128, 128);
+    fCu.Enqueue(kPrep, [@pq, @pb, @pd, @pz, @pdt, @pna, @kh, @vh, @dk, @dv,
+      @channels], 2 * aKh + aVh, 128, aRows);
+    fCu.Enqueue(kRule, [@pq, @pb, @pd, @ps, @py, @rows, @channels, @kh, @vh, @dk,
+      @dv], aVh, 128, (aDv + 3) div 4);
+    SetLength(qc, length(qkv));
+    SetLength(cc, length(conv));
+    SetLength(bc, length(beta));
+    SetLength(dc, length(decay));
+    SetLength(zc, length(z));
+    SetLength(sc, length(state));
+    SetLength(yc, length(y));
+    Down(pq, qc);
+    Down(pc, cc);
+    Down(pb, bc);
+    Down(pd, dc);
+    Down(pz, zc);
+    Down(ps, sc);
+    Down(py, yc);
+    // the CPU: the convolution and silu per channel, the factors, the norms
+    // (as TDecoderModel.DeltaPrep), then TInferCpuBackend.DeltaRule
+    for c := 0 to cd - 1 do
+      for t := 0 to aRows - 1 do
+      begin
+        acc := w[c * aKw + k1] * qkv[t * cd + c];
+        for j := 0 to k1 - 1 do
+          acc := acc + w[c * aKw + j] * conv[c * k1 + j];
+        for j := 0 to k1 - 2 do
+          conv[c * k1 + j] := conv[c * k1 + j + 1];
+        if k1 > 0 then
+          conv[c * k1 + k1 - 1] := qkv[t * cd + c];
+        qkv[t * cd + c] := Silu(acc);
+      end;
+    for t := 0 to aRows - 1 do
+    begin
+      for i := 0 to 2 * aKh - 1 do
+      begin
+        acc := 0;
+        for j := 0 to aDk - 1 do
+          acc := acc + sqr(qkv[t * cd + i * aDk + j]);
+        a := 1 / Sqrt(acc + 1e-6);
+        if i < aKh then
+          a := a / Sqrt(1.0 * aDk);
+        for j := 0 to aDk - 1 do
+          qkv[t * cd + i * aDk + j] := qkv[t * cd + i * aDk + j] * a;
+      end;
+      for i := 0 to aVh - 1 do
+      begin
+        beta[t * aVh + i] := 1 / (1 + Exp(-beta[t * aVh + i]));
+        a := decay[t * aVh + i] + dt[i];
+        if a > 20 then
+          sp := a
+        else
+          sp := Ln(1 + Exp(a));
+        decay[t * aVh + i] := Exp(na[i] * sp);
+        for j := 0 to aDv - 1 do
+          z[t * vd + i * aDv + j] := Silu(z[t * vd + i * aDv + j]);
+      end;
+    end;
+    Near(cc, conv, 1e-6, FormatUtf8('dnconv state, kernel %', [aKw]));
+    Near(qc, qkv, 2e-6, FormatUtf8('dnconv and dnprep % rows, key dim %', [aRows, aDk]));
+    Near(bc, beta, 1e-6, 'dnprep beta');
+    Near(dc, decay, 2e-6, 'dnprep decay');
+    Near(zc, z, 1e-6, 'dnprep silu(z)');
+    ref.DeltaRule(pointer(qkv), aRows, cd, aKh, aVh, aDk, aDv, pointer(beta),
+      pointer(decay), pointer(state), pointer(y));
+    Near(yc, y, 2e-5, FormatUtf8('deltarule % rows, % / % heads of % / %',
+      [aRows, aKh, aVh, aDk, aDv]));
+    Near(sc, state, 2e-5, 'deltarule state');
+    // gatednorm on the device output: w * norm(x) * z per value head
+    fCu.Enqueue(kNorm, [@py, @pn, @pz, @py, @cols, @eps], aRows * aVh, 128);
+    Down(py, yc);
+    ref.RmsNorm(pointer(y), aRows * aVh, aDv, pointer(nw), eps, pointer(y));
+    for i := 0 to aRows * vd - 1 do
+      y[i] := y[i] * z[i];
+    Near(yc, y, 5e-5, 'gatednorm');
+    // splitgate and gatemul: q and gate apart, then the gate applied
+    Fill(q2, aRows * aVh * 2 * aDv, 51, 30);
+    pq := Up(q2);
+    SetLength(c2, aRows * aVh * aDv);
+    pc := Up(c2);
+    pd := Up(c2);
+    cols := aRows * aVh;
+    fCu.Enqueue(kSplit, [@pq, @pc, @pd, @cols, @dv], (aRows * vd + 127) div 128, 128);
+    SetLength(qc, length(c2));
+    SetLength(dc, length(c2));
+    Down(pc, qc);
+    Down(pd, dc);
+    for i := 0 to aRows * aVh - 1 do
+    begin
+      Check(CompareMem(@q2[i * 2 * aDv], @qc[i * aDv], aDv * 4), 'splitgate query');
+      Check(CompareMem(@q2[i * 2 * aDv + aDv], @dc[i * aDv], aDv * 4), 'splitgate gate');
+    end;
+    cols := aRows * vd;
+    fCu.Enqueue(kMul, [@pc, @pd, @cols], (aRows * vd + 127) div 128, 128);
+    Down(pc, c2);
+    for i := 0 to aRows * vd - 1 do
+      if dc[i] < -100 then
+        qc[i] := 0
+      else
+        qc[i] := qc[i] * (1 / (1 + Exp(-dc[i])));
+    Near(c2, qc, 1e-6, 'gatemul');
+  end;
+
+var
+  i: PtrInt;
+begin
+  if not HasDevice then
+    exit;
+  ref := TInferCpuBackend.Create;
+  dn := TInferCuModule.Create(fCu, @PTX_DELTANET);
+  try
+    kConv := dn.Kernel('dnconv');
+    kPrep := dn.Kernel('dnprep');
+    kRule := dn.Kernel('deltarule');
+    kNorm := dn.Kernel('gatednorm');
+    kSplit := dn.Kernel('splitgate');
+    kMul := dn.Kernel('gatemul');
+    DeltaCase(5, 2, 4, 16, 8, 4);     // the tiny models
+    DeltaCase(7, 2, 4, 128, 128, 4);  // Qwen3.5-0.8B's heads
+    DeltaCase(1, 1, 2, 256, 64, 3);   // the widest key, one decode row
+    DeltaCase(3, 2, 2, 48, 20, 1);    // no multiple of 32, a kernel of 1
+  finally
+    for i := 0 to high(bufs) do
+      bufs[i].Free;
+    dn.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferCuda.Qwen35MatchesCpu;
+const
+  PROMPT = 300; // more than one chunk of the device forward pass (256)
+  /// the relative error of the F32 logits: a cache of floats, of half floats
+  TOL: array[boolean] of double = (1e-4, 6e-3);
+var
+  dir: TFileName;
+  gpu: TInferCudaBackend;
+  ref: TInferCpuFastBackend;
+  model: TDecoderModel;
+  dev: TQwen3Cuda;
+  c1: TQwen3Context;
+  c2, c3, c4: TQwen3CuContext;
+  ids, a, b: TIntegerDynArray;
+  l1, l2, l3, want: TSingleDynArray;
+  i, k, v, m, kept: PtrInt;
+  seed: cardinal;
+  e: double;
+  cmp: TInferCompare;
+  id: integer;
+  quant: boolean;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen35');
+  if CheckFailed(dir <> '', 'tiny-qwen35 found') then
+    exit;
+  // 0: F32, 1: F32 with the cache in half floats, 2: Q8_0 at load, 3: the
+  // Qwen3_5ForCausalLM layout (an untied head, a convolution of 3)
+  for k := 0 to 3 do
+  begin
+    gpu := TInferCudaBackend.Create;
+    ref := TInferCpuFastBackend.Create;
+    model := nil;
+    dev := nil;
+    c1 := nil;
+    c2 := nil;
+    c3 := nil;
+    c4 := nil;
+    try
+      case k of
+        2:
+          model := TQwen35Model.Create(dir, ref, idtQ8_0);
+        3:
+          model := NewDecoderModel(MakePath([dir, 'text']), ref);
+      else
+        model := NewDecoderModel(dir, ref);
+      end;
+      Check(dxOutputGate in model.Extras, 'an output gate');
+      v := model.Config.VocabSize;
+      SetLength(ids, PROMPT);
+      seed := 23 + k;
+      for i := 0 to PROMPT - 1 do
+      begin
+        seed := seed * 1103515245 + 12345;
+        ids[i] := 3 + PtrInt(seed shr 16) mod (v - 4);
+      end;
+      // the CPU computes Q8_0 matrices with Q8_0 activations, the device in
+      // float: compared by cosine
+      quant := k = 2;
+      dev := TQwen3Cuda.Create(model, gpu);
+      dev.KvF16 := k = 1;
+      c1 := model.NewContext;
+      c2 := dev.NewContext;
+      SetLength(l1, PROMPT * v);
+      SetLength(l2, PROMPT * v);
+      SetLength(l3, v);
+      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+      dev.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      if quant then
+      begin
+        cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
+        CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
+          'Qwen3.5 % prompt logits: %', [k, InferCompareText(cmp)]);
+      end
+      else
+      begin
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= TOL[dev.KvF16], 'Qwen3.5 % prompt logits (KvF16 %): ' +
+          'relative error %', [k, dev.KvF16, e]);
+      end;
+      // decoding: graphs (c2) against launches (c3, the same prompt first),
+      // one range and ranges of 64 keys
+      c3 := dev.NewContext;
+      dev.Forward(c3, pointer(ids), PROMPT, nil);
+      for i := 0 to 5 do
+      begin
+        id := ids[i];
+        dev.SplitKeys := (i and 1) * 64;
+        model.Forward(c1, @id, 1, pointer(l1));
+        dev.UseGraphs := false;
+        dev.Forward(c3, @id, 1, pointer(l3));
+        dev.UseGraphs := true;
+        dev.Forward(c2, @id, 1, pointer(l2));
+        CheckUtf8(CompareMem(pointer(l2), pointer(l3), v * 4),
+          'Qwen3.5 % decode step %: a graph the bits of the launches', [k, i]);
+        if quant then
+        begin
+          cmp := InferCompare(pointer(l2), pointer(l1), v, 0.5, 0.5);
+          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
+            'Qwen3.5 % decode step %: %', [k, i, InferCompareText(cmp)]);
+        end
+        else
+        begin
+          e := RelError(pointer(l2), pointer(l1), v);
+          CheckUtf8(e <= TOL[dev.KvF16], 'Qwen3.5 % decode step % (KvF16 %): ' +
+            'relative error %', [k, i, dev.KvF16, e]);
+        end;
+      end;
+      // restore points on the device (through the model: it splits the rows)
+      m := v - 1; // the turn start, at 5 and 40
+      a := copy(ids, 0, 60);
+      for i := 0 to high(a) do
+        if a[i] = m then
+          a[i] := 3;
+      a[5] := m;
+      a[40] := m;
+      c4 := dev.NewContext;
+      c4.CheckpointId := m;
+      model.Forward(c4, pointer(a), 60, pointer(l3));
+      CheckEqual(c4.Checkpoints, 2, 'two restore points on the device');
+      b := copy(a);
+      b[45] := 4;
+      kept := model.Reuse(c4, pointer(b), 60);
+      CheckEqual(kept, 40, 'the branch goes on from 40');
+      model.Forward(c4, @b[kept], 60 - kept, pointer(l3));
+      FreeAndNil(c3);
+      c3 := dev.NewContext;
+      c3.CheckpointId := m;
+      SetLength(want, v);
+      model.Forward(c3, pointer(b), 60, pointer(want));
+      CheckUtf8(CompareMem(pointer(l3), pointer(want), v * 4),
+        'Qwen3.5 % branch on the device: the bits of a fresh pass', [k]);
+      // the first prompt again: it shares 45 tokens with the branch, so on
+      // from the restore point at 40 - its logits a fresh pass's
+      kept := model.Reuse(c4, pointer(a), 60);
+      CheckEqual(kept, 40, 'the first prompt from 40');
+      model.Forward(c4, @a[kept], 60 - kept, pointer(l3));
+      FreeAndNil(c3);
+      c3 := dev.NewContext;
+      c3.CheckpointId := m;
+      model.Forward(c3, pointer(a), 60, pointer(want));
+      CheckUtf8(CompareMem(pointer(l3), pointer(want), v * 4),
+        'Qwen3.5 % the first prompt again on the device: the bits of a fresh pass',
+        [k]);
+    finally
+      c4.Free;
+      c3.Free;
+      c2.Free;
+      c1.Free;
+      dev.Free;
+      model.Free;
+      ref.Free;
+      gpu.Free;
+    end;
+  end;
+end;
+
+procedure TTestInferCuda.Qwen35OnDevice;
+var
+  dir, refdir: TFileName;
+  gpu: TInferCudaBackend;
+  cpu: TInferCpuFastBackend;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  dev: TQwen3Cuda;
+  ctx: TQwen3Context;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  msgs: TLlmMessageDynArray;
+  req: TLlmChatRequest;
+  r, r2: TLlmChatResponse;
+  ids, want: PIntegerArray;
+  margins: PSingleArray;
+  prompt, mine: TIntegerDynArray;
+  logits: TSingleDynArray;
+  cmp: TInferCompare;
+  k, n, m, diff: PtrInt;
+  margin: double;
+  timer: TPrecisionTimer;
+  calls, reused: Int64;
+begin
+  if not HasDevice then
+    exit;
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3.5-0.8B on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  dir := FindVendorModel('qwen3.5-0.8b' + PathDelim + 'model.safetensors.index.json');
+  if dir = '' then
+  begin
+    Check(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3.5-0.8b');
+    AddConsole('SKIP Qwen3.5-0.8B on the device: no vendor/models/qwen3.5-0.8b');
+    exit;
+  end;
+  dir := ExtractFilePath(dir);
+  refdir := FindInferRefDir('qwen35-0.8b');
+  if CheckFailed(refdir <> '', 'qwen35-0.8b reference found') then
+    exit;
+  gpu := TInferCudaBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  model := nil;
+  dev := nil;
+  try
+    // F32 against transformers in float32: the last logits and the greedy
+    // tokens of the cases of TTestInferQwen35.Qwen35Real
+    timer.Start;
+    model := NewDecoderModel(dir, cpu);
+    dev := TQwen3Cuda.Create(model, gpu);
+    dev.KvF16 := false; // compared with a reference
+    AddConsole(FormatString('Qwen3.5-0.8B loaded and on % in %', [fCu.DeviceName,
+      timer.Stop]));
+    model.Device := dev;
+    SetLength(logits, model.Config.VocabSize);
+    for k := 0 to 3 do
+    begin
+      ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+      SetLength(prompt, n);
+      MoveFast(ids^, prompt[0], n * SizeOf(integer));
+      ctx := model.NewContext;
+      try
+        Check(ctx is TQwen3CuContext, 'a context on the device');
+        model.Forward(ctx, pointer(prompt), n, pointer(logits));
+      finally
+        ctx.Free;
+      end;
+      cmp := InferCompare(pointer(logits), ref.F32(FormatUtf8('case%.logits_last',
+        [k]), m), model.Config.VocabSize, 1, 0);
+      want := ref.I32(FormatUtf8('case%.greedy', [k]), m);
+      margins := ref.F32(FormatUtf8('case%.greedy_margin', [k]), m);
+      ctx := model.NewContext;
+      try
+        mine := model.Greedy(ctx, prompt, m, []);
+      finally
+        ctx.Free;
+      end;
+      diff := 0;
+      while (diff < m) and (diff < length(mine)) and (mine[diff] = want^[diff]) do
+        inc(diff);
+      margin := 0;
+      if diff < m then
+        margin := margins^[diff];
+      AddConsole(FormatString('device case %: logits cos % maxabs %, greedy equal ' +
+        'for % of % tokens (reference margin there %)', [k, cmp.Cosine,
+        cmp.MaxAbs, diff, m, margin]));
+      CheckUtf8(cmp.NonFinite = 0, 'device case % logits finite', [k]);
+      CheckUtf8(cmp.Cosine >= 0.99999, 'device case % logits cosine %', [k, cmp.Cosine]);
+      CheckUtf8(cmp.MaxAbs <= 1e-2, 'device case % logits max error %', [k, cmp.MaxAbs]);
+      CheckUtf8((diff >= m) or (margin < 0.1), 'device case % greedy leaves the ' +
+        'reference at step % where it was % sure', [k, diff, margin]);
+    end;
+    model.Device := nil;
+    FreeAndNil(dev);
+    FreeAndNil(model);
+    // the client on the device (Q8_0, the default): an answer, a tool call,
+    // the next question of the conversation from a restore point
+    timer.Start;
+    client := TNativeLlmClient.Create(dir, '', gpu);
+    llm := client; // the interface frees the client, and with it its Device
+    client.Device := TQwen3Cuda.Create(client.Model, gpu);
+    AddConsole(FormatString('Qwen3.5-0.8B client loaded and on the device in %',
+      [timer.Stop]));
+    calls := gpu.GpuLinears;
+    SetLength(msgs, 1);
+    msgs[0] := LlmMessage(lrUser, 'What is the capital of France? Answer with one word.');
+    req := LlmChatRequest('', msgs);
+    req.Temperature := 0;
+    req.MaxTokens := 100;
+    timer.Start;
+    r := llm.ChatComplete(req);
+    AddConsole(FormatString('capital on the device in %: "%"', [timer.Stop, r.Content]));
+    Check(gpu.GpuLinears = calls, 'the device computed it, not the backend');
+    Check(PosEx('Paris', r.Content) > 0, 'the answer Paris');
+    SetLength(req.Messages, 3);
+    req.Messages[1] := LlmMessage(lrAssistant, r.Content);
+    req.Messages[2] := LlmMessage(lrUser,
+      'And the capital of Germany? Answer with one word.');
+    reused := client.Cache.ReusedTokens;
+    timer.Start;
+    r := llm.ChatComplete(req);
+    AddConsole(FormatString('next turn on the device in %: "%" (% tokens reused)',
+      [timer.Stop, r.Content, client.Cache.ReusedTokens - reused]));
+    Check(PosEx('Berlin', r.Content) > 0, 'the answer Berlin');
+    Check(client.Cache.ReusedTokens - reused > 10, 'from a restore point');
+    client.Cache.Slots := 0;
+    r2 := llm.ChatComplete(req);
+    CheckEqual(r2.Content, r.Content, 'the same answer computed from the start');
+    client.Cache.Slots := NATIVE_LLM_DEFAULT_CACHE_SLOTS;
+    // a tool call, typed by the schema
+    SetLength(req.Messages, 1);
+    req.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
+    SetLength(req.Tools, 1);
+    req.Tools[0].Name := 'get_weather';
+    req.Tools[0].Description := 'The current weather of a city';
+    req.Tools[0].ParametersJson := '{"type":"object","properties":{"city":{"type":' +
+      '"string","description":"The city"}},"required":["city"]}';
+    timer.Start;
+    r := llm.ChatComplete(req);
+    AddConsole(FormatString('weather on the device in %: % calls', [timer.Stop,
+      length(r.ToolCalls)]));
+    if not CheckFailed(length(r.ToolCalls) = 1, 'one tool call') then
+      CheckEqual(r.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
+    llm := nil; // the client and its device before the backend they compute with
+  finally
+    dev.Free;
+    model.Free;
+    ref.Free;
+    cpu.Free;
+    gpu.Free;
+  end;
+end;
+
 
 end.

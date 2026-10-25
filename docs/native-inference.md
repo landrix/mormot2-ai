@@ -1817,6 +1817,67 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7e1 erledigt (2026-10-25): Qwen3.5 auf CUDA.** `TQwen3Cuda` nimmt Qwen3.5 an: die Gated
+DeltaNet-Layer, das Ausgangsgate der vollen Attention und die Teil-RoPE.
+
+- *Kernel* (`tools/cuda/deltanet.cu`, neues Modul `PTX_DELTANET`): `dnconv` (die kausale
+  Convolution je Kanal ein Thread, ihre letzten Eingaben in Registern, dann silu), `dnprep`
+  (je Zeile und Kopf: Q und K L2-normiert, Q mal dk^-0,5; je Value-Kopf beta, der Zerfall
+  und silu(z)), `deltarule` (je Value-Kopf und Spalte j von S ein Warp - die Zeile S[j]
+  bleibt über alle Tokens des Chunks in den Registern der 32 Lanes, die Skalarprodukte per
+  Shuffle), `gatednorm` (RMSNorm je Value-Kopf mal silu(z)), `splitgate` und `gatemul` (die
+  Query-Projektion trägt je Kopf Query und Gate; danach Attention mal sigmoid(Gate)).
+  `qkrope` bekommt `rot`: nur der gedrehte Anteil eines Kopfes rotiert (64 von 256 bei
+  Qwen3.5-0.8B), der Rest geht genormt durch. Rechnen in float wie die übrigen Kernel.
+- *Zustand auf dem Gerät:* je DeltaNet-Layer Convolution und S als Puffer des Kontexts,
+  genullt, wenn eine Sequenz beginnt (außerhalb des CUDA-Graphen: er spielte das Nullen
+  sonst bei jedem Schritt ab); der KV-Cache nur für die Attention-Layer. Ein Decode-Schritt
+  bleibt ein Graph.
+- *Rücksetzpunkte:* `TDecoderCheckpoint` trägt jetzt Länge und Slot, die Kopien liegen je
+  Slot; `TDecoderContext.SaveStates`/`LoadStates` sind virtuell, `TQwen3CuContext` kopiert auf
+  dem Gerät (auf dem Stream, in Reihe mit den Kerneln). `TDecoderModel.Forward` teilt auch für
+  einen Gerätekontext vor jedem Turn-Token; `CheckPart` (Zustand nach einem Fehler, Teilung
+  wie ein frischer Durchlauf) ist eine Methode des Kontexts, die das Gerät an seinem Eingang
+  selbst ruft. `Reuse` des Geräts nimmt `Usable`.
+- *Genauigkeit:* Qwen3.5-0.8B in F32 auf der RTX 5090 gegen transformers: Logits mit Kosinus
+  0,99999999999 und max. 5e-5, alle Greedy-Tokens der vier Fälle gleich (die CPU: 4e-5).
+- *Tempo (RTX 5090, Qwen3.5-0.8B, 22 Threads der CPU zum Vergleich):*
+
+  | | Prefill 512 | Decode |
+  |---|---|---|
+  | CPU F32 | 1108 ms | 83,6 ms/Token |
+  | CPU Q8_0 | 1801 ms | 37,2 ms/Token |
+  | CUDA F32 | 44,6 ms | 3,47 ms/Token |
+  | CUDA Q8_0 | 42,3 ms | 2,47 ms/Token (405 Tokens/s) |
+
+  Mit 2000 Tokens Prompt: Prefill 172 ms, Decode 2,44 ms/Token. Die Chunk-Form der
+  Delta-Regel braucht es auch hier nicht.
+- *Tests* (`test.infer.cuda`): `DeltaNetOpsMatchCpu` (jeder Kernel gegen die CPU, Key-Dim 16,
+  48, 128 und 256, Kernel 1, 3 und 4), `OpsMatchCpu` mit Teil-RoPE, `Qwen35MatchesCpu`
+  (Tiny-Qwen3.5 in F32, mit Half-Float-Cache, in Q8_0 und im Text-Layout; ein Prompt über zwei
+  Chunks, Decode-Schritte als Graph bitgleich zu einzelnen Starts, Rücksetzpunkte auf dem
+  Gerät: Verzweigung und Rückkehr bitgleich zu einem frischen Gerätekontext),
+  `Qwen35OnDevice` (Qwen3.5-0.8B gegen transformers, dann über `TNativeLlmClient` auf dem
+  Gerät: „Paris“ in 27 ms, die nächste Frage „Berlin“ mit 17 Tokens aus dem Rücksetzpunkt und
+  gleich wie ohne Cache, der Aufruf von `get_weather`; das Backend rechnet dabei nichts selbst).
+  Nicht getestet: ein Chunk, der auf dem Gerät mitten in den Layern scheitert (dort gibt es
+  keinen Zustands-Callback, mit dem ein Test ihn erzwingen könnte).
+- *Gegenprobe:* 24 eingebaute Fehler auf dem RTX-Rechner, alle scheitern - in `dnconv`
+  Gewicht, Verschieben, silu; in `dnprep` L2-Norm, Skala, -exp(A_log), beta; in `deltarule`
+  Zerfall, beta, Key-Kopf des Value-Kopfs, Zurückschreiben; `gatednorm` ohne z; `qkrope` den
+  ganzen Kopf gedreht oder ohne den Rest; `splitgate` vertauscht; `gatemul` ohne sigmoid; im
+  Gerät kein Nullen, kein Laden und kein Sichern der Rücksetzpunkte, `Reuse` mit `Common`,
+  `rot` über den ganzen Kopf, cos/sin über den ganzen Kopf, `fStateOk` nie gesetzt, der Zustand eines anderen
+  Layers.
+- *Review:* Claude-Finder und Codex in zwei Runden. Behoben: Ein direkter Aufruf von
+  `TQwen3Cuda.Forward` umging die Prüfung des Zustands nach einem Fehler und die Teilung von
+  D7d (jetzt `TDecoderContext.CheckPart` am Eingang des Geräts); ein gescheitertes Anlegen der
+  Zustandspuffer ließ den Kontext unvollständig (`Prepare` legt jeden fehlenden an). In der
+  zweiten Runde beide ohne Befund.
+- *Läufe:* RTX-Rechner FPC und Delphi 13 je 8425 Assertions, Delphi 7 5229 (ohne CUDA: ein
+  32-Bit-Prozess lädt den Treiber nicht); WSL Infer 6473 und LLM 741; Mac M2 Infer 6030 und
+  LLM 730.
+
 **D7d erledigt (2026-10-25): Rücksetzpunkte des Zustands von Qwen3.5.** Ein Kontext mit
 DeltaNet-Layern hielt seinen Zustand nur für die ganze Sequenz (D7a: zurück nur auf 0 oder
 bleiben). Im Chat half der Prompt-Cache damit nie: Die nächste Anfrage eines Gesprächs

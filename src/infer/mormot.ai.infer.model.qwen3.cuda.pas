@@ -35,6 +35,12 @@
 //   attention kernels (or attnmerge), the output, router and expert biases
 //   (expert e at row e of its bias), the clamped SwiGLU (swiglu with alpha and
 //   limit) and its MXFP4 experts through the Linear kernels
+// - Qwen3.5 (phase D, slice D7e1): the Gated DeltaNet layers (dnconv, dnprep,
+//   deltarule, gatednorm of tools/cuda/deltanet.cu) with their states on the
+//   device - zeroed when a sequence starts, copied to and from the restore
+//   points of TDecoderContext (SaveStates, LoadStates) -, the output gate of
+//   the full attention (splitgate, gatemul) and the partial rotary share
+//   (qkrope with rot); the KV cache only for the attention layers
 unit mormot.ai.infer.model.qwen3.cuda;
 
 {
@@ -104,8 +110,21 @@ type
     // the decode step as a graph (TQwen3Cuda.UseGraphs), on fCu
     fCu: TInferCuda;
     fGraph: TCuHandle;
+    // Qwen3.5: the Q rows with their gates and the gates alone; the
+    // convolved Q, K, V rows, z, beta, the decay and the output of a DeltaNet
+    // layer; per DeltaNet layer its states (nil for the others), and their
+    // copies per restore point slot
+    fDevQg, fDevGateQ, fDevQkv, fDevZ, fDevBeta, fDevDecay,
+      fDevCore: TInferCuBuffer;
+    fDevConv, fDevState: TInferCuBufferDynArray;
+    fDevSlotConv, fDevSlotState: array of TInferCuBufferDynArray;
     procedure FreeScratch;
     procedure FreeCache;
+    procedure FreeStates;
+    /// the states into restore point slot aSlot, on the device
+    procedure SaveStates(aSlot: PtrInt); override;
+    /// the states of slot aSlot back, on the device
+    procedure LoadStates(aSlot: PtrInt); override;
   public
     destructor Destroy; override;
     /// true when the cache holds half floats (TQwen3Cuda.KvF16 when it was
@@ -135,6 +154,11 @@ type
     fExpertGate, fExpertUp, fExpertDown: array of TCuDevicePtrDynArray;
     fStrideGate, fStrideUp, fStrideDown: TInt64DynArray;
     fQkRope16, fAttention16: TCuHandle; // for a KV cache of half floats
+    // Qwen3.5: the module and kernels of tools/cuda/deltanet.cu; a layer is
+    // dmDeltaNet
+    fDeltaNet: TInferCuModule;
+    fDnConv, fDnPrep, fDeltaRule, fGatedNorm, fSplitGate, fGateMul: TCuHandle;
+    fRecurrent: boolean;
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     fSplitKeys: integer;
     fUseGraphs, fKvF16: boolean;
@@ -161,6 +185,9 @@ type
     procedure EnqueueMoeDevice(aCtx: TQwen3CuContext; aLayer: PtrInt);
     /// CheckRoute: the device's choice against TDecoderModel.Route
     procedure CheckDeviceRoute(aCtx: TQwen3CuContext);
+    /// the dmDeltaNet mixer of layer aLayer: fDevH in, fDevTmp out, its
+    // states moved on
+    procedure EnqueueDeltaNet(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
   public
     /// upload every weight of aModel to the device of aBackend; raises
     // EInferError when a matrix type has no kernel (F32, Q8_0, Q5_0, Q4_K and
@@ -270,6 +297,15 @@ begin
   aBuffer := TInferCuBuffer.Create(aCu, aBytes);
 end;
 
+/// a device buffer of exactly aBytes: a copy of a state takes its size
+procedure NeedDeviceOf(aCu: TInferCuda; var aBuffer: TInferCuBuffer; aBytes: Int64);
+begin
+  if (aBuffer <> nil) and (aBuffer.Size = aBytes) then
+    exit;
+  FreeAndNil(aBuffer);
+  aBuffer := TInferCuBuffer.Create(aCu, aBytes);
+end;
+
 
 { TQwen3CuContext }
 
@@ -279,6 +315,7 @@ begin
     fCu.GraphFree(fGraph);
   FreeScratch;
   FreeCache;
+  FreeStates;
   inherited Destroy;
 end;
 
@@ -304,6 +341,13 @@ begin
   FreeAndNil(fDevKGate);
   FreeAndNil(fDevKUp);
   FreeAndNil(fDevKDown);
+  FreeAndNil(fDevQg);
+  FreeAndNil(fDevGateQ);
+  FreeAndNil(fDevQkv);
+  FreeAndNil(fDevZ);
+  FreeAndNil(fDevBeta);
+  FreeAndNil(fDevDecay);
+  FreeAndNil(fDevCore);
   fRows := 0;
 end;
 
@@ -323,6 +367,83 @@ begin
   fCapacity := 0;
 end;
 
+procedure FreeBuffers(var aBuffers: TInferCuBufferDynArray);
+var
+  i: PtrInt;
+begin
+  for i := 0 to high(aBuffers) do
+    FreeAndNil(aBuffers[i]);
+  aBuffers := nil;
+end;
+
+procedure TQwen3CuContext.FreeStates;
+var
+  i: PtrInt;
+begin
+  FreeBuffers(fDevConv);
+  FreeBuffers(fDevState);
+  for i := 0 to high(fDevSlotConv) do
+  begin
+    FreeBuffers(fDevSlotConv[i]);
+    FreeBuffers(fDevSlotState[i]);
+  end;
+  fDevSlotConv := nil;
+  fDevSlotState := nil;
+end;
+
+procedure TQwen3CuContext.SaveStates(aSlot: PtrInt);
+var
+  l: PtrInt;
+  b: TInferCudaBackend;
+begin
+  b := TQwen3Cuda(fDevice).Backend;
+  b.GpuLock;
+  try
+    if aSlot >= system.length(fDevSlotState) then
+    begin
+      SetLength(fDevSlotConv, aSlot + 1);
+      SetLength(fDevSlotState, aSlot + 1);
+    end;
+    if system.length(fDevSlotState[aSlot]) <> system.length(fDevState) then
+    begin
+      FreeBuffers(fDevSlotConv[aSlot]);
+      FreeBuffers(fDevSlotState[aSlot]);
+      SetLength(fDevSlotConv[aSlot], system.length(fDevConv));
+      SetLength(fDevSlotState[aSlot], system.length(fDevState));
+    end;
+    // in order with the kernels on the stream: after the part that came first
+    for l := 0 to high(fDevState) do
+      if fDevState[l] <> nil then
+      begin
+        NeedDeviceOf(fCu, fDevSlotConv[aSlot][l], fDevConv[l].Size);
+        NeedDeviceOf(fCu, fDevSlotState[aSlot][l], fDevState[l].Size);
+        fDevConv[l].CopyTo(0, fDevSlotConv[aSlot][l], 0, fDevConv[l].Size);
+        fDevState[l].CopyTo(0, fDevSlotState[aSlot][l], 0, fDevState[l].Size);
+      end;
+  finally
+    b.GpuUnLock;
+  end;
+end;
+
+procedure TQwen3CuContext.LoadStates(aSlot: PtrInt);
+var
+  l: PtrInt;
+  b: TInferCudaBackend;
+begin
+  b := TQwen3Cuda(fDevice).Backend;
+  b.GpuLock;
+  try
+    for l := 0 to high(fDevState) do
+      if fDevState[l] <> nil then
+      begin
+        fDevSlotConv[aSlot][l].CopyTo(0, fDevConv[l], 0, fDevConv[l].Size);
+        fDevSlotState[aSlot][l].CopyTo(0, fDevState[l], 0, fDevState[l].Size);
+      end;
+  finally
+    b.GpuUnLock;
+  end;
+end;
+
 
 { TQwen3Cuda }
 
@@ -333,16 +454,35 @@ begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
     EInferError.RaiseUtf8('%.Create: no model or no backend', [self]);
-  // the layers it runs: attention, and a dense SwiGLU block or experts
+  // the layers it runs: attention or a Gated DeltaNet (Qwen3.5, slice D7e1),
+  // and a dense SwiGLU block or experts
+  fRecurrent := false;
   for l := 0 to high(aModel.Config.Spec) do
-    if aModel.Config.Spec[l].Mixer <> dmAttention then
+    case aModel.Config.Spec[l].Mixer of
+      dmAttention:
+        ;
+      dmDeltaNet:
+        fRecurrent := true;
+    else
       EInferError.RaiseUtf8('%: layers of another kind not supported', [self]);
+    end;
   // attention sinks, the output, router and expert biases and the clamped
   // SwiGLU of gpt-oss run here too (slice D5d)
-  fMoe := not aModel.HasOnly(dmAttention, dfDense);
-  // what Gemma 4 computes beyond gpt-oss is not here yet (slice D6e)
-  if aModel.Extras - DECODER_EXTRAS_GPTOSS <> [] then
+  fMoe := false;
+  for l := 0 to high(aModel.Config.Spec) do
+    if aModel.Config.Spec[l].Ffn <> dfDense then
+      fMoe := true;
+  // what Gemma 4 computes beyond gpt-oss and Qwen3.5 is not here yet (slice
+  // D6e)
+  if aModel.Extras - DECODER_EXTRAS_GPTOSS - [dxOutputGate, dxPartialRope] <> [] then
     EInferError.RaiseUtf8('%: % computes what this device does not', [self, aModel]);
+  // deltarule keeps a column of S in the registers of a warp, dnconv the
+  // inputs of a channel in those of a thread
+  if fRecurrent and ((aModel.Config.LinKeyDim > 256) or
+     (aModel.Config.LinConv < 1) or (aModel.Config.LinConv > 8) or
+     (aModel.Config.LinValueHeads mod aModel.Config.LinKeyHeads <> 0)) then
+    EInferError.RaiseUtf8('%: a Gated DeltaNet of key dim % and kernel % not ' +
+      'supported', [self, aModel.Config.LinKeyDim, aModel.Config.LinConv]);
   // qkrope keeps one normalized head in shared memory, the attention reads
   // the keys as float4
   if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
@@ -371,6 +511,13 @@ begin
   fUseGraphs := true;
   fKvF16 := true;
   fAdd := fBasic.Kernel('add');
+  fDeltaNet := TInferCuModule.Create(fCu, @PTX_DELTANET);
+  fDnConv := fDeltaNet.Kernel('dnconv');
+  fDnPrep := fDeltaNet.Kernel('dnprep');
+  fDeltaRule := fDeltaNet.Kernel('deltarule');
+  fGatedNorm := fDeltaNet.Kernel('gatednorm');
+  fSplitGate := fDeltaNet.Kernel('splitgate');
+  fGateMul := fDeltaNet.Kernel('gatemul');
   fBackend.GpuLock;
   try
     UploadWeights;
@@ -389,6 +536,7 @@ begin
   // frees later may come back at the same address with other weights
   if (fModel <> nil) and (fBackend <> nil) then
     fModel.ForgetWeights(fBackend);
+  fDeltaNet.Free;
   fBasic.Free;
   fOps.Free;
   inherited Destroy;
@@ -402,7 +550,7 @@ end;
 procedure TQwen3Cuda.UploadWeights;
 var
   c: TQwen3Config;
-  l, qw, kvw: PtrInt;
+  l, qw, kvw, cd, vd: PtrInt;
   ly: ^TQwen3Layer;
 
   procedure Matrix(const w: TInferWeight; aRows, aCols: PtrInt);
@@ -477,10 +625,32 @@ begin
   for l := 0 to c.Layers - 1 do
   begin
     ly := @fModel.Layers[l];
-    Matrix(ly^.Q, qw, c.Hidden);
-    Matrix(ly^.K, kvw, c.Hidden);
-    Matrix(ly^.V, kvw, c.Hidden);
-    Matrix(ly^.O, c.Hidden, qw);
+    if c.Spec[l].Mixer = dmDeltaNet then
+    begin
+      // the four projections, the output, the convolution and the factors
+      cd := fModel.LinChannels;
+      vd := c.LinValueHeads * c.LinValueDim;
+      Matrix(ly^.LinQkv, cd, c.Hidden);
+      Matrix(ly^.LinZ, vd, c.Hidden);
+      Matrix(ly^.LinB, c.LinValueHeads, c.Hidden);
+      Matrix(ly^.LinA, c.LinValueHeads, c.Hidden);
+      Matrix(ly^.LinOut, c.Hidden, vd);
+      Vector(ly^.LinConvW, cd * c.LinConv);
+      Vector(ly^.LinDtBias, c.LinValueHeads);
+      Vector(ly^.LinNegA, c.LinValueHeads);
+      Vector(ly^.LinNorm, c.LinValueDim);
+    end
+    else
+    begin
+      // an output gate: per head the query, then its gate
+      if c.Spec[l].OutputGate then
+        Matrix(ly^.Q, 2 * qw, c.Hidden)
+      else
+        Matrix(ly^.Q, qw, c.Hidden);
+      Matrix(ly^.K, kvw, c.Hidden);
+      Matrix(ly^.V, kvw, c.Hidden);
+      Matrix(ly^.O, c.Hidden, qw);
+    end;
     if c.Spec[l].Ffn = dfMoe then
     begin
       Matrix(ly^.Router, c.Experts, c.Hidden);
@@ -568,7 +738,29 @@ var
 begin
   c := fModel.Config;
   kvw := c.KvHeads * c.HeadDim;
-  half := c.HeadDim shr 1;
+  half := c.RopeDims shr 1; // the rotary factors of a row
+  // the states of the DeltaNet layers: each one that is not there yet (an
+  // allocation that failed is tried again)
+  if fRecurrent then
+  begin
+    if length(aCtx.fDevState) <> c.Layers then
+    begin
+      aCtx.FreeStates;
+      SetLength(aCtx.fDevConv, c.Layers);
+      SetLength(aCtx.fDevState, c.Layers);
+    end;
+    for l := 0 to c.Layers - 1 do
+      if c.Spec[l].Mixer = dmDeltaNet then
+      begin
+        if aCtx.fDevConv[l] = nil then
+          aCtx.fDevConv[l] := TInferCuBuffer.Create(fCu,
+            Int64(fModel.LinChannels) * MaxPtrInt(c.LinConv - 1, 1) * 4);
+        if aCtx.fDevState[l] = nil then
+          aCtx.fDevState[l] := TInferCuBuffer.Create(fCu, Int64(c.LinValueHeads) *
+            c.LinValueDim * c.LinKeyDim * 4);
+      end;
+  end;
+  aCtx.fRecurrent := fRecurrent;
   // an empty context takes the cache format of KvF16
   if (aCtx.fLength = 0) and (aCtx.fCapacity > 0) and (aCtx.fKvF16 <> fKvF16) then
     aCtx.FreeCache;
@@ -593,6 +785,8 @@ begin
     try
       for l := 0 to c.Layers - 1 do
       begin
+        if c.Spec[l].Mixer <> dmAttention then
+          continue; // a DeltaNet layer keeps its state instead
         keys[l] := TInferCuBuffer.Create(fCu, Int64(cap) * kvw * es);
         values[l] := TInferCuBuffer.Create(fCu, Int64(cap) * kvw * es);
         if aCtx.fLength > 0 then
@@ -636,6 +830,20 @@ begin
       MaxPtrInt(c.Intermediate, c.ExpertIntermediate) * 4);
     NeedDevice(fCu, aCtx.fDevCos, Int64(aRows) * half * 2 * 4); // cos, then sin
     SetLength(aCtx.fIn, aRows * (c.Hidden + 2 * half));
+    if dxOutputGate in fModel.Extras then
+    begin
+      NeedDevice(fCu, aCtx.fDevQg, Int64(aRows) * 2 * c.Heads * c.HeadDim * 4);
+      NeedDevice(fCu, aCtx.fDevGateQ, Int64(aRows) * c.Heads * c.HeadDim * 4);
+    end;
+    if fRecurrent then
+    begin
+      NeedDevice(fCu, aCtx.fDevQkv, Int64(aRows) * fModel.LinChannels * 4);
+      NeedDevice(fCu, aCtx.fDevZ, Int64(aRows) * c.LinValueHeads * c.LinValueDim * 4);
+      NeedDevice(fCu, aCtx.fDevCore, Int64(aRows) * c.LinValueHeads *
+        c.LinValueDim * 4);
+      NeedDevice(fCu, aCtx.fDevBeta, Int64(aRows) * c.LinValueHeads * 4);
+      NeedDevice(fCu, aCtx.fDevDecay, Int64(aRows) * c.LinValueHeads * 4);
+    end;
     if fMoe then
     begin
       NeedDevice(fCu, aCtx.fDevRoute, Int64(aRows) * c.Experts * 4);
@@ -888,6 +1096,59 @@ begin
   end;
 end;
 
+procedure TQwen3Cuda.EnqueueDeltaNet(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
+var
+  c: TQwen3Config;
+  ly: ^TQwen3Layer;
+  h, cd, vd: PtrInt;
+  pq, pw, pc, pb, pd, pz, pdt, pna, ps, py, pn: TCuDevicePtr;
+  rows, channels, kw, kh, vh, dk, dv, cols: cardinal;
+  eps: single;
+begin
+  c := fModel.Config;
+  ly := @fModel.Layers[aLayer];
+  h := c.Hidden;
+  cd := fModel.LinChannels;
+  vd := c.LinValueHeads * c.LinValueDim;
+  // the four projections of the normed rows
+  fBackend.EnqueueLinear(aCtx.fDevH, aRows, h, ly^.LinQkv, cd, aCtx.fDevQkv);
+  fBackend.EnqueueLinear(aCtx.fDevH, aRows, h, ly^.LinZ, vd, aCtx.fDevZ);
+  fBackend.EnqueueLinear(aCtx.fDevH, aRows, h, ly^.LinB, c.LinValueHeads,
+    aCtx.fDevBeta);
+  fBackend.EnqueueLinear(aCtx.fDevH, aRows, h, ly^.LinA, c.LinValueHeads,
+    aCtx.fDevDecay);
+  pq := aCtx.fDevQkv.Ptr;
+  pw := Vector(ly^.LinConvW, cd * c.LinConv);
+  pc := aCtx.fDevConv[aLayer].Ptr;
+  rows := aRows;
+  channels := cd;
+  kw := c.LinConv;
+  fCu.Enqueue(fDnConv, [@pq, @pw, @pc, @rows, @channels, @kw],
+    (channels + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+  pb := aCtx.fDevBeta.Ptr;
+  pd := aCtx.fDevDecay.Ptr;
+  pz := aCtx.fDevZ.Ptr;
+  pdt := Vector(ly^.LinDtBias, c.LinValueHeads);
+  pna := Vector(ly^.LinNegA, c.LinValueHeads);
+  kh := c.LinKeyHeads;
+  vh := c.LinValueHeads;
+  dk := c.LinKeyDim;
+  dv := c.LinValueDim;
+  fCu.Enqueue(fDnPrep, [@pq, @pb, @pd, @pz, @pdt, @pna, @kh, @vh, @dk, @dv,
+    @channels], 2 * kh + vh, OPS_BLOCK, aRows);
+  ps := aCtx.fDevState[aLayer].Ptr;
+  py := aCtx.fDevCore.Ptr;
+  fCu.Enqueue(fDeltaRule, [@pq, @pb, @pd, @ps, @py, @rows, @channels, @kh, @vh,
+    @dk, @dv], vh, OPS_BLOCK, (dv + 3) div 4);
+  // RMSNorm per value head times silu(z), the output projection
+  pn := Vector(ly^.LinNorm, c.LinValueDim);
+  cols := dv;
+  eps := c.RmsEps;
+  fCu.Enqueue(fGatedNorm, [@py, @pn, @pz, @py, @cols, @eps], aRows * c.LinValueHeads,
+    OPS_BLOCK);
+  fBackend.EnqueueLinear(aCtx.fDevCore, aRows, vd, ly^.LinOut, h, aCtx.fDevTmp);
+end;
+
 procedure TQwen3Cuda.Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
   aNormed: PSingleArray);
@@ -897,9 +1158,9 @@ var
     wsplits, last: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
-  pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt, psk: TCuDevicePtr;
+  pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt, psk, pg: TCuDevicePtr;
   rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count,
-    norm, rope, window: cardinal;
+    norm, rope, window, rot: cardinal;
   eps, alpha, limit: single;
   capture, device: boolean;
   qkrope, attention: TCuHandle;
@@ -910,7 +1171,7 @@ begin
   f := c.Intermediate;
   qw := c.Heads * c.HeadDim;
   kvw := c.KvHeads * c.HeadDim;
-  half := c.HeadDim shr 1;
+  half := c.RopeDims shr 1; // the rotary factors of a row
   past := aCtx.fLength;
   outRows := 0;
   if aLogits <> nil then
@@ -975,10 +1236,27 @@ begin
   fModel.Rotary(past, n, @p^[n * h], @p^[n * h + n * half]);
   aCtx.fDevX.Upload(0, p, Int64(n) * h * 4);
   aCtx.fDevCos.Upload(0, @p^[n * h], Int64(n) * half * 2 * 4);
+  // a new sequence: the states of the DeltaNet layers start at 0 (outside a
+  // graph: it would replay the fill at every step)
+  aCtx.fStateOk := false;
+  if fRecurrent and (past = 0) then
+    for l := 0 to c.Layers - 1 do
+      if aCtx.fDevState[l] <> nil then
+      begin
+        pt := aCtx.fDevConv[l].Ptr;
+        count := aCtx.fDevConv[l].Size div 4;
+        fCu.Enqueue(fFill0, [@pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
+          OPS_BLOCK);
+        pt := aCtx.fDevState[l].Ptr;
+        count := aCtx.fDevState[l].Size div 4;
+        fCu.Enqueue(fFill0, [@pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
+          OPS_BLOCK);
+      end;
   rows := n;
   heads := c.Heads;
   kvHeads := c.KvHeads;
   headDim := c.HeadDim;
+  rot := c.RopeDims; // the whole head unless Qwen3.5 rotates a share of it
   ppast := past;
   nsplits := splits;
   hblock := hb;
@@ -1004,46 +1282,69 @@ begin
     for l := 0 to c.Layers - 1 do
     begin
       ly := @fModel.Layers[l];
-      // attention block: the projections, per head the norms, rotary positions
-      // and the store of k and v into the cache, the attention, the output
-      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, ly^.QBias);
-      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, ly^.KBias);
-      fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, ly^.VBias);
-      // without head norms (Qwen2) the kernel reads no qn or kn
-      norm := ord(ly^.QNorm <> nil);
-      rope := ord(not c.Spec[l].NoRope);
-      window := c.Spec[l].Window;
-      nsplits := splits;
-      rblock := rb;
-      if window > 0 then
+      if c.Spec[l].Mixer = dmDeltaNet then
+        EnqueueDeltaNet(aCtx, l, n)
+      else
       begin
-        nsplits := wsplits;
-        rblock := 1;
+        // attention block: the projections, per head the norms, rotary positions
+        // and the store of k and v into the cache, the attention, the output
+        if c.Spec[l].OutputGate then
+        begin
+          // per head the query, then its gate
+          fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Q, 2 * qw, aCtx.fDevQg);
+          px := aCtx.fDevQg.Ptr;
+          pg := aCtx.fDevGateQ.Ptr;
+          count := n * c.Heads;
+          fCu.Enqueue(fSplitGate, [@px, @pq, @pg, @count, @headDim],
+            (count * headDim + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+        end
+        else
+          fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, ly^.QBias);
+        fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, ly^.KBias);
+        fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, ly^.VBias);
+        // without head norms (Qwen2) the kernel reads no qn or kn
+        norm := ord(ly^.QNorm <> nil);
+        rope := ord(not c.Spec[l].NoRope);
+        window := c.Spec[l].Window;
+        nsplits := splits;
+        rblock := rb;
+        if window > 0 then
+        begin
+          nsplits := wsplits;
+          rblock := 1;
+        end;
+        pqn := 0;
+        pkn := 0;
+        if ly^.QNorm <> nil then
+        begin
+          pqn := Vector(ly^.QNorm, c.HeadDim);
+          pkn := Vector(ly^.KNorm, c.HeadDim);
+        end;
+        pkc := aCtx.fDevKeys[l].Ptr;
+        pvc := aCtx.fDevValues[l].Ptr;
+        // the attention sinks of gpt-oss, 0 without
+        psk := 0;
+        if ly^.Sinks <> nil then
+          psk := Vector(ly^.Sinks, c.Heads);
+        fCu.Enqueue(qkrope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
+          @heads, @kvHeads, @headDim, @ppast, @eps, @norm, @rope, @rot],
+          c.Heads + c.KvHeads, OPS_BLOCK, n);
+        fCu.Enqueue(attention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
+          @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock, @window, @psk],
+          c.Heads div hb, OPS_BLOCK, (n + PtrInt(rblock) - 1) div PtrInt(rblock),
+          nsplits);
+        if nsplits > 1 then
+          fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits, @psk],
+            c.Heads, OPS_BLOCK, n);
+        if c.Spec[l].OutputGate then
+        begin
+          pg := aCtx.fDevGateQ.Ptr;
+          count := n * qw;
+          fCu.Enqueue(fGateMul, [@pa, @pg, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
+            OPS_BLOCK);
+        end;
+        fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp, ly^.OBias);
       end;
-      pqn := 0;
-      pkn := 0;
-      if ly^.QNorm <> nil then
-      begin
-        pqn := Vector(ly^.QNorm, c.HeadDim);
-        pkn := Vector(ly^.KNorm, c.HeadDim);
-      end;
-      pkc := aCtx.fDevKeys[l].Ptr;
-      pvc := aCtx.fDevValues[l].Ptr;
-      // the attention sinks of gpt-oss, 0 without
-      psk := 0;
-      if ly^.Sinks <> nil then
-        psk := Vector(ly^.Sinks, c.Heads);
-      fCu.Enqueue(qkrope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
-        @heads, @kvHeads, @headDim, @ppast, @eps, @norm, @rope],
-        c.Heads + c.KvHeads, OPS_BLOCK, n);
-      fCu.Enqueue(attention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
-        @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock, @window, @psk],
-        c.Heads div hb, OPS_BLOCK, (n + PtrInt(rblock) - 1) div PtrInt(rblock),
-        nsplits);
-      if nsplits > 1 then
-        fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits, @psk],
-          c.Heads, OPS_BLOCK, n);
-      fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp, ly^.OBias);
       // residual and the feed-forward pre-norm, gate and up, SwiGLU, down
       EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, ly^.PostNorm, aCtx.fDevH);
       if c.Spec[l].Ffn = dfMoe then
@@ -1115,6 +1416,7 @@ begin
   else
     FillCharFast(aCtx.fIds[past], n * SizeOf(integer), $ff); // -1: no id
   aCtx.fLength := past + n;
+  aCtx.fStateOk := true;
 end;
 
 procedure TQwen3Cuda.ForwardRows(aCtx: TQwen3Context; aIds: PIntegerArray;
@@ -1145,6 +1447,9 @@ begin
       if (aIds^[i] < 0) or (aIds^[i] >= vocab) then
         EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary',
           [self, aIds^[i]]);
+  // an undone recurrent state refused, a part noted that a fresh pass would
+  // not make (as TDecoderModel.Forward)
+  ctx.CheckPart(aIds, aCount);
   fBackend.GpuLock;
   try
     // the backend forgot the weights (ClearWeights): up again
@@ -1200,9 +1505,11 @@ function TQwen3Cuda.Reuse(aCtx: TQwen3Context; aIds: PIntegerArray;
 begin
   if (aCtx = nil) or (aCtx.Device <> self) then
     EInferError.RaiseUtf8('%.Reuse: no context of this instance', [self]);
+  // the cache keeps every row: the common prefix, or a restore point of the
+  // states of a DeltaNet layer before it
   result := 0;
   if aCount > 0 then
-    result := aCtx.Common(aIds, aCount - 1);
+    result := aCtx.Usable(aIds, aCount - 1);
   aCtx.Truncate(result);
 end;
 

@@ -367,10 +367,11 @@ type
       read fDiffersGap;
   end;
 
-  /// a copy of the recurrent states of a context at one length
+  /// a restore point of the recurrent states of a context: its length and
+  // the slot of the copy (TDecoderContext.SaveStates)
   TDecoderCheckpoint = record
     Length: PtrInt;
-    Conv, State: array of TSingleDynArray; // per layer, as in the context
+    Slot: PtrInt;
   end;
 
   /// the KV cache and scratch buffers of one sequence
@@ -423,6 +424,8 @@ type
     fCheckpoints: array of TDecoderCheckpoint;
     fCheckpointCount, fMaxCheckpoints: PtrInt;
     fCheckpointId: integer;
+    // the copies of the states per slot, as fConv and fState (SaveStates)
+    fSlotConv, fSlotState: array of array of TSingleDynArray;
     // every part so far started at 0 or at a CheckpointId token, and none
     // held one after its start: the rows are split as a fresh pass splits
     // them - the restore points are kept only then
@@ -450,6 +453,15 @@ type
     function FindCheckpoint(aLength: PtrInt): PtrInt;
     /// forget the restore points after aLength
     procedure DropCheckpoints(aLength: PtrInt);
+    /// copy the states into slot aSlot (from 0, a new one is the next after
+    // the last) - a device context overrides both with its own buffers
+    procedure SaveStates(aSlot: PtrInt); virtual;
+    /// copy the states of slot aSlot back
+    procedure LoadStates(aSlot: PtrInt); virtual;
+    /// before aCount new rows of aIds (nil: embedding rows): refuse an undone
+    // recurrent state, note a part a fresh pass would not make (fAligned) -
+    // a device calls it where its Forward starts
+    procedure CheckPart(aIds: PIntegerArray; aCount: PtrInt);
   public
     /// an empty context: no restore points until CheckpointId is set
     constructor Create;
@@ -635,8 +647,6 @@ type
     /// raise unless every FP16 scale of the blocks of aTensor is finite
     procedure CheckBlockScales(aTensor: PInferTensor; const aName: RawUtf8);
     procedure Grow(aCtx: TDecoderContext; aTokens, aNew: PtrInt);
-    /// the channels of the convolution of a dmDeltaNet layer: Q, K and V
-    function LinChannels: PtrInt;
     /// room in the rows of sliding-window layer aLayer for aRows new tokens
     // at aPast: older keys than the window of aPast moved out first
     procedure Slide(aCtx: TDecoderContext; aLayer, aPast, aRows: PtrInt);
@@ -759,6 +769,9 @@ type
     /// true when the model has a head: logits need one (a stack without one
     // gives the normed state of ForwardEmbeds only)
     function HasHead: boolean;
+    /// the channels of the convolution of a dmDeltaNet layer: Q, K and V
+    // (the rows a device keeps per token of such a layer)
+    function LinChannels: PtrInt;
     /// keep the cached tokens of aCtx that start aIds[0..aCount-1], forget the
     // others, and return how many stayed: the rest of aIds is to be computed
     // - at most aCount - 1 stay, so a Forward of the rest has a token to give
@@ -928,8 +941,6 @@ begin
 end;
 
 procedure TDecoderContext.Truncate(aLength: PtrInt);
-var
-  c, l: PtrInt;
 begin
   if (aLength < 0) or (aLength > fLength) then
     EInferError.RaiseUtf8('%.Truncate(%) of % tokens', [self, aLength, fLength]);
@@ -945,15 +956,7 @@ begin
   if fRecurrent and ((aLength <> fLength) or not fStateOk) then
   begin
     // back to a restore point: its states are the states of aLength tokens
-    c := FindCheckpoint(aLength);
-    for l := 0 to high(fState) do
-      if fState[l] <> nil then
-      begin
-        MoveFast(pointer(fCheckpoints[c].Conv[l])^, pointer(fConv[l])^,
-          system.length(fConv[l]) * SizeOf(single));
-        MoveFast(pointer(fCheckpoints[c].State[l])^, pointer(fState[l])^,
-          system.length(fState[l]) * SizeOf(single));
-      end;
+    LoadStates(fCheckpoints[FindCheckpoint(aLength)].Slot);
     fStateOk := true;
     fAligned := true; // only aligned ones are kept
   end;
@@ -969,7 +972,7 @@ begin
   if aValue < 0 then
     EInferError.RaiseUtf8('%.MaxCheckpoints = %', [self, aValue]);
   fMaxCheckpoints := aValue;
-  // the oldest go, their buffers stay behind the ones in use
+  // the oldest go, their slots stay behind the ones in use
   while fCheckpointCount > aValue do
   begin
     n := system.length(fCheckpoints);
@@ -992,7 +995,7 @@ end;
 
 procedure TDecoderContext.SaveCheckpoint;
 var
-  i, n, l: PtrInt;
+  i, n: PtrInt;
   c: ^TDecoderCheckpoint;
   keep: TDecoderCheckpoint;
 begin
@@ -1002,7 +1005,7 @@ begin
     exit;
   if fCheckpointCount >= fMaxCheckpoints then
   begin
-    // the oldest one goes: its buffers are taken again
+    // the oldest one goes: its slot is taken again
     n := fCheckpointCount;
     keep := fCheckpoints[0];
     for i := 1 to n - 1 do
@@ -1011,41 +1014,93 @@ begin
     dec(fCheckpointCount);
   end;
   if fCheckpointCount >= system.length(fCheckpoints) then
-    SetLength(fCheckpoints, fCheckpointCount + 1);
+  begin
+    // a new slot: every one so far is in a record
+    n := system.length(fCheckpoints);
+    SetLength(fCheckpoints, n + 1);
+    fCheckpoints[n].Slot := n;
+  end;
   c := @fCheckpoints[fCheckpointCount];
   c^.Length := -1; // not in use until copied: an allocation may fail
-  if system.length(c^.State) <> system.length(fState) then
+  SaveStates(c^.Slot);
+  c^.Length := fLength;
+  inc(fCheckpointCount);
+end;
+
+procedure TDecoderContext.CheckPart(aIds: PIntegerArray; aCount: PtrInt);
+var
+  i: PtrInt;
+begin
+  // a recurrent state left undone by a failed Forward cannot go on
+  if fRecurrent and (fLength > 0) and not fStateOk then
+    EInferError.RaiseUtf8('%.Forward: the recurrent state is undone by an ' +
+      'earlier failure - Reset it, or Truncate it to a restore point', [self]);
+  // a part a fresh pass would not make: one starting elsewhere than at 0 or
+  // at a CheckpointId token, or one holding such a token after its start
+  if (fLength > 0) and ((aIds = nil) or (aIds^[0] <> fCheckpointId)) then
+    fAligned := false;
+  if aIds <> nil then
+    for i := 1 to aCount - 1 do
+      if aIds^[i] = fCheckpointId then
+      begin
+        fAligned := false;
+        break;
+      end;
+end;
+
+procedure TDecoderContext.SaveStates(aSlot: PtrInt);
+var
+  l: PtrInt;
+begin
+  if aSlot >= system.length(fSlotState) then
   begin
-    c^.Conv := nil;
-    c^.State := nil;
-    SetLength(c^.Conv, system.length(fConv));
-    SetLength(c^.State, system.length(fState));
+    SetLength(fSlotConv, aSlot + 1);
+    SetLength(fSlotState, aSlot + 1);
+  end;
+  if system.length(fSlotState[aSlot]) <> system.length(fState) then
+  begin
+    fSlotConv[aSlot] := nil;
+    fSlotState[aSlot] := nil;
+    SetLength(fSlotConv[aSlot], system.length(fConv));
+    SetLength(fSlotState[aSlot], system.length(fState));
   end;
   for l := 0 to high(fState) do
     if fState[l] = nil then
     begin
-      c^.Conv[l] := nil;
-      c^.State[l] := nil;
+      fSlotConv[aSlot][l] := nil;
+      fSlotState[aSlot][l] := nil;
     end
     else
     begin
-      if system.length(c^.Conv[l]) <> system.length(fConv[l]) then
+      if system.length(fSlotConv[aSlot][l]) <> system.length(fConv[l]) then
       begin
-        c^.Conv[l] := nil;
-        SetLength(c^.Conv[l], system.length(fConv[l]));
+        fSlotConv[aSlot][l] := nil;
+        SetLength(fSlotConv[aSlot][l], system.length(fConv[l]));
       end;
-      if system.length(c^.State[l]) <> system.length(fState[l]) then
+      if system.length(fSlotState[aSlot][l]) <> system.length(fState[l]) then
       begin
-        c^.State[l] := nil;
-        SetLength(c^.State[l], system.length(fState[l]));
+        fSlotState[aSlot][l] := nil;
+        SetLength(fSlotState[aSlot][l], system.length(fState[l]));
       end;
-      MoveFast(pointer(fConv[l])^, pointer(c^.Conv[l])^,
+      MoveFast(pointer(fConv[l])^, pointer(fSlotConv[aSlot][l])^,
         system.length(fConv[l]) * SizeOf(single));
-      MoveFast(pointer(fState[l])^, pointer(c^.State[l])^,
+      MoveFast(pointer(fState[l])^, pointer(fSlotState[aSlot][l])^,
         system.length(fState[l]) * SizeOf(single));
     end;
-  c^.Length := fLength;
-  inc(fCheckpointCount);
+end;
+
+procedure TDecoderContext.LoadStates(aSlot: PtrInt);
+var
+  l: PtrInt;
+begin
+  for l := 0 to high(fState) do
+    if fState[l] <> nil then
+    begin
+      MoveFast(pointer(fSlotConv[aSlot][l])^, pointer(fConv[l])^,
+        system.length(fConv[l]) * SizeOf(single));
+      MoveFast(pointer(fSlotState[aSlot][l])^, pointer(fState[l])^,
+        system.length(fState[l]) * SizeOf(single));
+    end;
 end;
 
 function TDecoderContext.FindCheckpoint(aLength: PtrInt): PtrInt;
@@ -2976,8 +3031,8 @@ var
   i, start, past, vocab: PtrInt;
   part: PSingleArray;
 begin
-  // the states of aOnState are of one pass: not split
-  if (aCtx = nil) or (aCtx.fDevice <> nil) or (aIds = nil) or (aCount <= 0) or
+  // the states of aOnState are of one pass: not split (a device gives none)
+  if (aCtx = nil) or (aIds = nil) or (aCount <= 0) or
      Assigned(aOnState) or (aCtx.fCheckpointId < 0) or
      (aCtx.fMaxCheckpoints <= 0) or not Recurrent then
   begin
@@ -3073,22 +3128,7 @@ begin
         EInferError.RaiseUtf8('%.Forward: token id % outside the vocabulary', [self, id]);
     end;
   Grow(aCtx, past + n, n);
-  // a recurrent state left undone by a failed Forward cannot go on
-  if aCtx.fRecurrent and (past > 0) and not aCtx.fStateOk then
-    EInferError.RaiseUtf8('%.Forward: the recurrent state of the context is ' +
-      'undone by an earlier failure - Reset it, or Truncate it to a restore point',
-      [self]);
-  // a part a fresh pass would not make: one starting elsewhere than at 0 or
-  // at a CheckpointId token, or one holding such a token after its start
-  if (past > 0) and ((aIds = nil) or (aIds^[0] <> aCtx.fCheckpointId)) then
-    aCtx.fAligned := false;
-  if aIds <> nil then
-    for i := 1 to n - 1 do
-      if aIds^[i] = aCtx.fCheckpointId then
-      begin
-        aCtx.fAligned := false;
-        break;
-      end;
+  aCtx.CheckPart(aIds, n);
   aCtx.fStateOk := false;
   RopeFactors(aCtx, n, past);
   // embeddings: of the ids, or the rows as given
