@@ -419,8 +419,9 @@ type
     /// the children of aNode, in their order
     procedure AddChildren(aNode: integer; const aKids: TIntegerDynArray;
       const aKeys: TRawUtf8DynArray; aCount: integer);
-    /// parse aJson by the rules of PythonJson (a float it would round raises)
-    procedure Parse(const aJson: RawUtf8);
+    /// parse aJson by the rules of PythonJson (a float it would round raises,
+    // or is kept as written with aKeepInexactFloats)
+    procedure Parse(const aJson: RawUtf8; aKeepInexactFloats: boolean = false);
     /// the member aKey of aNode - -1 (the Jinja undefined) when aNode is no
     // object or has no such member
     function Member(aNode: integer; const aKey: RawUtf8): integer;
@@ -1303,7 +1304,7 @@ begin
   end;
 end;
 
-procedure THarmonyJson.Parse(const aJson: RawUtf8);
+procedure THarmonyJson.Parse(const aJson: RawUtf8; aKeepInexactFloats: boolean);
 var
   w: TPythonJsonWriter;
 begin
@@ -1313,7 +1314,7 @@ begin
   w.P := w.Start;
   w.Out := '';
   w.Depth := 0;
-  w.KeepInexactFloats := false;
+  w.KeepInexactFloats := aKeepInexactFloats;
   w.Tree := @self;
   if w.P = nil then
     w.Fail('empty');
@@ -2384,7 +2385,7 @@ begin
         aOut.Add('call:' + m^.ToolCalls[j].Name + '{');
         if m^.ToolCalls[j].ArgumentsJson <> '' then
         begin
-          w.T.Parse(m^.ToolCalls[j].ArgumentsJson);
+          w.T.Parse(m^.ToolCalls[j].ArgumentsJson, {keepinexactfloats=}true);
           // null is the template's none: nothing between the braces
           if w.T.Nodes[0].Kind = hjNull then
             SetLength(kids, 0)
@@ -2695,7 +2696,7 @@ begin
             if m^.ToolCalls[j].ArgumentsJson <> '' then
             begin
               // the members of the object in their order (|items)
-              T.Parse(m^.ToolCalls[j].ArgumentsJson);
+              T.Parse(m^.ToolCalls[j].ArgumentsJson, {keepinexactfloats=}true);
               if T.Nodes[0].Kind <> hjObject then
                 EInferError.RaiseUtf8('%: the arguments of call % are no JSON ' +
                   'object', [self, m^.ToolCalls[j].Name]);

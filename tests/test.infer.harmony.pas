@@ -797,6 +797,12 @@ begin
       '<|message|>{"city": "Ulm"}<|call|>' +
       '<|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>"18"<|end|>' +
       '<|start|>assistant', 'reasoning and preamble');
+    // a float json.dumps would round, as the parser keeps it: passed on as
+    // written - the next turn of an agent loop must not break on it
+    m[1].ToolCalls[0] := Call('c1', 'get_weather', '{"lat":0.1000000000000000055511}');
+    text := tpl.RenderWith(m, nil, true, o);
+    Check(PosEx('<|message|>{"lat": 0.1000000000000000055511}<|call|>', text) > 0,
+      'an inexact float');
     // the date of today when none is given
     today := StringToUtf8(FormatDateTime('yyyy"-"mm"-"dd', Now));
     text := tpl.Render(m, nil, true);

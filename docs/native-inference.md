@@ -483,7 +483,10 @@ Indizier-Job im Backend) und ein Lauf auf echter Sensor-Hardware.
     bleibt immer Text. Ein `<|im_end|>` im Text eines Nutzers schließt also nicht seinen
     Turn.
   - Floats mit mehr als 15 signifikanten Stellen weist `PythonJson` ab, statt die
-    binäre Rundung zu raten.
+    binäre Rundung zu raten. Ausnahme: die Argumente eines Aufrufs im Verlauf - die Parser
+    behalten einen solchen Float so, wie das Modell ihn schrieb, und jedes Template gibt
+    ihn so zurück (seit 2026-10-25 auch Gemma 4 und Qwen3.5), damit eine
+    Agentenschleife im nächsten Turn nicht scheitert.
 - **2b, Forward** (`mormot.ai.infer.model.qwen3`):
   - Aufbau: RMSNorm, Q/K-Norm je Kopf, RoPE, GQA, kausale Attention, SwiGLU, verbundener
     oder eigener LM-Head.
@@ -1905,6 +1908,15 @@ nachgebaut, kein Code übernommen.
   - der Name bei einer Ablehnung;
   - Tests, die bei einer fremden Ablehnung bestanden hätten;
   - die Zählung der textgleichen Fälle.
+- *Nachtrag 2026-10-25, ungenaue Floats:* Die Templates von Gemma 4 und Qwen3.5 lehnten einen
+  Float in den Argumenten eines Aufrufs ab, den `json.dumps` runden würde (mehr als 15
+  Stellen) - die Parser behalten ihn aber wörtlich, die Agentenschleife scheiterte so im
+  nächsten Turn. Jetzt lesen beide die Argumente mit `THarmonyJson.Parse(..., true)` und
+  geben den Float wörtlich weiter, wie Harmony, Qwen2.5 und Qwen3 schon (Qwen3 schreibt
+  die Argumente unverändert). Die Werte stimmen dann
+  nicht unbedingt mit transformers überein, das den Float erst rundet. Bei
+  Tool-Schemas bleibt die Ablehnung. Tests für Qwen2.5, Qwen3, Harmony, Gemma 4 und Qwen3.5; Gegenprobe ohne das
+  Flag: die Tests von Gemma 4 und Qwen3.5 scheitern.
 
 **D7b erledigt (2026-10-21): der Prefill von Qwen3.5 auf allen Kernen.** Erst gemessen: Nach
 D7a lagen im Prefill von 512 Tokens (Qwen3.5-0.8B, F32, RTX-Rechner) 5,8 s von 9,4 s in der

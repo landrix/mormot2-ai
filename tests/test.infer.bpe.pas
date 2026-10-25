@@ -1074,6 +1074,14 @@ begin
     CheckEqual(fTemplate.Render(msgs, nil, false, true),
       '<|im_start|>user'#10'x<|im_end|>'#10'<|im_start|>assistant'#10'<think>'#10 +
       'r'#10'</think>'#10#10'<think>a</think>b<|im_end|>'#10, 'reasoning, content kept');
+    // a float json.dumps would round, as the parser keeps it: passed on as written
+    msgs[1] := LlmMessage(lrAssistant, '');
+    SetLength(msgs[1].ToolCalls, 1);
+    msgs[1].ToolCalls[0].Name := 'f';
+    msgs[1].ToolCalls[0].ArgumentsJson := '{"n": 0.1000000000000000055511}';
+    text := fTemplate.Render(msgs, nil, false, true);
+    CheckUtf8(PosEx('"arguments": {"n": 0.1000000000000000055511}}', text) > 0,
+      'an inexact float: %', [text]);
   finally
     ref.Free;
   end;
@@ -1152,6 +1160,11 @@ begin
     text := tpl.Render(msgs, nil, false);
     CheckUtf8(PosEx('{"name": "now", "arguments": {}}', text) > 0, 'no arguments: %',
       [text]);
+    // a float json.dumps would round, as a parser keeps it: passed on as written
+    msgs[1].ToolCalls[0].ArgumentsJson := '{"n": 0.1000000000000000055511}';
+    text := tpl.Render(msgs, nil, false);
+    CheckUtf8(PosEx('"arguments": {"n": 0.1000000000000000055511}}', text) > 0,
+      'an inexact float: %', [text]);
   finally
     tpl.Free;
     tok.Free;

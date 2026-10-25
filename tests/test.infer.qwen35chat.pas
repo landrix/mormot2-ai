@@ -681,6 +681,11 @@ begin
       '"a": [1, "x"], "n": 1.5, "u": null}', 'typed values');
     CheckEqual(Q35RoundTrip(tpl, '{"s": "x\ny\n", "n": 1E5}', Q35Tools),
       '{"s": "x\ny\n", "n": 100000.0}', 'newlines and an exponent');
+    // a float json.dumps would round: kept as written both ways
+    CheckEqual(Q35RoundTrip(tpl, '{"n": 0.1000000000000000055511, ' +
+      '"o": {"k": [1.2345678901234567]}}', Q35Tools),
+      '{"n": 0.1000000000000000055511, "o": {"k": [1.2345678901234567]}}',
+      'inexact floats');
     CheckEqual(Q35RoundTrip(tpl, '{}', Q35Tools), '{}', 'no arguments');
     // the tags inside an object: it ends where it is JSON
     CheckEqual(Q35RoundTrip(tpl, '{"o": {"t": "a</parameter><parameter=x>b"}, ' +

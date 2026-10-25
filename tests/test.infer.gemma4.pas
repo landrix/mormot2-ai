@@ -721,7 +721,7 @@ var
   tok: TSpBpeTokenizer;
   tpl: TGemma4ChatTemplate;
   m: TLlmMessageDynArray;
-  text: RawUtf8;
+  text, name, args: RawUtf8;
 begin
   Check(not TGemma4ChatTemplate.DefaultEnableThinking, 'thinks on request only');
   Check(TChatTemplate.DefaultEnableThinking, 'the others think by default');
@@ -743,6 +743,14 @@ begin
     Check(TemplateRaises(tpl, m, nil, 'no JSON object'), 'array arguments');
     m[1].ToolCalls[0].ArgumentsJson := '{"a":';
     Check(TemplateRaises(tpl, m, nil, 'PythonJson'), 'invalid JSON');
+    // a float json.dumps would round: the parser keeps it as written, the
+    // template passes it on so - the next turn of an agent loop
+    Check(ParseGemma4ToolCall('call:f{n:0.1000000000000000055511}', name, args),
+      'an inexact float parsed');
+    m[1].ToolCalls[0].ArgumentsJson := args;
+    text := tpl.RenderWith(m, nil, false, ChatTemplateOptions(false));
+    CheckUtf8(PosEx('call:f{n:0.1000000000000000055511}', text) > 0,
+      'an inexact float passed on: %', [text]);
     SetLength(m, 1);
     // schemas the template would write as a Python repr, or could not take
     Check(TemplateRaises(tpl, m, OneTool('[1]'), 'no object'), 'parameters an array');
