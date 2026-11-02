@@ -978,12 +978,22 @@ type
 { ************ JSON-RPC 2.0 Protocol Processor }
 
 type
+  /// outcome of TMcpJsonRpcProcessor.ParseRequestEx
+  // - mrpParseError and mrpInvalidRequest are answered with -32700 and -32600,
+  //   both with "id": null: JSON-RPC 2.0 §5.1 for a body whose id could not be
+  //   determined
+  TMcpRequestParse = (
+    mrpValid,
+    mrpParseError,
+    mrpInvalidRequest);
+
   /// Stateless JSON-RPC 2.0 request/response processor for MCP
   // - handles all MCP protocol methods
   TMcpJsonRpcProcessor = class
   private
     fServerName: RawUtf8;
     fServerVersion: RawUtf8;
+    fAdvertiseListNotifications: boolean;
     // id -> settings object, advertised as ServerCapabilities.extensions
     // - guarded: RegisterExtension is deliberately callable after Start (the
     //   sister setters lock themselves down with CheckNotStarted, this one is
@@ -992,7 +1002,6 @@ type
     //   capability must not be able to tear a discover response.
     fExtensions: TDocVariantData;
     fExtensionsSafe: TLightLock;
-    function ExtractRequestId(const aRequest: variant): variant;
     function CreateResponse(const aRequestId: variant): variant;
     function CreateErrorResponse(const aRequestId: variant;
       aErrorCode: integer; const aErrorMsg: RawUtf8; const aData: variant): variant;
@@ -1000,9 +1009,19 @@ type
     /// initialize with server information
     constructor Create(const aServerName, aServerVersion: RawUtf8);
     /// parse JSON-RPC request and return method name and params
-    // - raises exception on parse error
+    // - returns false for anything ParseRequestEx does not report as mrpValid
     function ParseRequest(const aJson: RawUtf8;
       out aMethod: RawUtf8; out aParams: variant; out aRequestId: variant): boolean;
+    /// parse JSON-RPC request, telling a parse error from an invalid request
+    // - mrpParseError: aJson is not one complete JSON value (-32700)
+    // - mrpInvalidRequest: valid JSON, but not a request envelope (-32600): no
+    //   object, missing or wrong "jsonrpc", no string "method", scalar "params",
+    //   or an "id" that is neither a string nor an integer (McpIsValidRequestId)
+    // - on mrpValid a void aRequestId means the "id" member is ABSENT, i.e. a
+    //   notification; "id": null is refused instead, since MCP forbids a null id
+    //   and JSON-RPC only calls a request without the member a notification
+    function ParseRequestEx(const aJson: RawUtf8; out aMethod: RawUtf8;
+      out aParams: variant; out aRequestId: variant): TMcpRequestParse;
     /// create a successful JSON-RPC response
     // - stamps the mandatory `resultType` and the server identity into the
     //   result, so every handler can return its payload unadorned
@@ -1055,6 +1074,17 @@ type
     property ServerName: RawUtf8 read fServerName write fServerName;
     /// the server version reported alongside ServerName
     property ServerVersion: RawUtf8 read fServerVersion write fServerVersion;
+    /// whether server/discover advertises the list-change notifications
+    // - true (the default) announces tools/prompts/resources `listChanged` and
+    //   resources `subscribe`: the bundled transports deliver them through
+    //   subscriptions/listen
+    // - set it to false when the server is mounted on a foreign route that only
+    //   calls ExecuteRequest and cannot stream: a capability the client cannot
+    //   receive is a promise this server would not keep. The capability objects
+    //   themselves stay, empty - tools/prompts/resources are still served.
+    // - set it before Start: it is read per request without a lock
+    property AdvertiseListNotifications: boolean
+      read fAdvertiseListNotifications write fAdvertiseListNotifications;
   end;
 
 
@@ -1647,6 +1677,24 @@ function McpHeaderValue(const aHeaders, aName: RawUtf8): RawUtf8;
 //   check, the HTTP transport), so all of them share one notion of "valid"
 function McpInitJsonComplete(var aDoc: TDocVariantData; const aJson: RawUtf8;
   aOptions: TDocVariantOptions): boolean;
+
+/// true if aId may be a JSON-RPC request id under MCP: a string or an integer
+// - "Requests MUST include a string or integer ID", and "Unlike base JSON-RPC,
+//   the ID MUST NOT be null" (basic/index): null, booleans, fractions, objects
+//   and arrays are refused. So is a whole number written as 1.0: echoing it
+//   back as 1 could keep a client from matching the response to its request.
+function McpIsValidRequestId(const aId: variant): boolean;
+
+/// the JSON-RPC error for a body McpInitJsonComplete refused as an object
+// - JSONRPC_INVALID_REQUEST (-32600) when aJson is valid JSON after all, just
+//   not an object: a scalar such as 42 or "text" - InitJsonInPlace only builds
+//   objects and arrays, so its failure alone does not prove the text invalid
+// - JSONRPC_PARSE_ERROR (-32700) otherwise: truncated, trailing data, a raw
+//   control character (JSON-RPC 2.0 §5.1)
+// - known limit: mORMot's IsValidJson guesses numbers and escapes, so a body
+//   like `1e` or `"\q"` is answered with -32600 instead of -32700. Both are
+//   HTTP 400 and neither is dispatched; only the code is less precise
+function McpJsonFailureCode(const aJson: RawUtf8): integer;
 
 /// validate the standard MCP request headers against the request body
 // - checks MCP-Protocol-Version, Mcp-Method, Mcp-Name and the tool's own
@@ -2391,6 +2439,12 @@ begin
     // Add to properties
     propName := LowerCaseU(prop.Name);
     props.AddValue(propName, variant(propSchema));
+    // release our reference before the next InitObject: Init* nils VName/VValue
+    // without freeing them, so every field leaked its predecessor's arrays - on
+    // every tools/list, tools/call and header check of a typed tool (issue #2).
+    // AFTER the AddValue, not before the Init: on the first pass the record is
+    // not initialized yet, and Clear on stack garbage raises under Delphi.
+    propSchema.Clear;
 
     // Required unless the tool declared it optional. RTTI carries no such
     // marker, and listing everything was a contract this code did not keep:
@@ -2415,11 +2469,7 @@ begin
   inherited Create;
   fServerName := aServerName;
   fServerVersion := aServerVersion;
-end;
-
-function TMcpJsonRpcProcessor.ExtractRequestId(const aRequest: variant): variant;
-begin
-  result := _Safe(aRequest)^.GetValueOrNull('id');
+  fAdvertiseListNotifications := true;
 end;
 
 function TMcpJsonRpcProcessor.CreateResponse(const aRequestId: variant): variant;
@@ -2451,13 +2501,20 @@ end;
 
 function TMcpJsonRpcProcessor.ParseRequest(const aJson: RawUtf8;
   out aMethod: RawUtf8; out aParams: variant; out aRequestId: variant): boolean;
+begin
+  result := ParseRequestEx(aJson, aMethod, aParams, aRequestId) = mrpValid;
+end;
+
+function TMcpJsonRpcProcessor.ParseRequestEx(const aJson: RawUtf8;
+  out aMethod: RawUtf8; out aParams: variant;
+  out aRequestId: variant): TMcpRequestParse;
 var
   doc: PDocVariantData;
   request: variant;
   jsonrpc: RawUtf8;
-  paramsIdx: PtrInt;
+  paramsIdx, idIdx: PtrInt;
 begin
-  result := false;
+  result := mrpParseError;
   aMethod := '';
   aParams := Null;
   aRequestId := Null;
@@ -2473,7 +2530,14 @@ begin
   // Complete parse: trailing data after the object makes the whole body
   // invalid instead of being silently ignored (McpInitJsonComplete)
   if not McpInitJsonComplete(TDocVariantData(request), aJson, JSON_FAST_FLOAT) then
+  begin
+    // not JSON at all: -32700, not -32600 (JSON-RPC 2.0 §5.1) - but a valid
+    // scalar (42, "text") fails here as well, and is merely no request
+    if McpJsonFailureCode(aJson) = JSONRPC_INVALID_REQUEST then
+      result := mrpInvalidRequest;
     exit;
+  end;
+  result := mrpInvalidRequest;
   doc := _Safe(request);
   if not doc.IsObject then
     exit;
@@ -2499,10 +2563,20 @@ begin
   else
     aParams := Null;
 
-  // Extract id (absent => notification; when present must be string/number/null)
-  aRequestId := ExtractRequestId(request);
+  // Extract id: absent => notification. When present it MUST be a string or an
+  // integer, and MUST NOT be null. Looked up by index, not GetValueOrNull: that
+  // maps "id": null to the same Null as an absent id, so a malformed request
+  // was dropped as a notification instead of being answered with -32600. An
+  // object id was even echoed back as the response id.
+  idIdx := doc.GetValueIndex('id');
+  if idIdx >= 0 then
+  begin
+    if not McpIsValidRequestId(doc.Values[idIdx]) then
+      exit;
+    aRequestId := doc.Values[idIdx];
+  end;
 
-  result := true;
+  result := mrpValid;
 end;
 
 function TMcpJsonRpcProcessor.ServerInfo: variant;
@@ -2646,15 +2720,22 @@ begin
   // listChanged/subscribe are advertised because the registry raises those
   // notifications itself (see RegisterTool/RegisterResource) — a client that
   // opens subscriptions/listen for them will really be told about changes.
-  caps.InitObject([
-    'tools', _ObjFast(['listChanged', true]),
-    'prompts', _ObjFast(['listChanged', true]),
-    // "Servers that support completions MUST declare the completions
-    // capability" — an empty object, it has no sub-features
-    'completions', _ObjFast([]),
-    'resources', _ObjFast([
-      'listChanged', true,
-      'subscribe', true])], JSON_FAST);
+  // A host that cannot deliver them switches them off: AdvertiseListNotifications.
+  if fAdvertiseListNotifications then
+    caps.InitObject([
+      'tools', _ObjFast(['listChanged', true]),
+      'prompts', _ObjFast(['listChanged', true]),
+      'resources', _ObjFast([
+        'listChanged', true,
+        'subscribe', true])], JSON_FAST)
+  else
+    caps.InitObject([
+      'tools', _ObjFast([]),
+      'prompts', _ObjFast([]),
+      'resources', _ObjFast([])], JSON_FAST);
+  // "Servers that support completions MUST declare the completions
+  // capability" — an empty object, it has no sub-features
+  caps.AddValue('completions', _ObjFast([]));
   // extensions is OMITTED when none are registered rather than sent empty: an
   // empty map and an absent field mean the same thing, and the absent one does
   // not invite a client to look for settings that are not there
@@ -4223,20 +4304,25 @@ begin
   // audiences against — publishing anything else would have clients obtain
   // tokens this server then rejects.
   doc.AddValue('resource', fAuthResource);
+  // arr is reused for three arrays: each is cleared once doc holds it, since
+  // a second Init* would drop the first one's arrays unreleased (issue #2)
   if fAuthorizationServers <> nil then
   begin
     arr.InitArrayFrom(fAuthorizationServers, JSON_FAST);
     doc.AddValue('authorization_servers', variant(arr));
+    arr.Clear;
   end;
   if fScopesSupported <> nil then
   begin
     arr.InitArrayFrom(fScopesSupported, JSON_FAST);
     doc.AddValue('scopes_supported', variant(arr));
+    arr.Clear;
   end;
   // we read the token from the Authorization header and nowhere else: "Access
   // tokens MUST NOT be included in the URI query string"
   arr.InitArray(['header'], JSON_FAST);
   doc.AddValue('bearer_methods_supported', variant(arr));
+  arr.Clear;
   result := doc.ToJson;
 end;
 
@@ -4543,7 +4629,11 @@ begin
                   ((params^.GetValueIndex(MCP_PARAM_INPUT_RESPONSES) >= 0) or
                    (params^.GetValueIndex(MCP_PARAM_REQUEST_STATE) >= 0));
 
-  doc.InitJson(aResponseJson, JSON_FAST);
+  // JSON_FAST_FLOAT: doc is written back out below, and the default options
+  // would turn a float they cannot hold in currency (0.0809461) into a STRING -
+  // against the tool's own outputSchema (issue #2, see ParseRequest). req above
+  // only answers "which method, which params", so it can stay as it is.
+  doc.InitJson(aResponseJson, JSON_FAST_FLOAT);
   idx := doc.GetValueIndex('result');
   if idx < 0 then
     exit; // an error response — nothing to stamp
@@ -4593,20 +4683,32 @@ begin
     exit;
   end;
 
-  // Parse request: a malformed envelope (bad JSON / missing or wrong jsonrpc /
-  // scalar params) is an Invalid Request — answer with -32600 and no id (we
-  // could not reliably extract one), never dispatch it.
-  if not fProcessor.ParseRequest(aRequestJson, aMethod, aParams, aRequestId) then
-  begin
-    aErrorJson := fProcessor.CreateError(Null, JSONRPC_INVALID_REQUEST,
-      'Invalid JSON-RPC request');
-    exit;
+  // Parse request: a body that is no JSON at all is a Parse error (-32700), a
+  // malformed envelope (missing or wrong jsonrpc / scalar params / an id that
+  // is null or neither string nor integer) an Invalid Request (-32600). Both
+  // answer with "id": null (we could not reliably extract one), never dispatch.
+  case fProcessor.ParseRequestEx(aRequestJson, aMethod, aParams, aRequestId) of
+    mrpParseError:
+      begin
+        aErrorJson := fProcessor.CreateError(Null, JSONRPC_PARSE_ERROR,
+          'Parse error');
+        exit;
+      end;
+    mrpInvalidRequest:
+      begin
+        aErrorJson := fProcessor.CreateError(Null, JSONRPC_INVALID_REQUEST,
+          'Invalid JSON-RPC request');
+        exit;
+      end;
   end;
 
   // Notifications are exempt from everything below: the per-request _meta is
   // specified for requests, an unknown notification is silently ignored per
   // JSON-RPC, and there is no response to carry an error in anyway.
-  if VarIsVoid(aRequestId) then
+  // VarIsEmptyOrNull, not VarIsVoid: ParseRequestEx leaves the id Null only
+  // when the member is ABSENT, while VarIsVoid also takes the valid string id
+  // "" for "no id" - such a request went unanswered
+  if VarIsEmptyOrNull(aRequestId) then
   begin
     aHttpStatus := HTTP_MCP_SUCCESS;
     result := true;
@@ -4674,7 +4776,7 @@ begin
   aScopeChallenge := '';
   if not Preflight(aRequestJson, method, params, requestId, result, status) then
     exit;
-  isNotification := VarIsVoid(requestId);
+  isNotification := VarIsEmptyOrNull(requestId); // "" is an id (see Preflight)
   m := McpMethodFromName(method);
 
   personalized := false;
@@ -5205,6 +5307,32 @@ begin
     aDoc.Clear;
 end;
 
+function McpIsValidRequestId(const aId: variant): boolean;
+begin
+  // the types the JSON parser produces for an integer or a string
+  case cardinal(VarDataFromVariant(aId)^.VType) of
+    varShortInt, varSmallint, varInteger, varInt64,
+    varByte, varWord, varLongWord, varWord64,
+    {$ifdef HASVARUSTRING} varUString, {$endif HASVARUSTRING}
+    varString, varOleStr:
+      result := true;
+  else
+    result := false;
+  end;
+end;
+
+function McpJsonFailureCode(const aJson: RawUtf8): integer;
+begin
+  // strict: no comments, no MongoDB extensions; trimmed because IsValidJson
+  // wants the value to fill the buffer, and blanks around it are still JSON.
+  // HasNonJsonControlChar first: TrimU would strip a leading #1 as a blank.
+  if not HasNonJsonControlChar(aJson) and
+     IsValidJson(TrimU(aJson), {strict=}true) then
+    result := JSONRPC_INVALID_REQUEST
+  else
+    result := JSONRPC_PARSE_ERROR;
+end;
+
 function McpValidateRequestHeaders(const aHeaders, aBody: RawUtf8;
   aServer: TMcpServer; out aErrorMsg: RawUtf8): boolean;
 var
@@ -5230,7 +5358,8 @@ begin
   // Compare against the body — but only for requests. The spec leaves header
   // requirements for notification POSTs undefined, and a notification carries
   // no _meta to compare against.
-  if not VarIsVoid(doc.GetValueOrNull('id')) then
+  // presence of the member, not its content: "id": "" is a request too
+  if doc.GetValueIndex('id') >= 0 then
   begin
     bodyName := '';
     if doc.GetAsDocVariant('params', params) and params^.IsObject then

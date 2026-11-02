@@ -108,6 +108,10 @@ Konsequenzen, die die ganze Implementierung prägen:
   `listChanged`/`subscribe` — die Ankündigung deckt sich mit dem Verhalten.
   **Nur der Streamable-HTTP-Transport** kann das; stdio und der einfache
   HTTP-Transport antworten mit `-32601` statt einer leeren Erfolgsantwort.
+  Ein Host, der `ExecuteRequest` auf einer eigenen, nicht streamenden Route
+  einhängt, schaltet die Ankündigung mit
+  `Processor.AdvertiseListNotifications := false` ab (Issue #2): Die
+  Capability-Objekte bleiben, nur `listChanged`/`subscribe` fallen weg.
   Zwei Grenzen sind bewusst gesetzt: `MaxSubscriptions` (Default 8), weil jeder
   offene Stream einen Worker-Thread hält, und `MCP_SUBSCRIPTION_MAX_PENDING`
   (256) pro Stream — ein Client, der nicht mitkommt, wird abgeworfen statt den
@@ -932,7 +936,7 @@ außer TAB/LF/CR macht den Text ungültig (RFC 8259); mORMots Parser hält an `#
 `ParseRequest` (und damit HTTP, stdio, Legacy-Brücke), `McpValidateRequestHeaders` und der Preflight
 des HTTP-Transports. Ein Host, der den Server als Route einhängt, sollte für seine eigene
 Vorab-Prüfung denselben Helfer nehmen. Sonst läuft ein Body mit Rest dort in die Header-Prüfung und
-bekommt `-32020` statt `-32600`. Er muss außerdem wie der Transport `PreflightRequest` vor
+bekommt `-32020` statt `-32700` (seit Issue #2 Parse error, vorher `-32600`). Er muss außerdem wie der Transport `PreflightRequest` vor
 `ExecuteRequest` aufrufen und dessen Status senden. Nur so bekommt ein Request ohne Pflicht-`_meta`
 die von der Spec verlangte 400 (`-32602`): Aus der fertigen Antwort ist das nicht abzuleiten, weil
 `-32602` auch für ein unbekanntes Werkzeug steht (200).
@@ -941,6 +945,60 @@ die von der Spec verlangte 400 (`-32602`): Aus der fertigen Antwort ist das nich
 fest, aber der Preflight des eigenen Transports antwortet ohnehin mit 400. Eine eingehängte Route
 kennt nur die fertige Antwort und bekam bisher 200. Auch im Transport war es uneinheitlich: Der
 Body `{` bekam 200, ein Array-Body 400.
+
+### Befunde aus Issue #2 (externe Integration, 2026-11-02)
+
+Ein Integrator hat `mormot.ai.mcp` (Stand 119518f) als Route in einer eigenen
+mORMot2-Anwendung betrieben und unter FPC-heaptrc gemessen. Alle fünf Befunde
+stimmten:
+
+- **Leck in `TMcpSchemaGenerator.GenerateSchema`**: `propSchema` wurde je Feld
+  neu mit `InitObject` belegt, ohne vorher freigegeben zu werden. `Init*` setzt
+  `VName`/`VValue` auf nil, ohne sie freizugeben. Das passierte bei jedem
+  `tools/list`, `tools/call` und jeder Header-Prüfung eines typisierten Tools.
+  Jetzt steht `Clear` **nach** dem `AddValue`. Der im Issue vorgeschlagene
+  Platz **vor** dem `InitObject` wäre unter Delphi im ersten Durchlauf
+  gekracht: `Clear` auf einem nie initialisierten lokalen Record liest
+  Stack-Müll als `VType`.
+- **Dasselbe Muster in `ProtectedResourceMetadata`**: `arr` wurde für drei Arrays
+  wiederverwendet. Jetzt folgt jedem `AddValue` ein `Clear`. Ein Scan aller
+  `src`-Units fand keine weitere Stelle.
+- heaptrc über `mcp.tests` (FPC 3.2.4, aarch64-linux): vorher 907
+  unfreigegebene Blöcke, 894 davon über `GenerateSchema`; nachher 7, keiner
+  mehr über eine der beiden Routinen. Die 7 stammen aus Tests, die
+  `RegisterTool(TFoo.Create(…))` absichtlich mit einem doppelten Namen
+  aufrufen: Das neue Objekt am `const`-Interface-Parameter bekommt nie einen
+  Referenzzähler, wenn die Registrierung wirft.
+- **`FinalizeHookResponse`** liest die Hook-Antwort jetzt mit `JSON_FAST_FLOAT`
+  ein. Mit `JSON_FAST` ging `0.0809461` als String hinaus, entgegen dem
+  `outputSchema` des Tools.
+- **Envelope-Prüfung**: `ParseRequestEx` liefert `TMcpRequestParse` und
+  unterscheidet „kein JSON“ (`-32700`) von „JSON, aber kein Request“ (`-32600`).
+  `ParseRequest` bleibt als boolesche Hülle erhalten. Eine `id` muss ein String
+  oder eine ganze Zahl sein (`McpIsValidRequestId`). Eine Notification hat
+  **kein** `id`-Member; `"id": null` wird mit `-32600` beantwortet und nicht mehr
+  mit 202 verworfen. Eine Objekt-`id` wird abgelehnt und nicht mehr als `id` der
+  Antwort zurückgeschickt. `1.0` und `1e3` zählen nicht als ganze Zahl: Sie
+  kommen als Double an, und ein Echo als `1` bzw. `1000` könnte der Client
+  seinem Request nicht mehr zuordnen. Der Streamable-HTTP-Transport prüft
+  dasselbe in seiner eigenen Vorab-Prüfung, vor der Header-Prüfung. Dafür
+  parst er jetzt ebenfalls mit `JSON_FAST_FLOAT`: Mit `JSON_FAST` kam
+  `"id": 1e3` als String `"1e3"` an und rutschte durch die Typprüfung.
+- Ein gültiger JSON-Skalar (`42`, `"text"`) ist `-32600`, nicht `-32700`:
+  `InitJsonInPlace` baut nur Objekte und Arrays, sein Scheitern beweist also kein
+  ungültiges JSON. Die Unterscheidung trifft `McpJsonFailureCode`, den Core und
+  Transport gemeinsam nutzen. Bekannte Grenze: mORMots `IsValidJson` prüft
+  Zahlen und Escapes nur grob, deshalb bekommt ein Body wie `1e` oder `"\q"`
+  `-32600` statt `-32700`. Beides ist HTTP 400 und wird nicht ausgeführt; ein
+  eigener Grammatik-Validator nur für den genaueren Code lohnt nicht.
+- **`"id": ""` ist ein Request.** Ob ein Request eine Notification ist, entscheidet
+  jetzt, ob das `id`-Member vorhanden ist (`GetValueIndex`, im Core
+  `VarIsEmptyOrNull` auf dem Ergebnis von `ParseRequestEx`). `VarIsVoid` hielt den
+  leeren String für „keine id“, und der Request blieb unbeantwortet (HTTP 202).
+  Das betraf `Preflight`, `ExecuteRequest`, den Transport, die Legacy-Brücke und
+  `McpValidateRequestHeaders`. Der Fehler bestand schon vor Issue #2.
+- **`AdvertiseListNotifications`** (Processor, Default `true`): siehe den
+  Abschnitt zu `subscriptions/listen`.
 
 ## Lizenz / Veröffentlichung
 

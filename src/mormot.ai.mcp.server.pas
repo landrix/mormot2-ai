@@ -731,6 +731,7 @@ var
   doc: TDocVariantData;
   method: RawUtf8;
   status: integer;
+  idIdx: PtrInt;
   tokenResult: TMcpTokenResult;
   authCtx: TMcpAuthContext;
 begin
@@ -797,14 +798,42 @@ begin
   // McpInitJsonComplete, not InitJson: trailing data after the object must
   // fail here too, or this transport would dispatch a body the core rejects
   body := Ctxt.InContent;
-  if not McpInitJsonComplete(doc, body, JSON_FAST) or
-     not doc.IsObject then
+  // no JSON at all is a Parse error (-32700), not an Invalid Request: JSON-RPC
+  // 2.0 §5.1 keeps the two apart, and so does the core's Preflight. A valid
+  // scalar (42) fails the object parse too, but is -32600 (McpJsonFailureCode).
+  // JSON_FAST_FLOAT, as in the core: JSON_FAST stores a number it cannot hold
+  // in currency (1e3, 0.0809461) as TEXT, and McpIsValidRequestId below would
+  // then accept a fractional id as a string - and echo it as one
+  if not McpInitJsonComplete(doc, body, JSON_FAST_FLOAT) then
+  begin
+    if McpJsonFailureCode(body) = JSONRPC_PARSE_ERROR then
+      result := SendProtocolError(Ctxt, fServer.Processor.CreateError(
+        Null, JSONRPC_PARSE_ERROR, 'Parse error'), HTTP_MCP_BAD_REQUEST)
+    else
+      result := SendProtocolError(Ctxt, fServer.Processor.CreateError(
+        Null, JSONRPC_INVALID_REQUEST,
+        'Request body must be a single JSON-RPC object'), HTTP_MCP_BAD_REQUEST);
+    exit;
+  end;
+  if not doc.IsObject then
   begin
     result := SendProtocolError(Ctxt, fServer.Processor.CreateError(
       Null, JSONRPC_INVALID_REQUEST,
       'Request body must be a single JSON-RPC object ' +
       '(batching is not part of this protocol revision)'),
       HTTP_MCP_BAD_REQUEST);
+    exit;
+  end;
+  // a present id must be a string or an integer - before anything echoes it:
+  // an object id came back as the id of the error, and "id": null made the
+  // notification branch below drop a request with 202 and no answer
+  idIdx := doc.GetValueIndex('id');
+  if (idIdx >= 0) and
+     not McpIsValidRequestId(doc.Values[idIdx]) then
+  begin
+    result := SendProtocolError(Ctxt, fServer.Processor.CreateError(
+      Null, JSONRPC_INVALID_REQUEST,
+      'Request "id" must be a string or an integer'), HTTP_MCP_BAD_REQUEST);
     exit;
   end;
   if not doc.GetAsRawUtf8('method', method) then
@@ -848,7 +877,8 @@ begin
   end;
 
   // --- Notification (no id): process and return 202 with no body ---
-  if VarIsVoid(doc.GetValueOrNull('id')) then
+  // the member's presence decides: VarIsVoid also took the valid id "" for none
+  if idIdx < 0 then
   begin
     // WITH the context: this was the one path that dropped it, which made a
     // notification run as an anonymous caller while every sibling path (:379,

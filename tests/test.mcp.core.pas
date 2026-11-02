@@ -348,7 +348,10 @@ type
     procedure ToolExceptionBecomesError;
     procedure InvalidJsonRpcEnvelope;
     procedure NotificationsNoResponse;
+    procedure RequestIdIsTypeChecked;
     procedure DiscoverReportsVersionAndIdentity;
+    procedure DiscoverListNotificationsCanBeOff;
+    procedure HookResponseKeepsFloats;
     procedure RequestMetaIsMandatory;
     procedure ResultsCarryResultTypeAndServerInfo;
     procedure RequestParamsMergeExistingMeta;
@@ -1330,10 +1333,17 @@ begin
     server.RegisterResource(res);
     server.Start;
 
-    // invalid JSON / malformed envelope -> Invalid Request (-32600)
+    // invalid JSON -> Parse error (-32700, JSON-RPC 2.0 §5.1), not -32600
     response := Exec(server, '{');
-    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
+    CheckErrorResponse(response, JSONRPC_PARSE_ERROR, 'Parse error');
+    // raw, not via Exec: its lenient re-parse would drop the trailing data
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":1,"method":"ping"}garbage');
+    CheckErrorResponse(response, JSONRPC_PARSE_ERROR, '');
 
+    // valid JSON, malformed envelope -> Invalid Request (-32600)
+    response := Exec(server, '[{"jsonrpc":"2.0","id":1,"method":"ping"}]');
+    CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
     response := Exec(server, '{"jsonrpc":"2.0","id":1}');
     CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
 
@@ -1426,6 +1436,96 @@ begin
   end;
 end;
 
+procedure TTestMcpCore.RequestIdIsTypeChecked;
+const
+  // "Requests MUST include a string or integer ID" and "the ID MUST NOT be
+  // null": everything here is valid JSON, but none of it is a request id.
+  // 1.0 and 1e3 are whole numbers, yet arrive as Double: echoed back as 1 and
+  // 1000 a client could not match them to what it sent.
+  // 0.0809461 and 1.00001 do not fit a currency: JSON_FAST would have stored
+  // them as TEXT, which a string check then waved through
+  BAD_IDS: array[0..8] of RawUtf8 = (
+    'null', '{"a":1}', '[1]', 'true', '1.5', '1.0', '1e3', '0.0809461',
+    '1.00001');
+  // valid JSON, but no object: InitJsonInPlace refuses them all the same
+  SCALARS: array[0..4] of RawUtf8 = (
+    '42', '"text"', 'true', 'null', ' 42 ');
+var
+  server: TMcpServer;
+  proc: TMcpJsonRpcProcessor;
+  response, method: RawUtf8;
+  params, id, rv: variant;
+  p: PVariant;
+  i: PtrInt;
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    proc := server.Processor;
+    // the two kinds of a valid id, both handed on unchanged
+    Check(proc.ParseRequestEx('{"jsonrpc":"2.0","id":"abc","method":"ping"}',
+      method, params, id) = mrpValid, 'string id');
+    CheckEqual(VariantToUtf8(id), 'abc', 'string id kept');
+    Check(proc.ParseRequestEx(
+      '{"jsonrpc":"2.0","id":9007199254740993,"method":"ping"}',
+      method, params, id) = mrpValid, 'int64 id');
+    CheckEqual(VariantToUtf8(id), '9007199254740993', 'int64 id kept exactly');
+    // only an ABSENT id makes a notification
+    Check(proc.ParseRequestEx('{"jsonrpc":"2.0","method":"ping"}',
+      method, params, id) = mrpValid, 'notification');
+    Check(VarIsVoid(id), 'a notification has a void id');
+    // no JSON at all is told apart from JSON that is no request
+    Check(proc.ParseRequestEx('{', method, params, id) = mrpParseError,
+      'not JSON -> parse error');
+    Check(proc.ParseRequestEx('[]', method, params, id) = mrpInvalidRequest,
+      'an array -> invalid request');
+    Check(not proc.ParseRequest('{', method, params, id),
+      'the boolean ParseRequest still refuses it');
+    Check(proc.ParseRequestEx('42x', method, params, id) = mrpParseError,
+      'a scalar with trailing data is no JSON');
+    for i := 0 to high(SCALARS) do
+    begin
+      Check(proc.ParseRequestEx(SCALARS[i], method, params, id) =
+        mrpInvalidRequest, 'valid JSON, no request: ' + Utf8ToString(SCALARS[i]));
+      CheckErrorResponse(server.ExecuteRequest(SCALARS[i]),
+        JSONRPC_INVALID_REQUEST, '');
+    end;
+    // "" is a valid string id: VarIsVoid took it for "no id", and the request
+    // was dropped as a notification. Here it fails the _meta check - which is
+    // the point: it is ANSWERED, and with the id it came with
+    response := server.ExecuteRequest(
+      '{"jsonrpc":"2.0","id":"","method":"server/discover"}');
+    Check(response <> '', 'id "" is answered');
+    rv := _JsonFast(response);
+    p := _Safe(rv)^.GetPVariantByPath('id');
+    Check((p <> nil) and not VarIsEmptyOrNull(p^) and (VariantToUtf8(p^) = ''),
+      'with "id": ""');
+    for i := 0 to high(BAD_IDS) do
+    begin
+      Check(proc.ParseRequestEx('{"jsonrpc":"2.0","id":' + BAD_IDS[i] +
+        ',"method":"ping"}', method, params, id) = mrpInvalidRequest,
+        Utf8ToString(BAD_IDS[i]));
+      Check(not McpIsValidRequestId(id), 'no bad id leaks out');
+      // ANSWERED, not dropped: "id": null used to pass as a notification and
+      // got no response at all; an object id came back as the response id
+      response := server.ExecuteRequest('{"jsonrpc":"2.0","id":' + BAD_IDS[i] +
+        ',"method":"server/discover"}');
+      Check(response <> '', 'answered: ' + Utf8ToString(BAD_IDS[i]));
+      CheckErrorResponse(response, JSONRPC_INVALID_REQUEST, '');
+      rv := _JsonFast(response);
+      p := _Safe(rv)^.GetPVariantByPath('id');
+      Check((p <> nil) and VarIsEmptyOrNull(p^), 'error carries "id": null');
+    end;
+    // control: a valid string id passes the same envelope and comes back as sent
+    rv := _JsonFast(Exec(server,
+      '{"jsonrpc":"2.0","id":"req-1","method":"server/discover"}'));
+    CheckEqual(_Safe(rv)^.U['id'], 'req-1', 'string id echoed');
+    Check(_Safe(rv)^.GetValueIndex('result') >= 0, 'string id dispatched');
+  finally
+    server.Free;
+  end;
+end;
+
 // Like Exec, but the tool arguments go in as RAW text. Exec parses and
 // re-writes the whole request, which already turns 2.0 into 2 - so a test
 // through it never sees what the server's own parser (_JsonFastFloat) makes of
@@ -1451,7 +1551,7 @@ begin
   doc.InitJson(aJson, JSON_FAST);
   // malformed payloads and notifications go through untouched
   if not doc.IsObject or
-     VarIsVoid(doc.GetValueOrNull('id')) then
+     (doc.GetValueIndex('id') < 0) then // presence, not content: "" is an id
   begin
     result := aServer.ExecuteRequest(aJson);
     exit;
@@ -1504,6 +1604,87 @@ begin
       JSONRPC_METHOD_NOT_FOUND, 'initialize');
     CheckErrorResponse(Exec(server, '{"jsonrpc":"2.0","id":3,"method":"ping"}'),
       JSONRPC_METHOD_NOT_FOUND, 'ping');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.DiscoverListNotificationsCanBeOff;
+const
+  DISCOVER = '{"jsonrpc":"2.0","id":1,"method":"server/discover"}';
+var
+  server: TMcpServer;
+  rv: variant;
+  d: PDocVariantData;
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    // default: advertised, the bundled transports deliver them
+    Check(server.Processor.AdvertiseListNotifications, 'on by default');
+    server.Start;
+    rv := _JsonFast(Exec(server, DISCOVER));
+    d := _Safe(rv);
+    Check(d^.GetPVariantByPath('result.capabilities.tools.listChanged') <> nil,
+      'tools.listChanged');
+    Check(d^.GetPVariantByPath('result.capabilities.prompts.listChanged') <> nil,
+      'prompts.listChanged');
+    Check(d^.GetPVariantByPath('result.capabilities.resources.listChanged') <> nil,
+      'resources.listChanged');
+    Check(d^.GetPVariantByPath('result.capabilities.resources.subscribe') <> nil,
+      'resources.subscribe');
+    // a host on a non-streaming route switches them off: the capabilities
+    // themselves stay (tools and resources are still served), only the
+    // notifications it cannot deliver are no longer promised
+    server.Processor.AdvertiseListNotifications := false;
+    rv := _JsonFast(Exec(server, DISCOVER));
+    d := _Safe(rv);
+    Check(d^.GetPVariantByPath('result.capabilities.tools') <> nil, 'tools kept');
+    Check(d^.GetPVariantByPath('result.capabilities.prompts') <> nil, 'prompts kept');
+    Check(d^.GetPVariantByPath('result.capabilities.resources') <> nil,
+      'resources kept');
+    Check(d^.GetPVariantByPath('result.capabilities.completions') <> nil,
+      'completions kept');
+    Check(d^.GetPVariantByPath('result.capabilities.tools.listChanged') = nil,
+      'no tools.listChanged');
+    Check(d^.GetPVariantByPath('result.capabilities.prompts.listChanged') = nil,
+      'no prompts.listChanged');
+    Check(d^.GetPVariantByPath('result.capabilities.resources.listChanged') = nil,
+      'no resources.listChanged');
+    Check(d^.GetPVariantByPath('result.capabilities.resources.subscribe') = nil,
+      'no resources.subscribe');
+  finally
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpCore.HookResponseKeepsFloats;
+var
+  server: TMcpServer;
+  response: RawUtf8;
+  rv: variant;
+  p: PVariant;
+begin
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.Start;
+    // a hook answers outside the dispatch, and its response is re-parsed to be
+    // stamped: with the default options 0.0809461 (more than four decimals, so
+    // no currency) went out as the STRING "0.0809461"
+    response := server.FinalizeHookResponse(
+      '{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"p":0.0809461}}}',
+      '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x"}}');
+    Check(PosEx('"0.0809461"', response) = 0, 'not turned into a string');
+    rv := _JsonFastFloat(response);
+    p := _Safe(rv)^.GetPVariantByPath('result.structuredContent.p');
+    Check(p <> nil, 'value present');
+    if p <> nil then
+    begin
+      CheckEqual(TVarData(p^).VType, varDouble, 'still a number');
+      CheckSame(double(p^), 0.0809461, 1E-12, 'same value');
+    end;
+    // the stamping itself still happens
+    Check(PosEx('"resultType":"' + MCP_RESULT_COMPLETE + '"', response) > 0,
+      'resultType stamped');
   finally
     server.Free;
   end;

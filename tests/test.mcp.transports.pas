@@ -152,8 +152,9 @@ begin
   if doc.IsObject and doc.GetAsRawUtf8('method', method) then
   begin
     headers := headers + #13#10 + 'Mcp-Method: ' + method;
-    // notifications carry no id and need no _meta
-    if not VarIsVoid(doc.GetValueOrNull('id')) then
+    // notifications carry no id and need no _meta - presence decides, as in
+    // the server: VarIsVoid would take the valid id "" for none
+    if doc.GetValueIndex('id') >= 0 then
     begin
       // a non-object params is a deliberately malformed envelope: post it as is
       if doc.GetValueIndex('params') >= 0 then
@@ -1835,7 +1836,8 @@ begin
       'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
       'Mcp-Method: tools/list');
     CheckEqual(status, HTTP_BADREQUEST, 'trailing data -> 400');
-    CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
+    // the body as a whole is no JSON: Parse error, not Invalid Request
+    CheckErrorCode(client.Content, JSONRPC_PARSE_ERROR);
     // an embedded #0 through the real transport: the preflight parses into a
     // local TDocVariantData record, the path a variant-based test cannot reach
     status := client.Post(transport.Endpoint,
@@ -1846,7 +1848,57 @@ begin
       'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
       'Mcp-Method: tools/list');
     CheckEqual(status, HTTP_BADREQUEST, 'embedded #0 -> 400');
+    CheckErrorCode(client.Content, JSONRPC_PARSE_ERROR);
+
+    // "id": null is a malformed request, not a notification: it was answered
+    // with 202 and no body, so the client waited for a response forever
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":null,"method":"tools/list","params":{"_meta":{"' +
+      MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '","' +
+      MCP_META_CLIENT_CAPABILITIES + '":{}}}}', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'null id -> 400, not 202');
     CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
+    // an object id is refused as well - and not echoed as the error's id
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":{"x":1},"method":"tools/list","params":{"_meta":{"' +
+      MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '","' +
+      MCP_META_CLIENT_CAPABILITIES + '":{}}}}', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'object id -> 400');
+    CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
+    Check(PosEx('"x"', client.Content) = 0, 'the object id is not echoed');
+    // a fractional id that does not fit a currency: parsed with JSON_FAST it
+    // became the STRING "1e3", passed the id check and came back as an id the
+    // client never sent. The wrong Mcp-Method makes that visible: the -32020
+    // of the header check must not be reached at all
+    status := client.Post(transport.Endpoint,
+      '{"jsonrpc":"2.0","id":1e3,"method":"tools/list","params":{"_meta":{"' +
+      MCP_META_PROTOCOL_VERSION + '":"' + MCP_PROTOCOL_VERSION + '","' +
+      MCP_META_CLIENT_CAPABILITIES + '":{}}}}', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: resources/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'fractional id -> 400');
+    CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
+    Check(PosEx('"1e3"', client.Content) = 0, 'not echoed as a string');
+    // a scalar body is valid JSON, just no request: -32600, not -32700
+    status := client.Post(transport.Endpoint, '42', JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: text/event-stream, application/json'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_BADREQUEST, 'scalar body -> 400');
+    CheckErrorCode(client.Content, JSONRPC_INVALID_REQUEST);
+    // "id": "" is a request: the notification branch took it for none (202)
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":"","method":"tools/list"}');
+    CheckEqual(status, HTTP_SUCCESS, 'id "" is a request, not a notification');
+    Check(PosEx('text/event-stream', client.ContentType) > 0,
+      'id "" is streamed like any request');
 
     // a request that IS dispatchable still streams as before
     status := McpPost(client, transport.Endpoint,

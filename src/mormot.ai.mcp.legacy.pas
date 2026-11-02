@@ -284,9 +284,11 @@ begin
         exit;
     end;
   end;
+  // "no id" is VarIsEmptyOrNull below, never VarIsVoid: ParseRequest leaves id
+  // Null only for an absent member, and VarIsVoid would take the id "" for none
   if method = 'initialize' then
   begin
-    if VarIsVoid(id) then
+    if VarIsEmptyOrNull(id) then
       exit; // an "initialize" notification means nothing; the core ignores it
     // a repeated "initialize" starts over, as a reconnect would: the last
     // negotiation wins, including the client capabilities it declares
@@ -297,13 +299,13 @@ begin
     result := lrAnswered // acknowledged by silence, like every notification
   else if method = 'ping' then
   begin
-    if VarIsVoid(id) then
+    if VarIsEmptyOrNull(id) then
       exit;
     aResponse := JsonRpcResult(id, _ObjFast([]));
     result := lrAnswered;
   end
   else if fInitialized and
-          not VarIsVoid(id) then
+          not VarIsEmptyOrNull(id) then
   begin
     // a request of the negotiated legacy session: add the per-request metadata
     // the modern core requires, from what "initialize" declared. Rewritten on a
