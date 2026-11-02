@@ -384,6 +384,7 @@ type
     procedure ToolArgumentsAreTypeChecked;
     procedure TypeCheckLeavesAmbiguousFormsToTheLoader;
     procedure RegistriesKeepTheirContract;
+    procedure RefusedRegistrationReleasesObject;
     procedure TypedToolCarriesManagedFields;
     procedure GenericShellMatchesRecordTool;
   end;
@@ -4190,6 +4191,121 @@ begin
   finally
     server.Free;
   end;
+end;
+
+var
+  // destructor calls of the T*Counted classes below
+  CountedReleased: integer;
+
+type
+  TCountedCalcTool = class(TCalcTool)
+  public
+    destructor Destroy; override;
+  end;
+  TCountedResource = class(TVersionResource)
+  public
+    destructor Destroy; override;
+  end;
+  TCountedPrompt = class(TReviewPrompt)
+  public
+    destructor Destroy; override;
+  end;
+  TCountedTemplate = class(TFilesTemplate)
+  public
+    destructor Destroy; override;
+  end;
+
+destructor TCountedCalcTool.Destroy;
+begin
+  inc(CountedReleased);
+  inherited Destroy;
+end;
+
+destructor TCountedResource.Destroy;
+begin
+  inc(CountedReleased);
+  inherited Destroy;
+end;
+
+destructor TCountedPrompt.Destroy;
+begin
+  inc(CountedReleased);
+  inherited Destroy;
+end;
+
+destructor TCountedTemplate.Destroy;
+begin
+  inc(CountedReleased);
+  inherited Destroy;
+end;
+
+procedure TTestMcpCore.RefusedRegistrationReleasesObject;
+var
+  server: TMcpServer;
+  raised: boolean;
+begin
+  // RegisterX(TFoo.Create(…)) is how every caller writes it. With a const
+  // interface parameter the fresh object was never reference-counted, so a
+  // registration that raised (taken name) left it allocated for good - heaptrc
+  // found the leaked blocks under RegistriesKeepTheirContract
+  EnsureCalcParamsRtti;
+  CountedReleased := 0;
+  server := TMcpServer.Create('TestServer', '1.0');
+  try
+    server.RegisterTool(TCalcTool.Create('calc', 'first'));
+    raised := false;
+    try
+      server.RegisterTool(TCountedCalcTool.Create('calc', 'taken'));
+    except
+      on ESynException do
+        raised := true;
+    end;
+    Check(raised, 'tool name taken');
+    CheckEqual(CountedReleased, 1, 'the refused tool is released');
+
+    server.RegisterResource(TVersionResource.Create('version://info', 'Version',
+      'Server version', 'application/json'));
+    raised := false;
+    try
+      server.RegisterResource(TCountedResource.Create('version://info', 'Again',
+        'Server version', 'application/json'));
+    except
+      on ESynException do
+        raised := true;
+    end;
+    Check(raised, 'resource URI taken');
+    CheckEqual(CountedReleased, 2, 'the refused resource is released');
+
+    server.RegisterPrompt(TReviewPrompt.Create('review'));
+    raised := false;
+    try
+      server.RegisterPrompt(TCountedPrompt.Create('review'));
+    except
+      on ESynException do
+        raised := true;
+    end;
+    Check(raised, 'prompt name taken');
+    CheckEqual(CountedReleased, 3, 'the refused prompt is released');
+
+    server.RegisterResourceTemplate(TFilesTemplate.Create);
+    raised := false;
+    try
+      server.RegisterResourceTemplate(TCountedTemplate.Create);
+    except
+      on ESynException do
+        raised := true;
+    end;
+    Check(raised, 'URI template taken');
+    CheckEqual(CountedReleased, 4, 'the refused template is released');
+
+    // control: an accepted registration is kept alive by the server, not
+    // released early by the missing const
+    server.RegisterTool(TCountedCalcTool.Create('kept', 'accepted'));
+    CheckEqual(CountedReleased, 4, 'an accepted tool stays alive');
+  finally
+    server.Free;
+  end;
+  CheckEqual(CountedReleased, 5, 'and is released with the server');
 end;
 
 procedure TTestMcpCore.TypedToolCarriesManagedFields;

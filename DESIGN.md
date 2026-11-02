@@ -965,10 +965,15 @@ stimmten:
   `src`-Units fand keine weitere Stelle.
 - heaptrc über `mcp.tests` (FPC 3.2.4, aarch64-linux): vorher 907
   unfreigegebene Blöcke, 894 davon über `GenerateSchema`; nachher 7, keiner
-  mehr über eine der beiden Routinen. Die 7 stammen aus Tests, die
+  mehr über eine der beiden Routinen. Die 7 stammten aus Tests, die
   `RegisterTool(TFoo.Create(…))` absichtlich mit einem doppelten Namen
-  aufrufen: Das neue Objekt am `const`-Interface-Parameter bekommt nie einen
-  Referenzzähler, wenn die Registrierung wirft.
+  aufrufen: Ein frisch erzeugtes Objekt an einem `const`-Interface-Parameter
+  bekommt nie einen Referenzzähler, und wenn die Registrierung warf, gab es
+  niemand frei. Seither nehmen `RegisterTool`/`RegisterResource`/
+  `RegisterPrompt`/`RegisterResourceTemplate` ihr Interface **ohne** `const`,
+  entgegen dem sonstigen mORMot-Stil, und geben ein abgelehntes Objekt beim
+  Werfen frei. Test: `RefusedRegistrationReleasesObject`. heaptrc meldet jetzt
+  0 unfreigegebene Blöcke.
 - **`FinalizeHookResponse`** liest die Hook-Antwort jetzt mit `JSON_FAST_FLOAT`
   ein. Mit `JSON_FAST` ging `0.0809461` als String hinaus, entgegen dem
   `outputSchema` des Tools.

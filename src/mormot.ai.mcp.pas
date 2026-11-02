@@ -1311,23 +1311,29 @@ type
     destructor Destroy; override;
     /// register a tool implementation
     // - thread-safe, can be called before or after Start
-    procedure RegisterTool(const aTool: IMcpTool);
+    // - raises on a taken name or an unusable schema, and the tool passed in is
+    //   released then: RegisterTool(TMyTool.Create(…)) does not leak
+    // - the four Register* methods take their interface WITHOUT const, unlike
+    //   the usual mORMot style, and must keep it that way: a freshly created
+    //   object passed to a const interface parameter is never reference-
+    //   counted, so when the registration raised nobody freed it
+    procedure RegisterTool(aTool: IMcpTool);
     /// register a resource implementation
     // - thread-safe
-    procedure RegisterResource(const aResource: IMcpResource);
+    procedure RegisterResource(aResource: IMcpResource);
     /// unregister a tool by name
     function UnregisterTool(const aName: RawUtf8): boolean;
     /// unregister a resource by URI
     function UnregisterResource(const aUri: RawUtf8): boolean;
     /// register a prompt template
     // - thread-safe
-    procedure RegisterPrompt(const aPrompt: IMcpPrompt);
+    procedure RegisterPrompt(aPrompt: IMcpPrompt);
     /// unregister a prompt by name
     function UnregisterPrompt(const aName: RawUtf8): boolean;
     /// register a parameterized resource (RFC 6570 URI template)
     // - thread-safe; broadcasts resources/list_changed, since a template is
     //   part of what the resource surface offers
-    procedure RegisterResourceTemplate(const aTemplate: IMcpResourceTemplate);
+    procedure RegisterResourceTemplate(aTemplate: IMcpResourceTemplate);
     /// unregister a resource template by its URI template
     function UnregisterResourceTemplate(const aUriTemplate: RawUtf8): boolean;
     /// the `x-mcp-header` annotations of one registered tool
@@ -3433,7 +3439,7 @@ begin
   inherited;
 end;
 
-procedure TMcpServer.RegisterTool(const aTool: IMcpTool);
+procedure TMcpServer.RegisterTool(aTool: IMcpTool);
 var
   name, reason: RawUtf8;
 begin
@@ -3461,7 +3467,7 @@ begin
   NotifyToolsListChanged;
 end;
 
-procedure TMcpServer.RegisterResource(const aResource: IMcpResource);
+procedure TMcpServer.RegisterResource(aResource: IMcpResource);
 var
   uri: RawUtf8;
 begin
@@ -3503,7 +3509,7 @@ begin
     NotifyResourcesListChanged;
 end;
 
-procedure TMcpServer.RegisterPrompt(const aPrompt: IMcpPrompt);
+procedure TMcpServer.RegisterPrompt(aPrompt: IMcpPrompt);
 var
   name: RawUtf8;
 begin
@@ -3725,7 +3731,7 @@ begin
       [promptName]);
 end;
 
-procedure TMcpServer.RegisterResourceTemplate(const aTemplate: IMcpResourceTemplate);
+procedure TMcpServer.RegisterResourceTemplate(aTemplate: IMcpResourceTemplate);
 var
   uri: RawUtf8;
 begin
