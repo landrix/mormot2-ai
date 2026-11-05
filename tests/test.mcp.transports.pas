@@ -72,6 +72,9 @@ type
     function WaitForFileLineCount(const aFileName: TFileName;
       aLines, aTimeoutMs: integer): boolean;
   published
+    /// the 401/403 challenge and the metadata CORS header are real header
+    // lines ("Name: value"), not the name glued to the value
+    procedure HttpTransportAuthHeaders;
     procedure HttpTransportPost;
     procedure HttpTransportAcceptHeader;
     procedure HttpTransportOptions;
@@ -2413,6 +2416,7 @@ var
   port, status: integer;
   client: THttpClientSocket;
   scopes, authServers: TRawUtf8DynArray;
+  challenge, origin: RawUtf8;
 
   // POST a tools/list with an explicit Authorization header
   // - hand-built rather than routed through McpPost, because the token has to
@@ -2471,6 +2475,10 @@ begin
     CheckEqual(status, HTTP_UNAUTHORIZED, 'an unauthenticated request -> 401');
     Check(PosEx('Bearer', client.Headers) > 0,
       'the refusal carries a WWW-Authenticate challenge');
+    // found by name: a glued "WWW-AuthenticateBearer ..." line is not a header
+    Check(FindNameValue(client.Headers, 'WWW-AUTHENTICATE:', challenge),
+      'as a real WWW-Authenticate header line');
+    Check(IdemPChar(pointer(challenge), 'BEARER '), 'carrying a Bearer challenge');
     Check(PosEx(MCP_WELL_KNOWN_RESOURCE, client.Headers) > 0,
       'pointing at the metadata that names the authorization server');
     Check(PosEx('tools', client.Content) = 0,
@@ -2514,6 +2522,9 @@ begin
       'a valid token lacking the scope -> 403, not a 200 with an error body');
     Check(PosEx('insufficient_scope', client.Headers) > 0,
       'the challenge says why');
+    Check(FindNameValue(client.Headers, 'WWW-AUTHENTICATE:', challenge),
+      'in a real WWW-Authenticate header line');
+    Check(PosEx('insufficient_scope', challenge) > 0, 'naming insufficient_scope');
     Check(PosEx('files:write', client.Headers) > 0,
       'and names the scope to step up to - without it the client can only ' +
       'retry the same failing request');
@@ -2528,6 +2539,9 @@ begin
       'and names where to authenticate');
     status := client.Get(MCP_WELL_KNOWN_RESOURCE);
     CheckEqual(status, HTTP_SUCCESS, 'the metadata is served unauthenticated');
+    Check(FindNameValue(client.Headers, 'ACCESS-CONTROL-ALLOW-ORIGIN:', origin),
+      'a real CORS header line');
+    CheckEqual(origin, '*', 'readable from any origin');
     Check(PosEx('https://mcp.example.com/mcp', client.Content) > 0,
       'and names this resource, so a client can request a token for it');
     Check(PosEx('bearer_methods_supported', client.Content) > 0,
@@ -2859,6 +2873,78 @@ begin
       transport.Stop;
     transport.Free;
     client.Free;
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpTransports.HttpTransportAuthHeaders;
+var
+  server: TMcpServer;
+  transport: TMcpHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  scopes, authServers: TRawUtf8DynArray;
+  challenge, origin: RawUtf8;
+
+  function PostAs(const aToken: RawUtf8; aId: integer;
+    const aTool: RawUtf8): integer;
+  var
+    hdr, body: RawUtf8;
+    doc: TDocVariantData;
+  begin
+    doc.InitJson('{"jsonrpc":"2.0","method":"tools/call"}', JSON_FAST);
+    doc.AddOrUpdateValue('id', aId);
+    doc.AddOrUpdateValue('params', McpRequestParams(
+      _ObjFast(['name', aTool, 'arguments', _ObjFast([])]), 'mcp.tests', '1.0'));
+    body := doc.ToJson;
+    hdr := 'Accept: application/json, text/event-stream'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/call'#13#10'Mcp-Name: ' + aTool;
+    if aToken <> '' then
+      hdr := hdr + #13#10'Authorization: Bearer ' + aToken;
+    result := client.Post('/mcp', body, JSON_CONTENT_TYPE, HTTP_KEEPALIVE_MS, hdr);
+  end;
+
+begin
+  server := TMcpServer.Create('HttpTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.AuthResource := 'https://mcp.example.com/mcp';
+    AddRawUtf8(scopes, 'mcp:use');
+    server.ScopesSupported := scopes;
+    AddRawUtf8(authServers, 'https://as.example.com');
+    server.AuthorizationServers := authServers;
+    server.TokenVerifier := TTransportVerifier.Create;
+    server.RegisterTool(TIdentityEchoTool.Create);
+    server.Start;
+    port := StartHttpTransport(server, transport);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    // --- 401: the challenge must be a header a client can find by name ----
+    status := PostAs('', 1, 'whoami');
+    CheckEqual(status, HTTP_UNAUTHORIZED, 'no token -> 401');
+    Check(FindNameValue(client.Headers, 'WWW-AUTHENTICATE:', challenge),
+      'a real WWW-Authenticate header line');
+    Check(IdemPChar(pointer(challenge), 'BEARER '), 'carrying a Bearer challenge');
+    Check(PosEx('resource_metadata="', challenge) > 0,
+      'naming the protected resource metadata (RFC 9728)');
+    // --- 403: the step-up challenge too ----------------------------------
+    status := PostAs('narrow-token', 2, 'whoami');
+    CheckEqual(status, HTTP_FORBIDDEN, 'a token lacking the scope -> 403');
+    Check(FindNameValue(client.Headers, 'WWW-AUTHENTICATE:', challenge),
+      'a real WWW-Authenticate header line');
+    Check(PosEx('insufficient_scope', challenge) > 0, 'naming insufficient_scope');
+    // --- the public metadata carries a real CORS header line ---------------
+    status := client.Get(MCP_WELL_KNOWN_RESOURCE);
+    CheckEqual(status, HTTP_SUCCESS, 'the metadata is served unauthenticated');
+    Check(FindNameValue(client.Headers, 'ACCESS-CONTROL-ALLOW-ORIGIN:', origin),
+      'a real CORS header line');
+    CheckEqual(origin, '*', 'readable from any origin');
+  finally
+    client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
     server.Free;
   end;
 end;
