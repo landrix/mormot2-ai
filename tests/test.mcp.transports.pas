@@ -64,7 +64,7 @@ type
     procedure EnsureCalcParamsRtti;
     function VariantToInt64Loose(const V: variant; out aValue: Int64): boolean;
     function StartHttpTransport(const aServer: TMcpServer;
-      out aTransport: TMcpHttpTransport): integer;
+      out aTransport: TMcpHttpTransport; aMaxContentLength: Int64 = 0): integer;
     procedure BackupStdIo(out aInput, aOutput: TMcpTextRec);
     procedure RestoreStdIo(const aInput, aOutput: TMcpTextRec);
     function WaitForFileNotEmpty(const aFileName: TFileName;
@@ -75,6 +75,8 @@ type
     /// the 401/403 challenge and the metadata CORS header are real header
     // lines ("Name: value"), not the name glued to the value
     procedure HttpTransportAuthHeaders;
+    /// MaximumAllowedContentLength bounds the plain HTTP transport too
+    procedure HttpTransportRefusesOversizedBody;
     procedure HttpTransportPost;
     procedure HttpTransportAcceptHeader;
     procedure HttpTransportOptions;
@@ -133,6 +135,8 @@ type
     procedure OversizedBodyRefusedBeforeReading;
     /// OnStreamAuthorized cancels a listen stream whose caller lost its rights
     procedure SubscriptionStreamEndsWhenAuthorizationWithdrawn;
+    /// an OnStreamAuthorized that raises ends the stream like a refusal
+    procedure SubscriptionStreamEndsWhenAuthorizationCheckRaises;
   end;
 
 implementation
@@ -141,6 +145,51 @@ const
   /// the per-request protocol metadata every request must carry since 2026-07-28
   MCP_TEST_META = '"_meta":{"io.modelcontextprotocol/protocolVersion":"' +
     MCP_PROTOCOL_VERSION + '","io.modelcontextprotocol/clientCapabilities":{}}';
+
+// send aJson as ONE chunk of a chunked body, over a raw socket - a
+// THttpClientSocket always sends a Content-Length - and return the status
+// - aKeptAlive first completes a body-less OPTIONS on the same connection, so
+//   the chunked request is the second one the server parses on it
+// - aExtraHeaders: more header lines, each ending with CRLF
+function McpSendChunked(aPort: integer; const aMethod, aEndpoint,
+  aJson: RawUtf8; aKeptAlive: boolean = false;
+  const aExtraHeaders: RawUtf8 = ''): integer;
+var
+  sock: TCrtSocket;
+  line: RawUtf8;
+begin
+  result := 0;
+  sock := TCrtSocket.Open('127.0.0.1', UInt32ToUtf8(aPort));
+  try
+    if aKeptAlive then
+    begin
+      sock.SndLow('OPTIONS ' + aEndpoint + ' HTTP/1.1'#13#10 +
+        'Host: 127.0.0.1'#13#10#13#10);
+      repeat
+        sock.SockRecvLn(line); // status line and headers of the 204
+      until line = '';
+    end;
+    sock.SndLow(aMethod + ' ' + aEndpoint + ' HTTP/1.1'#13#10 +
+      'Host: 127.0.0.1'#13#10 +
+      'Content-Type: application/json'#13#10 +
+      'Accept: application/json, text/event-stream'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list'#13#10 + aExtraHeaders +
+      'Transfer-Encoding: chunked'#13#10#13#10 +
+      CardinalToHex(length(aJson)) + #13#10 + aJson + #13#10'0'#13#10#13#10);
+    sock.SockRecvLn(line); // e.g. 'HTTP/1.1 413 Payload Too Large'
+    if length(line) > 9 then
+      result := GetInteger(PUtf8Char(pointer(line)) + 9);
+  finally
+    sock.Free;
+  end;
+end;
+
+function McpPostChunked(aPort: integer; const aEndpoint, aJson: RawUtf8;
+  aKeptAlive: boolean = false): integer;
+begin
+  result := McpSendChunked(aPort, 'POST', aEndpoint, aJson, aKeptAlive);
+end;
 
 /// POST an MCP request the way a conforming 2026-07-28 client would
 // - injects the mandatory _meta into params and mirrors method (and name/uri,
@@ -284,7 +333,7 @@ begin
 end;
 
 function TTestMcpTransports.StartHttpTransport(const aServer: TMcpServer;
-  out aTransport: TMcpHttpTransport): integer;
+  out aTransport: TMcpHttpTransport; aMaxContentLength: Int64): integer;
 var
   i: integer;
   port: integer;
@@ -301,6 +350,7 @@ begin
     try
       transport := TMcpHttpTransport.Create(aServer);
       transport.Port := port;
+      transport.MaximumAllowedContentLength := aMaxContentLength;
       transport.Start;
       aTransport := transport;
       result := port;
@@ -2577,6 +2627,22 @@ begin
   result := Calls = 1; // e.g. the API key of the caller was revoked meanwhile
 end;
 
+type
+  /// an authorization check that fails outright, e.g. its database is gone
+  TRaisingStreamGate = class
+  public
+    Calls: integer;
+    function Allowed(const aAuthCtx: TMcpAuthContext): boolean;
+  end;
+
+function TRaisingStreamGate.Allowed(const aAuthCtx: TMcpAuthContext): boolean;
+begin
+  inc(Calls);
+  result := false; // never reached: set only so that no compiler warns
+  if Calls > 0 then
+    raise ESynException.Create('the key store is unreachable');
+end;
+
 procedure TTestMcpStreamableTransport.OversizedBodyRefusedBeforeReading;
 var
   server: TMcpServer;
@@ -2602,6 +2668,16 @@ begin
       'Mcp-Method: tools/list');
     CheckEqual(status, HTTP_PAYLOADTOOLARGE, 'an oversized body -> 413');
     FreeAndNil(client);
+    // a chunked body has no Content-Length: it is counted while it arrives
+    CheckEqual(McpPostChunked(port, transport.Endpoint, body),
+      HTTP_PAYLOADTOOLARGE, 'an oversized chunked body -> 413');
+    CheckEqual(McpPostChunked(port, transport.Endpoint, body, true),
+      HTTP_PAYLOADTOOLARGE, 'also as the second request of a connection');
+    // and a small one reaches the deferred SSE path through its stream
+    CheckEqual(McpPostChunked(port, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{' +
+      MCP_TEST_META + '}}'), HTTP_SUCCESS,
+      'a small chunked body is served');
     // a request within the limit is still served (on a fresh connection)
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
     status := McpPost(client, transport.Endpoint,
@@ -2647,6 +2723,49 @@ begin
       'the teardown is announced like every other end of a stream');
     Check(PosEx('authorization of this stream was withdrawn', body) > 0,
       'and says why');
+    CheckEqual(server.SubscriptionCount, 0, 'the slot came back');
+  finally
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    client.Free;
+    server.Free;
+    gate.Free;
+  end;
+end;
+
+procedure TTestMcpStreamableTransport.SubscriptionStreamEndsWhenAuthorizationCheckRaises;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  gate: TRaisingStreamGate;
+  body: RawUtf8;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  gate := TRaisingStreamGate.Create;
+  try
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    transport.StreamCheckIntervalMs := 50;
+    transport.OnStreamAuthorized := gate.Allowed;
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":9,"method":"subscriptions/listen",' +
+      '"params":{"notifications":{"toolsListChanged":true}}}');
+    CheckEqual(status, HTTP_SUCCESS, 'the stream completed');
+    body := client.Content;
+    CheckEqual(gate.Calls, 1, 'asked once: the failure ended the stream');
+    // an escaping exception would tear the worker down mid-stream: no
+    // teardown, no final response, and a truncated chunked body
+    Check(PosEx('notifications/cancelled', body) > 0,
+      'the teardown is announced like a refusal');
+    Check(PosEx('authorization of this stream was withdrawn', body) > 0,
+      'with the same reason');
+    Check(PosEx('"id":9', body) > 0, 'and the final response is sent');
     CheckEqual(server.SubscriptionCount, 0, 'the slot came back');
   finally
     if transport <> nil then
@@ -3043,6 +3162,70 @@ begin
     Check(FindNameValue(client.Headers, 'ACCESS-CONTROL-ALLOW-ORIGIN:', origin),
       'a real CORS header line');
     CheckEqual(origin, '*', 'readable from any origin');
+  finally
+    client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpTransports.HttpTransportRefusesOversizedBody;
+var
+  server: TMcpServer;
+  transport: TMcpHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  body: RawUtf8;
+begin
+  server := TMcpServer.Create('HttpTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.Start;
+    port := StartHttpTransport(server, transport, 1024);
+    CheckEqual(transport.MaximumAllowedContentLength, 1024, 'the limit is kept');
+    body := '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":"' +
+      RawUtf8OfChar('x', 4096) + '"}}';
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    status := McpPost(client, '/mcp', body);
+    CheckEqual(status, HTTP_PAYLOADTOOLARGE, 'an oversized body -> 413');
+    FreeAndNil(client);
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    status := McpPost(client, '/mcp', '{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
+    CheckEqual(status, HTTP_SUCCESS, 'a small body is served');
+    // a chunked body carries no length to compare: left to mORMot's plain
+    // Content buffering it would grow up to the 1 GB default, so it is
+    // counted while it arrives
+    CheckEqual(McpPostChunked(port, '/mcp', body), HTTP_PAYLOADTOOLARGE,
+      'an oversized chunked body -> 413');
+    CheckEqual(McpPostChunked(port, '/mcp', body, true), HTTP_PAYLOADTOOLARGE,
+      'also as the second request of a kept-alive connection');
+    CheckEqual(McpPostChunked(port, '/mcp',
+      '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{' +
+      MCP_TEST_META + '}}'), HTTP_SUCCESS,
+      'a small chunked body is served');
+    // the parser reads a chunked body whatever the method
+    CheckEqual(McpSendChunked(port, 'OPTIONS', '/mcp', body), HTTP_PAYLOADTOOLARGE,
+      'a chunked OPTIONS -> 413 as well');
+    CheckEqual(McpSendChunked(port, 'GET', MCP_WELL_KNOWN_RESOURCE, body),
+      HTTP_PAYLOADTOOLARGE, 'and a chunked GET');
+    // mORMot never offers the body of an upgrade request to OnBodyDownload,
+    // so it could not be counted: refused from its headers instead
+    CheckEqual(McpSendChunked(port, 'OPTIONS', '/mcp', body, false,
+      'Connection: Upgrade'#13#10'Upgrade: websocket'#13#10),
+      HTTP_LENGTHREQUIRED, 'a chunked upgrade request -> 411');
+    CheckEqual(McpSendChunked(port, 'POST', '/mcp', body, true,
+      'Connection: Upgrade'#13#10'Upgrade: h2c'#13#10),
+      HTTP_LENGTHREQUIRED, 'also on a kept-alive connection');
+    // without a limit, chunked bodies are accepted as before
+    transport.Stop;
+    FreeAndNil(transport);
+    port := StartHttpTransport(server, transport);
+    CheckEqual(McpPostChunked(port, '/mcp',
+      '{"jsonrpc":"2.0","id":4,"method":"tools/list"}'), HTTP_SUCCESS,
+      'no limit: a chunked body is served');
   finally
     client.Free;
     if transport <> nil then

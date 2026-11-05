@@ -54,6 +54,20 @@ type
     fActive: boolean;
     fPort: integer;
     fHost: RawUtf8;
+    fMaximumAllowedContentLength: Int64;
+    // OnBodyDownload of the HTTP server while a body limit is set: receives a
+    // chunked body into memory too, but as a stream the limit applies to
+    function BoundChunkedBody(const aUrl, aMethod, aInHeaders, aInContentType,
+      aRemoteIP: RawUtf8; aContentLength: Int64): TStream;
+    // OnBeforeBody of the HTTP server while a body limit is set: refuses the
+    // chunked body of an upgrade request, which OnBodyDownload never sees
+    function RefuseUnboundedUpgrade(var aUrl, aMethod, aInHeaders,
+      aInContentType, aRemoteIP, aBearerToken: RawUtf8; aContentLength: Int64;
+      aFlags: THttpServerRequestFlags): cardinal;
+    // copy MaximumAllowedContentLength onto the HTTP server, from Start
+    procedure ApplyBodyLimit(aHttpServer: THttpServerGeneric);
+    // the request body, wherever the server put it (see BoundChunkedBody)
+    class function ReadRequestBody(Ctxt: THttpServerRequestAbstract): RawUtf8;
   public
     /// initialize with MCP server instance
     constructor Create(aServer: TMcpServer); reintroduce; virtual;
@@ -70,6 +84,15 @@ type
     property Port: integer read fPort write fPort;
     /// the host address
     property Host: RawUtf8 read fHost write fHost;
+    /// the largest request body accepted, in bytes (0 = no limit, default)
+    // - copied to the HTTP server by Start, so set it before: a larger
+    //   Content-Length is answered 413 from the headers, before the body is
+    //   buffered, and so before any bearer check could refuse an
+    //   unauthenticated client
+    // - a chunked body has no Content-Length to compare: it is answered 413
+    //   as soon as its received chunks add up past the limit
+    property MaximumAllowedContentLength: Int64
+      read fMaximumAllowedContentLength write fMaximumAllowedContentLength;
   end;
 
 
@@ -154,6 +177,11 @@ type
   // - aAuthCtx is the caller the stream was opened for; return false once its
   //   authorization was withdrawn (e.g. its API key was revoked): the stream
   //   is then cancelled - the token expiry alone would let it run until then
+  // - called from the worker thread of each open stream, so concurrently for
+  //   several streams: it must be thread-safe, and fast - a slow answer holds
+  //   the stream (and its notifications) for as long as it takes
+  // - an exception it raises counts as false: the stream is cancelled rather
+  //   than left running on an authorization nobody could confirm
   TMcpStreamAuthorized = function(
     const aAuthCtx: TMcpAuthContext): boolean of object;
 
@@ -179,7 +207,6 @@ type
     fOnStreamCall: TMcpStreamCall;
     fOnStreamAuthorized: TMcpStreamAuthorized;
     fStreamCheckMs: integer;
-    fMaximumAllowedContentLength: Int64;
     // -- helper methods --
     procedure SetCorsHeaders(var Ctxt: THttpServerRequest);
     function ValidateOrigin(var Ctxt: THttpServerRequest): boolean;
@@ -213,6 +240,9 @@ type
     // queued notifications until the client disconnects or the server ends it.
     // Runs on the connection's own thread for the lifetime of the stream (see
     // TMcpServer.MaxSubscriptions for why that is bounded).
+    // why an open listen stream may not go on for this caller ('' = it may)
+    function StreamAuthorizationEnded(const aAuthCtx: TMcpAuthContext;
+      var aNextCheck: Int64): RawUtf8;
     procedure StreamSubscription(const aWrite: TMcpRawWrite;
       const aBody: RawUtf8; const aAuthCtx: TMcpAuthContext);
     // -- GET/DELETE are gone with protocol sessions: answer 405 --
@@ -250,16 +280,15 @@ type
     property OnStreamCall: TMcpStreamCall read fOnStreamCall write fOnStreamCall;
     /// optional check of the authorization of an open subscriptions/listen
     // stream, every StreamCheckIntervalMs: false cancels the stream
+    // - see TMcpStreamAuthorized: called from the worker threads, and an
+    //   exception counts as a withdrawn authorization
     property OnStreamAuthorized: TMcpStreamAuthorized
       read fOnStreamAuthorized write fOnStreamAuthorized;
-    /// how often OnStreamAuthorized is called on an open stream (default 1000)
+    /// how often OnStreamAuthorized is called on an open stream, in ms
+    // - default 1000; 0 or less asks on every pass of the stream loop
+    //   (MCP_SUBSCRIPTION_POLL_MS), which is as fast as it can react
     property StreamCheckIntervalMs: integer
       read fStreamCheckMs write fStreamCheckMs;
-    /// the largest request body accepted, in bytes (0 = no limit, default)
-    // - set on the THttpAsyncServer by Start: a larger Content-Length is
-    //   answered 413 before the body is read
-    property MaximumAllowedContentLength: Int64
-      read fMaximumAllowedContentLength write fMaximumAllowedContentLength;
   published
     /// single endpoint handler — routes by HTTP method
     // - uses RTTI-based route publishing (same pattern as TMcpHttpTransport)
@@ -311,6 +340,63 @@ begin
   fActive := false;
   fPort := 3000;
   fHost := 'localhost';
+end;
+
+function TMcpTransportBase.BoundChunkedBody(const aUrl, aMethod, aInHeaders,
+  aInContentType, aRemoteIP: RawUtf8; aContentLength: Int64): TStream;
+begin
+  // THttpAsyncServer checks MaximumAllowedContentLength against the
+  // Content-Length header only. The running total that bounds a chunked body
+  // (ContentMaxSize) it sets solely when OnBodyDownload supplied a stream:
+  // buffered as plain Content, a chunked body grows up to the 1 GB default -
+  // whatever the method, since the parser reads it before any handler runs.
+  // So a chunked body (-1, from the parser's own hfTransferChunked flag, not
+  // from a header we would have to find) gets a memory stream: still in RAM,
+  // but counted, and refused with 413 once past the limit. A body with a
+  // Content-Length was already judged against the limit by its header, and
+  // stays plain Content (nil).
+  if aContentLength < 0 then
+    result := TRawByteStringStream.Create
+  else
+    result := nil;
+end;
+
+function TMcpTransportBase.RefuseUnboundedUpgrade(var aUrl, aMethod,
+  aInHeaders, aInContentType, aRemoteIP, aBearerToken: RawUtf8;
+  aContentLength: Int64; aFlags: THttpServerRequestFlags): cardinal;
+begin
+  // DoHeaders skips OnBodyDownload for a request flagged Connection: Upgrade,
+  // so BoundChunkedBody cannot count its chunked body - and neither transport
+  // upgrades anything, so the body would simply be buffered. A Content-Length
+  // was already judged against the limit; a length of 0 is what the parser
+  // leaves for a chunked body (or an empty one, which no MCP request is), so
+  // it is refused here. An upgrade request without any body (-1, e.g. the h2c
+  // offer of curl --http2) is answered as before.
+  if (hsrConnectionUpgrade in aFlags) and
+     (aContentLength = 0) then
+    result := HTTP_LENGTHREQUIRED
+  else
+    result := HTTP_SUCCESS;
+end;
+
+class function TMcpTransportBase.ReadRequestBody(
+  Ctxt: THttpServerRequestAbstract): RawUtf8;
+begin
+  result := Ctxt.InContent;
+  // a BoundChunkedBody stream, owned and freed by the server
+  if (result = '') and
+     (Ctxt.InContentStream <> nil) then
+    result := StreamToRawByteString(Ctxt.InContentStream);
+end;
+
+procedure TMcpTransportBase.ApplyBodyLimit(aHttpServer: THttpServerGeneric);
+begin
+  aHttpServer.MaximumAllowedContentLength := fMaximumAllowedContentLength;
+  if fMaximumAllowedContentLength > 0 then
+  begin
+    aHttpServer.OnBodyDownload := BoundChunkedBody;
+    aHttpServer.OnBeforeBody := RefuseUnboundedUpgrade;
+  end;
 end;
 
 function TMcpTransportBase.IsActive: boolean;
@@ -409,7 +495,7 @@ begin
   end;
 
   // Read request body
-  requestBody := Ctxt.InContent;
+  requestBody := ReadRequestBody(Ctxt);
 
   // Execute MCP request ON BEHALF OF the caller we just verified: without
   // handing the context down, every tool would see an unauthenticated caller
@@ -465,6 +551,8 @@ begin
     ]);
   //  if pin2Core <> -1 then
   //    fHttpServer.Async.SetCpuAffinity(pin2Core);
+  // reject an oversized body from its headers, before reading it
+  ApplyBodyLimit(fHttpServer);
   fHttpServer.HttpQueueLength := 10000; // needed e.g. from wrk/ab benchmarks
   fHttpServer.ServerName := 'MMCP-HTTP';
   // use default routing using RTTI on the TRawAsyncServer published methods
@@ -582,7 +670,11 @@ begin
          length(refusal), refusal]));
     end
     else
-      transport.StreamDeferredResponse(WriteRaw, fHttp.Content,
+      // ReadRequestBody, not fHttp.Content: a chunked body under a size limit
+      // arrived as a stream (BoundChunkedBody), freed only by the inherited
+      // AfterWrite below
+      transport.StreamDeferredResponse(WriteRaw,
+        TMcpTransportBase.ReadRequestBody(fRequest),
         fRequest.OutCustomHeaders, authCtx);
     fStreaming := false;
     // finalize once: hrsResponseDone lets the inherited AfterWrite run the
@@ -640,7 +732,7 @@ begin
   // let the streaming connection reach this transport for deferred responses
   TMcpStreamableAsyncServer(fHttpServer).Transport := self;
   // reject an oversized body from its headers, before reading it
-  fHttpServer.MaximumAllowedContentLength := fMaximumAllowedContentLength;
+  ApplyBodyLimit(fHttpServer);
   fHttpServer.HttpQueueLength := 10000;
   fHttpServer.ServerName := 'MMCP-Streamable';
   // RTTI-based route publishing: the published 'mcp' method handles /mcp
@@ -822,7 +914,7 @@ begin
   // downgrade to the removed initialize handshake against this very server.
   // McpInitJsonComplete, not InitJson: trailing data after the object must
   // fail here too, or this transport would dispatch a body the core rejects
-  body := Ctxt.InContent;
+  body := ReadRequestBody(Ctxt);
   // no JSON at all is a Parse error (-32700), not an Invalid Request: JSON-RPC
   // 2.0 §5.1 keeps the two apart, and so does the core's Preflight. A valid
   // scalar (42) fails the object parse too, but is -32600 (McpJsonFailureCode).
@@ -1113,6 +1205,42 @@ begin
     fTransport.FormatSseEvent('message', aJsonMessage)));
 end;
 
+function TMcpStreamableHttpTransport.StreamAuthorizationEnded(
+  const aAuthCtx: TMcpAuthContext; var aNextCheck: Int64): RawUtf8;
+var
+  allowed: boolean;
+begin
+  result := '';
+  // A stream outlives a token easily: the one check at connect time was
+  // minutes ago, and "take all necessary steps to ensure no data is returned
+  // to unauthorized parties" does not stop applying because the connection
+  // stayed open. A verifier that reports no expiry opts out.
+  if (aAuthCtx.ExpiresUnix > 0) and
+     (UnixTimeUtc >= aAuthCtx.ExpiresUnix) then
+  begin
+    result := 'the access token presented for this stream has expired';
+    exit;
+  end;
+  // The rights behind a token that has not expired can still be withdrawn
+  // while the stream is open (e.g. a revoked API key): only the host knows,
+  // so it is asked - at most once per StreamCheckIntervalMs.
+  if not Assigned(fOnStreamAuthorized) or
+     (GetTickCount64 < aNextCheck) then
+    exit;
+  // The callback is foreign code: an exception escaping into the connection's
+  // OnRead would tear down the worker mid-stream. And an authorization nobody
+  // could confirm is not one - it ends the stream like a refusal.
+  try
+    allowed := fOnStreamAuthorized(aAuthCtx);
+  except
+    allowed := false;
+  end;
+  // counted from the answer, so a slow callback cannot be asked back to back
+  aNextCheck := GetTickCount64 + fStreamCheckMs;
+  if not allowed then
+    result := 'the authorization of this stream was withdrawn';
+end;
+
 procedure TMcpStreamableHttpTransport.StreamSubscription(
   const aWrite: TMcpRawWrite; const aBody: RawUtf8;
   const aAuthCtx: TMcpAuthContext);
@@ -1125,6 +1253,7 @@ var
   idle: integer;
   alive: boolean;
   nextCheck: Int64;
+  reason: RawUtf8;
 begin
   doc.InitJson(aBody, JSON_FAST);
   requestId := doc.GetValueOrNull('id');
@@ -1155,6 +1284,16 @@ begin
     nextCheck := GetTickCount64 + fStreamCheckMs;
     while alive and fActive do
     begin
+      // The authorization comes first, BEFORE the drain: a caller whose token
+      // expired or whose rights were withdrawn must not receive what is still
+      // queued. Tested after the drain, it would also never run while
+      // notifications keep arriving - a non-empty drain loops straight back.
+      reason := StreamAuthorizationEnded(aAuthCtx, nextCheck);
+      if reason <> '' then
+      begin
+        sub.Cancel(reason);
+        break;
+      end;
       // Drain BEFORE testing for cancellation: an orderly shutdown must still
       // deliver what is already queued. Testing first would silently drop
       // notifications that were produced microseconds before the cancel.
@@ -1171,17 +1310,7 @@ begin
       end;
       if sub.Cancelled then
         break; // nothing left to deliver, and we were asked to stop
-      // A stream outlives a token easily: the one check at connect time was
-      // minutes ago, and "take all necessary steps to ensure no data is
-      // returned to unauthorized parties" does not stop applying because the
-      // connection stayed open. A verifier that reports no expiry opts out.
-      if (aAuthCtx.ExpiresUnix > 0) and
-         (UnixTimeUtc >= aAuthCtx.ExpiresUnix) then
-      begin
-        sub.Cancel('the access token presented for this stream has expired');
-        break;
-      end;
-      // And an absolute bound on top, because the check above bites only when
+      // And an absolute bound on top, because the expiry check bites only when
       // a verifier reports an expiry - on an open server there is no token at
       // all, and the stream would then hold its worker thread forever without
       // the caller ever authenticating.
@@ -1190,18 +1319,6 @@ begin
       begin
         sub.Cancel('this stream reached its maximum lifetime; reconnect to continue');
         break;
-      end;
-      // the authorization of the caller may be withdrawn while the stream is
-      // open (e.g. a revoked API key): the expiry of its token is too late
-      if Assigned(fOnStreamAuthorized) and
-         (GetTickCount64 >= nextCheck) then
-      begin
-        nextCheck := GetTickCount64 + fStreamCheckMs;
-        if not fOnStreamAuthorized(aAuthCtx) then
-        begin
-          sub.Cancel('the authorization of this stream was withdrawn');
-          break;
-        end;
       end;
       SleepHiRes(MCP_SUBSCRIPTION_POLL_MS);
       inc(idle, MCP_SUBSCRIPTION_POLL_MS);

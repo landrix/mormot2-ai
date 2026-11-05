@@ -1005,6 +1005,85 @@ stimmten:
 - **`AdvertiseListNotifications`** (Processor, Default `true`): siehe den
   Abschnitt zu `subscriptions/listen`.
 
+### Beiträge aus PR #3 und #4 (flydev, 2026-11-05)
+
+- **Header ohne Trenner (PR #3)**: `SetOutCustomHeader` ist nur ein
+  `AppendLine` und setzt keinen Trenner. Fünf Aufrufe übergaben Name und Wert
+  als zwei Argumente, gesendet wurden also `WWW-AuthenticateBearer …` und
+  `Access-Control-Allow-Origin*`. Ein Client fand den RFC-6750-Challenge
+  damit nie und kam nicht an die `resource_metadata`-URL, die
+  OAuth-Discovery scheiterte beim ersten Kontakt. Der alte Test suchte nur
+  nach Teilstrings, die auch in der verklebten Zeile stehen. Jetzt sucht er
+  den Header über `FindNameValue` beim Namen, auch für `TMcpHttpTransport`
+  (`HttpTransportAuthHeaders`).
+- **`MaximumAllowedContentLength` (PR #4)**, Default 0 (kein Deckel): `Start`
+  gibt den Wert an den `THttpAsyncServer` weiter. Ein zu großer Body wird
+  dann mit 413 abgewiesen, noch bevor er gelesen wird. Ein Body mit
+  `Content-Length` scheitert schon am Header, ein chunked Body, sobald er
+  über den Deckel wächst (`ContentMaxSize`). Beides passiert vor der
+  Bearer-Prüfung, die erst nach dem Lesen des Bodys läuft. Nachgearbeitet:
+  - Die Property sitzt in `TMcpTransportBase` und gilt damit auch für
+    `TMcpHttpTransport`, im PR stand sie nur am Streamable-Transport.
+  - **Chunked Bodys umgingen den Deckel** (Codex-Review, drei Runden):
+    `THttpAsyncServer` vergleicht `MaximumAllowedContentLength` nur mit dem
+    `Content-Length`-Header. `ContentMaxSize`, die laufende Summe für
+    chunked Bodys, setzt mORMot nur, wenn `OnBodyDownload` einen Stream
+    liefert. Als normaler `Content` gepuffert, wuchs ein chunked Body bis zum
+    1-GB-Default, und zwar bei **jeder** Methode, weil der Parser ihn vor
+    jedem Handler liest. Abhilfe: Mit Deckel ist `BoundChunkedBody` als
+    `OnBodyDownload` eingehängt. Für einen chunked Body (Länge -1, aus dem
+    Parser-Flag `hfTransferChunked`) gibt es einen `TRawByteStringStream`
+    zurück. Der Body bleibt im RAM, wird aber gezählt und ab dem Deckel mit
+    413 abgewiesen. Ein Body mit `Content-Length` bleibt normaler `Content`
+    (nil). `ReadRequestBody` liest den Body von dort, wo der Server ihn
+    abgelegt hat: in `mcp()` beider Transporte und in der verzögerten
+    SSE-Übergabe (`AfterWrite`, vor dem geerbten Aufräumen, das den Stream
+    freigibt).
+    Eine Lücke bleibt im Stream-Weg: Bei `Connection: Upgrade` überspringt
+    `DoHeaders` den `OnBodyDownload` (Codex, Runde 4). Für diesen Fall prüft
+    `RefuseUnboundedUpgrade` (`OnBeforeBody`) das per Request gesetzte Flag
+    `hsrConnectionUpgrade`. Hat ein solcher Request Länge 0, also chunked
+    oder leer, bekommt er 411. Ein Upgrade mit `Content-Length` ist schon
+    über den Header gedeckelt. Ein Upgrade-Angebot ohne Body (Länge -1,
+    etwa h2c von `curl --http2`) läuft weiter wie bisher.
+    Verworfen wurden zwei Zwischenstände. 411 für ein POST der Länge 0
+    erwischte OPTIONS und GET nicht, und an der Länge allein ist chunked von
+    `Content-Length: 0` nicht zu unterscheiden. `hsoHeadersUnfiltered`,
+    damit `OnBeforeBody` den `Transfer-Encoding`-Header sieht, gilt nur für
+    den ersten Request einer Verbindung: `THttpRequestContext.Reset` setzt
+    nach jedem Keep-alive `Options := []` und `HttpInit` stellt sie nicht
+    wieder her (Fehler in mORMot, upstream meldenswert). Ein NUL in einem
+    anderen Header hätte die Header-Suche außerdem vorzeitig beendet.
+    Die eigentliche Korrektur gehört upstream: `ContentMaxSize` auch für
+    Bodys im Speicher setzen. Upstream bleibt außerdem eine Grenze, die hier
+    nicht lösbar ist (Codex, Runde 5): `ProcessParseLine` prüft keine Länge,
+    solange kein CR kommt. Eine Chunk-Size- oder Header-Zeile ohne Ende
+    wächst damit unbegrenzt im Lesepuffer. Das betrifft jeden mORMot-Server
+    und hat mit dem Deckel nichts zu tun. Tests: `HttpTransportRefusesOversizedBody`
+    (POST, OPTIONS, GET, Upgrade, zweiter Request einer Keep-alive-Verbindung, kleiner
+    chunked Body wird bedient; ohne Deckel bleibt chunked wie bisher) und
+    `OversizedBodyRefusedBeforeReading` (auch über den SSE-Pfad).
+- **`OnStreamAuthorized` + `StreamCheckIntervalMs` (PR #4)**: Eine offene
+  Listen-Subscription fragt den Host höchstens einmal pro Intervall
+  (Default 1000 ms), ob der Aufrufer noch berechtigt ist, etwa wenn sein
+  API-Key widerrufen wurde. Bei `false` endet sie über `sub.Cancel` wie bei
+  einem abgelaufenen Token. Nachgearbeitet:
+  - Der Callback ist fremder Code. Wirft er, würde die Exception in `OnRead`
+    entkommen und den Worker mitten im Stream abreißen. Sie wird deshalb
+    gefangen und zählt als `false`.
+  - Ablauf- und Callback-Prüfung (`StreamAuthorizationEnded`) stehen jetzt
+    **vor** dem Drain. Hinter dem Drain lief die Prüfung bei stetigem
+    Notification-Fluss nie, denn ein nicht-leerer Drain springt mit
+    `continue` zurück. Außerdem bekäme ein Aufrufer ohne Berechtigung noch
+    die Warteschlange zugestellt. Die Lebensdauergrenze bleibt hinter dem
+    Drain, sie ist keine Berechtigungsfrage.
+  - Für die Verhungern-Lücke gibt es keinen eigenen Test: Er bräuchte einen
+    Producer, der schneller feuert, als die Schleife schreibt, und wäre damit
+    zeitabhängig. Getestet sind der werfende Callback
+    (`SubscriptionStreamEndsWhenAuthorizationCheckRaises`) und der Deckel am
+    einfachen HTTP-Transport (`HttpTransportRefusesOversizedBody`). Beide
+    Tests schlagen fehl, wenn der jeweilige Fix fehlt.
+
 ## Lizenz / Veröffentlichung
 
 > **Überholt (2026-07-29):** Ein Synopse-PR ist **nicht** mehr das Ziel — LandrixAI
