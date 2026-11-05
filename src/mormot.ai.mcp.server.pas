@@ -150,6 +150,13 @@ type
     const aEmitter: IMcpStreamEmitter; const aAuthCtx: TMcpAuthContext;
     out aResponseJson: RawUtf8): boolean of object;
 
+  /// callback telling whether an open subscriptions/listen stream may go on
+  // - aAuthCtx is the caller the stream was opened for; return false once its
+  //   authorization was withdrawn (e.g. its API key was revoked): the stream
+  //   is then cancelled - the token expiry alone would let it run until then
+  TMcpStreamAuthorized = function(
+    const aAuthCtx: TMcpAuthContext): boolean of object;
+
   /// Streamable HTTP transport implementing MCP 2026-07-28
   // - the endpoint accepts POST and OPTIONS only: GET (the standalone
   //   notification stream) and DELETE (session teardown) were removed with
@@ -170,6 +177,9 @@ type
     fCorsEnabled: boolean;
     fCorsOrigins: RawUtf8;
     fOnStreamCall: TMcpStreamCall;
+    fOnStreamAuthorized: TMcpStreamAuthorized;
+    fStreamCheckMs: integer;
+    fMaximumAllowedContentLength: Int64;
     // -- helper methods --
     procedure SetCorsHeaders(var Ctxt: THttpServerRequest);
     function ValidateOrigin(var Ctxt: THttpServerRequest): boolean;
@@ -238,6 +248,18 @@ type
     // - a hook that handles a request bypasses ExecuteRequest entirely, so it
     //   receives the authenticated context and owns the authorization
     property OnStreamCall: TMcpStreamCall read fOnStreamCall write fOnStreamCall;
+    /// optional check of the authorization of an open subscriptions/listen
+    // stream, every StreamCheckIntervalMs: false cancels the stream
+    property OnStreamAuthorized: TMcpStreamAuthorized
+      read fOnStreamAuthorized write fOnStreamAuthorized;
+    /// how often OnStreamAuthorized is called on an open stream (default 1000)
+    property StreamCheckIntervalMs: integer
+      read fStreamCheckMs write fStreamCheckMs;
+    /// the largest request body accepted, in bytes (0 = no limit, default)
+    // - set on the THttpAsyncServer by Start: a larger Content-Length is
+    //   answered 413 before the body is read
+    property MaximumAllowedContentLength: Int64
+      read fMaximumAllowedContentLength write fMaximumAllowedContentLength;
   published
     /// single endpoint handler — routes by HTTP method
     // - uses RTTI-based route publishing (same pattern as TMcpHttpTransport)
@@ -582,6 +604,7 @@ begin
   fEndpoint := '/mcp';
   fCorsEnabled := true;
   fCorsOrigins := '*';
+  fStreamCheckMs := 1000;
   // no session map anymore: 2026-07-28 removed protocol-level sessions, so the
   // transport keeps no per-client state at all
 end;
@@ -616,6 +639,8 @@ begin
      hsoIncludeDateHeader]);
   // let the streaming connection reach this transport for deferred responses
   TMcpStreamableAsyncServer(fHttpServer).Transport := self;
+  // reject an oversized body from its headers, before reading it
+  fHttpServer.MaximumAllowedContentLength := fMaximumAllowedContentLength;
   fHttpServer.HttpQueueLength := 10000;
   fHttpServer.ServerName := 'MMCP-Streamable';
   // RTTI-based route publishing: the published 'mcp' method handles /mcp
@@ -1099,6 +1124,7 @@ var
   i: PtrInt;
   idle: integer;
   alive: boolean;
+  nextCheck: Int64;
 begin
   doc.InitJson(aBody, JSON_FAST);
   requestId := doc.GetValueOrNull('id');
@@ -1126,6 +1152,7 @@ begin
       exit;
     idle := 0;
     alive := true;
+    nextCheck := GetTickCount64 + fStreamCheckMs;
     while alive and fActive do
     begin
       // Drain BEFORE testing for cancellation: an orderly shutdown must still
@@ -1163,6 +1190,18 @@ begin
       begin
         sub.Cancel('this stream reached its maximum lifetime; reconnect to continue');
         break;
+      end;
+      // the authorization of the caller may be withdrawn while the stream is
+      // open (e.g. a revoked API key): the expiry of its token is too late
+      if Assigned(fOnStreamAuthorized) and
+         (GetTickCount64 >= nextCheck) then
+      begin
+        nextCheck := GetTickCount64 + fStreamCheckMs;
+        if not fOnStreamAuthorized(aAuthCtx) then
+        begin
+          sub.Cancel('the authorization of this stream was withdrawn');
+          break;
+        end;
       end;
       SleepHiRes(MCP_SUBSCRIPTION_POLL_MS);
       inc(idle, MCP_SUBSCRIPTION_POLL_MS);
