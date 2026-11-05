@@ -334,7 +334,7 @@ function TMcpHttpTransport.OnResourceMetadata(
 begin
   // public by construction: a client fetches this precisely because it has no
   // token yet, so requiring one would make discovery impossible
-  Ctxt.SetOutCustomHeader(['Access-Control-Allow-Origin', '*']);
+  Ctxt.SetOutCustomHeader(['Access-Control-Allow-Origin: *']);
   if not fServer.IsProtected then
   begin
     result := HTTP_NOTFOUND; // nothing to discover on an open server
@@ -380,7 +380,7 @@ begin
   tokenResult := fServer.AuthorizeToken(Ctxt.AuthBearer, authCtx);
   if tokenResult <> mtrValid then
   begin
-    Ctxt.SetOutCustomHeader(['WWW-Authenticate', fServer.AuthChallenge(tokenResult)]);
+    Ctxt.SetOutCustomHeader(['WWW-Authenticate: ', fServer.AuthChallenge(tokenResult)]);
     Ctxt.SetOutJson('{"error":"' + MCP_TOKEN_ERROR[tokenResult] + '"}');
     result := fServer.AuthHttpStatus(tokenResult);
     exit;
@@ -398,7 +398,7 @@ begin
   // what to ask for, not a 200 carrying a JSON-RPC error
   if scopeChallenge <> '' then
   begin
-    Ctxt.SetOutCustomHeader(['WWW-Authenticate',
+    Ctxt.SetOutCustomHeader(['WWW-Authenticate: ',
       fServer.AuthChallenge(mtrInsufficientScope, scopeChallenge)]);
     Ctxt.SetOutJson(responseBody);
     result := HTTP_MCP_FORBIDDEN;
@@ -673,7 +673,7 @@ begin
   // RFC 6750: a refusal carries the challenge that tells the client HOW to come
   // back — which scheme, which scopes, and where to find the metadata naming
   // the authorization server. A bare 401 leaves a first-contact client stuck.
-  Ctxt.SetOutCustomHeader(['WWW-Authenticate', fServer.AuthChallenge(aResult, aScope)]);
+  Ctxt.SetOutCustomHeader(['WWW-Authenticate: ', fServer.AuthChallenge(aResult, aScope)]);
   Ctxt.OutContentType := JSON_CONTENT_TYPE_VAR;
   // The body is deliberately NOT a JSON-RPC error: this refusal happens at the
   // HTTP layer, before the body was even read, so there is no request id to
@@ -690,7 +690,7 @@ begin
   // discovery impossible — the metadata is public by construction.
   // Registered explicitly rather than by RTTI: the well-known path contains
   // dots and dashes, which no Pascal method name can carry.
-  Ctxt.SetOutCustomHeader(['Access-Control-Allow-Origin', '*']);
+  Ctxt.SetOutCustomHeader(['Access-Control-Allow-Origin: *']);
   if Ctxt.Method = 'OPTIONS' then
   begin
     result := HTTP_NOCONTENT;
