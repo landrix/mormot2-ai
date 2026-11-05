@@ -1052,14 +1052,18 @@ stimmten:
     damit `OnBeforeBody` den `Transfer-Encoding`-Header sieht, gilt nur für
     den ersten Request einer Verbindung: `THttpRequestContext.Reset` setzt
     nach jedem Keep-alive `Options := []` und `HttpInit` stellt sie nicht
-    wieder her (Fehler in mORMot, upstream meldenswert). Ein NUL in einem
+    wieder her (Fehler in mORMot, synopse/mORMot2#725). Ein NUL in einem
     anderen Header hätte die Header-Suche außerdem vorzeitig beendet.
     Die eigentliche Korrektur gehört upstream: `ContentMaxSize` auch für
-    Bodys im Speicher setzen. Upstream bleibt außerdem eine Grenze, die hier
-    nicht lösbar ist (Codex, Runde 5): `ProcessParseLine` prüft keine Länge,
-    solange kein CR kommt. Eine Chunk-Size- oder Header-Zeile ohne Ende
-    wächst damit unbegrenzt im Lesepuffer. Das betrifft jeden mORMot-Server
-    und hat mit dem Deckel nichts zu tun. Tests: `HttpTransportRefusesOversizedBody`
+    Bodys im Speicher setzen (synopse/mORMot2#724). Upstream bleibt
+    außerdem eine Grenze, die hier nicht lösbar ist (Codex, Runde 5):
+    `ProcessParseLine` prüft keine Länge, solange kein CR kommt. Eine
+    Chunk-Size- oder Header-Zeile ohne Ende wächst damit unbegrenzt im
+    Lesepuffer des `THttpAsyncServer` (der Socket-Server deckelt per
+    `SockRecvLn` bei 16 KB). Sie hat mit dem Deckel nichts zu tun:
+    synopse/mORMot2#726. Den Keep-alive-Verlust der Request-Optionen
+    behebt synopse/mORMot2#725. Sind alle drei gemergt, können
+    `BoundChunkedBody`/`RefuseUnboundedUpgrade` entfallen. Tests: `HttpTransportRefusesOversizedBody`
     (POST, OPTIONS, GET, Upgrade, zweiter Request einer Keep-alive-Verbindung, kleiner
     chunked Body wird bedient; ohne Deckel bleibt chunked wie bisher) und
     `OversizedBodyRefusedBeforeReading` (auch über den SSE-Pfad).
