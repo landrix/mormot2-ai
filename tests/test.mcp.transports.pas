@@ -94,7 +94,8 @@ type
   protected
     procedure EnsureCalcParamsRtti;
     function StartStreamableTransport(const aServer: TMcpServer;
-      out aTransport: TMcpStreamableHttpTransport): integer;
+      out aTransport: TMcpStreamableHttpTransport;
+      aMaxContentLength: Int64 = 0): integer;
     /// assert a buffered response body is a JSON-RPC error with that code
     procedure CheckErrorCode(const aBody: RawUtf8; aExpectedCode: integer);
     /// the payload of the last `data:` line of an SSE response
@@ -125,6 +126,10 @@ type
     procedure ThrowingVerifierRefusesWithoutLeaking;
     /// a listen stream cannot hold its worker thread forever
     procedure SubscriptionStreamHasAMaximumLifetime;
+    /// MaximumAllowedContentLength refuses an oversized body from its headers
+    procedure OversizedBodyRefusedBeforeReading;
+    /// OnStreamAuthorized cancels a listen stream whose caller lost its rights
+    procedure SubscriptionStreamEndsWhenAuthorizationWithdrawn;
   end;
 
 implementation
@@ -1221,7 +1226,8 @@ end;
 
 function TTestMcpStreamableTransport.StartStreamableTransport(
   const aServer: TMcpServer;
-  out aTransport: TMcpStreamableHttpTransport): integer;
+  out aTransport: TMcpStreamableHttpTransport;
+  aMaxContentLength: Int64): integer;
 var
   i, port, base: integer;
   transport: TMcpStreamableHttpTransport;
@@ -1236,6 +1242,7 @@ begin
     try
       transport := TMcpStreamableHttpTransport.Create(aServer);
       transport.Port := port;
+      transport.MaximumAllowedContentLength := aMaxContentLength;
       transport.Start;
       aTransport := transport;
       result := port;
@@ -2538,6 +2545,102 @@ begin
       transport.Stop;
     transport.Free;
     server.Free;
+  end;
+end;
+
+
+type
+  /// grants a listen stream once, then withdraws the authorization
+  TStreamGate = class
+  public
+    Calls: integer;
+    function Allowed(const aAuthCtx: TMcpAuthContext): boolean;
+  end;
+
+function TStreamGate.Allowed(const aAuthCtx: TMcpAuthContext): boolean;
+begin
+  inc(Calls);
+  result := Calls = 1; // e.g. the API key of the caller was revoked meanwhile
+end;
+
+procedure TTestMcpStreamableTransport.OversizedBodyRefusedBeforeReading;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  body: RawUtf8;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  try
+    server.Start;
+    port := StartStreamableTransport(server, transport, 1024);
+    CheckEqual(transport.MaximumAllowedContentLength, 1024, 'the limit is kept');
+    // a body larger than the limit is refused from its Content-Length header
+    body := '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":"' +
+      RawUtf8OfChar('x', 4096) + '"}}';
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    status := client.Post(transport.Endpoint, body, JSON_CONTENT_TYPE,
+      HTTP_KEEPALIVE_MS, 'Accept: application/json, text/event-stream'#13#10 +
+      'MCP-Protocol-Version: ' + MCP_PROTOCOL_VERSION + #13#10 +
+      'Mcp-Method: tools/list');
+    CheckEqual(status, HTTP_PAYLOADTOOLARGE, 'an oversized body -> 413');
+    FreeAndNil(client);
+    // a request within the limit is still served (on a fresh connection)
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
+    CheckEqual(status, HTTP_SUCCESS, 'a small body is served');
+  finally
+    client.Free;
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    server.Free;
+  end;
+end;
+
+procedure TTestMcpStreamableTransport.SubscriptionStreamEndsWhenAuthorizationWithdrawn;
+var
+  server: TMcpServer;
+  transport: TMcpStreamableHttpTransport;
+  port, status: integer;
+  client: THttpClientSocket;
+  gate: TStreamGate;
+  body: RawUtf8;
+begin
+  server := TMcpServer.Create('StreamableTestServer', '1.0');
+  transport := nil;
+  client := nil;
+  gate := TStreamGate.Create;
+  try
+    server.Start;
+    port := StartStreamableTransport(server, transport);
+    CheckEqual(transport.StreamCheckIntervalMs, 1000, 'checked every second by default');
+    transport.StreamCheckIntervalMs := 50;
+    transport.OnStreamAuthorized := gate.Allowed;
+    client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
+    // nothing fires on this stream: only the withdrawn authorization ends it
+    status := McpPost(client, transport.Endpoint,
+      '{"jsonrpc":"2.0","id":8,"method":"subscriptions/listen",' +
+      '"params":{"notifications":{"toolsListChanged":true}}}');
+    CheckEqual(status, HTTP_SUCCESS, 'the stream completed');
+    body := client.Content;
+    Check(gate.Calls >= 2, 'the callback was asked again while the stream was open');
+    Check(PosEx('notifications/cancelled', body) > 0,
+      'the teardown is announced like every other end of a stream');
+    Check(PosEx('authorization of this stream was withdrawn', body) > 0,
+      'and says why');
+    CheckEqual(server.SubscriptionCount, 0, 'the slot came back');
+  finally
+    if transport <> nil then
+      transport.Stop;
+    transport.Free;
+    client.Free;
+    server.Free;
+    gate.Free;
   end;
 end;
 
