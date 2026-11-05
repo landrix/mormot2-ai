@@ -55,19 +55,8 @@ type
     fPort: integer;
     fHost: RawUtf8;
     fMaximumAllowedContentLength: Int64;
-    // OnBodyDownload of the HTTP server while a body limit is set: receives a
-    // chunked body into memory too, but as a stream the limit applies to
-    function BoundChunkedBody(const aUrl, aMethod, aInHeaders, aInContentType,
-      aRemoteIP: RawUtf8; aContentLength: Int64): TStream;
-    // OnBeforeBody of the HTTP server while a body limit is set: refuses the
-    // chunked body of an upgrade request, which OnBodyDownload never sees
-    function RefuseUnboundedUpgrade(var aUrl, aMethod, aInHeaders,
-      aInContentType, aRemoteIP, aBearerToken: RawUtf8; aContentLength: Int64;
-      aFlags: THttpServerRequestFlags): cardinal;
     // copy MaximumAllowedContentLength onto the HTTP server, from Start
     procedure ApplyBodyLimit(aHttpServer: THttpServerGeneric);
-    // the request body, wherever the server put it (see BoundChunkedBody)
-    class function ReadRequestBody(Ctxt: THttpServerRequestAbstract): RawUtf8;
   public
     /// initialize with MCP server instance
     constructor Create(aServer: TMcpServer); reintroduce; virtual;
@@ -342,61 +331,12 @@ begin
   fHost := 'localhost';
 end;
 
-function TMcpTransportBase.BoundChunkedBody(const aUrl, aMethod, aInHeaders,
-  aInContentType, aRemoteIP: RawUtf8; aContentLength: Int64): TStream;
-begin
-  // THttpAsyncServer checks MaximumAllowedContentLength against the
-  // Content-Length header only. The running total that bounds a chunked body
-  // (ContentMaxSize) it sets solely when OnBodyDownload supplied a stream:
-  // buffered as plain Content, a chunked body grows up to the 1 GB default -
-  // whatever the method, since the parser reads it before any handler runs.
-  // So a chunked body (-1, from the parser's own hfTransferChunked flag, not
-  // from a header we would have to find) gets a memory stream: still in RAM,
-  // but counted, and refused with 413 once past the limit. A body with a
-  // Content-Length was already judged against the limit by its header, and
-  // stays plain Content (nil).
-  if aContentLength < 0 then
-    result := TRawByteStringStream.Create
-  else
-    result := nil;
-end;
-
-function TMcpTransportBase.RefuseUnboundedUpgrade(var aUrl, aMethod,
-  aInHeaders, aInContentType, aRemoteIP, aBearerToken: RawUtf8;
-  aContentLength: Int64; aFlags: THttpServerRequestFlags): cardinal;
-begin
-  // DoHeaders skips OnBodyDownload for a request flagged Connection: Upgrade,
-  // so BoundChunkedBody cannot count its chunked body - and neither transport
-  // upgrades anything, so the body would simply be buffered. A Content-Length
-  // was already judged against the limit; a length of 0 is what the parser
-  // leaves for a chunked body (or an empty one, which no MCP request is), so
-  // it is refused here. An upgrade request without any body (-1, e.g. the h2c
-  // offer of curl --http2) is answered as before.
-  if (hsrConnectionUpgrade in aFlags) and
-     (aContentLength = 0) then
-    result := HTTP_LENGTHREQUIRED
-  else
-    result := HTTP_SUCCESS;
-end;
-
-class function TMcpTransportBase.ReadRequestBody(
-  Ctxt: THttpServerRequestAbstract): RawUtf8;
-begin
-  result := Ctxt.InContent;
-  // a BoundChunkedBody stream, owned and freed by the server
-  if (result = '') and
-     (Ctxt.InContentStream <> nil) then
-    result := StreamToRawByteString(Ctxt.InContentStream);
-end;
-
 procedure TMcpTransportBase.ApplyBodyLimit(aHttpServer: THttpServerGeneric);
 begin
+  // mORMot checks it against the Content-Length header, and - since
+  // synopse/mORMot2#724 - also counts a chunked body against it while it is
+  // received, whatever the method, upgrade requests included
   aHttpServer.MaximumAllowedContentLength := fMaximumAllowedContentLength;
-  if fMaximumAllowedContentLength > 0 then
-  begin
-    aHttpServer.OnBodyDownload := BoundChunkedBody;
-    aHttpServer.OnBeforeBody := RefuseUnboundedUpgrade;
-  end;
 end;
 
 function TMcpTransportBase.IsActive: boolean;
@@ -495,7 +435,7 @@ begin
   end;
 
   // Read request body
-  requestBody := ReadRequestBody(Ctxt);
+  requestBody := Ctxt.InContent;
 
   // Execute MCP request ON BEHALF OF the caller we just verified: without
   // handing the context down, every tool would see an unauthenticated caller
@@ -670,11 +610,7 @@ begin
          length(refusal), refusal]));
     end
     else
-      // ReadRequestBody, not fHttp.Content: a chunked body under a size limit
-      // arrived as a stream (BoundChunkedBody), freed only by the inherited
-      // AfterWrite below
-      transport.StreamDeferredResponse(WriteRaw,
-        TMcpTransportBase.ReadRequestBody(fRequest),
+      transport.StreamDeferredResponse(WriteRaw, fHttp.Content,
         fRequest.OutCustomHeaders, authCtx);
     fStreaming := false;
     // finalize once: hrsResponseDone lets the inherited AfterWrite run the
@@ -914,7 +850,7 @@ begin
   // downgrade to the removed initialize handshake against this very server.
   // McpInitJsonComplete, not InitJson: trailing data after the object must
   // fail here too, or this transport would dispatch a body the core rejects
-  body := ReadRequestBody(Ctxt);
+  body := Ctxt.InContent;
   // no JSON at all is a Parse error (-32700), not an Invalid Request: JSON-RPC
   // 2.0 §5.1 keeps the two apart, and so does the core's Preflight. A valid
   // scalar (42) fails the object parse too, but is -32600 (McpJsonFailureCode).

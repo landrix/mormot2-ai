@@ -2673,7 +2673,7 @@ begin
       HTTP_PAYLOADTOOLARGE, 'an oversized chunked body -> 413');
     CheckEqual(McpPostChunked(port, transport.Endpoint, body, true),
       HTTP_PAYLOADTOOLARGE, 'also as the second request of a connection');
-    // and a small one reaches the deferred SSE path through its stream
+    // and a small one still reaches the deferred SSE path
     CheckEqual(McpPostChunked(port, transport.Endpoint,
       '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{' +
       MCP_TEST_META + '}}'), HTTP_SUCCESS,
@@ -3195,9 +3195,9 @@ begin
     client := THttpClientSocket.Open('127.0.0.1', UInt32ToUtf8(port));
     status := McpPost(client, '/mcp', '{"jsonrpc":"2.0","id":2,"method":"tools/list"}');
     CheckEqual(status, HTTP_SUCCESS, 'a small body is served');
-    // a chunked body carries no length to compare: left to mORMot's plain
-    // Content buffering it would grow up to the 1 GB default, so it is
-    // counted while it arrives
+    // a chunked body carries no length to compare: it is counted while it
+    // arrives (before synopse/mORMot2#724, buffered in memory, it grew up to
+    // the 1 GB default)
     CheckEqual(McpPostChunked(port, '/mcp', body), HTTP_PAYLOADTOOLARGE,
       'an oversized chunked body -> 413');
     CheckEqual(McpPostChunked(port, '/mcp', body, true), HTTP_PAYLOADTOOLARGE,
@@ -3211,14 +3211,14 @@ begin
       'a chunked OPTIONS -> 413 as well');
     CheckEqual(McpSendChunked(port, 'GET', MCP_WELL_KNOWN_RESOURCE, body),
       HTTP_PAYLOADTOOLARGE, 'and a chunked GET');
-    // mORMot never offers the body of an upgrade request to OnBodyDownload,
-    // so it could not be counted: refused from its headers instead
+    // an upgrade request bypasses OnBodyDownload: its chunked body is counted
+    // by mORMot itself since synopse/mORMot2#724
     CheckEqual(McpSendChunked(port, 'OPTIONS', '/mcp', body, false,
       'Connection: Upgrade'#13#10'Upgrade: websocket'#13#10),
-      HTTP_LENGTHREQUIRED, 'a chunked upgrade request -> 411');
+      HTTP_PAYLOADTOOLARGE, 'a chunked upgrade request -> 413');
     CheckEqual(McpSendChunked(port, 'POST', '/mcp', body, true,
       'Connection: Upgrade'#13#10'Upgrade: h2c'#13#10),
-      HTTP_LENGTHREQUIRED, 'also on a kept-alive connection');
+      HTTP_PAYLOADTOOLARGE, 'also on a kept-alive connection');
     // without a limit, chunked bodies are accepted as before
     transport.Stop;
     FreeAndNil(transport);
