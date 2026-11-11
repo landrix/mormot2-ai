@@ -1,0 +1,46 @@
+{
+ "dataset": "tiny-qwen35/gguf",
+ "environment": {
+  "created_utc": "2026-11-11T16:47:48Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 1,
+  "deterministic_algorithms": false,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "ggml": {
+  "dir": "vendor/sqlite-ext/aarch64-linux",
+  "sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  }
+ },
+ "source": "tiny-qwen35, tiny-qwen35/text",
+ "note": "tiny-qwen35 (bf16, q8_0) and tiny-qwen35/text (text-bf16, text-q8_0) as llama.cpp's converter writes qwen35, with the keys of ggml-org/Qwen3.5-0.8B-GGUF: the text settings, the ssm.* shapes, full_attention_interval and, for text, attention.recurrent_layers; the weights in float32 before any change, the value heads of text (2 key, 4 value) in the tiled order, A_log as -exp(A_log), every norm but linear_attn.norm as 1 + weight, conv1d squeezed; norms, vectors and conv1d in F32, the matrices in BF16 or Q8_0 (quantize_row_q8_0_ref, the head and ssm_alpha / ssm_beta too, as the published file); bf16 and q8_0 carry an mtp layer after the model (block_count 5, nextn_predict_layers 1, three tensors under blk.4). The expected values are those of the source folders. bad-* (the first seven with the embedding and the last norm only): another architecture, a prism.hadamard key, an inner size of no whole value heads, as many mtp layers as blocks, recurrent_layers of another count, an odd rotary count, a rope scaling, a missing blk.1.ssm_a, an extra blk.1.attn_k_norm.weight, a positive blk.0.ssm_a (A_log not negated)",
+ "files": {
+  "bad-arch.gguf": "dbde82ac66d179535f5d5d631def983c0370579d3155a0898e5e784805dfa62a",
+  "bad-extra.gguf": "bff2dea4e0fe4d5ab104392431fdebc2fa0dd608e2adacc75f5d62edc5c048b5",
+  "bad-inner.gguf": "163c3dda71c16a7347e87cd951b191814028f16f3c9cdca572199eff8cc3ae8e",
+  "bad-missing.gguf": "7633b5a5f4f438ea756d1dd76091d794e24345ec6bde17dbc73c616664e157e6",
+  "bad-mtp.gguf": "340974dca796ab44201d6743211a23812021e2635b950411da8b3996eff0157a",
+  "bad-prism.gguf": "e67a90c616947bd16908c736d7eca13ffba78ed1cdd0c7056482a04326ad1513",
+  "bad-recurrent.gguf": "11c4b194d9c0903e7b2bd5f91aa3bad381a2d8571503478553843d52ac239198",
+  "bad-rope.gguf": "f66b289db425ab372e8848b53edfa197742ea6c52195233994c7b551de8851c4",
+  "bad-scaling.gguf": "f2f6db7002a16f42ec8f90eebcbb615159b4d1bb0a1478ad5d3d4cc95fbb283a",
+  "bad-ssm-a.gguf": "8037e708efb26c476d852a693d757cc64980d3bb796b86dfe3e00b350d4955d5",
+  "bf16.gguf": "6bd14c280b9a408e2782c7cfdccd4bb75d96243dc18a3e8eacf4949d14adb10c",
+  "q8_0.gguf": "2aeda731e04f98de080e037a3ae28a1369fdc19838546433b4e5b6fb7970bfb3",
+  "text-bf16.gguf": "619959148458256d11cda1cd40262faddd5ac6f6eee9583d2234685ce47fdad5",
+  "text-q8_0.gguf": "b5b242c3e58be52a21b6afb55cca939f21b79bff0c4fe614588f08228b7895f5"
+ }
+}

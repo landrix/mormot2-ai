@@ -110,6 +110,14 @@ never a build input.
            -> mormot.ai.infer.tensor / backend.cpu / kernels. Checked byte- and
            bit-exactly against the same lembed oracle build (libggml-*.so sha256
            in the next section; datasets q4 and qk), not against a source commit.
+  Followed (backlog D7f, written anew - no code taken): how convert_hf_to_gguf.py writes
+           the architecture qwen35 (conversion/qwen.py: Qwen3NextModel.modify_tensors,
+           _LinearAttentionVReorderBase - the tiled order of the value heads -,
+           Qwen3_5TextModel; conversion/base.py prepare_tensors: BF16 to float32 first),
+           the tensor and key names (src/llama-arch.cpp, src/models/qwen35.cpp) of the
+           llama.cpp commit 956591f4570aa6636895d90439892fef7c075b17 (2026-11-11)
+           -> mormot.ai.infer.model.qwen35 and the tiny files of
+           tools/infer-ref/make_reference_d7.py (tiny-qwen35-gguf).
   Followed (backlog D5b, written anew - no code taken): the MXFP4 block (an E8M0
            exponent and 16 bytes of E2M1 nibbles, value j low and j + 16 high),
            kvalues_mxfp4 (the E2M1 values doubled) and GGML_E8M0_TO_FP32_HALF,
@@ -267,6 +275,14 @@ never a build input.
     tokenizer_config.json             49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c
     chat_template.jinja               273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80
     LICENSE                           bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a
+  Model:     ggml-org/Qwen3.5-0.8B-GGUF (Apache-2.0; converted from the revision above by
+             llama.cpp, .src_sha in the repository)
+  Revision:  807dfd9a6fadbf703207aac3bfb0b2b3040d077c
+  Files (sha256), in vendor/models (gitignored):
+    qwen3.5-0.8b-q8_0.gguf (Qwen3.5-0.8B-Q8_0.gguf)
+                                      37ae482d336108d23516fa35e8e0c4126688d81018b87178a18d752a1357814f
+    qwen3.5-0.8b-q4_0.gguf (Qwen3.5-0.8B-Q4_0.gguf)
+                                      57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf
   Datasets from it: qwen35-0.8b (tools/infer-ref/make_reference_d7.py); tiny-qwen35 (same
     script) uses the modeling code of transformers only, no file of the model. Generated
     in the WSL reference (Linux aarch64): Python 3.12.13, torch 2.14.1+cpu, transformers

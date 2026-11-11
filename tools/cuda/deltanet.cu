@@ -119,13 +119,14 @@ extern "C" __global__ void dnprep(float* qkv, float* beta, float* decay,
 // per warp (grid y: four columns per block) - S[j] decayed, what it predicts
 // for the key, the correction written in, the column read by the query; S[j]
 // stays in the registers of its warp over all the tokens
-// - qkv rows at stride: [q all | k all | v all]; a key head serves
-//   valueHeads / keyHeads neighbouring value heads; y [rows, valueHeads *
-//   valueDim]
+// - qkv rows at stride: [q all | k all | v all]; value head h reads key head
+//   (h / group) % keyHeads - group = valueHeads / keyHeads: neighbouring
+//   value heads share a key head, 1: llama.cpp's tiled order; y [rows,
+//   valueHeads * valueDim]
 extern "C" __global__ void deltarule(const float* qkv, const float* beta,
   const float* decay, float* state, float* y, unsigned int rows,
   unsigned int stride, unsigned int keyHeads, unsigned int valueHeads,
-  unsigned int keyDim, unsigned int valueDim)
+  unsigned int keyDim, unsigned int valueDim, unsigned int group)
 {
   unsigned int head = blockIdx.x;
   unsigned int j = blockIdx.y * 4u + (threadIdx.x >> 5);
@@ -134,7 +135,7 @@ extern "C" __global__ void deltarule(const float* qkv, const float* beta,
     return; // the whole warp: no block-wide sync follows
   unsigned int kd = keyHeads * keyDim;
   unsigned int vd = valueHeads * valueDim;
-  unsigned int off = (head / (valueHeads / keyHeads)) * keyDim;
+  unsigned int off = ((head / group) % keyHeads) * keyDim;
   float* row = state + ((unsigned long long)head * valueDim + j) * keyDim;
   float s[MAXK / 32u];
   for (unsigned int m = 0u; m < MAXK / 32u; m++)

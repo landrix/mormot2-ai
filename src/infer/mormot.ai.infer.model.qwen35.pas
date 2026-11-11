@@ -27,7 +27,13 @@
 //   mormot.ai.infer.chat and mormot.ai.llm.native (D7c); restore points of
 //   the recurrent state: TDecoderContext.CheckpointId (D7d)
 // - on a device: TQwen3Cuda (D7e1) and TQwen3Vulkan (D7e2)
-// - not yet: GGUF
+// - GGUF (D7f): the architecture qwen35 as llama.cpp's converter writes it
+//   (looked up in convert_hf_to_gguf.py - Qwen3_5TextModel,
+//   _LinearAttentionVReorderBase, Qwen3NextModel - and src/models/qwen35.cpp of
+//   llama.cpp, MIT, no code taken): the norms already 1 + weight, A_log as
+//   -exp(A_log), conv1d squeezed, the value heads tiled when there are more of
+//   them than key heads (TDecoderConfig.LinTiled), the multi-token prediction
+//   layers after the model left alone
 unit mormot.ai.infer.model.qwen35;
 
 {
@@ -56,6 +62,7 @@ uses
   mormot.core.variants,
   mormot.ai.infer.tensor,
   mormot.ai.infer.backend,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.decoder;
 
 type
@@ -76,10 +83,21 @@ type
   // rope_theta at all, a rotating part that is odd
   // - in_proj_b and in_proj_a stay F32 when the matrices are quantized at
   // load: they feed the exponentials of beta and the decay
+  // - CreateFromGguf: a qwen35 file of llama.cpp's converter (the types the
+  // file holds, ssm_alpha and ssm_beta included); refused: a rope scaling, a
+  // sliding window, weights folded with a Hadamard transform (prism.*), no
+  // whole value heads in ssm.inner_size, an odd rotary count
   TQwen35Model = class(TDecoderModel)
   protected
     /// the settings of the text model (aDoc: its object)
     procedure LoadTextConfig(const aDoc: TDocVariantData; const aSource: TFileName);
+    /// a positive count of the GGUF metadata
+    function GgufCount(const aKey: RawUtf8): PtrInt;
+    /// the tensors of the GGUF file but those of the layers after the model
+    // (the multi-token prediction head)
+    function GgufTrunkCount: PtrInt;
+    /// without a dmDeltaNet layer: the DeltaNet shapes 0
+    procedure ClearUnusedShapes;
     procedure LoadConfig(const aConfigFile: TFileName); override;
     procedure LoadGgufConfig; override;
     procedure LoadWeights; override;
@@ -184,7 +202,7 @@ var
   d, rope, types, only: PDocVariantData;
   i, j, interval: PtrInt;
   t, k: RawUtf8;
-  known, lin: boolean;
+  known: boolean;
   dims: double;
 begin
   d := @aDoc;
@@ -287,21 +305,25 @@ begin
       else
         EInferError.RaiseUtf8('%: layer type "%" not supported', [self, t]);
     end;
-    // full attention only: the DeltaNet shapes (defaults included) unused
-    lin := false;
-    for i := 0 to fConfig.Layers - 1 do
-      if fConfig.Spec[i].Mixer = dmDeltaNet then
-        lin := true;
-    if not lin then
-    begin
-      fConfig.LinKeyHeads := 0;
-      fConfig.LinValueHeads := 0;
-      fConfig.LinKeyDim := 0;
-      fConfig.LinValueDim := 0;
-      fConfig.LinConv := 0;
-    end;
+    ClearUnusedShapes;
   end;
   CheckConfig(aSource);
+end;
+
+procedure TQwen35Model.ClearUnusedShapes;
+var
+  i: PtrInt;
+begin
+  // full attention only: the DeltaNet shapes (defaults included) unused
+  for i := 0 to high(fConfig.Spec) do
+    if fConfig.Spec[i].Mixer = dmDeltaNet then
+      exit;
+  fConfig.LinKeyHeads := 0;
+  fConfig.LinValueHeads := 0;
+  fConfig.LinKeyDim := 0;
+  fConfig.LinValueDim := 0;
+  fConfig.LinConv := 0;
+  fConfig.LinTiled := false;
 end;
 
 procedure TQwen35Model.LoadConfig(const aConfigFile: TFileName);
@@ -332,14 +354,189 @@ begin
   LoadTextConfig(d^, aConfigFile);
 end;
 
-procedure TQwen35Model.LoadGgufConfig;
+function TQwen35Model.GgufCount(const aKey: RawUtf8): PtrInt;
+var
+  v: Int64;
 begin
-  EInferError.RaiseUtf8('%: GGUF not supported yet', [self]);
+  v := fGguf.Int(aKey);
+  if (v <= 0) or (v > 1 shl 30) then
+    EInferError.RaiseUtf8('%: % = % out of range', [self, aKey, v]);
+  result := v;
 end;
 
+procedure TQwen35Model.LoadGgufConfig;
+var
+  emb: PInferTensor;
+  v: PGgufValue;
+  a: RawUtf8;
+  blocks, mtp, interval, inner, i: PtrInt;
+  recurrent: boolean;
+begin
+  if fGguf.Str('general.architecture') <> Architecture then
+    EInferError.RaiseUtf8('%: architecture "%" is not %',
+      [self, fGguf.Str('general.architecture'), Architecture]);
+  a := Architecture + '.';
+  // weights folded with a Hadamard transform want it on the activations too
+  for i := 0 to high(fGguf.Values) do
+    if IdemPChar(pointer(fGguf.Values[i].Key), 'PRISM.') then
+      EInferError.RaiseUtf8('%: % (weights of a transformed basis) not supported',
+        [self, fGguf.Values[i].Key]);
+  // a scaled RoPE or a sliding window would change the arithmetic
+  if fGguf.Has(a + 'rope.scaling.type') and
+     (fGguf.Str(a + 'rope.scaling.type') <> 'none') then
+    EInferError.RaiseUtf8('%: rope scaling "%" not supported',
+      [self, fGguf.Str(a + 'rope.scaling.type')]);
+  if fGguf.Has(a + 'attention.sliding_window') then
+    EInferError.RaiseUtf8('%: sliding window attention not supported', [self]);
+  emb := fGguf.Tensor('token_embd.weight');
+  if length(emb^.Shape) <> 2 then
+    EInferError.RaiseUtf8('%: token_embd.weight is shaped %',
+      [self, InferShapeText(emb^.Shape)]);
+  if (emb^.Shape[0] <= 0) or (emb^.Shape[0] > 1 shl 22) then
+    EInferError.RaiseUtf8('%: a vocabulary of % tokens', [self, emb^.Shape[0]]);
+  fConfig.VocabSize := emb^.Shape[0];
+  fConfig.Hidden := GgufCount(a + 'embedding_length');
+  // the multi-token prediction layers follow the model: not computed
+  blocks := GgufCount(a + 'block_count');
+  mtp := 0;
+  if fGguf.Has(a + 'nextn_predict_layers') then
+    mtp := fGguf.Int(a + 'nextn_predict_layers');
+  if (mtp < 0) or (mtp >= blocks) then
+    EInferError.RaiseUtf8('%: % prediction layers of % blocks', [self, mtp, blocks]);
+  fConfig.Layers := blocks - mtp;
+  if fConfig.Layers > 1024 then
+    EInferError.RaiseUtf8('%: % layers', [self, fConfig.Layers]);
+  fConfig.Heads := GgufCount(a + 'attention.head_count');
+  fConfig.KvHeads := GgufCount(a + 'attention.head_count_kv');
+  fConfig.HeadDim := GgufCount(a + 'attention.key_length');
+  if fGguf.Has(a + 'attention.value_length') and
+     (GgufCount(a + 'attention.value_length') <> fConfig.HeadDim) then
+    EInferError.RaiseUtf8('%: key and value heads of different sizes', [self]);
+  fConfig.Intermediate := GgufCount(a + 'feed_forward_length');
+  fConfig.MaxPositions := GgufCount(a + 'context_length');
+  fConfig.RmsEps := fGguf.Float(a + 'attention.layer_norm_rms_epsilon');
+  fConfig.RopeTheta := fGguf.Float(a + 'rope.freq_base');
+  // the rotating values of every head (rope.dimension_sections only place
+  // the positions of an image: text has one position per token)
+  fConfig.RopeDims := GgufCount(a + 'rope.dimension_count');
+  if odd(fConfig.RopeDims) or (fConfig.RopeDims > fConfig.HeadDim) then
+    EInferError.RaiseUtf8('%: % rotating values of a head of %',
+      [self, fConfig.RopeDims, fConfig.HeadDim]);
+  // the DeltaNet shapes: the value heads share the key width only in llama.cpp
+  // itself - inner_size gives their own
+  fConfig.LinConv := GgufCount(a + 'ssm.conv_kernel');
+  fConfig.LinKeyDim := GgufCount(a + 'ssm.state_size');
+  fConfig.LinKeyHeads := GgufCount(a + 'ssm.group_count');
+  fConfig.LinValueHeads := GgufCount(a + 'ssm.time_step_rank');
+  inner := GgufCount(a + 'ssm.inner_size');
+  if inner mod fConfig.LinValueHeads <> 0 then
+    EInferError.RaiseUtf8('%: an inner size of % for % value heads',
+      [self, inner, fConfig.LinValueHeads]);
+  fConfig.LinValueDim := inner div fConfig.LinValueHeads;
+  // the converter puts the value heads in tiled order when there are more of
+  // them than key heads (_LinearAttentionVReorderBase)
+  fConfig.LinTiled := fConfig.LinValueHeads <> fConfig.LinKeyHeads;
+  // the kind of every layer: recurrent_layers, else every interval-th is full
+  SetLength(fConfig.Spec, fConfig.Layers);
+  v := fGguf.Find(a + 'attention.recurrent_layers');
+  if (v <> nil) and ((v^.VType <> gtArray) or (v^.ElemType <> gtBool) or
+     (v^.Count <> blocks)) then
+    EInferError.RaiseUtf8('%: attention.recurrent_layers is no array of % booleans',
+      [self, blocks]);
+  interval := 4;
+  if (v = nil) and fGguf.Has(a + 'full_attention_interval') then
+    interval := GgufCount(a + 'full_attention_interval');
+  for i := 0 to fConfig.Layers - 1 do
+  begin
+    if v <> nil then
+      recurrent := PByteArray(v^.Data)^[i] <> 0
+    else
+      recurrent := (i + 1) mod interval <> 0;
+    if recurrent then
+      fConfig.Spec[i].Mixer := dmDeltaNet
+    else
+      fConfig.Spec[i].OutputGate := true;
+  end;
+  ClearUnusedShapes;
+  // llama.cpp ties the head to the embedding by leaving output.weight out
+  fConfig.TiedEmbeddings := fGguf.FindTensor('output.weight') = nil;
+  CheckConfig(fGguf.FileName);
+end;
+
+const
+  /// Hugging Face names and llama.cpp's for the tensors of one layer
+  LAYER_NAMES: array[0..19, 0..1] of RawUtf8 = (
+    ('input_layernorm.weight', 'attn_norm.weight'),
+    ('post_attention_layernorm.weight', 'post_attention_norm.weight'),
+    ('mlp.gate_proj.weight', 'ffn_gate.weight'),
+    ('mlp.up_proj.weight', 'ffn_up.weight'),
+    ('mlp.down_proj.weight', 'ffn_down.weight'),
+    ('self_attn.q_proj.weight', 'attn_q.weight'),
+    ('self_attn.k_proj.weight', 'attn_k.weight'),
+    ('self_attn.v_proj.weight', 'attn_v.weight'),
+    ('self_attn.o_proj.weight', 'attn_output.weight'),
+    ('self_attn.q_norm.weight', 'attn_q_norm.weight'),
+    ('self_attn.k_norm.weight', 'attn_k_norm.weight'),
+    ('linear_attn.in_proj_qkv.weight', 'attn_qkv.weight'),
+    ('linear_attn.in_proj_z.weight', 'attn_gate.weight'),
+    ('linear_attn.in_proj_b.weight', 'ssm_beta.weight'),
+    ('linear_attn.in_proj_a.weight', 'ssm_alpha.weight'),
+    ('linear_attn.out_proj.weight', 'ssm_out.weight'),
+    ('linear_attn.conv1d.weight', 'ssm_conv1d.weight'),
+    ('linear_attn.dt_bias', 'ssm_dt.bias'),
+    ('linear_attn.A_log', 'ssm_a'), // holds -exp(A_log)
+    ('linear_attn.norm.weight', 'ssm_norm.weight'));
+
 function TQwen35Model.GgufName(const aName: RawUtf8): RawUtf8;
+var
+  p, i: PtrInt;
+  layer, rest: RawUtf8;
 begin
   result := '';
+  if aName = 'model.embed_tokens.weight' then
+    result := 'token_embd.weight'
+  else if aName = 'model.norm.weight' then
+    result := 'output_norm.weight'
+  else if aName = 'lm_head.weight' then
+    result := 'output.weight'
+  else if IdemPChar(pointer(aName), 'MODEL.LAYERS.') then
+  begin
+    rest := copy(aName, 14, maxInt);
+    p := PosEx('.', rest);
+    if p <= 1 then
+      exit;
+    layer := copy(rest, 1, p - 1);
+    rest := copy(rest, p + 1, maxInt);
+    for i := 0 to high(LAYER_NAMES) do
+      if rest = LAYER_NAMES[i, 0] then
+      begin
+        result := 'blk.' + layer + '.' + LAYER_NAMES[i, 1];
+        exit;
+      end;
+  end;
+end;
+
+function TQwen35Model.GgufTrunkCount: PtrInt;
+var
+  i, p, n: PtrInt;
+  t: PInferTensor;
+begin
+  result := 0;
+  t := pointer(fGguf.Tensors);
+  for i := 1 to length(fGguf.Tensors) do
+  begin
+    // blk.N. with N >= Layers: a layer after the model
+    n := -1;
+    if IdemPChar(pointer(t^.Name), 'BLK.') then
+    begin
+      p := PosEx('.', t^.Name, 5);
+      if p > 5 then
+        n := GetInteger(pointer(copy(t^.Name, 5, p - 5)));
+    end;
+    if n < fConfig.Layers then
+      inc(result);
+    inc(t);
+  end;
 end;
 
 function TQwen35Model.PlusOne(const aName: RawUtf8; aCount: PtrInt): PSingleArray;
@@ -349,8 +546,14 @@ var
   i: PtrInt;
 begin
   // output * (1.0 + weight.float()): the sum in float32, then the product -
-  // the folded weight gives the very products of the reference
+  // the folded weight gives the very products of the reference; llama.cpp's
+  // converter stores the sum itself (in float32 as well)
   w := Weight(aName, [aCount]);
+  if fGguf <> nil then
+  begin
+    result := w;
+    exit;
+  end;
   SetLength(v, aCount);
   for i := 0 to aCount - 1 do
     v[i] := 1 + w^[i];
@@ -373,12 +576,20 @@ begin
   if headType = idtQ4_0 then
     headType := idtQ8_0;
   h := fConfig.Hidden;
-  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h]);
+  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h],
+    fGguf <> nil);
+  // read per token: its scales checked here, also when the head is untied
+  if fEmbedSrc^.DType in INFER_BLOCK_DTYPES then
+    CheckBlockScales(fEmbedSrc, 'model.embed_tokens.weight');
   used := 2;
   if not fConfig.TiedEmbeddings then
-    // outside the prefix: not counted below
-    fHead := Matrix('lm_head.weight', fConfig.VocabSize, h, headType)
-  else if fWeights = idtF32 then
+  begin
+    // outside the prefix of a folder: not counted below
+    fHead := Matrix('lm_head.weight', fConfig.VocabSize, h, headType);
+    if fGguf <> nil then
+      inc(used);
+  end
+  else if (fGguf = nil) and (fWeights = idtF32) then
   begin
     fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),
       idtF32);
@@ -414,18 +625,37 @@ begin
       l^.LinB := Matrix(p + 'in_proj_b.weight', vh, h, idtF32);
       l^.LinA := Matrix(p + 'in_proj_a.weight', vh, h, idtF32);
       l^.LinOut := Matrix(p + 'out_proj.weight', h, vd, fWeights);
-      // [channels, 1, kernel] as nn.Conv1d stores a depthwise one
-      l^.LinConvW := Weight(p + 'conv1d.weight', [cd, 1, kw]);
+      // [channels, 1, kernel] as nn.Conv1d stores a depthwise one, squeezed
+      // to [channels, kernel] by llama.cpp's converter: the same values
+      if fGguf <> nil then
+        l^.LinConvW := Weight(p + 'conv1d.weight', [cd, kw])
+      else
+        l^.LinConvW := Weight(p + 'conv1d.weight', [cd, 1, kw]);
       l^.LinDtBias := Weight(p + 'dt_bias', [vh]);
-      // -A_log.float().exp(): the factor of the decay, in float32
+      // -A_log.float().exp(): the factor of the decay, in float32 (ssm_a of
+      // a GGUF file holds it)
       alog := Weight(p + 'A_log', [vh]);
-      SetLength(negA, vh);
-      for j := 0 to vh - 1 do
+      if fGguf <> nil then
       begin
-        e := Exp(alog^[j]);
-        negA[j] := -e;
+        // -exp(x) is negative and finite: a file holding A_log itself would
+        // let the state grow instead of decay (by its bits: no FPU)
+        for j := 0 to vh - 1 do
+          if (PCardinal(@alog^[j])^ and $80000000 = 0) or
+             (PCardinal(@alog^[j])^ and $7f800000 = $7f800000) then
+            EInferError.RaiseUtf8('%: blk.%.ssm_a[%] is no -exp(A_log)',
+              [self, i, j]);
+        l^.LinNegA := alog;
+      end
+      else
+      begin
+        SetLength(negA, vh);
+        for j := 0 to vh - 1 do
+        begin
+          e := Exp(alog^[j]);
+          negA[j] := -e;
+        end;
+        l^.LinNegA := Own(negA);
       end;
-      l^.LinNegA := Own(negA);
       // the gated RMSNorm multiplies by its weight as it is
       l^.LinNorm := Weight(p + 'norm.weight', [fConfig.LinValueDim]);
       inc(used, 9);
@@ -443,8 +673,15 @@ begin
       inc(used, 6);
     end;
   end;
-  // an unknown tensor of the text model means one we do not understand
-  if used <> TensorCountOf(fStackPrefix) then
+  // an unknown tensor of the text model means one we do not understand (in
+  // a GGUF file: outside the layers after the model)
+  if fGguf <> nil then
+  begin
+    if used <> GgufTrunkCount then
+      EInferError.RaiseUtf8('%: % tensors of the model in %, % understood',
+        [self, GgufTrunkCount, fGguf.FileName, used]);
+  end
+  else if used <> TensorCountOf(fStackPrefix) then
     EInferError.RaiseUtf8('%: % tensors under %, % understood',
       [self, TensorCountOf(fStackPrefix), fStackPrefix, used]);
 end;

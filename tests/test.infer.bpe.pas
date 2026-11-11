@@ -662,7 +662,7 @@ begin
   fn := FindInferRefDir('tiny-qwen3-gguf');
   if not CheckFailed(fn <> '', 'tiny-qwen3-gguf found') then
   begin
-    Check(GgufRefused(fn + 'tok-bad-pre.gguf', 'is neither qwen2 nor gpt-4o'),
+    Check(GgufRefused(fn + 'tok-bad-pre.gguf', 'is none of qwen2, qwen35, gpt-4o'),
       'another pre-tokenizer refused');
     Check(GgufRefused(fn + 'tok-bad-type.gguf', 'of type 6'),
       'a byte token after the vocabulary refused');

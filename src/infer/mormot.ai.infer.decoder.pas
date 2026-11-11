@@ -217,6 +217,10 @@ type
     // LinValueHeads div LinKeyHeads neighbouring value heads), their widths,
     // the kernel of the causal convolution - 0 without such a layer
     LinKeyHeads, LinValueHeads, LinKeyDim, LinValueDim, LinConv: PtrInt;
+    /// the value heads in llama.cpp's tiled order (a GGUF file with more value
+    // than key heads): value head h reads key head h mod LinKeyHeads, not h div
+    // (LinValueHeads div LinKeyHeads) - every per-value-head tensor in that order
+    LinTiled: boolean;
   end;
 
   /// weights by expert
@@ -772,6 +776,9 @@ type
     /// the channels of the convolution of a dmDeltaNet layer: Q, K and V
     // (the rows a device keeps per token of such a layer)
     function LinChannels: PtrInt;
+    /// the aGroup of TInferBackend.DeltaRule for a dmDeltaNet layer: 1 in
+    // llama.cpp's tiled order (LinTiled), else LinValueHeads div LinKeyHeads
+    function LinGroup: PtrInt;
     /// keep the cached tokens of aCtx that start aIds[0..aCount-1], forget the
     // others, and return how many stayed: the rest of aIds is to be computed
     // - at most aCount - 1 stay, so a Forward of the rest has a token to give
@@ -1315,7 +1322,11 @@ begin
   fGguf := TGgufFile.Create(aFileName);
   LoadGgufConfig;
   LoadWeights;
-  fWeights := fLayer[0].Q.DType;
+  // the type of the first attention matrix, or of a DeltaNet layer's (Qwen3.5)
+  if fLayer[0].Q.Data <> nil then
+    fWeights := fLayer[0].Q.DType
+  else
+    fWeights := fLayer[0].LinQkv.DType;
 end;
 
 constructor TDecoderModel.CreateStack(const aFolder: TFileName;
@@ -2305,6 +2316,14 @@ begin
     fConfig.LinValueHeads * fConfig.LinValueDim;
 end;
 
+function TDecoderModel.LinGroup: PtrInt;
+begin
+  if fConfig.LinTiled or (fConfig.LinKeyHeads <= 0) then
+    result := 1
+  else
+    result := fConfig.LinValueHeads div fConfig.LinKeyHeads;
+end;
+
 procedure TDecoderModel.Slide(aCtx: TDecoderContext; aLayer, aPast, aRows: PtrInt);
 var
   w, base, first, keep, need, rows, cap, kvw: PtrInt;
@@ -2582,7 +2601,7 @@ begin
   fBackend.RunItems(aCtx.DeltaPrepItem, 2 * kh + vh);
   // the recurrence, then RMSNorm per value head times silu(z) (fZ holds it),
   // the output projection
-  fBackend.DeltaRule(pointer(aCtx.fQkv), n, cd, kh, vh, dk, dv,
+  fBackend.DeltaRule(pointer(aCtx.fQkv), n, cd, kh, vh, dk, dv, LinGroup,
     pointer(aCtx.fBeta), pointer(aCtx.fDecay), pointer(aCtx.fState[aLayer]),
     pointer(aCtx.fCore));
   fBackend.RmsNorm(pointer(aCtx.fCore), n * vh, dv, ly^.LinNorm, fConfig.RmsEps,

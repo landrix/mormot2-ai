@@ -137,14 +137,16 @@ type
     // - qkv: aRows rows of aStride values, each [q | k | v]: aKeyHeads heads
     // of aKeyDim queries (L2-normed and scaled), as many keys (L2-normed),
     // aValueHeads heads of aValueDim values; value head h reads key head
-    // h div (aValueHeads div aKeyHeads), as repeat_interleave does
+    // (h div aGroup) mod aKeyHeads: aGroup = aValueHeads div aKeyHeads as
+    // repeat_interleave does (neighbouring value heads share a key head), 1
+    // for llama.cpp's tiled order (value head h reads key head h mod aKeyHeads)
     // - beta, decay: [aRows, aValueHeads], the factors of every token and head
     // - state: [aValueHeads, aValueDim, aKeyDim] - row j of a head is column j
     // of its S - updated in place
     // - per token and head: S := decay S; kv := S^T k; S += k (beta (v -
     // kv))^T; y := S^T q, in double sums, y [aRows, aValueHeads * aValueDim]
     procedure DeltaRule(qkv: PSingleArray; aRows, aStride, aKeyHeads,
-      aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+      aValueHeads, aKeyDim, aValueDim, aGroup: PtrInt; beta, decay, state,
       y: PSingleArray); virtual; abstract;
     /// forget what the backend keeps of every weight whose host memory
     // overlaps aFrom .. aTo - 1: a GPU backend keeps a device copy, found

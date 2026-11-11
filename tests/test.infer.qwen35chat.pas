@@ -1,4 +1,4 @@
-/// tests for the tokenizer and the chat format of Qwen3.5 - phase D, slice D7c
+/// tests for the tokenizer and the chat format of Qwen3.5 - phase D, slices D7c, D7f
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - the gates: tests/data/infer-ref/qwen35-tokens (ids, NFC text, pre-tokenizer
@@ -8,6 +8,9 @@
 //   model; the ids need vendor/models/qwen3.5-0.8b/tokenizer.json and say SKIP
 //   without it, LAI_REQUIRE_MODEL=1 makes that a failure; the chat test needs
 //   its weights too (with a conversation going on from a restore point, D7d)
+// - D7f: the tokenizer of ggml-org/Qwen3.5-0.8B-GGUF against tokenizer.json and
+//   the reference ids, the client over that file (vendor/models/
+//   qwen3.5-0.8b-q8_0.gguf, SKIP without it)
 unit test.infer.qwen35chat;
 
 interface
@@ -28,6 +31,7 @@ uses
   mormot.ai.llm,
   mormot.ai.llm.native,
   mormot.ai.infer.tensor,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.tokenizer,
   mormot.ai.infer.tokenizer.bpe,
   mormot.ai.infer.chat,
@@ -49,6 +53,9 @@ type
     /// every chat case through TQwen35ChatTemplate: the same text (aIds
     // false) or the same ids; a case transformers refused raises
     procedure CheckChat(aTokenizer: TInferTokenizer; aIds: boolean);
+    /// every case of qwen35-tokens: the ids of the reference, decoded to the
+    // NFC text
+    procedure CheckIds(aTokenizer: TBpeTokenizer; const aLabel: RawUtf8);
   published
     /// the Qwen3.5 regex recognized, marks with the letters, NFC; truncation,
     // padding and a vocabulary text twice refused (no model needed)
@@ -74,6 +81,12 @@ type
     procedure Qwen35RequestOptions;
     /// Qwen3.5-0.8B behind ILlmClient: an answer, a tool call and its result
     procedure Qwen35Chat;
+    /// the tokenizer of the GGUF file (D7f): the vocabulary, the added tokens
+    // and every reference case as tokenizer.json gives them
+    procedure Qwen35GgufTokenizer;
+    /// the client over the GGUF file: an answer, the next turn from a restore
+    // point, a tool call
+    procedure Qwen35GgufChat;
   end;
 
 
@@ -285,6 +298,14 @@ begin
 end;
 
 procedure TTestInferQwen35Chat.Qwen35IdsMatchReference;
+begin
+  if not Ready then
+    exit;
+  CheckIds(fTokenizer, 'tokenizer.json');
+end;
+
+procedure TTestInferQwen35Chat.CheckIds(aTokenizer: TBpeTokenizer;
+  const aLabel: RawUtf8);
 var
   ref: TInferRefSet;
   dir: TFileName;
@@ -296,12 +317,10 @@ var
   text, norm, failures: RawUtf8;
   same: boolean;
 begin
-  if not Ready then
-    exit;
   dir := FindInferRefDir('qwen35-tokens');
   if CheckFailed(dir <> '', 'qwen35-tokens found') then
     exit;
-  Check(fTokenizer.PreTokenizer = bptQwen35, 'the Qwen3.5 regex');
+  CheckUtf8(aTokenizer.PreTokenizer = bptQwen35, '%: the Qwen3.5 regex', [aLabel]);
   ref := TInferRefSet.CreateFromFolder(dir);
   try
     cases := ref.Manifest^.A['cases'];
@@ -318,7 +337,7 @@ begin
     begin
       FastSetString(text, @texts^[textOffsets^[i]], textOffsets^[i + 1] - textOffsets^[i]);
       FastSetString(norm, @norms^[normOffsets^[i]], normOffsets^[i + 1] - normOffsets^[i]);
-      mine := fTokenizer.Encode(text);
+      mine := aTokenizer.Encode(text);
       first := offsets^[i];
       count := offsets^[i + 1] - first;
       same := length(mine) = count;
@@ -333,12 +352,13 @@ begin
           failures := failures + ' ' + _Safe(cases^.Values[i])^.U['id'];
       end;
       // the ids give back the NFC text
-      if fTokenizer.Decode(mine) <> norm then
+      if aTokenizer.Decode(mine) <> norm then
         inc(decBad);
     end;
-    CheckUtf8(idsBad = 0, '% of % cases with other ids:%',
-      [idsBad, cases^.Count, failures]);
-    CheckUtf8(decBad = 0, '% of % cases decode otherwise', [decBad, cases^.Count]);
+    CheckUtf8(idsBad = 0, '%: % of % cases with other ids:%',
+      [aLabel, idsBad, cases^.Count, failures]);
+    CheckUtf8(decBad = 0, '%: % of % cases decode otherwise',
+      [aLabel, decBad, cases^.Count]);
     CheckUtf8(cases^.Count > 3000, '% cases', [cases^.Count]);
   finally
     ref.Free;
@@ -986,6 +1006,138 @@ begin
       [timer.Stop, copy(a.Reasoning, 1, 80), copy(a.Content, 1, 80),
        a.Usage.CompletionTokens]));
     Check(a.Reasoning <> '', 'with reasoning');
+  finally
+    llm.Free;
+  end;
+end;
+
+const
+  /// ggml-org/Qwen3.5-0.8B-GGUF, Q8_0 (UPSTREAM_BASE)
+  QWEN35_GGUF = 'qwen3.5-0.8b-q8_0.gguf';
+
+/// vendor/models/qwen3.5-0.8b-q8_0.gguf, '' with a SKIP (or a failure under
+// LAI_REQUIRE_MODEL=1) when absent
+function FindQwen35Gguf(aTest: TSynTestCase; const aWhat: RawUtf8): TFileName;
+begin
+  result := FindVendorModel(QWEN35_GGUF);
+  if result <> '' then
+    exit;
+  aTest.CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+    'LAI_REQUIRE_MODEL=1 but no vendor/models/%', [QWEN35_GGUF]);
+  aTest.AddConsole(FormatString('SKIP %: no vendor/models/%', [aWhat, QWEN35_GGUF]));
+end;
+
+procedure TTestInferQwen35Chat.Qwen35GgufTokenizer;
+var
+  fn: TFileName;
+  g: TGgufFile;
+  tok: TBpeTokenizer;
+  i, bad: PtrInt;
+  added: RawUtf8;
+begin
+  if not Ready then
+    exit;
+  fn := FindQwen35Gguf(self, 'Qwen3.5 GGUF tokenizer');
+  if fn = '' then
+    exit;
+  g := TGgufFile.Create(fn);
+  tok := nil;
+  try
+    tok := TBpeTokenizer.CreateFromGguf(g);
+    // the converter adds the tokens of added_tokens_decoder in
+    // tokenizer_config.json, as transformers does: 7 after those of
+    // tokenizer.json (<|audio_start|> .. <|audio_pad|>), each found by its text
+    CheckEqual(tok.VocabSize, fTokenizer.VocabSize + 7, 'vocabulary size');
+    bad := 0;
+    for i := fTokenizer.VocabSize to tok.VocabSize - 1 do
+      if tok.TokenId(tok.TokenBytes(i)) <> i then
+        inc(bad);
+    CheckEqual(bad, 0, 'the tokens of tokenizer_config.json added');
+    CheckEqual(tok.BpeCount, fTokenizer.BpeCount, 'BPE tokens');
+    CheckEqual(tok.MergeCount, fTokenizer.MergeCount, 'merges');
+    bad := 0;
+    for i := 0 to fTokenizer.VocabSize - 1 do
+      if tok.TokenBytes(i) <> fTokenizer.TokenBytes(i) then
+        inc(bad);
+    CheckEqual(bad, 0, 'every token the same bytes');
+    bad := 0;
+    for i := fTokenizer.BpeCount to fTokenizer.VocabSize - 1 do
+    begin
+      added := fTokenizer.TokenBytes(i);
+      if (added <> '') and (tok.TokenId(added) <> fTokenizer.TokenId(added)) then
+        inc(bad);
+    end;
+    CheckEqual(bad, 0, 'every added token found by its content');
+    CheckIds(tok, 'GGUF');
+  finally
+    tok.Free;
+    g.Free;
+  end;
+end;
+
+procedure TTestInferQwen35Chat.Qwen35GgufChat;
+var
+  fn: TFileName;
+  llm: TNativeLlmClient;
+  r: TLlmChatRequest;
+  a: TLlmChatResponse;
+  timer: TPrecisionTimer;
+  reused: Int64;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3.5-0.8B GGUF chat: a 64-bit process');
+  exit;
+  {$endif CPU32}
+  fn := FindQwen35Gguf(self, 'Qwen3.5-0.8B GGUF chat');
+  if fn = '' then
+    exit;
+  timer.Start;
+  llm := TNativeLlmClient.CreateFromGguf(fn);
+  try
+    AddConsole(FormatString('Qwen3.5-0.8B GGUF client loaded in %', [timer.Stop]));
+    Check(llm.Template is TQwen35ChatTemplate, 'the Qwen3.5 template');
+    Finalize(r);
+    FillCharFast(r, SizeOf(r), 0);
+    SetLength(r.Messages, 1);
+    r.Messages[0] := LlmMessage(lrUser,
+      'What is the capital of France? Answer with one word.');
+    r.Temperature := 0;
+    r.MaxTokens := 200;
+    timer.Start;
+    a := llm.ChatComplete(r);
+    AddConsole(FormatString('GGUF capital in %: "%" (% tokens)',
+      [timer.Stop, a.Content, a.Usage.CompletionTokens]));
+    Check(a.FinishReason = lfrStop, 'stopped by itself');
+    Check(PosEx('Paris', a.Content) > 0, 'the answer Paris');
+    // the next turn from the restore point before it (D7d over GGUF)
+    SetLength(r.Messages, 3);
+    r.Messages[1] := LlmMessage(lrAssistant, a.Content);
+    r.Messages[2] := LlmMessage(lrUser,
+      'And the capital of Germany? Answer with one word.');
+    reused := llm.Cache.ReusedTokens;
+    timer.Start;
+    a := llm.ChatComplete(r);
+    AddConsole(FormatString('GGUF next turn in %: "%" (% tokens reused)',
+      [timer.Stop, a.Content, llm.Cache.ReusedTokens - reused]));
+    Check(PosEx('Berlin', a.Content) > 0, 'the answer Berlin');
+    Check(llm.Cache.ReusedTokens - reused > 10, 'the first turns from a restore point');
+    // a tool call
+    SetLength(r.Messages, 1);
+    SetLength(r.Tools, 1);
+    r.Tools[0].Name := 'get_weather';
+    r.Tools[0].Description := 'The current weather of a city';
+    r.Tools[0].ParametersJson := '{"type":"object","properties":{"city":{"type":' +
+      '"string","description":"The city"}},"required":["city"]}';
+    r.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
+    timer.Start;
+    a := llm.ChatComplete(r);
+    AddConsole(FormatString('GGUF weather in %: % calls, content "%"',
+      [timer.Stop, length(a.ToolCalls), a.Content]));
+    if not CheckFailed(length(a.ToolCalls) = 1, 'one tool call') then
+    begin
+      CheckEqual(a.ToolCalls[0].Name, 'get_weather', 'the tool');
+      CheckEqual(a.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
+    end;
   finally
     llm.Free;
   end;

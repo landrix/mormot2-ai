@@ -155,7 +155,7 @@ type
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
       aCos, aSin: PSingleArray; aRotDim: PtrInt = 0); override;
     procedure DeltaRule(qkv: PSingleArray; aRows, aStride, aKeyHeads,
-      aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+      aValueHeads, aKeyDim, aValueDim, aGroup: PtrInt; beta, decay, state,
       y: PSingleArray); override;
   end;
 
@@ -163,6 +163,8 @@ type
   TInferDeltaJob = record
     Qkv, Beta, Decay, State, Y: PSingleArray;
     Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim: PtrInt;
+    /// value head h reads key head (h div Group) mod KeyHeads
+    Group: PtrInt;
     /// true: float lanes (InferDeltaRowsF32), false: the double reference
     Fast: boolean;
   end;
@@ -271,7 +273,7 @@ type
       aCos, aSin: PSingleArray; aRotDim: PtrInt = 0); override;
     /// one value head per item; float lanes unless Exact
     procedure DeltaRule(qkv: PSingleArray; aRows, aStride, aKeyHeads,
-      aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+      aValueHeads, aKeyDim, aValueDim, aGroup: PtrInt; beta, decay, state,
       y: PSingleArray); override;
     /// the items on the pool, unless it is busy with another caller
     procedure RunItems(const aJob: TOnInferItem; aCount: integer); override;
@@ -1752,7 +1754,7 @@ begin
   dv := aJob.ValueDim;
   kd := aJob.KeyHeads * dk;
   vd := aJob.ValueHeads * dv;
-  off := (aHead div (aJob.ValueHeads div aJob.KeyHeads)) * dk;
+  off := ((aHead div aJob.Group) mod aJob.KeyHeads) * dk;
   st := @aJob.State^[aHead * dv * dk];
   for t := 0 to aJob.Rows - 1 do
   begin
@@ -1798,7 +1800,7 @@ begin
 end;
 
 procedure TInferCpuBackend.DeltaRule(qkv: PSingleArray; aRows, aStride,
-  aKeyHeads, aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+  aKeyHeads, aValueHeads, aKeyDim, aValueDim, aGroup: PtrInt; beta, decay, state,
   y: PSingleArray);
 var
   job: TInferDeltaJob;
@@ -1815,6 +1817,7 @@ begin
   job.ValueHeads := aValueHeads;
   job.KeyDim := aKeyDim;
   job.ValueDim := aValueDim;
+  job.Group := aGroup;
   job.Fast := false;
   for h := 0 to aValueHeads - 1 do
     DeltaRuleHead(job, h);
@@ -2712,7 +2715,7 @@ begin
 end;
 
 procedure TInferCpuFastBackend.DeltaRule(qkv: PSingleArray; aRows, aStride,
-  aKeyHeads, aValueHeads, aKeyDim, aValueDim: PtrInt; beta, decay, state,
+  aKeyHeads, aValueHeads, aKeyDim, aValueDim, aGroup: PtrInt; beta, decay, state,
   y: PSingleArray);
 var
   job: TInferDeltaJob;
@@ -2729,6 +2732,7 @@ begin
   job.ValueHeads := aValueHeads;
   job.KeyDim := aKeyDim;
   job.ValueDim := aValueDim;
+  job.Group := aGroup;
   // the kernel takes rows of a multiple of 16 values
   job.Fast := not fExact and Assigned(InferDeltaRowsF32) and (aKeyDim > 0) and
     (aKeyDim and 15 = 0);

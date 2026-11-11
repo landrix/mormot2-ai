@@ -167,12 +167,20 @@ step.
 - `tiny-qwen35-text` writes the same kind of model as `Qwen3_5ForCausalLM` under
   `tiny-qwen35/text`: explicit layer types, an untied head, two value heads per key head,
   value heads of 8 values for keys of 16, a convolution of 3, half of each head rotating.
+- `tiny-qwen35-gguf` (D7f, after both tiny targets) writes both tiny models under
+  `tiny-qwen35/gguf` as llama.cpp's converter writes the architecture `qwen35` (looked up in
+  `conversion/qwen.py` of llama.cpp `956591f`): the weights in float32 before any change,
+  the norms as `1 + weight`, `A_log` as `-exp(A_log)`, `conv1d` squeezed, the value heads of
+  the text model reordered to the tiled order; the matrices in BF16 or Q8_0 (ggml's
+  reference quantizer, so it needs `LD_LIBRARY_PATH` to the lembed build like `q8`); an mtp
+  layer after the published layout; ten damaged files. No expected values of their own: the
+  tests compare with the source folders.
 - `qwen35-0.8b` writes four prompts of the real model (`$LAI_QWEN35_DIR`, else the Hugging
   Face cache at the pinned revision; checked against the pinned hashes) in float32: ids,
   the last logits, the last row of every state, greedy with the cache.
 
 ```bash
-python tools/infer-ref/make_reference_d7.py                 # all three
+python tools/infer-ref/make_reference_d7.py                 # all four
 python tools/infer-ref/make_reference_d7.py tiny-qwen35     # one of them
 ```
 

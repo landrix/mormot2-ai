@@ -21,6 +21,11 @@ Targets (all of them when called without arguments):
                         model.), 5 layers of explicit layer_types (linear, full, linear,
                         linear, full), 2 key heads read by 4 value heads (repeat_interleave),
                         a convolution of 3, half of each head rotating, an untied head
+  tiny-qwen35-gguf      tests/data/infer-ref/tiny-qwen35/gguf (D7f): both tiny models as
+                        llama.cpp's converter writes qwen35 (the keys of
+                        ggml-org/Qwen3.5-0.8B-GGUF), matrices in BF16 or Q8_0, the value heads
+                        of text tiled, an mtp layer after the published one, damaged files;
+                        no expected values of their own (needs both tiny folders first)
   qwen35-0.8b           tests/data/infer-ref/qwen35-0.8b: Qwen/Qwen3.5-0.8B at the pinned
                         revision (LAI_QWEN35_DIR, else the Hugging Face cache): ids of a few
                         prompts (plain text and the chat template without thinking),
@@ -476,8 +481,239 @@ def qwen35_08b():
     blob.write(os.path.join(mr.OUT, "qwen35-0.8b"), manifest)
 
 
+def reorder_v_heads(a, dim, num_k, per_k, head_dim):
+    """llama.cpp's _reorder_v_heads: the value heads along dim from grouped by key
+    head [G0 v0..v(r-1), G1 v0..] to tiled [G0 v0, G1 v0, .., G0 v1, G1 v1, ..]"""
+    shape = list(a.shape)
+    a = a.reshape(shape[:dim] + [num_k, per_k, head_dim] + shape[dim + 1:])
+    a = np.swapaxes(a, dim, dim + 1)
+    return np.ascontiguousarray(a).reshape(shape)
+
+
+def qwen35_gguf_tensors(g, cfg, sd, matrix):
+    """the tensors of a qwen35 GGUF as llama.cpp's converter (Qwen3_5TextModel,
+    _LinearAttentionVReorderBase, Qwen3NextModel.modify_tensors) writes them: the
+    weights in float32 before any change (BF16 is converted first), the value heads
+    tiled when there are more of them than key heads, A_log as -exp(A_log), every
+    norm but linear_attn.norm as 1 + weight, conv1d squeezed; 1-D tensors, norms and
+    conv1d in F32, the matrices in BF16 (the bits of the float32 values: exact) or
+    in Q8_0 from ggml's reference quantizer (matrix 'bf16' or 'q8')"""
+    nk = cfg["linear_num_key_heads"]
+    nv = cfg["linear_num_value_heads"]
+    dk = cfg["linear_key_head_dim"]
+    dv = cfg["linear_value_head_dim"]
+    per = nv // nk
+    ts = []
+
+    def f32(name):
+        a = sd[name]
+        if a.dtype == np.uint16:
+            return (a.astype(np.uint32) << 16).view(np.float32)
+        return a.astype(np.float32)
+
+    def vec(name, a):
+        a = np.ascontiguousarray(a, np.float32)
+        ts.append((name, 0, list(reversed(a.shape)), a.tobytes()))
+
+    def mat(name, a):
+        a = np.ascontiguousarray(a, np.float32)
+        ne = list(reversed(a.shape))
+        if matrix == "q8":
+            ts.append((name, 8, ne, b"".join(g.quant_ref(r) for r in a)))
+        else:
+            ts.append((name, 30, ne, (a.view(np.uint32) >> 16).astype(np.uint16).tobytes()))
+
+    def tiled(a, dim, head_dim):
+        return reorder_v_heads(a, dim, nk, per, head_dim) if nk != nv else a
+
+    mat("token_embd.weight", f32("model.embed_tokens.weight"))
+    vec("output_norm.weight", f32("model.norm.weight") + np.float32(1))
+    if "lm_head.weight" in sd:
+        mat("output.weight", f32("lm_head.weight"))
+    for i, kind in enumerate(cfg["layer_types"]):
+        p = f"model.layers.{i}."
+        b = f"blk.{i}."
+        vec(b + "attn_norm.weight", f32(p + "input_layernorm.weight") + np.float32(1))
+        vec(b + "post_attention_norm.weight",
+            f32(p + "post_attention_layernorm.weight") + np.float32(1))
+        for hf, gg in [("gate_proj", "ffn_gate"), ("up_proj", "ffn_up"),
+                       ("down_proj", "ffn_down")]:
+            mat(b + gg + ".weight", f32(p + "mlp." + hf + ".weight"))
+        if kind == "full_attention":
+            a = p + "self_attn."
+            for hf, gg in [("q_proj", "attn_q"), ("k_proj", "attn_k"),
+                           ("v_proj", "attn_v"), ("o_proj", "attn_output")]:
+                mat(b + gg + ".weight", f32(a + hf + ".weight"))
+            vec(b + "attn_q_norm.weight", f32(a + "q_norm.weight") + np.float32(1))
+            vec(b + "attn_k_norm.weight", f32(a + "k_norm.weight") + np.float32(1))
+            continue
+        a = p + "linear_attn."
+        qkv = f32(a + "in_proj_qkv.weight")
+        qkv = np.concatenate([qkv[:2 * nk * dk], tiled(qkv[2 * nk * dk:], 0, dv)])
+        mat(b + "attn_qkv.weight", qkv)
+        mat(b + "attn_gate.weight", tiled(f32(a + "in_proj_z.weight"), 0, dv))
+        mat(b + "ssm_beta.weight", tiled(f32(a + "in_proj_b.weight"), 0, 1))
+        mat(b + "ssm_alpha.weight", tiled(f32(a + "in_proj_a.weight"), 0, 1))
+        mat(b + "ssm_out.weight", tiled(f32(a + "out_proj.weight"), 1, dv))
+        conv = f32(a + "conv1d.weight").reshape(-1, cfg["linear_conv_kernel_dim"])
+        conv = np.concatenate([conv[:2 * nk * dk], tiled(conv[2 * nk * dk:], 0, dv)])
+        vec(b + "ssm_conv1d.weight", conv)
+        vec(b + "ssm_dt.bias", tiled(f32(a + "dt_bias")[:, None], 0, 1)[:, 0])
+        # -torch.exp in float32, as the converter computes it
+        alog = torch.from_numpy(tiled(f32(a + "A_log")[:, None], 0, 1)[:, 0].copy())
+        vec(b + "ssm_a", (-torch.exp(alog)).numpy())
+        vec(b + "ssm_norm.weight", f32(a + "norm.weight"))
+    return ts
+
+
+def qwen35_gguf_kvs(cfg, name, blocks, mtp, recurrent):
+    """the keys of ggml-org/Qwen3.5-0.8B-GGUF for cfg (the text settings)"""
+    arch = "qwen35"
+    rp = cfg["rope_parameters"]
+    sections = list(rp["mrope_section"]) + [0] * (4 - len(rp["mrope_section"]))
+    kvs = [("general.architecture", "str", arch),
+           ("general.name", "str", name),
+           (arch + ".block_count", "u32", blocks),
+           (arch + ".context_length", "u32", cfg["max_position_embeddings"]),
+           (arch + ".embedding_length", "u32", cfg["hidden_size"]),
+           (arch + ".feed_forward_length", "u32", cfg["intermediate_size"]),
+           (arch + ".attention.head_count", "u32", cfg["num_attention_heads"]),
+           (arch + ".attention.head_count_kv", "u32", cfg["num_key_value_heads"]),
+           (arch + ".rope.dimension_sections", "arr", ("i32", sections)),
+           (arch + ".rope.freq_base", "f32", rp["rope_theta"]),
+           (arch + ".attention.layer_norm_rms_epsilon", "f32", cfg["rms_norm_eps"]),
+           (arch + ".attention.key_length", "u32", cfg["head_dim"]),
+           (arch + ".attention.value_length", "u32", cfg["head_dim"]),
+           (arch + ".ssm.conv_kernel", "u32", cfg["linear_conv_kernel_dim"]),
+           (arch + ".ssm.state_size", "u32", cfg["linear_key_head_dim"]),
+           (arch + ".ssm.group_count", "u32", cfg["linear_num_key_heads"]),
+           (arch + ".ssm.time_step_rank", "u32", cfg["linear_num_value_heads"]),
+           (arch + ".ssm.inner_size", "u32",
+            cfg["linear_value_head_dim"] * cfg["linear_num_value_heads"])]
+    if recurrent:
+        kvs.append((arch + ".attention.recurrent_layers", "arr",
+                    ("bool", [t == "linear_attention" for t in cfg["layer_types"]] +
+                     [False] * (blocks - len(cfg["layer_types"])))))
+    kvs.append((arch + ".full_attention_interval", "u32",
+                cfg.get("full_attention_interval", 4)))
+    kvs.append((arch + ".rope.dimension_count", "u32",
+                int(cfg["head_dim"] * rp["partial_rotary_factor"])))
+    if mtp:
+        kvs.append((arch + ".nextn_predict_layers", "u32", mtp))
+    return kvs
+
+
+def tiny_qwen35_gguf():
+    """tiny-qwen35 and tiny-qwen35/text as GGUF, as llama.cpp's converter writes
+    qwen35 (ggml-org/Qwen3.5-0.8B-GGUF)"""
+    print("tiny Qwen3.5 as GGUF")
+    from safetensors.torch import load_file
+    g = mr.Ggml()
+    base = os.path.join(mr.OUT, "tiny-qwen35")
+    folder = os.path.join(base, "gguf")
+    os.makedirs(folder, exist_ok=True)
+
+    def source(sub, prefix):
+        src = os.path.join(base, sub)
+        conf = json.load(open(os.path.join(src, "config.json"), encoding="utf-8"))
+        cfg = dict(conf.get("text_config", conf))
+        if "layer_types" not in cfg:
+            n = cfg["full_attention_interval"]
+            cfg["layer_types"] = ["linear_attention" if (i + 1) % n else "full_attention"
+                                  for i in range(cfg["num_hidden_layers"])]
+        sd = {}
+        for k, v in load_file(os.path.join(src, "model.safetensors")).items():
+            if not k.startswith(prefix):
+                if k != "lm_head.weight":
+                    continue  # the vision tower, the mtp head
+            else:
+                k = "model." + k[len(prefix):]
+            sd[k] = (v.view(torch.int16).numpy().view(np.uint16)
+                     if v.dtype == torch.bfloat16 else v.numpy())
+        if conf.get("tie_word_embeddings"):
+            sd.pop("lm_head.weight", None)
+        return cfg, sd
+
+    pub, psd = source("", "model.language_model.")
+    txt, tsd = source("text", "model.")
+    layers = len(pub["layer_types"])
+    # the published file appends the multi-token prediction layer (nextn): a
+    # full-attention block after the model, here three of its tensors
+    torch.manual_seed(TINY_SEED + 9)
+    h = pub["hidden_size"]
+    extra = [(f"blk.{layers}.attn_norm.weight", 0, [h], np.ones(h, np.float32).tobytes()),
+             (f"blk.{layers}.nextn.enorm.weight", 0, [h], np.ones(h, np.float32).tobytes()),
+             (f"blk.{layers}.nextn.eh_proj.weight", 0, [2 * h, h],
+              (0.08 * torch.randn(h, 2 * h)).numpy().astype(np.float32).tobytes())]
+    kvp = qwen35_gguf_kvs(pub, "tiny-qwen35", layers + 1, 1, False)
+    kvt = qwen35_gguf_kvs(txt, "tiny-qwen35-text", len(txt["layer_types"]), 0, True)
+    pb = qwen35_gguf_tensors(g, pub, psd, "bf16")
+    tb = qwen35_gguf_tensors(g, txt, tsd, "bf16")
+    files = {"bf16.gguf": (kvp, pb + extra),
+             "q8_0.gguf": (kvp, qwen35_gguf_tensors(g, pub, psd, "q8") + extra),
+             "text-bf16.gguf": (kvt, tb),
+             "text-q8_0.gguf": (kvt, qwen35_gguf_tensors(g, txt, tsd, "q8"))}
+
+    def kv(kvs, key, t, v):
+        out = [k for k in kvs if k[0] != key]
+        return out + [(key, t, v)] if v is not None else out
+
+    # damaged: each one fails a different check of the loader; those refused
+    # while the settings are read carry only the embedding and the last norm
+    a = "qwen35."
+    ph = [t for t in pb if t[0] in ("token_embd.weight", "output_norm.weight")]
+    th = [t for t in tb if t[0] in ("token_embd.weight", "output_norm.weight")]
+    files["bad-arch.gguf"] = (kv(kvp, "general.architecture", "str", "qwen3next"), ph)
+    files["bad-prism.gguf"] = (kvp + [("prism.hadamard.version", "u32", 1)], ph)
+    files["bad-inner.gguf"] = (kv(kvt, a + "ssm.inner_size", "u32", 30), th)
+    files["bad-mtp.gguf"] = (kv(kvp, a + "nextn_predict_layers", "u32", layers + 1), ph)
+    files["bad-recurrent.gguf"] = (kv(kvt, a + "attention.recurrent_layers", "arr",
+                                      ("bool", [True, False])), th)
+    files["bad-rope.gguf"] = (kv(kvp, a + "rope.dimension_count", "u32", 7), ph)
+    files["bad-scaling.gguf"] = (kvp + [(a + "rope.scaling.type", "str", "yarn")], ph)
+    files["bad-missing.gguf"] = (kvp, [t for t in pb if t[0] != "blk.1.ssm_a"])
+    files["bad-extra.gguf"] = (kvp, pb + [t for t in tb if t[0] == "blk.1.attn_k_norm.weight"])
+    # A_log as it is (a converter that forgot -exp): a growing state
+    raw = psd["model.layers.0.linear_attn.A_log"]
+    raw = ((raw.astype(np.uint32) << 16).view(np.float32) if raw.dtype == np.uint16
+           else raw.astype(np.float32))
+    files["bad-ssm-a.gguf"] = (kvp, [t if t[0] != "blk.0.ssm_a" else
+                                     (t[0], 0, t[2], np.abs(raw).astype(np.float32).tobytes())
+                                     for t in pb])
+    for name, (k, t) in files.items():
+        mr.gguf_write(os.path.join(folder, name), k, t)
+    manifest = {"dataset": "tiny-qwen35/gguf", "environment": mr.environment(),
+                "ggml": {"dir": os.path.relpath(mr.GGML_DIR, mr.ROOT), "sha256": g.libs},
+                "source": "tiny-qwen35, tiny-qwen35/text",
+                "note": "tiny-qwen35 (bf16, q8_0) and tiny-qwen35/text (text-bf16, "
+                        "text-q8_0) as llama.cpp's converter writes qwen35, with the "
+                        "keys of ggml-org/Qwen3.5-0.8B-GGUF: the text settings, the "
+                        "ssm.* shapes, full_attention_interval and, for text, "
+                        "attention.recurrent_layers; the weights in float32 before "
+                        "any change, the value heads of text (2 key, 4 value) in the "
+                        "tiled order, A_log as -exp(A_log), every norm but "
+                        "linear_attn.norm as 1 + weight, conv1d squeezed; norms, "
+                        "vectors and conv1d in F32, the matrices in BF16 or Q8_0 "
+                        "(quantize_row_q8_0_ref, the head and ssm_alpha / ssm_beta "
+                        "too, as the published file); bf16 and q8_0 carry an mtp "
+                        "layer after the model (block_count 5, nextn_predict_layers "
+                        "1, three tensors under blk.4). The expected values are those "
+                        "of the source folders. bad-* (the first seven with the "
+                        "embedding and the last norm only): another architecture, a "
+                        "prism.hadamard key, an inner size of no whole value heads, "
+                        "as many mtp layers as blocks, recurrent_layers of another "
+                        "count, an odd rotary count, a rope scaling, a missing "
+                        "blk.1.ssm_a, an extra blk.1.attn_k_norm.weight, "
+                        "a positive blk.0.ssm_a (A_log not negated)",
+                "files": {n: mr.sha256_file(os.path.join(folder, n)) for n in sorted(files)}}
+    with open(os.path.join(folder, "manifest.json"), "w", encoding="utf-8",
+              newline="\n") as f:
+        json.dump(manifest, f, indent=1)
+        f.write("\n")
+
+
 TARGETS = {"tiny-qwen35": tiny_qwen35, "tiny-qwen35-text": tiny_qwen35_text,
-           "qwen35-0.8b": qwen35_08b}
+           "tiny-qwen35-gguf": tiny_qwen35_gguf, "qwen35-0.8b": qwen35_08b}
 
 if __name__ == "__main__":
     want = sys.argv[1:] or list(TARGETS)

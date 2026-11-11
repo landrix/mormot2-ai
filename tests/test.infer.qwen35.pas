@@ -1,4 +1,4 @@
-/// tests for Qwen3.5 in the native inference engine (phase D, slices D7a, D7d)
+/// tests for Qwen3.5 in the native inference engine (phase D, slices D7a, D7d, D7f)
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - the Gated DeltaNet and the gated full attention against transformers:
@@ -7,8 +7,10 @@
 //   tools/infer-ref/make_reference_d7.py; the recurrent state of a context
 //   (restore points 0 and Length only, a failed Forward), its restore points
 //   before a CheckpointId token (D7d: a branch the bits of a fresh pass); the
-//   settings refused
-// - Qwen3.5-0.8B needs vendor/models/qwen3.5-0.8b and a 64-bit process; it
+//   settings refused; both tiny models from GGUF (D7f: tiny-qwen35/gguf, the
+//   value heads of text tiled) and the damaged files refused
+// - Qwen3.5-0.8B needs vendor/models/qwen3.5-0.8b (and for GGUF
+//   qwen3.5-0.8b-q8_0.gguf, qwen3.5-0.8b-q4_0.gguf) and a 64-bit process; it
 //   says SKIP otherwise, LAI_REQUIRE_MODEL=1 makes that a failure
 unit test.infer.qwen35;
 
@@ -27,6 +29,7 @@ uses
   mormot.core.test,
   mormot.ai.infer.tensor,
   mormot.ai.infer.backend,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen35,
   test.infer.ref,
@@ -71,6 +74,15 @@ type
     /// Qwen3.5-0.8B in F32 against transformers: the last row of every state,
     // the last logits, greedy - skipped without vendor/models/qwen3.5-0.8b
     procedure Qwen35Real;
+    /// both tiny models from GGUF as llama.cpp's converter writes them (D7f):
+    // the settings of the folder, the mtp layer left alone, the value heads
+    // of text tiled; BF16 every case of the reference, Q8_0 near F32
+    procedure TinyGguf;
+    /// the damaged GGUF files refused, each by its own check
+    procedure GgufRefused;
+    /// ggml-org/Qwen3.5-0.8B-GGUF (Q8_0, Q4_0) against transformers - skipped
+    // without vendor/models/qwen3.5-0.8b-q8_0.gguf / -q4_0.gguf
+    procedure Qwen35Gguf;
   end;
 
 
@@ -956,6 +968,216 @@ begin
     CheckLastRows(model, ref, 'Qwen3.5-0.8B Q8_0', 0.997, 0.997, 1);
   finally
     model.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen35.TinyGguf;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  folder, g: TDecoderModel;
+  a, b: TDecoderConfig;
+  ctx: TDecoderContext;
+  ids: PIntegerArray;
+  lf, lg: TSingleDynArray;
+  n, v, w, k: PtrInt;
+  cmp: TInferCompare;
+  sub, pre: RawUtf8;
+  tiled: boolean;
+begin
+  dir := FindInferRefDir('tiny-qwen35');
+  if CheckFailed(dir <> '', 'tiny-qwen35 found') then
+    exit;
+  // 0: the published layout (with an mtp layer after it), 1: text (2 key
+  // heads read by 4 value heads, tiled in the file)
+  for w := 0 to 1 do
+  begin
+    sub := '';
+    pre := '';
+    if w = 1 then
+    begin
+      sub := 'text';
+      pre := 'text-';
+    end;
+    ref := TInferRefSet.CreateFromFolder(MakePath([dir, sub], true));
+    folder := nil;
+    g := nil;
+    try
+      folder := NewDecoderModel(MakePath([dir, sub]), fCpu);
+      g := NewDecoderModelFromGguf(MakePath([dir, 'gguf', pre + 'bf16.gguf']), fCpu);
+      Check(g.ClassType = TQwen35Model, 'qwen35: a TQwen35Model');
+      a := folder.Config;
+      b := g.Config;
+      tiled := b.LinTiled;
+      CheckUtf8((a.Layers = b.Layers) and (a.Hidden = b.Hidden) and
+        (a.VocabSize = b.VocabSize) and (a.HeadDim = b.HeadDim) and
+        (a.RopeDims = b.RopeDims) and (a.RopeTheta = b.RopeTheta) and
+        (a.LinKeyHeads = b.LinKeyHeads) and (a.LinValueHeads = b.LinValueHeads) and
+        (a.LinKeyDim = b.LinKeyDim) and (a.LinValueDim = b.LinValueDim) and
+        (a.LinConv = b.LinConv) and (a.TiedEmbeddings = b.TiedEmbeddings) and
+        (a.Intermediate = b.Intermediate) and (a.MaxPositions = b.MaxPositions),
+        '% the settings of the folder', [sub]);
+      for k := 0 to a.Layers - 1 do
+        CheckUtf8((a.Spec[k].Mixer = b.Spec[k].Mixer) and
+          (a.Spec[k].OutputGate = b.Spec[k].OutputGate), '% layer % kind', [sub, k]);
+      CheckUtf8(tiled = (w = 1), '% tiled %', [sub, tiled]);
+      Check((g.Layers[0].LinB.DType = idtF32) and (g.Layers[0].LinNegA^[0] < 0),
+        'BF16 widened, ssm_a read as it is');
+      // the norms (1 + weight) and -exp(A_log) as the folder computes them:
+      // the logits of BF16 match those of the folder within the float sums
+      ids := ref.I32('case2.ids', n);
+      v := a.VocabSize;
+      SetLength(lf, n * v);
+      SetLength(lg, n * v);
+      ctx := folder.NewContext;
+      try
+        folder.Forward(ctx, ids, n, pointer(lf), true);
+      finally
+        ctx.Free;
+      end;
+      ctx := g.NewContext;
+      try
+        g.Forward(ctx, ids, n, pointer(lg), true);
+      finally
+        ctx.Free;
+      end;
+      cmp := InferCompare(pointer(lg), pointer(lf), n * v, 1e-5, 1e-5);
+      AddConsole(FormatString('Qwen3.5 % GGUF BF16 vs folder: %, same bits %',
+        [sub, InferCompareText(cmp), CompareMem(pointer(lg), pointer(lf), n * v * 4)]));
+      CheckUtf8(InferCompareOk(cmp), '% GGUF BF16 vs the folder: %',
+        [sub, InferCompareText(cmp)]);
+      CheckTiny(g, ref, 'gguf ' + sub);
+      // Q8_0 as llama-quantize writes it (the head, ssm_alpha and ssm_beta too)
+      FreeAndNil(g);
+      g := TQwen35Model.CreateFromGguf(MakePath([dir, 'gguf', pre + 'q8_0.gguf']), fFast);
+      Check((g.Weights = idtQ8_0) and (g.Layers[0].LinB.DType = idtQ8_0) and
+        (g.Head.DType = idtQ8_0) and (g.Config.LinTiled = tiled),
+        'the types of the Q8_0 file');
+      for k := 0 to 2 do
+      begin
+        ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+        SetLength(lf, n * v);
+        SetLength(lg, n * v);
+        ctx := folder.NewContext;
+        try
+          folder.Forward(ctx, ids, n, pointer(lf), true);
+        finally
+          ctx.Free;
+        end;
+        ctx := g.NewContext;
+        try
+          g.Forward(ctx, ids, n, pointer(lg), true);
+        finally
+          ctx.Free;
+        end;
+        // as TinyQuantized (Q8_0 at load): the tiny model is chaotic
+        cmp := InferCompare(pointer(lg), pointer(lf), n * v, 0.5, 0);
+        AddConsole(FormatString('Qwen3.5 % GGUF Q8_0 case % vs F32: %',
+          [sub, k, InferCompareText(cmp)]));
+        CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.99),
+          '% GGUF Q8_0 case % vs F32: %', [sub, k, InferCompareText(cmp)]);
+      end;
+    finally
+      g.Free;
+      folder.Free;
+      ref.Free;
+    end;
+  end;
+end;
+
+procedure TTestInferQwen35.GgufRefused;
+var
+  dir: TFileName;
+
+  function Refused(const aFile, aWhy: RawUtf8): boolean;
+  var
+    why: RawUtf8;
+  begin
+    why := 'accepted';
+    try
+      TQwen35Model.CreateFromGguf(dir + Utf8ToString(aFile), fCpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    result := PosEx(aWhy, why) > 0;
+    if not result then
+      AddConsole(FormatString('%: "%"', [aFile, why]));
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-qwen35');
+  if CheckFailed(dir <> '', 'tiny-qwen35 found') then
+    exit;
+  dir := MakePath([dir, 'gguf'], true);
+  Check(Refused('bad-arch.gguf', 'architecture'), 'another architecture');
+  Check(Refused('bad-prism.gguf', 'prism.hadamard.version'), 'a Hadamard basis');
+  Check(Refused('bad-inner.gguf', 'inner size'), 'no whole value heads');
+  Check(Refused('bad-mtp.gguf', 'prediction layers'), 'only prediction layers');
+  Check(Refused('bad-recurrent.gguf', 'recurrent_layers'),
+    'recurrent_layers of another count');
+  Check(Refused('bad-rope.gguf', 'rotating values'), 'an odd rotary count');
+  Check(Refused('bad-scaling.gguf', 'rope scaling'), 'a rope scaling');
+  Check(Refused('bad-missing.gguf', 'blk.1.ssm_a'), 'a missing tensor');
+  Check(Refused('bad-extra.gguf', 'understood'), 'an extra tensor');
+  Check(Refused('bad-ssm-a.gguf', 'no -exp(A_log)'), 'A_log not negated');
+end;
+
+procedure TTestInferQwen35.Qwen35Gguf;
+const
+  FILES: array[0..1] of RawUtf8 = ('qwen3.5-0.8b-q8_0.gguf', 'qwen3.5-0.8b-q4_0.gguf');
+var
+  fn, refdir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  timer: TPrecisionTimer;
+  w: PtrInt;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3.5-0.8B GGUF: a 64-bit process');
+  exit;
+  {$endif CPU32}
+  refdir := FindInferRefDir('qwen35-0.8b');
+  if CheckFailed(refdir <> '', 'qwen35-0.8b reference found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  try
+    for w := 0 to high(FILES) do
+    begin
+      fn := FindVendorModel(Utf8ToString(FILES[w]));
+      if fn = '' then
+      begin
+        CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+          'LAI_REQUIRE_MODEL=1 but no vendor/models/%', [FILES[w]]);
+        AddConsole(FormatString('SKIP Qwen3.5-0.8B GGUF: no vendor/models/% ' +
+          '(revision in UPSTREAM_BASE)', [FILES[w]]));
+        continue;
+      end;
+      timer.Start;
+      model := NewDecoderModelFromGguf(fn, fFast);
+      try
+        AddConsole(FormatString('% loaded in %', [FILES[w], timer.Stop]));
+        // the Q8_0 file carries the mtp layer (25 blocks), the Q4_0 one not
+        Check((model.Config.Layers = 24) and (model.Config.Spec[3].Mixer = dmAttention) and
+          (model.Config.Spec[22].Mixer = dmDeltaNet) and (model.Config.RopeDims = 64) and
+          not model.Config.LinTiled and model.Config.TiedEmbeddings,
+          'the layers of Qwen3.5-0.8B');
+        // measured 2026-11-11 (FPC, aarch64): Q8_0 states cosine >= 0.9983,
+        // logits >= 0.9989 and max 0.64, greedy as the reference where it was
+        // sure (as Q8_0 at load); Q4_0 cases 0..2 states >= 0.961, logits >=
+        // 0.981 and max 3.03 (x86_64: 0.960, 0.981, 3.01) - the chat case 3 drifts off (logits cosine 0.64),
+        // as Q4_0 at load from the folder does (0.66): the error of Q4_0 on
+        // a 0.8B model, not of the file
+        if w = 0 then
+          CheckLastRows(model, ref, 'Qwen3.5-0.8B GGUF Q8_0', 0.997, 0.997, 1)
+        else
+          CheckLastRows(model, ref, 'Qwen3.5-0.8B GGUF Q4_0', 0.95, 0.97, 3.5, 3);
+      finally
+        model.Free;
+      end;
+    end;
+  finally
     ref.Free;
   end;
 end;

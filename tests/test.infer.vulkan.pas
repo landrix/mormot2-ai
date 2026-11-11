@@ -2734,7 +2734,7 @@ end;
 
 type
   TDeltaRuleTestPush = record
-    Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim: cardinal;
+    Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim, Group: cardinal;
   end;
 
 procedure TTestInferVulkan.DeltaRuleMatchesCpu;
@@ -2750,7 +2750,8 @@ var
       MoveFast(pointer(v)^, result.Mapped^, aCount * 4);
   end;
 
-  procedure DeltaCase(aRows, aKh, aVh, aDk, aDv: PtrInt);
+  // aGroup: value heads per key head side by side, 1 for llama.cpp's tiled order
+  procedure DeltaCase(aRows, aKh, aVh, aDk, aDv, aGroup: PtrInt);
   var
     qkv, beta, decay, state, y: TSingleDynArray;
     b: array[0..4] of TInferVkBuffer;
@@ -2782,12 +2783,13 @@ var
       push.ValueHeads := aVh;
       push.KeyDim := aDk;
       push.ValueDim := aDv;
+      push.Group := aGroup;
       fVk.Run(pipe, [b[0], b[1], b[2], b[3], b[4]], @push, aVh, (aDv + 3) div 4);
-      ref.DeltaRule(pointer(qkv), aRows, cd, aKh, aVh, aDk, aDv, pointer(beta),
-        pointer(decay), pointer(state), pointer(y));
+      ref.DeltaRule(pointer(qkv), aRows, cd, aKh, aVh, aDk, aDv, aGroup,
+        pointer(beta), pointer(decay), pointer(state), pointer(y));
       e := RelError(b[4].Mapped, pointer(y), length(y));
-      CheckUtf8(e <= 2e-5, 'deltarule.comp % rows, % / % heads of % / %: relative ' +
-        'error %', [aRows, aKh, aVh, aDk, aDv, e]);
+      CheckUtf8(e <= 2e-5, 'deltarule.comp % rows, % / % heads of % / %, group %: ' +
+        'relative error %', [aRows, aKh, aVh, aDk, aDv, aGroup, e]);
       e := RelError(b[3].Mapped, pointer(state), length(state));
       CheckUtf8(e <= 2e-5, 'deltarule.comp state, key dim %: relative error %',
         [aDk, e]);
@@ -2804,10 +2806,11 @@ begin
   pipe := TInferVkPipeline.Create(fVk, @SPV_DELTARULE, length(SPV_DELTARULE), 5,
     SizeOf(TDeltaRuleTestPush));
   try
-    DeltaCase(5, 2, 4, 16, 8);     // the tiny models
-    DeltaCase(7, 2, 4, 128, 128);  // Qwen3.5-0.8B's heads
-    DeltaCase(1, 1, 2, 256, 64);   // the widest key, one decode row
-    DeltaCase(3, 2, 2, 48, 20);    // no multiple of 32, columns beyond the last
+    DeltaCase(5, 2, 4, 16, 8, 2);     // the tiny models
+    DeltaCase(7, 2, 4, 128, 128, 2);  // Qwen3.5-0.8B's heads
+    DeltaCase(1, 1, 2, 256, 64, 2);   // the widest key, one decode row
+    DeltaCase(3, 2, 2, 48, 20, 1);    // no multiple of 32, columns beyond the last
+    DeltaCase(4, 2, 6, 128, 16, 1);   // llama.cpp's tiled order (Qwen3.8-27B: 16 / 48)
   finally
     pipe.Free;
     ref.Free;
@@ -2836,6 +2839,7 @@ var
   cmp: TInferCompare;
   id: integer;
   quant: boolean;
+  qcos: double;
 begin
   if not HasDevice then
     exit;
@@ -2855,8 +2859,10 @@ begin
     FileFromString(cfg.ToJson, tmp + 'config.json');
     // 0: F32, 1: F32 with the cache in half floats, 2: Q8_0 at load, 3: the
     // Qwen3_5ForCausalLM layout (an untied head, a convolution of 3), 4: that
-    // layout rotating 6 values of a head, the cache in half floats
-    for k := 0 to 4 do
+    // layout rotating 6 values of a head, the cache in half floats; 5 and 6:
+    // that layout from GGUF (D7f: the value heads in llama.cpp's tiled order),
+    // the matrices in BF16 (widened to F32) and in Q8_0
+    for k := 0 to 6 do
     begin
       gpu := TInferVulkanBackend.Create;
       ref := TInferCpuFastBackend.Create;
@@ -2874,6 +2880,12 @@ begin
             model := NewDecoderModel(MakePath([dir, 'text']), ref);
           4:
             model := NewDecoderModel(tmp, ref);
+          5:
+            model := TQwen35Model.CreateFromGguf(MakePath([dir, 'gguf',
+              'text-bf16.gguf']), ref);
+          6:
+            model := TQwen35Model.CreateFromGguf(MakePath([dir, 'gguf',
+              'text-q8_0.gguf']), ref);
         else
           model := NewDecoderModel(dir, ref);
         end;
@@ -2890,7 +2902,14 @@ begin
         end;
         // the CPU computes Q8_0 matrices with Q8_0 activations, the device in
         // float: compared by cosine
-        quant := k = 2;
+        CheckUtf8((k < 5) or model.Config.LinTiled, 'case % tiled', [k]);
+        quant := k in [2, 6];
+        // the Q8_0 file quantizes ssm_alpha and ssm_beta too, and the CPU
+        // computes with Q8_0 activations over 300 tokens of a chaotic model:
+        // measured 2026-11-11 (lavapipe) decode cosine 0.985 .. 0.994
+        qcos := 0.995;
+        if k = 6 then
+          qcos := 0.98;
         dev := TQwen3Vulkan.Create(model, gpu);
         dev.KvF16 := k in [1, 4];
         c1 := model.NewContext;
@@ -2903,7 +2922,8 @@ begin
         if quant then
         begin
           cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
-          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
+          AddConsole(FormatString('Qwen3.5 % prompt: %', [k, InferCompareText(cmp)]));
+          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= qcos),
             'Qwen3.5 % prompt logits: %', [k, InferCompareText(cmp)]);
         end
         else
@@ -2928,7 +2948,7 @@ begin
           if quant then
           begin
             cmp := InferCompare(pointer(l2), pointer(l1), v, 0.5, 0.5);
-            CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= 0.995),
+            CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= qcos),
               'Qwen3.5 % decode step %: %', [k, i, InferCompareText(cmp)]);
           end
           else

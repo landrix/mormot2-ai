@@ -427,7 +427,12 @@ In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tok
   DeltaNet-Layer als Shader (`tools/vk/`), Zustand und Rücksetzpunkte auf dem Gerät; auf der
   RTX 5090 Prefill 512 in 42 ms, Decode 3,1 ms/Token (Q8_0), auf dem M2 über MoltenVK
   ebenso gegen transformers geprüft.
-- *Offen:* Qwen3.8-27B (volle Attention mit Kopfdimension 256), GGUF für Qwen3.5.
+- *D7f erledigt 2026-11-11* (`native-inference.md`, Phase D): Qwen3.5 aus GGUF
+  (`ggml-org/Qwen3.5-0.8B-GGUF`, Q8_0 und Q4_0) samt Tokenizer und Client; die gekachelte
+  Reihenfolge der Value-Köpfe, in die der Konverter bei mehr Value- als Key-Köpfen umordnet,
+  rechnen CPU, CUDA und Vulkan direkt (`DeltaRule` mit `aGroup`).
+- *Offen:* Qwen3.8-27B (volle Attention mit Kopfdimension 256; 16 Key- auf 48 Value-Köpfe,
+  aus GGUF also gekachelt).
 
 **D8 — Kolibri-1.** FP8 E4M3 mit 128×128-Skalen (oder eine geprüfte Umwandlung nach Q4_K/Q8_0
 beim Laden; ein GGUF von Dritten nur nach Prüfung gegen die Referenz), Sigmoid-Router mit Bias-Korrektur nur für die Auswahl,

@@ -1635,8 +1635,8 @@ end;
 /// the gated delta rule as written: S [key dim, value dim] per value head in
 // double - S := decay S; delta := beta (v - S^T k); S += k delta^T; y := S^T q
 procedure NaiveDeltaRule(const aQkv: TSingleDynArray; aRows, aStride, aKeyHeads,
-  aValueHeads, aKeyDim, aValueDim: PtrInt; const aBeta, aDecay: TSingleDynArray;
-  var aState, aY: TSingleDynArray);
+  aValueHeads, aKeyDim, aValueDim: PtrInt; aTiled: boolean;
+  const aBeta, aDecay: TSingleDynArray; var aState, aY: TSingleDynArray);
 var
   h, t, i, j, kq, kd: PtrInt;
   s, dl: TDoubleDynArray;
@@ -1652,7 +1652,11 @@ begin
     for i := 0 to aKeyDim - 1 do
       for j := 0 to aValueDim - 1 do
         s[i * aValueDim + j] := aState[(h * aValueDim + j) * aKeyDim + i];
-    kq := (h div (aValueHeads div aKeyHeads)) * aKeyDim;
+    // neighbouring value heads share a key head, or llama.cpp's tiled order
+    if aTiled then
+      kq := (h mod aKeyHeads) * aKeyDim
+    else
+      kq := (h div (aValueHeads div aKeyHeads)) * aKeyDim;
     for t := 0 to aRows - 1 do
     begin
       row := @aQkv[t * aStride];
@@ -1684,13 +1688,14 @@ end;
 
 procedure TTestInferFast.DeltaRuleMatchesReference;
 const
-  // rows, key heads, value heads, key dim, value dim - every row 5 values
-  // wider than its heads
-  CASES: array[0..6, 0..4] of integer = (
-    (1, 2, 2, 16, 16), (9, 2, 4, 32, 16), (5, 1, 3, 48, 8), (20, 2, 2, 128, 128),
-    (4, 1, 1, 16, 8), (3, 2, 2, 8, 4), (40, 1, 2, 64, 32));
+  // rows, key heads, value heads, key dim, value dim, tiled (1: llama.cpp's
+  // order of the value heads) - every row 5 values wider than its heads
+  CASES: array[0..8, 0..5] of integer = (
+    (1, 2, 2, 16, 16, 0), (9, 2, 4, 32, 16, 0), (5, 1, 3, 48, 8, 0),
+    (20, 2, 2, 128, 128, 0), (4, 1, 1, 16, 8, 0), (3, 2, 2, 8, 4, 0),
+    (40, 1, 2, 64, 32, 0), (9, 2, 4, 32, 16, 1), (6, 3, 9, 16, 8, 1));
 var
-  c, rows, kh, vh, dk, dv, stride, ns, ny, t, j, i: PtrInt;
+  c, rows, kh, vh, dk, dv, group, stride, ns, ny, t, j, i: PtrInt;
   qkv, beta, decay, st0, st1, st2, st3, st4, y1, y2, y3, y4: TSingleDynArray;
   coef: array[0..1] of single;
   cmp: TInferCompare;
@@ -1705,6 +1710,10 @@ begin
     vh := CASES[c, 2];
     dk := CASES[c, 3];
     dv := CASES[c, 4];
+    if CASES[c, 5] <> 0 then
+      group := 1
+    else
+      group := vh div kh;
     stride := 2 * kh * dk + vh * dv + 5;
     Fill(qkv, rows * stride, 700 + c, 1);
     // Q and K L2-normed per head as the model feeds them: S stays bounded
@@ -1738,13 +1747,14 @@ begin
     SetLength(y2, ny);
     SetLength(y3, ny);
     SetLength(y4, ny);
-    fRef.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, pointer(beta),
+    fRef.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, group, pointer(beta),
       pointer(decay), pointer(st1), pointer(y1));
-    fExact.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, pointer(beta),
+    fExact.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, group, pointer(beta),
       pointer(decay), pointer(st2), pointer(y2));
-    fFast.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, pointer(beta),
+    fFast.DeltaRule(pointer(qkv), rows, stride, kh, vh, dk, dv, group, pointer(beta),
       pointer(decay), pointer(st3), pointer(y3));
-    NaiveDeltaRule(qkv, rows, stride, kh, vh, dk, dv, beta, decay, st4, y4);
+    NaiveDeltaRule(qkv, rows, stride, kh, vh, dk, dv, CASES[c, 5] <> 0, beta, decay,
+      st4, y4);
     CheckUtf8(SameBits(pointer(y1), pointer(y2), ny) and
       SameBits(pointer(st1), pointer(st2), ns), 'delta rule exact, case %', [c]);
     cmp := InferCompare(pointer(y1), pointer(y4), ny, 1e-5, 1e-5);

@@ -367,7 +367,7 @@ type
 
   /// deltarule.comp
   TDeltaRulePush = record
-    Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim: cardinal;
+    Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim, Group: cardinal;
   end;
 
   /// splitgate.comp
@@ -1490,6 +1490,7 @@ begin
   rule.ValueHeads := c.LinValueHeads;
   rule.KeyDim := c.LinKeyDim;
   rule.ValueDim := c.LinValueDim;
+  rule.Group := fModel.LinGroup;
   fVk.BatchDispatch(fDeltaRule, [aCtx.fDevQkv, aCtx.fDevBeta, aCtx.fDevDecay,
     aCtx.fDevState[aLayer], aCtx.fDevCore], @rule, c.LinValueHeads,
     (c.LinValueDim + 3) div 4);

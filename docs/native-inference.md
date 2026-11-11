@@ -1818,6 +1818,72 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7f erledigt (2026-11-11): Qwen3.5 aus GGUF.** `TQwen35Model.CreateFromGguf` liest die
+Architektur `qwen35`, wie der Konverter von llama.cpp sie schreibt (nachgeschlagen in
+`conversion/qwen.py` und `src/models/qwen35.cpp`, Commit `956591f…`, kein Code übernommen);
+geprüft mit Tiny-GGUFs und mit `ggml-org/Qwen3.5-0.8B-GGUF` (Revision `807dfd9…`, Q8_0 und
+Q4_0, aus derselben Checkpoint-Revision `2fc0636` konvertiert wie unsere Safetensors).
+
+- *Was der Konverter ändert:* Er rechnet BF16 vor jeder Änderung in float32 um; die Norms stehen
+  als `1 + weight` in der Datei (außer `linear_attn.norm`), `A_log` als `-exp(A_log)` (`ssm_a`),
+  `conv1d` ohne die mittlere Dimension, `dt_bias` als `ssm_dt.bias`. Der Lader nimmt die Werte
+  so, wie sie dastehen: BF16-Gewichte geben die Logits des Ordners bis auf 6e-7.
+- *Value-Köpfe in gekachelter Reihenfolge:* Gibt es mehr Value- als Key-Köpfe, ordnet der
+  Konverter sie um (`_LinearAttentionVReorderBase`): Kopf h liest dann Key-Kopf `h mod kh`
+  statt `h div (vh / kh)`. Statt beim Laden zurückzusortieren (die Spalten von `ssm_out` in
+  128er-Gruppen gingen bei K-Quants mit 256er-Blöcken nicht) bekommt `DeltaRule` einen
+  Parameter `aGroup`: Key-Kopf = `(h div aGroup) mod kh` - `vh / kh` wie bisher, 1 gekachelt
+  (`TDecoderConfig.LinTiled`, `TDecoderModel.LinGroup`). Alles andere je Value-Kopf (V-Kanäle,
+  z, beta, Zerfall, `dt_bias`, A, `ssm_out`) steht in der Datei in derselben Reihenfolge. Auf
+  der CPU, in `deltanet.cu` und in `deltarule.comp`. Qwen3.5-0.8B hat 16/16 Köpfe (nichts
+  umgeordnet), Qwen3.8-27B 16/48.
+- *Was die Datei sonst trägt:* hinter dem Modell die Layer der Multi-Token-Vorhersage
+  (`nextn_predict_layers`, in der Q8_0-Datei einer, in der Q4_0-Datei keiner) - nicht
+  gerechnet und nicht gezählt; die Layerarten aus `attention.recurrent_layers` oder
+  `full_attention_interval`; die DeltaNet-Formen aus `ssm.*` (Value-Breite = `inner_size /
+  time_step_rank`: llama.cpp selbst nimmt dort die Key-Breite). `ssm_alpha` und `ssm_beta`
+  liegen quantisiert vor (der Ordnerweg hält sie in F32). Abgelehnt: eine RoPE-Skalierung, ein
+  Fenster, Gewichte in einer Hadamard-Basis (`prism.*`), keine ganzen Value-Köpfe, eine
+  ungerade Rotationsbreite, ein `ssm_a`, das nicht negativ und endlich ist (eine Datei mit
+  `A_log` selbst ließe den Zustand wachsen statt zerfallen).
+- *Tokenizer:* `tokenizer.ggml.pre` `qwen35` ist die Qwen3.5-Regex mit NFC; die Datei trägt 7
+  Steuertokens mehr als `tokenizer.json` (`<|audio_start|>` .. `<|audio_pad|>` aus
+  `added_tokens_decoder` von `tokenizer_config.json`, wie transformers sie lädt); alle 3181
+  Fälle von `qwen35-tokens` gleich. `TNativeLlmClient.CreateFromGguf` antwortet, ruft Tools
+  auf und nimmt die nächste Frage vom Rücksetzpunkt (17 Tokens).
+- *Genauigkeit (Qwen3.5-0.8B gegen transformers, WSL auf aarch64 und RTX-Rechner):* Q8_0
+  Zustände und Logits Kosinus >= 0,998, Greedy gleich, wo die Referenz sicher war (wie Q8_0
+  beim Laden); Q4_0 in den Fällen 0..2 Zustände >= 0,960, Logits >= 0,980 - im Chat-Fall
+  (25 Tokens) nur 0,64, genau wie Q4_0 beim Laden aus dem Ordner (0,66): der Fehler von Q4_0
+  bei 0,8B, nicht der Datei.
+- *Tests:* `test.infer.qwen35`: `TinyGguf` (beide Tiny-Modelle als BF16 und Q8_0, das
+  Text-Layout gekachelt: Einstellungen des Ordners, jeder Referenzfall, Q8_0 nahe F32),
+  `GgufRefused` (zehn beschädigte Dateien, jede an ihrer eigenen Prüfung), `Qwen35Gguf` (die
+  echten Dateien); `test.infer.qwen35chat`: `Qwen35GgufTokenizer`, `Qwen35GgufChat`;
+  `DeltaRuleMatchesReference` (CPU, mit gekachelten Fällen gegen eine eigene naive Rechnung),
+  `DeltaNetOpsMatchCpu` (CUDA) und `DeltaRuleMatchesCpu` (Vulkan) je mit einem gekachelten
+  Fall, `Qwen35MatchesCpu` auf beiden Geräten mit dem Text-Layout aus GGUF (BF16, Q8_0).
+  Die Tiny-GGUFs schreibt `make_reference_d7.py tiny-qwen35-gguf` nach dem Vorbild des
+  Konverters.
+- *Gegenprobe:* 22 eingebaute Fehler, alle scheitern - 21 unter WSL (Lavapipe): die
+  CPU-Delta-Regel ohne `aGroup`, `LinGroup` nie gekachelt, `LinTiled` nicht gesetzt, die Norms
+  noch einmal +1, `ssm_a` als `A_log` genommen, die MTP-Layer gerechnet oder gezählt,
+  `recurrent_layers` übergangen, `prism.*`, eine falsche `inner_size`, eine RoPE-Skalierung
+  und ein positives `ssm_a` angenommen, die Value-Breite als Key-Breite, die ganze Kopfbreite
+  gedreht, immer gebundener Kopf, der ungebundene Kopf (`output.weight`) nicht mitgezählt,
+  der Gewichtstyp aus Q von Layer 0 (eine DeltaNet-Layer hat keines), der Pre-Tokenizer ohne NFC oder als qwen2, `deltarule.comp` ohne `group`,
+  der Push mit gruppierter Zuordnung; einer auf dem RTX-Rechner: `deltarule` in `deltanet.cu`
+  ohne `group`.
+- *Review:* Claude-Finder und Codex in zwei Runden. Runde 1: Codex ohne Befund, der Finder fand: ein
+  `ssm_a`, das noch `A_log` enthält, liefe ohne Fehler falsch durch - jetzt abgelehnt (mit
+  beschädigter Datei und Gegenprobe); ein falscher Kommentar im CUDA-Test. Hinweis: `DeltaRule`
+  hat einen Parameter mehr, ein eigenes Backend außerhalb dieses Repos muss ihn nachziehen.
+  Runde 2 (die Korrekturen): beide ohne Befund.
+- *Läufe:* RTX-Rechner FPC und Delphi 13 je 9341 Assertions, Delphi 7 5593 (alle Modelle,
+  CUDA und Vulkan); WSL Infer 7233 und LLM 741 (Lavapipe); Mac M2 Infer 7299 und LLM 730
+  (MoltenVK). Auf dem RTX-Rechner antwortet der Client aus der Q8_0-Datei auf der CPU in
+  194 ms, die nächste Frage in 248 ms.
+
 **D7e2 erledigt (2026-10-25): Qwen3.5 auf Vulkan.** `TQwen3Vulkan` nimmt Qwen3.5 an wie
 `TQwen3Cuda` seit D7e1.
 

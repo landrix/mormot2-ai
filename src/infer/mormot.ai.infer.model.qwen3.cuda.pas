@@ -1102,7 +1102,7 @@ var
   ly: ^TQwen3Layer;
   h, cd, vd: PtrInt;
   pq, pw, pc, pb, pd, pz, pdt, pna, ps, py, pn: TCuDevicePtr;
-  rows, channels, kw, kh, vh, dk, dv, cols: cardinal;
+  rows, channels, kw, kh, vh, dk, dv, cols, group: cardinal;
   eps: single;
 begin
   c := fModel.Config;
@@ -1138,8 +1138,9 @@ begin
     @channels], 2 * kh + vh, OPS_BLOCK, aRows);
   ps := aCtx.fDevState[aLayer].Ptr;
   py := aCtx.fDevCore.Ptr;
+  group := fModel.LinGroup;
   fCu.Enqueue(fDeltaRule, [@pq, @pb, @pd, @ps, @py, @rows, @channels, @kh, @vh,
-    @dk, @dv], vh, OPS_BLOCK, (dv + 3) div 4);
+    @dk, @dv, @group], vh, OPS_BLOCK, (dv + 3) div 4);
   // RMSNorm per value head times silu(z), the output projection
   pn := Vector(ly^.LinNorm, c.LinValueDim);
   cols := dv;

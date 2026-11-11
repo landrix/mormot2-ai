@@ -6,9 +6,10 @@
 //   registers over all the tokens; per token S[j] decayed, what it predicts
 //   for the key, the correction written in, the column read by the query -
 //   the two sums over the 32 invocations through shared memory
-// - qkv rows at stride: [q all | k all | v all]; a key head serves
-//   valueHeads / keyHeads neighbouring value heads; y [rows, valueHeads *
-//   valueDim]; state [valueHeads, valueDim, keyDim], moved on
+// - qkv rows at stride: [q all | k all | v all]; value head h reads key head
+//   (h / group) % keyHeads - group = valueHeads / keyHeads: neighbouring
+//   value heads share a key head, 1: llama.cpp's tiled order; y [rows,
+//   valueHeads * valueDim]; state [valueHeads, valueDim, keyDim], moved on
 #version 450
 
 layout(local_size_x = 128) in;
@@ -20,7 +21,7 @@ layout(std430, binding = 3) buffer BufState { float state[]; };
 layout(std430, binding = 4) writeonly buffer BufY { float y[]; };
 
 layout(push_constant) uniform Push {
-  uint rows, stride, keyHeads, valueHeads, keyDim, valueDim;
+  uint rows, stride, keyHeads, valueHeads, keyDim, valueDim, group;
 } p;
 
 shared float red[128];
@@ -52,7 +53,7 @@ void main()
   bool live = j < p.valueDim;
   uint kd = p.keyHeads * p.keyDim;
   uint vd = p.valueHeads * p.valueDim;
-  uint off = (head / (p.valueHeads / p.keyHeads)) * p.keyDim;
+  uint off = ((head / p.group) % p.keyHeads) * p.keyDim;
   uint row = (head * p.valueDim + j) * p.keyDim;
   float s[8];
   for (uint m = 0u; m < 8u; m++)

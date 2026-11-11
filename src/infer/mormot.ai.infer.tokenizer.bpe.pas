@@ -392,10 +392,10 @@ var
   i, n: PtrInt;
 begin
   inherited CreateFromGguf(aGguf);
-  // llama.cpp's names of the pipelines: a GPT-2 byte-level BPE with the qwen2
-  // or the gpt-4o pre-tokenizer (the Split regexes of tokenizer.json); GGUF
+  // llama.cpp's names of the pipelines: a GPT-2 byte-level BPE with the qwen2,
+  // qwen35 or gpt-4o pre-tokenizer (the Split regexes of tokenizer.json); GGUF
   // stores neither a normalizer nor ignore_merges - Qwen's tokenizer.json has
-  // NFC, which Normalize applies, gpt-oss's ignore_merges
+  // NFC (Qwen3.5's too), which Normalize applies, gpt-oss's ignore_merges
   if aGguf.Str('tokenizer.ggml.model') <> 'gpt2' then
     EInferError.RaiseUtf8('%: tokenizer model "%" is no byte-level BPE',
       [self, aGguf.Str('tokenizer.ggml.model')]);
@@ -404,13 +404,18 @@ begin
     fPre := bptQwen2;
     fNfc := true;
   end
+  else if aGguf.Str('tokenizer.ggml.pre') = 'qwen35' then
+  begin
+    fPre := bptQwen35;
+    fNfc := true;
+  end
   else if aGguf.Str('tokenizer.ggml.pre') = 'gpt-4o' then
   begin
     fPre := bptO200k;
     fIgnoreMerges := true;
   end
   else
-    EInferError.RaiseUtf8('%: pre-tokenizer "%" is neither qwen2 nor gpt-4o',
+    EInferError.RaiseUtf8('%: pre-tokenizer "%" is none of qwen2, qwen35, gpt-4o',
       [self, aGguf.Str('tokenizer.ggml.pre')]);
   tokens := aGguf.Strings('tokenizer.ggml.tokens');
   count := length(tokens);

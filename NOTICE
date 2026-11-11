@@ -161,8 +161,11 @@ Qwen3.5  (Qwen team, Alibaba Cloud)  (MODEL INTERFACE, NOT CODE)
   gated full attention) after the modeling code of transformers 5.19 (read, not
   copied); tests/data/infer-ref/tiny-qwen35 holds seeded models of that
   architecture. It reads Qwen/Qwen3.5-0.8B (revision
-  2fc06364715b967f1860aea9cf38778875588b17) at runtime; the model is not part of
-  this repository (vendor/models/, gitignored). tests/data/infer-ref/qwen35-0.8b
+  2fc06364715b967f1860aea9cf38778875588b17) and its GGUF files
+  (ggml-org/Qwen3.5-0.8B-GGUF, revision 807dfd9a6fadbf703207aac3bfb0b2b3040d077c)
+  at runtime; the model is not part of this repository (vendor/models/,
+  gitignored). tests/data/infer-ref/tiny-qwen35/gguf holds the tiny models written
+  as llama.cpp's converter writes qwen35. tests/data/infer-ref/qwen35-0.8b
   holds token ids, logits and states computed with it, no weights. Its tokenizer
   pipeline and chat template (tokenizer.json, chat_template.jinja) are
   reimplemented (read, not copied); tests/data/infer-ref/qwen35-tokens and
