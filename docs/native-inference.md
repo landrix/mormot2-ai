@@ -1660,7 +1660,8 @@ mehr Experten je Token als Experten, Breiten und Experten, die nicht zur Datei p
 `Qwen3MoeChatClientGguf` (Qwen3-30B-A3B Q4_K_M hinter `TNativeLlmClient`, wo die Datei
 liegt). Gegenprobe: 14 eingebaute Fehler (Wahrscheinlichkeiten nicht normiert, `NormTopK` übergangen, niedrigster Logit gewählt, ein Experte doppelt, Router-Gewicht übergangen, Summe nicht geleert, Ausgabe in die gesammelte statt die eigene Zeile, jeder Experte dieselbe GGUF-Scheibe, Form der Experten ungeprüft, mehr Experten je Token als Experten, `mlp_only_layers` übergangen, `decoder_sparse_step` um eins verschoben, im GGUF jeder Layer mit Experten, Router quantisiert) - alle scheitern, der doppelte Experte durch Absturz (der Sammelpuffer läuft über; `Route` wählt nie doppelt).
 
-*Qwen3-30B-A3B* (`Qwen/Qwen3-30B-A3B-GGUF`, `Qwen3-30B-A3B-Q4_K_M.gguf`, 18,6 GB; Q4_K, Q6_K
+*Qwen3-30B-A3B* (`Qwen/Qwen3-30B-A3B-GGUF`, Revision `e4d4baf…`, `Qwen3-30B-A3B-Q4_K_M.gguf`,
+SHA-256 `0d003f66…`, 18,6 GB; Q4_K, Q6_K
 für einen Teil von `attn_v` und `ffn_down_exps`, Router F32) auf dem RTX-Rechner (i9-14900K,
 22 Threads, CPU): geladen in 3,8 s, 17,7 GB Spitze; Prefill 85 Tokens/s, Decode 16
 Tokens/s bei 200 Tokens Prompt (zum Vergleich Qwen3-0.6B Q8_0: 759 und 70). Antwortet

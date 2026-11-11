@@ -210,6 +210,12 @@ never a build input.
   File:      vendor/models/qwen3-0.6b-q4_k_m.gguf (gitignored)
              ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a
 
+  Model:     Qwen/Qwen3-30B-A3B-GGUF, Qwen3-30B-A3B-Q4_K_M.gguf (Apache-2.0)
+  Revision:  e4d4bafdfb96a411a163846265362aceb0b9c63a
+  File:      vendor/models/qwen3-30b-a3b-q4_k_m.gguf (gitignored)
+             0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5
+             (no dataset: the tests compare the device against the fast CPU backend)
+
   Model:     openai/gpt-oss-20b (Apache-2.0) - https://huggingface.co/openai/gpt-oss-20b
   Revision:  6cee5e81ee83917806bbde320786a8fb61efebee
   Files (sha256), in vendor/models/gpt-oss-20b (gitignored):
