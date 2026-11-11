@@ -178,6 +178,16 @@ step.
 - `qwen35-0.8b` writes four prompts of the real model (`$LAI_QWEN35_DIR`, else the Hugging
   Face cache at the pinned revision; checked against the pinned hashes) in float32: ids,
   the last logits, the last row of every state, greedy with the cache.
+- `qwen38-27b` (D7g) runs only when named: the same prompts for `Qwen/Qwen3.8-27B`
+  (`$LAI_QWEN38_DIR`, by default `vendor/models/qwen3.8-27b`; nothing is downloaded, the
+  pinned hashes are checked). In float32 the model would need 110 GB, so the BF16 matrices
+  of every Linear and the embedding stay BF16 and go to float32 only inside their product
+  (exact); everything else is read again from the files in its stored type (Qwen3.5-0.8B
+  keeps `A_log` and the gated norm in F32, which a BF16 load would round) and taken to
+  float32. With `LAI_QWEN35_UPCAST=1` the target `qwen35-0.8b` takes the same path into
+  `qwen35-0.8b-upcast`, which must equal `qwen35-0.8b` bit for bit (checked 2026-11-11). It
+  is generated on the RTX computer (Windows x86_64, 96 GB, about 60 GB used, an hour on one
+  thread) in an environment with the pins of `requirements.txt`.
 
 ```bash
 python tools/infer-ref/make_reference_d7.py                 # all four

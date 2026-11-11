@@ -243,6 +243,14 @@ function GreedyDiff(const aMine: TIntegerDynArray; aRef: TInferRefSet;
 function RotaryMatches(aModel: TDecoderModel; aRef: TInferRefSet;
   const aName: RawUtf8; out aWhy: RawUtf8): boolean;
 
+/// the cases of a real model's reference (case0 .. case3) on aModel with a
+// Device set: the logits of the last position against the reference (cosine at
+// least aCos, no value off by more than aMaxAbs), greedy (a step may differ
+// only where the reference itself was less than 1 sure), the time of each
+// prompt and of each continuation on the console
+procedure CheckDeviceCases(aTest: TSynTestCase; aModel: TDecoderModel;
+  aRef: TInferRefSet; const aLabel: RawUtf8; aCos, aMaxAbs: double);
+
 /// aDoc.D[aName] := aValue - which FPC 3.2.4 on aarch64-darwin compiles to
 // store 0 (TDocVariantData.SetDoubleByName): through a variant instead
 procedure SetFloat(var aDoc: TDocVariantData; const aName: RawUtf8; aValue: double);
@@ -4436,6 +4444,66 @@ begin
     CheckUtf8((diff >= m) or (margin < 1),
       '% case % greedy leaves the reference at step % where it was % sure',
       [aLabel, k, diff, margin]);
+  end;
+end;
+
+procedure CheckDeviceCases(aTest: TSynTestCase; aModel: TDecoderModel;
+  aRef: TInferRefSet; const aLabel: RawUtf8; aCos, aMaxAbs: double);
+var
+  ctx: TDecoderContext;
+  ids, want: PIntegerArray;
+  margins: PSingleArray;
+  prompt, mine: TIntegerDynArray;
+  logits: TSingleDynArray;
+  cmp: TInferCompare;
+  k, n, m, diff: PtrInt;
+  margin: double;
+  timer: TPrecisionTimer;
+  took, went: RawUtf8;
+begin
+  SetLength(logits, aModel.Config.VocabSize);
+  for k := 0 to 3 do
+  begin
+    ids := aRef.I32(FormatUtf8('case%.ids', [k]), n);
+    SetLength(prompt, n);
+    MoveFast(ids^, prompt[0], n * SizeOf(integer));
+    ctx := aModel.NewContext;
+    try
+      timer.Start;
+      aModel.Forward(ctx, pointer(prompt), n, pointer(logits));
+      took := timer.Stop;
+    finally
+      ctx.Free;
+    end;
+    cmp := InferCompare(pointer(logits), aRef.F32(FormatUtf8('case%.logits_last',
+      [k]), m), aModel.Config.VocabSize, 1, 0);
+    want := aRef.I32(FormatUtf8('case%.greedy', [k]), m);
+    margins := aRef.F32(FormatUtf8('case%.greedy_margin', [k]), m);
+    ctx := aModel.NewContext;
+    try
+      timer.Start;
+      mine := aModel.Greedy(ctx, prompt, m, []);
+      went := timer.Stop;
+    finally
+      ctx.Free;
+    end;
+    diff := 0;
+    while (diff < m) and (diff < length(mine)) and (mine[diff] = want^[diff]) do
+      inc(diff);
+    margin := 0;
+    if diff < m then
+      margin := margins^[diff];
+    aTest.AddConsole(FormatString('% case %: prompt of % tokens in %, % tokens ' +
+      'with it in %; logits cos % maxabs %, greedy equal for % of % tokens ' +
+      '(reference margin there %)', [aLabel, k, n, took, length(mine), went,
+      cmp.Cosine, cmp.MaxAbs, diff, m, margin]));
+    aTest.CheckUtf8(cmp.NonFinite = 0, '% case % logits finite', [aLabel, k]);
+    aTest.CheckUtf8(cmp.Cosine >= aCos, '% case % logits cosine %',
+      [aLabel, k, cmp.Cosine]);
+    aTest.CheckUtf8(cmp.MaxAbs <= aMaxAbs, '% case % logits max error %',
+      [aLabel, k, cmp.MaxAbs]);
+    aTest.CheckUtf8((diff >= m) or (margin < 1), '% case % greedy leaves the ' +
+      'reference at step % where it was % sure', [aLabel, k, diff, margin]);
   end;
 end;
 

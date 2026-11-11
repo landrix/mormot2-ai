@@ -1,4 +1,4 @@
-/// tests for Qwen3.5 in the native inference engine (phase D, slices D7a, D7d, D7f)
+/// tests for Qwen3.5 in the native inference engine (phase D, slices D7a, D7d, D7f, D7g)
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - the Gated DeltaNet and the gated full attention against transformers:
@@ -12,6 +12,9 @@
 // - Qwen3.5-0.8B needs vendor/models/qwen3.5-0.8b (and for GGUF
 //   qwen3.5-0.8b-q8_0.gguf, qwen3.5-0.8b-q4_0.gguf) and a 64-bit process; it
 //   says SKIP otherwise, LAI_REQUIRE_MODEL=1 makes that a failure
+// - Qwen3.8-27B (D7g) needs vendor/models/qwen3.8-27b-q8_0.gguf and/or
+//   -q4_k_m.gguf (the RTX computer) and says SKIP without them, also under
+//   LAI_REQUIRE_MODEL; its reference is tests/data/infer-ref/qwen38-27b
 unit test.infer.qwen35;
 
 interface
@@ -83,6 +86,10 @@ type
     /// ggml-org/Qwen3.5-0.8B-GGUF (Q8_0, Q4_0) against transformers - skipped
     // without vendor/models/qwen3.5-0.8b-q8_0.gguf / -q4_0.gguf
     procedure Qwen35Gguf;
+    /// ggml-org/Qwen3.8-27B-GGUF (Q8_0, Q4_K_M) against transformers (D7g):
+    // 64 layers, 16 key heads read by 48 tiled value heads - only where the
+    // files were put (a large model of its own, not LAI_REQUIRE_MODEL)
+    procedure Qwen38Gguf;
   end;
 
 
@@ -1173,6 +1180,66 @@ begin
           CheckLastRows(model, ref, 'Qwen3.5-0.8B GGUF Q8_0', 0.997, 0.997, 1)
         else
           CheckLastRows(model, ref, 'Qwen3.5-0.8B GGUF Q4_0', 0.95, 0.97, 3.5, 3);
+      finally
+        model.Free;
+      end;
+    end;
+  finally
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferQwen35.Qwen38Gguf;
+const
+  FILES: array[0..1] of RawUtf8 = ('qwen3.8-27b-q8_0.gguf', 'qwen3.8-27b-q4_k_m.gguf');
+var
+  fn, refdir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  timer: TPrecisionTimer;
+  w: PtrInt;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3.8-27B GGUF: a 64-bit process');
+  exit;
+  {$endif CPU32}
+  refdir := FindInferRefDir('qwen38-27b');
+  if CheckFailed(refdir <> '', 'qwen38-27b reference found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  try
+    for w := 0 to high(FILES) do
+    begin
+      fn := FindVendorModel(Utf8ToString(FILES[w]));
+      if fn = '' then
+      begin
+        AddConsole(FormatString('SKIP Qwen3.8-27B GGUF: no vendor/models/% ' +
+          '(revision in UPSTREAM_BASE)', [FILES[w]]));
+        continue;
+      end;
+      timer.Start;
+      model := NewDecoderModelFromGguf(fn, fFast);
+      try
+        AddConsole(FormatString('% loaded in %', [FILES[w], timer.Stop]));
+        Check((model.Config.Layers = 64) and (model.Config.Spec[3].Mixer = dmAttention) and
+          (model.Config.Spec[62].Mixer = dmDeltaNet) and (model.Config.RopeDims = 64) and
+          (model.Config.HeadDim = 256) and (model.Config.Heads = 24) and
+          (model.Config.KvHeads = 4) and (model.Config.LinKeyHeads = 16) and
+          (model.Config.LinValueHeads = 48) and model.Config.LinTiled and
+          (model.LinGroup = 1) and not model.Config.TiedEmbeddings,
+          'the layers of Qwen3.8-27B');
+        // measured 2026-11-11 (FPC, x86_64, the RTX computer): Q8_0 states
+        // cosine >= 0.9983, logits >= 0.9987 and max 0.72 (the chat case 3;
+        // plain text 0.9999), greedy as the reference where it was sure;
+        // Q4_K_M plain text states >= 0.995, logits >= 0.997 and max 1.0, the
+        // chat case states 0.951, logits 0.967 and max 4.6 with every greedy
+        // token equal - CUDA and Vulkan with float activations land at 0.9695
+        // and 4.43 there too (TTestInferCuda.Qwen38OnDevice): the error of
+        // the Q4_K weights of the file, not of our arithmetic
+        if w = 0 then
+          CheckLastRows(model, ref, 'Qwen3.8-27B GGUF Q8_0', 0.997, 0.997, 1.5)
+        else
+          CheckLastRows(model, ref, 'Qwen3.8-27B GGUF Q4_K_M', 0.94, 0.96, 5.5);
       finally
         model.Free;
       end;

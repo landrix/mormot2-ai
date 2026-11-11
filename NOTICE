@@ -171,5 +171,11 @@ Qwen3.5  (Qwen team, Alibaba Cloud)  (MODEL INTERFACE, NOT CODE)
   reimplemented (read, not copied); tests/data/infer-ref/qwen35-tokens and
   qwen35-chat hold texts, token ids and conversations rendered by transformers
   with them.
+  Qwen3.8-27B (Qwen/Qwen3.8-27B, revision
+  37561816e66b5b9153b1b64c10968c18c1e6f4a0, the same architecture) is read the same
+  way from its GGUF files (ggml-org/Qwen3.8-27B-GGUF, revision
+  8ccda149192dec5f41450a402e66889e5fd25a24); tests/data/infer-ref/qwen38-27b holds
+  token ids, logits and states computed with it, no weights.
   License: Apache-2.0.
   https://huggingface.co/Qwen/Qwen3.5-0.8B
+  https://huggingface.co/Qwen/Qwen3.8-27B

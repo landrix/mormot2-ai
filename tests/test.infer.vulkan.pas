@@ -158,6 +158,10 @@ type
     // the GGUF through TNativeLlmClient - reasoning and the answer, a tool
     // call, the answer with its result
     procedure GptOss20bOnDevice;
+    /// D7g: Qwen3.8-27B from ggml-org/Qwen3.8-27B-GGUF (Q4_K_M, Q8_0) on the
+    // device against the transformers reference (the logits of the last
+    // position, greedy) - only where the files were put
+    procedure Qwen38OnDevice;
     /// D3c: route.comp against the host's choice (TDecoderModel.Route
     // written out, as in TTestInferCuda): random logits and ties, with and
     // without renorming
@@ -2736,6 +2740,74 @@ type
   TDeltaRuleTestPush = record
     Rows, Stride, KeyHeads, ValueHeads, KeyDim, ValueDim, Group: cardinal;
   end;
+
+procedure TTestInferVulkan.Qwen38OnDevice;
+const
+  FILES: array[0..1] of RawUtf8 = ('qwen3.8-27b-q4_k_m.gguf', 'qwen3.8-27b-q8_0.gguf');
+  // measured 2026-11-11 on the RTX 5090, CUDA and Vulkan alike: Q4_K_M plain
+  // text logits cosine >= 0.9975 and max 0.92, the chat case 0.9695 and 4.43
+  // (the CPU lands there too: the Q4_K weights of the file); Q8_0 plain text
+  // 0.99998 and 0.09, the chat case 0.9993 and 0.64; greedy as the reference
+  // where it was sure
+  COS: array[0..1] of double = (0.96, 0.998);
+  MAXABS: array[0..1] of double = (5.5, 1);
+var
+  fn, refdir: TFileName;
+  gpu: TInferVulkanBackend;
+  cpu: TInferCpuFastBackend;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  dev: TQwen3Vulkan;
+  timer: TPrecisionTimer;
+  f: PtrInt;
+begin
+  if not HasDevice then
+    exit;
+  {$ifdef CPU32}
+  AddConsole('SKIP Qwen3.8-27B on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  refdir := FindInferRefDir('qwen38-27b');
+  if CheckFailed(refdir <> '', 'qwen38-27b reference found') then
+    exit;
+  gpu := TInferVulkanBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  ref := TInferRefSet.CreateFromFolder(refdir);
+  model := nil;
+  dev := nil;
+  try
+    // a large model of its own: only where it was put (not LAI_REQUIRE_MODEL)
+    for f := 0 to high(FILES) do
+    begin
+      fn := FindVendorModel(Utf8ToString(FILES[f]));
+      if fn = '' then
+      begin
+        AddConsole(FormatString('SKIP Qwen3.8-27B on the device: no vendor/models/%',
+          [FILES[f]]));
+        continue;
+      end;
+      timer.Start;
+      model := NewDecoderModelFromGguf(fn, cpu);
+      dev := TQwen3Vulkan.Create(model, gpu);
+      AddConsole(FormatString('% loaded and on % in %', [FILES[f], fVk.DeviceName,
+        timer.Stop]));
+      model.Device := dev;
+      CheckDeviceCases(self, model, ref, FormatUtf8('Qwen3.8-27B % on the device',
+        [FILES[f]]), COS[f], MAXABS[f]);
+      model.Device := nil;
+      FreeAndNil(dev);
+      FreeAndNil(model);
+    end;
+  finally
+    if model <> nil then
+      model.Device := nil;
+    dev.Free;
+    model.Free;
+    ref.Free;
+    cpu.Free;
+    gpu.Free;
+  end;
+end;
 
 procedure TTestInferVulkan.DeltaRuleMatchesCpu;
 var

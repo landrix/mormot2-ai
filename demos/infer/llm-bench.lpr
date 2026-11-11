@@ -45,6 +45,8 @@ uses
   mormot.ai.infer.decoder,
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.gptoss, // registers gpt-oss (NewDecoderModel)
+  mormot.ai.infer.model.gemma4, // registers Gemma 4
+  mormot.ai.infer.model.qwen35, // registers Qwen3.5 and Qwen3.8
   mormot.ai.infer.vulkan,
   mormot.ai.infer.backend.vulkan,
   mormot.ai.infer.model.qwen3.vulkan,
@@ -85,7 +87,10 @@ type
     procedure GeluTanhGlu(gate, up: PSingleArray; aCount: PtrInt); override;
     procedure RunItems(const aJob: TOnInferItem; aCount: integer); override;
     procedure Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-      aCos, aSin: PSingleArray); override;
+      aCos, aSin: PSingleArray; aRotDim: PtrInt = 0); override;
+    procedure DeltaRule(qkv: PSingleArray; aRows, aStride, aKeyHeads,
+      aValueHeads, aKeyDim, aValueDim, aGroup: PtrInt; beta, decay, state,
+      y: PSingleArray); override;
     procedure Reset;
   end;
 
@@ -201,14 +206,22 @@ begin
 end;
 
 procedure TTimedBackend.Rope(x: PSingleArray; aRows, aHeads, aHeadDim: PtrInt;
-  aCos, aSin: PSingleArray);
+  aCos, aSin: PSingleArray; aRotDim: PtrInt);
 var
   t0, t1: Int64;
 begin
   QueryPerformanceMicroSeconds(t0);
-  fInner.Rope(x, aRows, aHeads, aHeadDim, aCos, aSin);
+  fInner.Rope(x, aRows, aHeads, aHeadDim, aCos, aSin, aRotDim);
   QueryPerformanceMicroSeconds(t1);
   inc(RopeUs, t1 - t0);
+end;
+
+procedure TTimedBackend.DeltaRule(qkv: PSingleArray; aRows, aStride, aKeyHeads,
+  aValueHeads, aKeyDim, aValueDim, aGroup: PtrInt; beta, decay, state,
+  y: PSingleArray);
+begin
+  fInner.DeltaRule(qkv, aRows, aStride, aKeyHeads, aValueHeads, aKeyDim,
+    aValueDim, aGroup, beta, decay, state, y);
 end;
 
 procedure TTimedBackend.Reset;

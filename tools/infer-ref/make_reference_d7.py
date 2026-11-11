@@ -31,6 +31,13 @@ Targets (all of them when called without arguments):
                         prompts (plain text and the chat template without thinking),
                         logits of the last position, the last row of every state, greedy
                         continuations with the cache
+  qwen38-27b            tests/data/infer-ref/qwen38-27b (D7g, only when named): the same
+                        prompts and states for Qwen/Qwen3.8-27B at the pinned revision
+                        (LAI_QWEN38_DIR, else vendor/models/qwen3.8-27b; nothing is
+                        downloaded). The BF16 matrices stay BF16 and go to float32 only
+                        inside their products (about 60 GB of RAM instead of 110); with
+                        LAI_QWEN35_UPCAST=1 qwen35-0.8b takes the same path into
+                        qwen35-0.8b-upcast, which must equal qwen35-0.8b bit for bit
 
 Same environment, format and rules as make_reference.py. Every tiny case is checked
 twice: two runs give the same bits, and the greedy continuation with the transformers
@@ -391,6 +398,49 @@ QWEN35_PROMPTS = [
 QWEN35_CHAT = [{"role": "user", "content": "What is 17 times 23? Answer briefly."}]
 QWEN35_GREEDY = 24
 
+QWEN38_ID = "Qwen/Qwen3.8-27B"
+QWEN38_REVISION = "37561816e66b5b9153b1b64c10968c18c1e6f4a0"
+QWEN38_SHA256 = {
+    "model-00001-of-00018.safetensors":
+        "ba0ce20aae489ad196733da5064bcdf159a1fe84f53336648196e1ebb7751b1c",
+    "model-00002-of-00018.safetensors":
+        "06a148c01bfbe3faa14a5f184a7ff29a706f7ae1c8b2705d2058e26d17a001fb",
+    "model-00003-of-00018.safetensors":
+        "2e1bf62cbcd406eaa64b60d10353e1f0ef4039d0976e56f05cabe953454f9968",
+    "model-00004-of-00018.safetensors":
+        "511e34063187882659753c4d93f3859f93c019fd438d8813071921c81d9a3f1a",
+    "model-00005-of-00018.safetensors":
+        "635cb53446dc74f219740fc59e18b774f877b803b9722e289ca62575a6efa701",
+    "model-00006-of-00018.safetensors":
+        "0bc5214fac607f0e6cc92eec3789d4b8559410ef9fce66621ba8158e8410dae0",
+    "model-00007-of-00018.safetensors":
+        "80b0c49033e9a0d5762562aa12f4acdb7f54da586f3d0110f28c48d91cf07892",
+    "model-00008-of-00018.safetensors":
+        "7192c5b66185d3592927daabee1cc19e6f6e0ce75988ee20e824b624765fda79",
+    "model-00009-of-00018.safetensors":
+        "af3c48cc37af44f3db6ae0579baf019180d48d9c527caa0a1f03ff85813a56d8",
+    "model-00010-of-00018.safetensors":
+        "163490a76f3bea3a40855b7efc04ce6d27afaf1a34f0bbde495b9491f76457c9",
+    "model-00011-of-00018.safetensors":
+        "5f3ae1b948aeee39da77aec558e8236cd65fe4d7cb7686a76bb007acc563c6d8",
+    "model-00012-of-00018.safetensors":
+        "a3de1c7114677a8f5ac5c4892c90e8238ea5c1e2038c80e757dfc87c3902ca55",
+    "model-00013-of-00018.safetensors":
+        "06ab79a41f74c9c5cb734816feb0c7fc364104b227165ee7391231e1155aa02a",
+    "model-00014-of-00018.safetensors":
+        "4138ed94603065ba884bbcadedb04d7718bb40117e85e6f5c6fc5b9c05b7a85b",
+    "model-00015-of-00018.safetensors":
+        "69224e27b9de4e7dbf6fc936c6eaae08447bda3b80a6c31a871ab451173afd22",
+    "model-00016-of-00018.safetensors":
+        "73cb9a1089fb6155cb648609478d6633be8a5c7d9ca5a05bc8925ce8a553cefe",
+    "model-00017-of-00018.safetensors":
+        "beb51f01056142ac4984bd800507b0dd0fd18de57f8e9ef6ea41d1a3598983a8",
+    "model-00018-of-00018.safetensors":
+        "1d3479509e21494658f9b64d317f5ea8e55c4025d28c702d6c4d0b356ce8ea06",
+    "tokenizer.json":
+        "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+}
+
 
 def qwen35_folder():
     folder = os.environ.get("LAI_QWEN35_DIR")
@@ -400,11 +450,68 @@ def qwen35_folder():
     return snapshot_download(QWEN35_ID, revision=QWEN35_REVISION)
 
 
-def qwen35_08b():
-    print("Qwen3.5-0.8B")
+def upcast_in_products(model, folder):
+    """keep the BF16 matrices of every Linear and the embedding, take each to float32
+    (exact) only inside its product; everything else (norms, convolution, A_log, dt
+    bias) read again from the files in its stored type (A_log and the gated norm can be
+    F32 there, which a BF16 load rounds) and taken to float32: the same arithmetic as a
+    float32 load, in half the RAM"""
+    import types
+    import torch.nn.functional as F
+    from safetensors import safe_open
+    big = set()
+
+    def linear(self, x):
+        b = None if self.bias is None else self.bias.float()
+        return F.linear(x, self.weight.float(), b)
+
+    def embedding(self, ids):
+        return F.embedding(ids, self.weight, self.padding_idx).float()
+
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.Linear):
+            mod.forward = types.MethodType(linear, mod)
+            big.add(id(mod.weight))
+        elif isinstance(mod, torch.nn.Embedding):
+            mod.forward = types.MethodType(embedding, mod)
+            big.add(id(mod.weight))
+    for p in model.parameters():
+        if id(p) not in big:
+            continue
+        if p.dtype != torch.bfloat16:
+            raise ValueError(f"a matrix in {p.dtype}")
+    index = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index):
+        with open(index, encoding="utf-8") as f:
+            where = json.load(f)["weight_map"]
+    else:
+        files = [n for n in os.listdir(folder) if n.endswith(".safetensors")]
+        if len(files) != 1:
+            raise ValueError(f"{folder}: no index and {len(files)} safetensors files")
+        with safe_open(os.path.join(folder, files[0]), "pt") as f:
+            where = {k: files[0] for k in f.keys()}
+    small = {}
+    for name, p in model.named_parameters():
+        if id(p) not in big:
+            small.setdefault(where[name], []).append((name, p))
+    with torch.no_grad():
+        for file, params in small.items():
+            with safe_open(os.path.join(folder, file), "pt") as f:
+                for name, p in params:
+                    t = f.get_tensor(name)
+                    if t.shape != p.shape:
+                        raise ValueError(f"{name}: {tuple(t.shape)} in the file")
+                    p.data = t.float()
+        for name, b in model.named_buffers():
+            if b.is_floating_point() and b.dtype != torch.float32:
+                raise ValueError(f"buffer {name} in {b.dtype}")
+
+
+def qwen35_real(dataset, model_id, revision, sha256, folder, upcast):
+    """ids, the last row of every state, the last logits and a greedy continuation of
+    QWEN35_PROMPTS for a published Qwen3.5-style checkpoint"""
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
-    folder = qwen35_folder()
-    for name, want in QWEN35_SHA256.items():
+    for name, want in sha256.items():
         got = mr.sha256_file(os.path.join(folder, name))
         if got != want:
             raise ValueError(f"{name}: sha256 {got}, pinned {want}")
@@ -412,8 +519,11 @@ def qwen35_08b():
         conf = json.load(f)
     tok = AutoTokenizer.from_pretrained(folder)
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        folder, dtype=torch.float32, attn_implementation="eager")
+        folder, dtype=torch.bfloat16 if upcast else torch.float32,
+        attn_implementation="eager")
     model.eval()
+    if upcast:
+        upcast_in_products(model, folder)
     eos = [tok.convert_tokens_to_ids("<|im_end|>"), conf["text_config"]["eos_token_id"]]
     blob = mr.Blob()
     entries = []
@@ -433,6 +543,8 @@ def qwen35_08b():
         def keep(name):
             def hook(_mod, _inp, out):
                 o = out[0] if isinstance(out, tuple) else out
+                if o.dtype != torch.float32:
+                    raise ValueError(f"{name}: {o.dtype}")
                 taken[name] = o[0, -1].detach().float().clone()
             return hook
 
@@ -447,6 +559,8 @@ def qwen35_08b():
         finally:
             for h in hooks:
                 h.remove()
+        if out.logits.dtype != torch.float32:
+            raise ValueError(f"logits: {out.logits.dtype}")
         logits = out.logits[0, -1].float().numpy()
         if k == 0:
             with torch.no_grad():
@@ -462,23 +576,40 @@ def qwen35_08b():
         blob.add(f"case{k}.greedy_margin", np.asarray(margins, dtype=np.float32))
         entries.append({"case": k, "kind": kind, "text": rendered, "tokens": len(ids),
                         "greedy_text": tok.decode(greedy), "min_margin": min(margins)})
+    how = ("BF16 weights kept, every matrix taken to float32 (exactly) inside its "
+           "product and everything else in float32 - the arithmetic of a float32 load"
+           if upcast else "BF16 weights upcast exactly")
     manifest = {
-        "dataset": "qwen35-0.8b",
-        "note": "Qwen/Qwen3.5-0.8B (Qwen3_5ForConditionalGeneration, text only), BF16 "
-                "weights upcast exactly, computed in float32, eager attention, one "
+        "dataset": dataset,
+        "note": f"{model_id} (Qwen3_5ForConditionalGeneration, text only), {how}, "
+                "computed in float32, eager attention, one "
                 "thread, the torch paths of the delta rule. Per case: ids (tokenizer.json "
                 "of the revision, no special tokens added; case 3 the chat template with "
                 "the generation prompt and enable_thinking false), logits_last, "
                 "last.embed / last.layerNN / last.norm: the row of the last position, "
                 "greedy up to 24 tokens with the cache (eos: <|im_end|> and "
                 "<|endoftext|>) and the top-2 margin per step",
-        "model": {"id": QWEN35_ID, "revision": QWEN35_REVISION, "sha256": QWEN35_SHA256},
+        "model": {"id": model_id, "revision": revision, "sha256": sha256},
         "eos": eos,
         "config": conf,
         "environment": mr.environment(),
         "cases": entries,
     }
-    blob.write(os.path.join(mr.OUT, "qwen35-0.8b"), manifest)
+    blob.write(os.path.join(mr.OUT, dataset), manifest)
+
+
+def qwen35_08b():
+    print("Qwen3.5-0.8B")
+    upcast = os.environ.get("LAI_QWEN35_UPCAST") == "1"  # only to check the 27B path
+    qwen35_real("qwen35-0.8b-upcast" if upcast else "qwen35-0.8b", QWEN35_ID,
+                QWEN35_REVISION, QWEN35_SHA256, qwen35_folder(), upcast)
+
+
+def qwen38_27b():
+    print("Qwen3.8-27B")
+    folder = os.environ.get("LAI_QWEN38_DIR",
+                            os.path.join(mr.ROOT, "vendor", "models", "qwen3.8-27b"))
+    qwen35_real("qwen38-27b", QWEN38_ID, QWEN38_REVISION, QWEN38_SHA256, folder, True)
 
 
 def reorder_v_heads(a, dim, num_k, per_k, head_dim):
@@ -713,10 +844,11 @@ def tiny_qwen35_gguf():
 
 
 TARGETS = {"tiny-qwen35": tiny_qwen35, "tiny-qwen35-text": tiny_qwen35_text,
-           "tiny-qwen35-gguf": tiny_qwen35_gguf, "qwen35-0.8b": qwen35_08b}
+           "tiny-qwen35-gguf": tiny_qwen35_gguf, "qwen35-0.8b": qwen35_08b,
+           "qwen38-27b": qwen38_27b}
 
 if __name__ == "__main__":
-    want = sys.argv[1:] or list(TARGETS)
+    want = sys.argv[1:] or [t for t in TARGETS if t != "qwen38-27b"]
     for t in want:
         if t not in TARGETS:
             raise SystemExit(f"unknown target {t}; known: {', '.join(TARGETS)}")

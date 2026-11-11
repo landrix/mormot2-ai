@@ -431,8 +431,16 @@ In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tok
   (`ggml-org/Qwen3.5-0.8B-GGUF`, Q8_0 und Q4_0) samt Tokenizer und Client; die gekachelte
   Reihenfolge der Value-Köpfe, in die der Konverter bei mehr Value- als Key-Köpfen umordnet,
   rechnen CPU, CUDA und Vulkan direkt (`DeltaRule` mit `aGroup`).
-- *Offen:* Qwen3.8-27B (volle Attention mit Kopfdimension 256; 16 Key- auf 48 Value-Köpfe,
-  aus GGUF also gekachelt).
+- *D7g erledigt 2026-11-11* (`native-inference.md`, Phase D): Qwen3.8-27B aus
+  `ggml-org/Qwen3.8-27B-GGUF` (Q8_0, Q4_K_M) auf CPU, CUDA und Vulkan gegen transformers
+  (Referenz auf dem RTX-Rechner, BF16-Matrizen erst im Produkt nach float32); Q8_0 Logits
+  >= 0,9987, Q4_K_M im Chat-Fall 0,967 (der Fehler der Q4_K-Gewichte, auf allen drei Wegen
+  gleich); auf der RTX 5090 Decode 31,5 (CUDA) bis 39,4 Tokens/s (Vulkan) in Q4_K_M.
+- *Offen:* D7h - das Chat-Template von Qwen3.8 (Thinking per Vorgabe an, Reasoning-Effort
+  xhigh/medium/low als Anweisung im System-Turn, `preserve_thinking`, `{% generation %}`),
+  gegen das Rendering von transformers wie D7c; dazu die Wahl des Templates (dieselbe
+  Modellklasse wie Qwen3.5, also nach dem Template der Datei) und der Client mit
+  Qwen3.8-27B auf dem Gerät.
 
 **D8 — Kolibri-1.** FP8 E4M3 mit 128×128-Skalen (oder eine geprüfte Umwandlung nach Q4_K/Q8_0
 beim Laden; ein GGUF von Dritten nur nach Prüfung gegen die Referenz), Sigmoid-Router mit Bias-Korrektur nur für die Auswahl,
@@ -971,3 +979,11 @@ rund 2 ms je Frame; flydev rechnet die Köpfe deshalb auf einem `TInferCpuFastBa
 *Vorschlag:* ein Stapel mit mehreren Köpfen auf dem Gerät (Vulkan und CUDA), `ForwardEmbeds`
 oder ein eigener Aufruf mit Kopf-Index, das Produkt im selben Durchlauf wie die Layer. Nach den
 Gemma-4-Scheiben (D6); nicht dringend (flydev). Rückmeldung im Issue, sobald es steht.
+
+## B19 — Q4_K auf CUDA langsamer als auf Vulkan (aufgenommen 2026-11-11)
+
+Anlass: D7g. Qwen3.8-27B Q4_K_M decodiert auf der RTX 5090 mit CUDA 31,5 Tokens/s, mit Vulkan
+39,4; Q8_0 auf CUDA 35,9 - obwohl Q8_0 fast die Hälfte mehr Bytes liest. Der Verdacht liegt auf
+dem Q4_K-Matvec-Kernel von CUDA (beim 0.8B-Modell in Q8_0 ist CUDA vorn). *Nächster Schritt:*
+messen, welcher Kernel die Zeit nimmt (`llm-bench` mit CUDA-Zeiten je Kernel), dann mit dem
+Vulkan-Shader vergleichen. Übernahme nur mit Messung; nicht dringend.

@@ -1818,6 +1818,58 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7g erledigt (2026-11-11): Qwen3.8-27B.** Das Modell (`Qwen/Qwen3.8-27B`, Revision
+`3756181…`, `model_type` `qwen3_5`) ist Qwen3.5 in groß: 64 Layer (16 × drei Gated DeltaNet
+und eine volle Attention), Hidden 5120, volle Attention mit 24 Köpfen der Breite 256 auf 4
+KV-Köpfe, DeltaNet mit 16 Key- auf 48 Value-Köpfe, ungebundener Kopf. Keine neue Rechnung:
+gelesen aus `ggml-org/Qwen3.8-27B-GGUF` (Revision `8ccda14…`, aus derselben
+Checkpoint-Revision konvertiert, `.src_sha`), dort sind die Value-Köpfe gekachelt (D7f). Nur
+auf dem RTX-Rechner (96 GB, RTX 5090).
+
+- *Die Dateien:* Q8_0 (28,6 GB, alles Q8_0 außer Norms und DeltaNet-Kleinteilen) und Q4_K_M
+  (19,4 GB: Q4_K nur in FFN und Embedding, sonst Q8_0); beide ohne MTP-Layer (die liegt dort
+  in einer eigenen Datei). `output_gate_type: "swish"` in `config.json` liest transformers
+  5.19 nicht (auch der aktuelle main-Zweig nicht): das Ausgangsgate der vollen Attention
+  bleibt sigmoid, die gegatete Norm der DeltaNet-Layer rechnet ohnehin mit silu (swish).
+- *Referenz:* `make_reference_d7.py qwen38-27b` auf dem RTX-Rechner (dieselben vier Prompts
+  wie `qwen35-0.8b`; der Chat-Fall mit `enable_thinking` false). In float32 geladen bräuchte
+  das Modell 110 GB; deshalb bleiben die BF16-Matrizen BF16 und werden erst in ihrem Produkt
+  nach float32 genommen (exakt), alles andere aus den Dateien in seinem gespeicherten Typ nach
+  float32 (der Checkpoint von 0.8B hält `A_log` und die gegatete Norm in F32, die ein
+  BF16-Laden runden würde - so beim ersten Versuch gefunden). Gegenprobe: Qwen3.5-0.8B auf
+  diesem Weg (`LAI_QWEN35_UPCAST=1`) gibt dieselben Bits wie der float32-Ladeweg. Eine Stunde
+  mit einem Thread, rund 60 GB RAM. Antworten der Referenz: „Paris.“, Code, „391“.
+- *Genauigkeit:* Q8_0 auf der CPU Zustände >= 0,9983, Logits >= 0,9987 (Text 0,9999),
+  größter Fehler 0,72; auf CUDA und Vulkan (Float-Aktivierungen) Text 0,99998, Chat 0,9993.
+  Q4_K_M im Text >= 0,997, im Chat-Fall 0,967 auf der CPU und 0,9695 auf beiden Geräten
+  (größter Fehler 4,4 bis 4,6), Greedy dort trotzdem gleich: der Fehler der Q4_K-Gewichte -
+  drei Rechenwege mit verschiedenen Aktivierungen landen auf demselben Wert.
+- *Tempo (RTX 5090, 200 Tokens Prompt, 32 neue, `llm-bench`):* Q4_K_M auf CUDA Prefill 530
+  Tokens/s, Decode 31,5 Tokens/s, auf Vulkan 560 und 39,4 (18,7 GB); Q8_0 auf CUDA 552 und
+  35,9 (27,5 GB, passt auf die 32-GB-Karte). Dass Q8_0 auf CUDA schneller decodiert als
+  Q4_K_M und Vulkan schneller als CUDA, zeigt auf den Q4_K-Kernel von CUDA (Backlog). Auf der
+  CPU (22 Threads) rund 0,65 s je Token in Q8_0, 0,5 s in Q4_K_M.
+- *Tests:* `TTestInferQwen35.Qwen38Gguf` (CPU, beide Dateien: Form des Modells, jeder Zustand
+  der letzten Zeile, Logits, Greedy), `Qwen38OnDevice` in `TTestInferCuda` und
+  `TTestInferVulkan` (beide Dateien auf dem Gerät: Logits der letzten Zeile, Greedy; der
+  gemeinsame Teil `CheckDeviceCases` in `test.infer.qwen3`). Wie beim 30B-Modell nur dort,
+  wo die Dateien liegen, nicht unter `LAI_REQUIRE_MODEL`; die Referenz (`qwen38-27b`, 9 MiB)
+  liegt im Repo.
+- *Chat:* Das Template von Qwen3.8 ist ein anderes als das von Qwen3.5 (Thinking per Vorgabe
+  an, Reasoning-Effort xhigh/medium/low als Anweisung im System-Turn, `preserve_thinking`);
+  `TNativeLlmClient` nähme bis dahin das Qwen3.5-Template. Eigene Scheibe D7h.
+- *Nebenbei:* `demos/infer/llm-bench` baute seit D7a nicht mehr (`Rope` ohne `aRotDim`, kein
+  `DeltaRule` im Zeitmess-Backend) und kannte Qwen3.5 und Gemma 4 nicht.
+- *Gegenprobe:* `LinGroup` ohne die gekachelte Reihenfolge - auf der CPU ab Layer 0 daneben
+  (535 Fehler), auf CUDA und Vulkan Logits-Kosinus 0,78.
+- *Review:* Claude-Finder und Codex ohne Befund. Hinweise des Finders bewusst gelassen: die
+  Referenz wird vor den Dateien gesucht (sie liegt im Repo, wie bei den anderen echten
+  Modellen), Greedy ohne Stop-Ids (wie `CheckLastRows`; verglichen werden nur die Tokens der
+  Referenz), `output_gate_type` (oben).
+- *Läufe:* RTX-Rechner FPC und Delphi 13 je 10490 Assertions (mit Qwen3.8-27B auf CPU,
+  CUDA und Vulkan), Delphi 7 5595 (32 Bit: das 27B-Modell übersprungen); WSL Infer 7237 und
+  LLM 741 (Lavapipe); Mac M2 Infer 7303 und LLM 730 (MoltenVK).
+
 **D7f erledigt (2026-11-11): Qwen3.5 aus GGUF.** `TQwen35Model.CreateFromGguf` liest die
 Architektur `qwen35`, wie der Konverter von llama.cpp sie schreibt (nachgeschlagen in
 `conversion/qwen.py` und `src/models/qwen35.cpp`, Commit `956591f…`, kein Code übernommen);
