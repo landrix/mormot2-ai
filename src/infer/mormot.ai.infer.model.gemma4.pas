@@ -32,10 +32,19 @@
 //   gemma-4-12B (Gemma4UnifiedForConditionalGeneration, model_type
 //   gemma4_unified, modeling_gemma4_unified.py): the layout of gemma4, its text
 //   model a dense Gemma 4
+// - or a llama.cpp GGUF file of the gemma4 architecture (CreateFromGguf), as
+//   convert_hf_to_gguf.py writes it (looked up in conversion/gemma.py -
+//   Gemma4Model -, src/llama-arch.cpp and src/models/gemma4.cpp of the
+//   llama.cpp commit 2a4daf0e08d6a9b6993ee0d4a9a3cfc35a6f405c, no code taken):
+//   the norms as they are (no 1 + weight), the router and the scales
+//   (ffn_gate_inp.scale, ffn_down_exps.scale) as they are, gate and up of the
+//   experts in one tensor (the gate rows first), K=V where a full layer has no
+//   attn_v, the proportional RoPE as the factors of rope_freqs (1 for a
+//   rotating pair, 1e30 for the others)
 // - the family of mormot.ai.infer.decoder: this unit reads config.json and
 //   maps the tensors; the forward pass is TDecoderModel's
 // - not yet (backlog D6): per-layer embeddings and shared KV layers (E2B,
-//   E4B), GGUF, the tokenizer and chat template, a device (Vulkan, CUDA)
+//   E4B), a device (Vulkan, CUDA)
 unit mormot.ai.infer.model.gemma4;
 
 {
@@ -65,6 +74,7 @@ uses
   mormot.core.variants,
   mormot.ai.infer.tensor,
   mormot.ai.infer.backend,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.decoder;
 
 type
@@ -83,12 +93,20 @@ type
   // double-wide MLP (use_double_wide_mlp), another activation than
   // gelu_pytorch_tanh, another rope_type
   // - the router stays F32 when the matrices are quantized at load
+  // - CreateFromGguf: a gemma4 file of llama.cpp's converter (gemma-4-26B-A4B,
+  // 31B and 12B, whose GGUF all name the architecture gemma4), the types the
+  // file holds (block types in place, BF16 / F16 widened); refused as from a
+  // folder, and a feed-forward width per layer, a rope scaling, an output.weight
   TGemma4Model = class(TDecoderModel)
   protected
     procedure LoadConfig(const aConfigFile: TFileName); override;
     procedure LoadGgufConfig; override;
     procedure LoadWeights; override;
     function GgufName(const aName: RawUtf8): RawUtf8; override;
+    /// a positive integer of the GGUF metadata
+    function GgufCount(const aKey: RawUtf8): PtrInt;
+    /// a positive integer of layer aLayer: an array per layer, or one value
+    function GgufPerLayer(const aKey: RawUtf8; aLayer: PtrInt): PtrInt;
     /// the settings of the text model (aDoc: its object)
     procedure LoadTextConfig(const aDoc: TDocVariantData; const aSource: TFileName);
     /// the rotary sets of rope_parameters
@@ -107,7 +125,7 @@ type
   public
     /// 'gemma4'
     class function ModelType: RawUtf8; override;
-    /// 'gemma4', as llama.cpp names it (GGUF: backlog D6)
+    /// 'gemma4', as llama.cpp names it
     class function Architecture: RawUtf8; override;
   end;
 
@@ -446,21 +464,259 @@ begin
   LoadTextConfig(d^, aConfigFile);
 end;
 
-procedure TGemma4Model.LoadGgufConfig;
+function TGemma4Model.GgufCount(const aKey: RawUtf8): PtrInt;
+var
+  v: Int64;
 begin
-  EInferError.RaiseUtf8('%: GGUF not supported yet', [self]);
+  v := fGguf.Int(aKey);
+  if (v <= 0) or (v > 1 shl 30) then
+    EInferError.RaiseUtf8('%: % = % out of range', [self, aKey, v]);
+  result := v;
 end;
 
+function TGemma4Model.GgufPerLayer(const aKey: RawUtf8; aLayer: PtrInt): PtrInt;
+var
+  v: PGgufValue;
+  x: Int64;
+begin
+  // a number for every layer, or one for all of them
+  v := fGguf.Find(aKey);
+  if (v = nil) or (v^.VType <> gtArray) then
+  begin
+    result := GgufCount(aKey);
+    exit;
+  end;
+  if v^.Count <> fConfig.Layers then
+    EInferError.RaiseUtf8('%: % has % values for % layers',
+      [self, aKey, v^.Count, fConfig.Layers]);
+  case v^.ElemType of
+    gtInt32:
+      x := PIntegerArray(v^.Data)^[aLayer];
+    gtUInt32:
+      x := PCardinalArray(v^.Data)^[aLayer];
+  else
+    begin
+      EInferError.RaiseUtf8('%: % is an array of %, expected integers',
+        [self, aKey, GGUF_TYPE_NAME[v^.ElemType]]);
+      x := 0;
+    end;
+  end;
+  if (x <= 0) or (x > 1 shl 30) then
+    EInferError.RaiseUtf8('%: %[%] = % out of range', [self, aKey, aLayer, x]);
+  result := x;
+end;
+
+procedure TGemma4Model.LoadGgufConfig;
+var
+  a: RawUtf8;
+  emb, freqs: PInferTensor;
+  pattern: PGgufValue;
+  full, window, i, r: PtrInt;
+  f: PSingleArray;
+begin
+  if fGguf.Str('general.architecture') <> Architecture then
+    EInferError.RaiseUtf8('%: architecture "%" is not %',
+      [self, fGguf.Str('general.architecture'), Architecture]);
+  a := Architecture + '.';
+  if not fBackend.Supports(ioGeluTanhGlu, idtF32) then
+    EInferError.RaiseUtf8('%: the backend has no GeluTanhGlu', [self]);
+  // what this family does not compute (yet): per-layer embeddings and shared
+  // KV layers (E2B, E4B), the double-wide MLP (a width per layer), a scaled
+  // RoPE, an untied head, prediction layers after the model
+  if fGguf.Has(a + 'embedding_length_per_layer_input') and
+     (fGguf.Int(a + 'embedding_length_per_layer_input') <> 0) then
+    EInferError.RaiseUtf8('%: per-layer embeddings not supported', [self]);
+  if fGguf.Has(a + 'attention.shared_kv_layers') and
+     (fGguf.Int(a + 'attention.shared_kv_layers') <> 0) then
+    EInferError.RaiseUtf8('%: shared KV layers not supported', [self]);
+  if fGguf.Has(a + 'nextn_predict_layers') and
+     (fGguf.Int(a + 'nextn_predict_layers') <> 0) then
+    EInferError.RaiseUtf8('%: prediction layers not supported', [self]);
+  if fGguf.Has(a + 'rope.scaling.type') and
+     (fGguf.Str(a + 'rope.scaling.type') <> 'none') then
+    EInferError.RaiseUtf8('%: rope scaling "%" not supported',
+      [self, fGguf.Str(a + 'rope.scaling.type')]);
+  if (fGguf.Find(a + 'feed_forward_length') <> nil) and
+     (fGguf.Find(a + 'feed_forward_length')^.VType = gtArray) then
+    EInferError.RaiseUtf8('%: a feed-forward width per layer (the double-wide ' +
+      'MLP) not supported', [self]);
+  if fGguf.FindTensor('output.weight') <> nil then
+    EInferError.RaiseUtf8('%: an untied head not supported', [self]);
+  emb := fGguf.Tensor('token_embd.weight');
+  if length(emb^.Shape) <> 2 then
+    EInferError.RaiseUtf8('%: token_embd.weight is shaped %',
+      [self, InferShapeText(emb^.Shape)]);
+  if (emb^.Shape[0] <= 0) or (emb^.Shape[0] > 1 shl 22) then
+    EInferError.RaiseUtf8('%: a vocabulary of % tokens', [self, emb^.Shape[0]]);
+  fConfig.VocabSize := emb^.Shape[0];
+  fConfig.Hidden := GgufCount(a + 'embedding_length');
+  fConfig.Layers := GgufCount(a + 'block_count');
+  if fConfig.Layers > 1024 then
+    EInferError.RaiseUtf8('%: % layers', [self, fConfig.Layers]);
+  fConfig.Heads := GgufCount(a + 'attention.head_count');
+  fConfig.Intermediate := GgufCount(a + 'feed_forward_length');
+  fConfig.MaxPositions := GgufCount(a + 'context_length');
+  fConfig.RmsEps := fGguf.Float(a + 'attention.layer_norm_rms_epsilon');
+  // the heads: key_length_swa for the sliding layers, key_length for the
+  // full ones; values of the same widths
+  fConfig.HeadDim := GgufCount(a + 'attention.key_length_swa');
+  full := GgufCount(a + 'attention.key_length');
+  if (GgufCount(a + 'attention.value_length_swa') <> fConfig.HeadDim) or
+     (GgufCount(a + 'attention.value_length') <> full) then
+    EInferError.RaiseUtf8('%: key and value heads of different sizes', [self]);
+  // the sliding layers rotate their whole head; the full ones too, by
+  // rope_freqs only the first pairs (the proportional RoPE, see below)
+  if (GgufCount(a + 'rope.dimension_count_swa') <> fConfig.HeadDim) or
+     (GgufCount(a + 'rope.dimension_count') <> full) then
+    EInferError.RaiseUtf8('%: rotating % and % values of heads of % and %',
+      [self, fGguf.Int(a + 'rope.dimension_count_swa'),
+       fGguf.Int(a + 'rope.dimension_count'), fConfig.HeadDim, full]);
+  fConfig.RopeTheta := fGguf.Float(a + 'rope.freq_base_swa');
+  fConfig.Rope2Theta := fGguf.Float(a + 'rope.freq_base');
+  // rope_freqs: a factor per pair of the full head, 1 for the rotating pairs,
+  // 1e30 for the others (the angle divided by it: none) - as the converter
+  // writes the proportional RoPE of transformers (generate_extra_tensors)
+  freqs := fGguf.Tensor('rope_freqs.weight');
+  if (freqs^.DType <> idtF32) or not InferShapeIs(freqs^, [full shr 1]) then
+    EInferError.RaiseUtf8('%: rope_freqs.weight is % %, expected F32 [%]',
+      [self, INFER_DTYPE_NAME[freqs^.DType], InferShapeText(freqs^.Shape), full shr 1]);
+  f := freqs^.Data;
+  r := 0;
+  while (r < full shr 1) and (f^[r] = 1) do
+    inc(r);
+  for i := r to (full shr 1) - 1 do
+    if not (f^[i] >= 1e30) then
+      EInferError.RaiseUtf8('%: rope_freqs.weight[%] = % is neither 1 before ' +
+        'the others nor 1e30 after them', [self, i, f^[i]]);
+  if r = 0 then
+    EInferError.RaiseUtf8('%: rope_freqs.weight rotates no pair', [self]);
+  // the share of the head whose Trunc(share * head) shr 1 (CheckConfig) is r
+  // under any rounding: 2r + 1 values, not 2r (2r / 44 * 44 may give
+  // 29.999..., one pair less); the whole head when every pair rotates
+  if 2 * r = full then
+    fConfig.Rope2Partial := 1
+  else
+    fConfig.Rope2Partial := (2 * r + 1) / full;
+  if Trunc(fConfig.Rope2Partial * full) shr 1 <> r then
+    EInferError.RaiseUtf8('%: % rotating pairs of a head of % not representable',
+      [self, r, full]);
+  fConfig.TiedEmbeddings := true;
+  fConfig.Activation := daGeluTanh;
+  fConfig.AttentionScale := 1;
+  fConfig.SandwichNorm := true;
+  fConfig.ValueNorm := true;
+  if fGguf.Has(a + 'final_logit_softcapping') then
+    fConfig.LogitSoftcap := fGguf.Float(a + 'final_logit_softcapping');
+  fConfig.EmbedScale := Sqrt(fConfig.Hidden);
+  if fGguf.Has(a + 'expert_count') and (fGguf.Int(a + 'expert_count') <> 0) then
+  begin
+    fConfig.Experts := GgufCount(a + 'expert_count');
+    fConfig.ExpertsUsed := GgufCount(a + 'expert_used_count');
+    fConfig.ExpertIntermediate := GgufCount(a + 'expert_feed_forward_length');
+    fConfig.NormTopK := true;
+  end;
+  // the kind of every layer: sliding_window_pattern (true = sliding)
+  pattern := fGguf.Find(a + 'attention.sliding_window_pattern');
+  if (pattern = nil) or (pattern^.VType <> gtArray) or
+     (pattern^.ElemType <> gtBool) or (pattern^.Count <> fConfig.Layers) then
+    EInferError.RaiseUtf8('%: attention.sliding_window_pattern is no array of % ' +
+      'booleans', [self, fConfig.Layers]);
+  window := GgufCount(a + 'attention.sliding_window');
+  SetLength(fConfig.Spec, fConfig.Layers);
+  fConfig.KvHeads := 0;
+  for i := 0 to fConfig.Layers - 1 do
+  begin
+    if fConfig.Experts > 0 then
+      fConfig.Spec[i].Ffn := dfDenseMoe;
+    if PByteArray(pattern^.Data)^[i] <> 0 then
+    begin
+      fConfig.Spec[i].Window := window;
+      // the KV heads of the config: those of the first sliding layer
+      if fConfig.KvHeads = 0 then
+        fConfig.KvHeads := GgufPerLayer(a + 'attention.head_count_kv', i);
+      fConfig.Spec[i].KvHeads := GgufPerLayer(a + 'attention.head_count_kv', i);
+    end
+    else
+    begin
+      fConfig.Spec[i].HeadDim := full;
+      fConfig.Spec[i].KvHeads := GgufPerLayer(a + 'attention.head_count_kv', i);
+      fConfig.Spec[i].Rope2 := true;
+      // attention_k_eq_v: the converter writes no attn_v (V is the K
+      // projection); a sliding layer always has its own
+      fConfig.Spec[i].KIsV :=
+        fGguf.FindTensor(FormatUtf8('blk.%.attn_v.weight', [i])) = nil;
+    end;
+  end;
+  if fConfig.KvHeads = 0 then
+    EInferError.RaiseUtf8('%: no sliding layer', [self]);
+  CheckConfig(fGguf.FileName);
+end;
+
+const
+  /// Hugging Face names and llama.cpp's for the tensors of one layer
+  LAYER_NAMES: array[0..21, 0..1] of RawUtf8 = (
+    ('input_layernorm.weight', 'attn_norm.weight'),
+    ('post_attention_layernorm.weight', 'post_attention_norm.weight'),
+    ('pre_feedforward_layernorm.weight', 'ffn_norm.weight'),
+    ('post_feedforward_layernorm.weight', 'post_ffw_norm.weight'),
+    ('post_feedforward_layernorm_1.weight', 'post_ffw_norm_1.weight'),
+    ('pre_feedforward_layernorm_2.weight', 'pre_ffw_norm_2.weight'),
+    ('post_feedforward_layernorm_2.weight', 'post_ffw_norm_2.weight'),
+    ('layer_scalar', 'layer_output_scale.weight'),
+    ('self_attn.q_proj.weight', 'attn_q.weight'),
+    ('self_attn.k_proj.weight', 'attn_k.weight'),
+    ('self_attn.v_proj.weight', 'attn_v.weight'),
+    ('self_attn.o_proj.weight', 'attn_output.weight'),
+    ('self_attn.q_norm.weight', 'attn_q_norm.weight'),
+    ('self_attn.k_norm.weight', 'attn_k_norm.weight'),
+    ('mlp.gate_proj.weight', 'ffn_gate.weight'),
+    ('mlp.up_proj.weight', 'ffn_up.weight'),
+    ('mlp.down_proj.weight', 'ffn_down.weight'),
+    ('router.proj.weight', 'ffn_gate_inp.weight'),
+    ('router.scale', 'ffn_gate_inp.scale'),
+    ('router.per_expert_scale', 'ffn_down_exps.scale'),
+    ('experts.gate_up_proj', 'ffn_gate_up_exps.weight'),
+    ('experts.down_proj', 'ffn_down_exps.weight'));
+
 function TGemma4Model.GgufName(const aName: RawUtf8): RawUtf8;
+var
+  p, i: PtrInt;
+  layer, rest: RawUtf8;
 begin
   result := '';
+  if aName = 'model.embed_tokens.weight' then
+    result := 'token_embd.weight'
+  else if aName = 'model.norm.weight' then
+    result := 'output_norm.weight'
+  else if IdemPChar(pointer(aName), 'MODEL.LAYERS.') then
+  begin
+    rest := copy(aName, 14, maxInt);
+    p := PosEx('.', rest);
+    if p <= 1 then
+      exit;
+    layer := copy(rest, 1, p - 1);
+    rest := copy(rest, p + 1, maxInt);
+    for i := 0 to high(LAYER_NAMES) do
+      if rest = LAYER_NAMES[i, 0] then
+      begin
+        result := 'blk.' + layer + '.' + LAYER_NAMES[i, 1];
+        exit;
+      end;
+  end;
 end;
 
 function TGemma4Model.Slice(aTensor: PInferTensor; aWide: PSingleArray;
   aFirst, aRows, aCols: Int64; const aName: RawUtf8): TInferWeight;
+var
+  t: TInferDType;
 begin
-  if fWeights = idtF32 then
+  t := aTensor^.DType;
+  if aWide <> nil then
     result := InferWeight(@aWide^[aFirst * aCols], idtF32)
+  else if t in INFER_BLOCK_DTYPES then
+    // a GGUF file: whole rows of blocks in place (a row holds whole blocks)
+    result := InferWeight(@PByteArray(aTensor^.Data)^[
+      (aFirst * aCols div INFER_DTYPE_BLOCK[t]) * INFER_DTYPE_SIZE[t]], t)
   else
     // the source rows: BF16 or F32, one value per element
     result := QuantizedRows(
@@ -474,6 +730,7 @@ var
   h, fi, n, e: PtrInt;
   gu, down: PInferTensor;
   wgu, wdown: PSingleArray;
+  tgu, tdown: TInferDType;
   b: RawUtf8;
 begin
   l := @fLayer[aLayer];
@@ -481,12 +738,40 @@ begin
   fi := fConfig.ExpertIntermediate;
   n := fConfig.Experts;
   b := aPrefix + 'experts.';
-  gu := Checked(b + 'gate_up_proj', [n, 2 * fi, h]);
-  down := Checked(b + 'down_proj', [n, h, fi]);
-  // F32: the tensors once in F32, every expert a view into them
+  // a GGUF file: [experts, 2 * width, hidden] and [experts, hidden, width] as
+  // in the folder (ffn_gate_up_exps, ffn_down_exps), blocks or floats
+  gu := Checked(b + 'gate_up_proj', [n, 2 * fi, h], fGguf <> nil);
+  down := Checked(b + 'down_proj', [n, h, fi], fGguf <> nil);
+  // F32: the tensors once in F32, every expert a view into them; a GGUF file
+  // keeps its blocks in place and widens its floats
   wgu := nil;
   wdown := nil;
-  if fWeights = idtF32 then
+  if fGguf <> nil then
+  begin
+    tgu := idtF32;
+    tdown := idtF32;
+    if gu^.DType in INFER_BLOCK_DTYPES then
+    begin
+      CheckBlockScales(gu, b + 'gate_up_proj');
+      tgu := gu^.DType;
+    end
+    else
+      wgu := Weight(b + 'gate_up_proj', [n, 2 * fi, h]);
+    if down^.DType in INFER_BLOCK_DTYPES then
+    begin
+      CheckBlockScales(down, b + 'down_proj');
+      tdown := down^.DType;
+    end
+    else
+      wdown := Weight(b + 'down_proj', [n, h, fi]);
+    // the types computed: the blocks as they are, the floats widened
+    if not fBackend.Supports(ioLinear, tgu) or
+       not fBackend.Supports(ioLinear, tdown) then
+      EInferError.RaiseUtf8('%: the backend has no Linear for the experts of ' +
+        'layer % (% and %)', [self, aLayer, INFER_DTYPE_NAME[tgu],
+        INFER_DTYPE_NAME[tdown]]);
+  end
+  else if fWeights = idtF32 then
   begin
     wgu := Weight(b + 'gate_up_proj', [n, 2 * fi, h]);
     wdown := Weight(b + 'down_proj', [n, h, fi]);
@@ -520,8 +805,12 @@ begin
   if headType = idtQ4_0 then
     headType := idtQ8_0;
   h := fConfig.Hidden;
-  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h]);
-  if fWeights = idtF32 then
+  fEmbedSrc := Checked('model.embed_tokens.weight', [fConfig.VocabSize, h],
+    fGguf <> nil);
+  // read per token: its scales checked here
+  if fEmbedSrc^.DType in INFER_BLOCK_DTYPES then
+    CheckBlockScales(fEmbedSrc, 'model.embed_tokens.weight');
+  if (fGguf = nil) and (fWeights = idtF32) then
   begin
     fEmbed := InferWeight(Weight('model.embed_tokens.weight', [fConfig.VocabSize, h]),
       idtF32);
@@ -579,8 +868,16 @@ begin
       inc(used, 8);
     end;
   end;
-  // an unknown tensor of the text model means one we do not understand
-  if used <> TensorCountOf(fStackPrefix) then
+  // an unknown tensor of the text model means one we do not understand (in
+  // a GGUF file: rope_freqs too, read with the settings)
+  if fGguf <> nil then
+  begin
+    inc(used);
+    if used <> length(fGguf.Tensors) then
+      EInferError.RaiseUtf8('%: % tensors in %, % understood',
+        [self, length(fGguf.Tensors), fGguf.FileName, used]);
+  end
+  else if used <> TensorCountOf(fStackPrefix) then
     EInferError.RaiseUtf8('%: % tensors under %, % understood',
       [self, TensorCountOf(fStackPrefix), fStackPrefix, used]);
 end;

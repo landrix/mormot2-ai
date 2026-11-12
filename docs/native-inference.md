@@ -1818,6 +1818,103 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D6d erledigt (2026-11-12): Gemma 4 aus GGUF.** `TGemma4Model.CreateFromGguf` liest die
+Architektur `gemma4`, wie der Konverter von llama.cpp sie schreibt (nachgeschlagen in
+`conversion/gemma.py`, `src/models/gemma4.cpp` und `src/llama-vocab.cpp`, Commit `2a4daf0…`,
+kein Code übernommen); geprüft mit Tiny-GGUFs und mit den Dateien von ggml-org:
+`gemma-4-26B-A4B-it-GGUF`, `gemma-4-31B-it-GGUF` (aus denselben Revisionen wie in D6b) und
+`gemma-4-12B-it-GGUF` (aus `43c9d01`: die Gewichte von `707f0a3`, ein korrigiertes
+`tokenizer.json`). Das 12B-GGUF hat dieselbe Architektur wie die anderen und lädt als
+`TGemma4Model`.
+
+- *Was die Datei trägt:* die Kopfbreiten als `key_length` (volle Layer) und
+  `key_length_swa`, die KV-Köpfe als Zahl oder als Feld je Layer (wenn die vollen Layer
+  eigene haben), die Layerarten als `sliding_window_pattern`, die Experten mit
+  `expert_feed_forward_length`. Die Norms stehen, anders als bei Qwen3.5, so in der Datei,
+  wie das Modell mit ihnen multipliziert (Gemma 4 rechnet nicht mit `1 + weight`). Der
+  Router heißt `ffn_gate_inp` (seine Skala `ffn_gate_inp.scale`), `per_expert_scale` heißt
+  `ffn_down_exps.scale`, der Layer-Skalar `layer_output_scale.weight`; Gate und Up der
+  Experten liegen in einem Tensor, die Gate-Zeilen vorn. K=V erkennt der Lader wie llama.cpp
+  daran, dass ein voller Layer kein `attn_v` hat.
+- *Die proportionale RoPE:* Die Datei schreibt die volle Kopfbreite als
+  `rope.dimension_count` und dazu `rope_freqs` - je Paar des vollen Kopfes ein Faktor, 1 für
+  die drehenden, 1e30 für die übrigen (der Winkel geteilt durch 1e30: keiner). Der Lader
+  zählt die Einsen (r) und verlangt danach nur noch 1e30. Aus r wird der Anteil
+  `Rope2Partial` so, dass `Trunc(Anteil * Kopf) shr 1` unter jeder Rundung r gibt
+  ((2r + 1) / Kopf; Codex-Review: 2r / Kopf gäbe bei einem Kopf von 44 und 15 Paaren
+  29,999… und damit 14; `rope44.gguf` hält es fest).
+- *Abgelehnt:* eine andere Architektur, Einbettungen je Layer und geteilte KV-Layer (E2B,
+  E4B), eine Feed-Forward-Breite je Layer (das doppelt breite MLP), eine RoPE-Skalierung,
+  eine andere Drehbreite der gleitenden Layer als ihr ganzer Kopf, ein
+  `sliding_window_pattern` anderer Länge, `rope_freqs` mit einem drehenden Paar hinter einem
+  ruhenden, ein `output.weight` (ein ungebundener Kopf), ein fehlender oder ein unbekannter
+  Tensor, ein gleitender Layer ohne `attn_v`.
+- *Tokenizer* (`TSpBpeTokenizer.CreateFromGguf`, `tokenizer.ggml.model` = `gemma4`): alle
+  Tokens als Vokabular, die Steuer- (3) und nutzerdefinierten Tokens (4) - genau die 24
+  `added_tokens` - als Added Tokens, die Byte-Tokens (6) als `<0xHH>` geprüft, die Merges als
+  „a b“; ein Byte-Token, das nicht genau `<0xHH>` ist (die Form, die der Decoder als Byte
+  liest), wird abgelehnt (Codex-Review). Beim 26B und 31B sind Tokens und Merges gleich denen aus `tokenizer.json`; das 12B
+  trägt das korrigierte `tokenizer.json` von `43c9d01` (die „Glitch-Tokens“: 239 Merges
+  weniger, sonst gleich). llama.cpp selbst kodiert anders - es schneidet den Text vor dem BPE
+  an Zeilenumbrüchen und erkennt die nutzerdefinierten Tokens auch im Text; wir bleiben bei
+  der Pipeline von transformers. Alle 3197 Fälle von `gemma4-tokens` sind mit allen drei
+  Dateien gleich (keiner ändert sich durch die fehlenden Merges); `gemma4-tokens/12b` prüft
+  je einen Text aus jedem fehlenden Merge (232 der 239 geben dort andere Ids als die alte
+  Datei). `tokenizer.gguf` (`make_reference_d6d.py gemma4-tokenizer-gguf`, gitignored, 16 MB)
+  trägt die Metadaten der 26B-Datei ohne ihre Tensoren - so läuft der Tokenizer aus GGUF auch
+  auf Rechnern ohne die 27 GB.
+- *Was Q8_0 aus der Datei ist:* `llama-quantize` aus der BF16-Konvertierung. Jedes Gewicht
+  aller drei Dateien - Matrizen und Experten in Q8_0, Router, Norms, Skalen und
+  Layer-Skalare in F32 - ist byte-gleich mit Q8_0 beim Laden aus dem Ordner (`SameWeights`,
+  auf dem RTX-Rechner gegen die Ordner aus D6b). Anders sind nur die
+  Embedding-Zeilen (in der Datei Q8_0, im Ordner BF16) und das Epsilon der Norms (float32:
+  9,99999997e-7 statt 1e-6 - so addiert transformers es auch; mit genau 1e-6 sind die Logits
+  des Tiny-Modells aus BF16-GGUF bitgleich mit denen des Ordners, gegengeprüft). Die
+  Q4_0-Dateien stammen aus den QAT-Checkpoints (`*-qat-q4_0-unquantized`), also aus anderen
+  Gewichten: kein Vergleich mit der Referenz, nur der Client (12B).
+- *Genauigkeit (Q8_0 aus GGUF gegen transformers in float32, RTX-Rechner):* 31B Zustände
+  >= 0,9966, Logits >= 0,9984, größter Fehler 2,0. 26B-A4B in den Fällen 1..3 Zustände
+  >= 0,9786, Logits >= 0,9964; im Rohtext-Fall 0 Zustände 0,955 und Logits 0,9953 (aus dem
+  Ordner 0,933 und 0,994) - mit der Expertenwahl der Referenz alle Fälle >= 0,996 / 0,9994
+  wie in D6b. 12B in den Fällen 1..3 Zustände >= 0,9933, Logits >= 0,9979; im Rohtext-Fall 0
+  Zustände 0,946, Logits 0,9854, größter Fehler 6,9 (aus dem Ordner 0,988, 0,9906 und 4,1):
+  der Fall, in dem das Instruct-Modell auf Prosa in Schleifen läuft, und hier ändern nur die
+  Q8_0-Embeddings etwas - für das GGUF dort eigene Schwellen, geprüft nur, wo der Vergleich
+  mit dem Ordner das belegt hat (sonst SKIP). Greedy überall gleich, wo die
+  Referenz sicher war.
+- *Laden:* 26B-A4B 19 s, 31B 25 s, 12B 8 s (aus safetensors in Q8_0: 36, 53 und 23 s; die
+  Datei liefert die Blöcke, es wird nichts quantisiert).
+- *Client* (`TNativeLlmClient.CreateFromGguf`, nur aus der Datei: Modell, Tokenizer,
+  Template): 26B-A4B Q8_0 lädt in 22 s, antwortet „Paris“ in 1,1 s, ruft `get_weather` mit
+  `{"city": "Berlin"}` auf und antwortet mit „17°C with rain“; 12B Q4_0 (QAT) lädt in 5 s
+  und antwortet ebenso. `suppress_tokens` des 12B (`<image|>`, `<audio|>`) wendet der Client
+  noch nicht an (Backlog).
+- *Tests:* `test.infer.qwen3`: `Gemma4TinyGguf` (beide Tiny-Modelle als BF16 und Q8_0: die
+  Einstellungen und Layer des Ordners, die drehenden Paare, die Logits, jeder Zustand, die
+  Bytes jedes Gewichts, Q8_0 gegen Q8_0 beim Laden mit derselben Expertenwahl),
+  `Gemma4GgufRefused` (zwölf beschädigte Dateien, jede an ihrer eigenen Prüfung; ein Kopf
+  von 44 behält seine 15 Paare),
+  `Gemma4GgufCheckpoints` (die drei Q8_0-Dateien gegen die Referenzen aus D6b, beim 26B-A4B
+  mit der Expertenwahl der Referenz, und gegen die Ordner); `test.infer.gemma4`:
+  `Gemma4GgufTokenizer`, `Gemma4GgufChat`, in `Gemma4TokenizerPipeline` ein kleiner
+  Tokenizer aus GGUF, zwei falsche Byte-Tokens und ein GGUF-Tokenizer anderer Art abgelehnt.
+  Die Tiny-GGUFs (4,9 MiB) schreibt `make_reference_d6d.py
+  tiny-gemma4-gguf` nach dem Vorbild des Konverters.
+- *Läufe:* RTX-Rechner FPC 16 171, Delphi 13 16 171, Delphi 7 5 863 (die großen Modelle nur
+  64 Bit; der erste Delphi-7-Lauf fand, dass `Gemma4GgufTokenizer` die 26-GB-Datei auch unter
+  32 Bit abbilden wollte - dort prüft er jetzt nur `tokenizer.gguf`) - alle grün; Mac M2
+  Infer 8 019, LLM 730 grün (ohne die Gewichte); auf der WSL dieses Rechners nur Kleines (die
+  Generatoren, die Tokenizer-Klasse), große Modelle reichen hier nicht in den Speicher.
+- *Review:* Claude-Finder und Codex in vier Runden. Runde 1: Codex fand die Rundung der
+  drehenden Paare (s. o.), der Finder die zu lose geprüften Byte-Tokens und das mehrfach
+  gelesene `sliding_window` (beides nachgezogen) und verlangte eine Begründung der
+  12B-Schwellen. Runde 2: Codex fand, dass `<0X41>` durchging und der Gewichtsvergleich die
+  Norms ausließ (`SameWeights` prüft jetzt jedes Gewicht), beide forderten einen Test für die
+  Rundung (`rope44.gguf`) und für falsche Tokenizer; die losen Schwellen des 12B gelten seitdem
+  nur nach dem Vergleich mit dem Ordner. Runde 3: der Finder wollte einen Merge-Rang-Test
+  (`' ab'`), Codex ohne Befund. Runde 4 (die 32-Bit-Korrektur): beide nur die SKIP-Meldung
+  (angepasst).
+
 **D6b erledigt (2026-11-12): die veröffentlichten Gemma-4-Checkpoints auf der CPU.**
 `google/gemma-4-26B-A4B-it` (Revision `4d7ae49…`, MoE: 30 Layer, 128 Experten, 8 davon je
 Token), `gemma-4-31B-it` (`842da37…`, dicht: 60 Layer, Hidden 5376) und `gemma-4-12B-it`
@@ -2532,7 +2629,7 @@ Dateien (gleiche SHA-256). Nachgebaut, kein Code übernommen.
   zuerst. Decodieren: U+2581 als Leerzeichen, `<0xNN>` als Byte. Abgelehnt: eine andere
   Pipeline, `truncation`/`padding` (die Bibliothek würde damit kürzen), ein Vokabeltext mit
   zwei Ids, ein Merge außerhalb des Vokabulars oder doppelt. Ungültiges UTF-8 wird je Byte
-  U+FFFD. GGUF folgt mit D6d.
+  U+FFFD. GGUF kam mit D6d (`CreateFromGguf`).
 - *Template* (`TGemma4ChatTemplate` in `mormot.ai.infer.chat`): `<bos>`, ein System-Turn bei
   Thinking, Tools oder einer ersten System-Nachricht (`<|think|>`, die getrimmten Anweisungen,
   jedes Tool als `<|tool>declaration:NAME{...}<tool|>`), dann die Turns. Ein Assistenten-Turn

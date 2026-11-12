@@ -1,0 +1,1977 @@
+{
+ "dataset": "gemma4-tokens/12b",
+ "note": "the tokenizer.json of google/gemma-4-12B-it @ 43c9d01 (its 210 glitch tokens fixed: 239 merges of 4d7ae49 dropped, the vocabulary and every other setting the same; ggml-org/gemma-4-12B-it-GGUF holds these tables). One case per dropped merge: the text of its two parts (U+2581 as a space), the ids of the fixed file without its added tokens, no special tokens added; old_ids where the old file gives others (it joins the parts)",
+ "model": {
+  "id": "google/gemma-4-12B-it",
+  "revision": "43c9d014b231474fa7212dbb48a762566c2b255d",
+  "files": {
+   "tokenizer.json": "9788bdb6a021b3170357cd3587b5d622b1177561ad3c5bf43d73728fd71aeacb"
+  }
+ },
+ "environment": {
+  "created_utc": "2026-11-12T17:09:06Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 12,
+  "deterministic_algorithms": false,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "changed": 232,
+ "cases": [
+  {
+   "id": "dropped_000",
+   "text": "jolsendev",
+   "tokens": 2,
+   "old_ids": [
+    16565
+   ]
+  },
+  {
+   "id": "dropped_001",
+   "text": " SRPGo",
+   "tokens": 2,
+   "old_ids": [
+    52600
+   ]
+  },
+  {
+   "id": "dropped_002",
+   "text": "FcmPhp",
+   "tokens": 2,
+   "old_ids": [
+    56818
+   ]
+  },
+  {
+   "id": "dropped_003",
+   "text": "GoRawContext",
+   "tokens": 2,
+   "old_ids": [
+    57309
+   ]
+  },
+  {
+   "id": "dropped_004",
+   "text": "getstarcore",
+   "tokens": 2,
+   "old_ids": [
+    58250
+   ]
+  },
+  {
+   "id": "dropped_005",
+   "text": "getstarcoredata",
+   "tokens": 3,
+   "old_ids": [
+    58251
+   ]
+  },
+  {
+   "id": "dropped_006",
+   "text": "arantadhatu",
+   "tokens": 2,
+   "old_ids": [
+    61095
+   ]
+  },
+  {
+   "id": "dropped_007",
+   "text": "arantadhatu",
+   "tokens": 2,
+   "old_ids": [
+    61095
+   ]
+  },
+  {
+   "id": "dropped_008",
+   "text": "SRPParaPkg",
+   "tokens": 2,
+   "old_ids": [
+    61251
+   ]
+  },
+  {
+   "id": "dropped_009",
+   "text": "\u52a0\u5165\u53c2\u6570\u5411\u91cf\u4e2d",
+   "tokens": 2,
+   "old_ids": [
+    64632
+   ]
+  },
+  {
+   "id": "dropped_010",
+   "text": "IMQTTRVM",
+   "tokens": 2,
+   "old_ids": [
+    68512
+   ]
+  },
+  {
+   "id": "dropped_011",
+   "text": " minGoto",
+   "tokens": 2,
+   "old_ids": [
+    71180
+   ]
+  },
+  {
+   "id": "dropped_012",
+   "text": " SRPGoGet",
+   "tokens": 3,
+   "old_ids": [
+    72528
+   ]
+  },
+  {
+   "id": "dropped_013",
+   "text": "SrvGroupIndex",
+   "tokens": 2,
+   "old_ids": [
+    72952
+   ]
+  },
+  {
+   "id": "dropped_014",
+   "text": "HDROffsets",
+   "tokens": 2,
+   "old_ids": [
+    77844
+   ]
+  },
+  {
+   "id": "dropped_015",
+   "text": "HDROffsets",
+   "tokens": 2,
+   "old_ids": [
+    77844
+   ]
+  },
+  {
+   "id": "dropped_016",
+   "text": " checkHDROffsets",
+   "tokens": 3,
+   "old_ids": [
+    77845
+   ]
+  },
+  {
+   "id": "dropped_017",
+   "text": "SRPInterfaceItem",
+   "tokens": 2,
+   "old_ids": [
+    79715
+   ]
+  },
+  {
+   "id": "dropped_018",
+   "text": "GoPrintError",
+   "tokens": 2,
+   "old_ids": [
+    80222
+   ]
+  },
+  {
+   "id": "dropped_019",
+   "text": " SRPGoGetStr",
+   "tokens": 4,
+   "old_ids": [
+    80797
+   ]
+  },
+  {
+   "id": "dropped_020",
+   "text": "OrdinateTuple",
+   "tokens": 2,
+   "old_ids": [
+    81945
+   ]
+  },
+  {
+   "id": "dropped_021",
+   "text": "coOrdinateTuple",
+   "tokens": 3,
+   "old_ids": [
+    84352
+   ]
+  },
+  {
+   "id": "dropped_022",
+   "text": "opssynth",
+   "tokens": 2,
+   "old_ids": [
+    85000
+   ]
+  },
+  {
+   "id": "dropped_023",
+   "text": "opssynth",
+   "tokens": 2,
+   "old_ids": [
+    85000
+   ]
+  },
+  {
+   "id": "dropped_024",
+   "text": "getHDRProcessor",
+   "tokens": 2,
+   "old_ids": [
+    86967
+   ]
+  },
+  {
+   "id": "dropped_025",
+   "text": "intFragmentation",
+   "tokens": 2,
+   "old_ids": [
+    87695
+   ]
+  },
+  {
+   "id": "dropped_026",
+   "text": "timePlusEvents",
+   "tokens": 2,
+   "old_ids": [
+    91072
+   ]
+  },
+  {
+   "id": "dropped_027",
+   "text": " subTestHDR",
+   "tokens": 2,
+   "old_ids": [
+    92122
+   ]
+  },
+  {
+   "id": "dropped_028",
+   "text": "SimulatorFlood",
+   "tokens": 2,
+   "old_ids": [
+    93804
+   ]
+  },
+  {
+   "id": "dropped_029",
+   "text": "WMNMDA",
+   "tokens": 2,
+   "old_ids": [
+    95551
+   ]
+  },
+  {
+   "id": "dropped_030",
+   "text": "pmmImp",
+   "tokens": 2,
+   "old_ids": [
+    96436
+   ]
+  },
+  {
+   "id": "dropped_031",
+   "text": "wiredElems",
+   "tokens": 2,
+   "old_ids": [
+    98408
+   ]
+  },
+  {
+   "id": "dropped_032",
+   "text": " TPASDW",
+   "tokens": 2,
+   "old_ids": [
+    100064
+   ]
+  },
+  {
+   "id": "dropped_033",
+   "text": " TPASDW",
+   "tokens": 2,
+   "old_ids": [
+    100064
+   ]
+  },
+  {
+   "id": "dropped_034",
+   "text": "RefInSrvGroup",
+   "tokens": 2,
+   "old_ids": [
+    100241
+   ]
+  },
+  {
+   "id": "dropped_035",
+   "text": "ConsecHtIdx",
+   "tokens": 2,
+   "old_ids": [
+    100251
+   ]
+  },
+  {
+   "id": "dropped_036",
+   "text": " HIMQTTRVM",
+   "tokens": 3,
+   "old_ids": [
+    104044
+   ]
+  },
+  {
+   "id": "dropped_037",
+   "text": " HIMQTTRVM",
+   "tokens": 3,
+   "old_ids": [
+    104044
+   ]
+  },
+  {
+   "id": "dropped_038",
+   "text": " iccadini",
+   "tokens": 2,
+   "old_ids": [
+    104989
+   ]
+  },
+  {
+   "id": "dropped_039",
+   "text": " iccadini",
+   "tokens": 2,
+   "old_ids": [
+    104989
+   ]
+  },
+  {
+   "id": "dropped_040",
+   "text": " SpringObjectID",
+   "tokens": 2,
+   "old_ids": [
+    106197
+   ]
+  },
+  {
+   "id": "dropped_041",
+   "text": " \u099a\u09bf\u09a6\u09be\u09ad",
+   "tokens": 2,
+   "old_ids": [
+    107794
+   ]
+  },
+  {
+   "id": "dropped_042",
+   "text": "TermObjectDefer",
+   "tokens": 2,
+   "old_ids": [
+    108356
+   ]
+  },
+  {
+   "id": "dropped_043",
+   "text": "ELEASESTR",
+   "tokens": 2,
+   "old_ids": [
+    109526
+   ]
+  },
+  {
+   "id": "dropped_044",
+   "text": "SAFERELEASESTR",
+   "tokens": 3,
+   "old_ids": [
+    109528
+   ]
+  },
+  {
+   "id": "dropped_045",
+   "text": "CasePTV",
+   "tokens": 2,
+   "old_ids": [
+    111029
+   ]
+  },
+  {
+   "id": "dropped_046",
+   "text": "GoSrvGroupIndex",
+   "tokens": 3,
+   "old_ids": [
+    111881
+   ]
+  },
+  {
+   "id": "dropped_047",
+   "text": "StarSXmlBody",
+   "tokens": 2,
+   "old_ids": [
+    113064
+   ]
+  },
+  {
+   "id": "dropped_048",
+   "text": "SRPBinBuf",
+   "tokens": 2,
+   "old_ids": [
+    113108
+   ]
+  },
+  {
+   "id": "dropped_049",
+   "text": "PAFStruct",
+   "tokens": 2,
+   "old_ids": [
+    113569
+   ]
+  },
+  {
+   "id": "dropped_050",
+   "text": "StarSrvGroupBody",
+   "tokens": 2,
+   "old_ids": [
+    116968
+   ]
+  },
+  {
+   "id": "dropped_051",
+   "text": "edLeftShape",
+   "tokens": 2,
+   "old_ids": [
+    119322
+   ]
+  },
+  {
+   "id": "dropped_052",
+   "text": "inertiaSeq",
+   "tokens": 2,
+   "old_ids": [
+    119779
+   ]
+  },
+  {
+   "id": "dropped_053",
+   "text": "doneProcessAvg",
+   "tokens": 2,
+   "old_ids": [
+    120545
+   ]
+  },
+  {
+   "id": "dropped_054",
+   "text": "SRPCoreShell",
+   "tokens": 2,
+   "old_ids": [
+    121223
+   ]
+  },
+  {
+   "id": "dropped_055",
+   "text": "HIMQTTRVM",
+   "tokens": 3,
+   "old_ids": [
+    121238
+   ]
+  },
+  {
+   "id": "dropped_056",
+   "text": " TestAvgCallback",
+   "tokens": 2,
+   "old_ids": [
+    122175
+   ]
+  },
+  {
+   "id": "dropped_057",
+   "text": " NewParaPkg",
+   "tokens": 2,
+   "old_ids": [
+    122782
+   ]
+  },
+  {
+   "id": "dropped_058",
+   "text": " NewParaPkg",
+   "tokens": 2,
+   "old_ids": [
+    122782
+   ]
+  },
+  {
+   "id": "dropped_059",
+   "text": "markUpdateChoice",
+   "tokens": 2,
+   "old_ids": [
+    122789
+   ]
+  },
+  {
+   "id": "dropped_060",
+   "text": "akarantadhatu",
+   "tokens": 3,
+   "old_ids": [
+    122982
+   ]
+  },
+  {
+   "id": "dropped_061",
+   "text": " subTestAvg",
+   "tokens": 2,
+   "old_ids": [
+    123778
+   ]
+  },
+  {
+   "id": "dropped_062",
+   "text": " doneProcessAvg",
+   "tokens": 2,
+   "old_ids": [
+    123779
+   ]
+  },
+  {
+   "id": "dropped_063",
+   "text": " doneProcessAvg",
+   "tokens": 2,
+   "old_ids": [
+    123779
+   ]
+  },
+  {
+   "id": "dropped_064",
+   "text": " StarSXml",
+   "tokens": 2,
+   "old_ids": [
+    125948
+   ]
+  },
+  {
+   "id": "dropped_065",
+   "text": " StarSXml",
+   "tokens": 2,
+   "old_ids": [
+    125948
+   ]
+  },
+  {
+   "id": "dropped_066",
+   "text": " LuaToGoObject",
+   "tokens": 2,
+   "old_ids": [
+    126009
+   ]
+  },
+  {
+   "id": "dropped_067",
+   "text": " addConfigureArg",
+   "tokens": 2,
+   "old_ids": [
+    127204
+   ]
+  },
+  {
+   "id": "dropped_068",
+   "text": " GoSrvGroupIndex",
+   "tokens": 3,
+   "old_ids": [
+    127633
+   ]
+  },
+  {
+   "id": "dropped_069",
+   "text": " GoSrvGroupIndex",
+   "tokens": 3,
+   "old_ids": [
+    127633
+   ]
+  },
+  {
+   "id": "dropped_070",
+   "text": "eltatdouble",
+   "tokens": 2,
+   "old_ids": [
+    129376
+   ]
+  },
+  {
+   "id": "dropped_071",
+   "text": " CCBUNDLE",
+   "tokens": 2,
+   "old_ids": [
+    130855
+   ]
+  },
+  {
+   "id": "dropped_072",
+   "text": "ecoexpr",
+   "tokens": 2,
+   "old_ids": [
+    130892
+   ]
+  },
+  {
+   "id": "dropped_073",
+   "text": "blusasFem",
+   "tokens": 2,
+   "old_ids": [
+    130893
+   ]
+  },
+  {
+   "id": "dropped_074",
+   "text": " studentLVector",
+   "tokens": 2,
+   "old_ids": [
+    131126
+   ]
+  },
+  {
+   "id": "dropped_075",
+   "text": " GoRawContext",
+   "tokens": 2,
+   "old_ids": [
+    131144
+   ]
+  },
+  {
+   "id": "dropped_076",
+   "text": " GoRawContext",
+   "tokens": 2,
+   "old_ids": [
+    131144
+   ]
+  },
+  {
+   "id": "dropped_077",
+   "text": " SRPGoSetStr",
+   "tokens": 3,
+   "old_ids": [
+    133025
+   ]
+  },
+  {
+   "id": "dropped_078",
+   "text": "SRPSXML",
+   "tokens": 2,
+   "old_ids": [
+    133044
+   ]
+  },
+  {
+   "id": "dropped_079",
+   "text": "jsbpmOb",
+   "tokens": 2,
+   "old_ids": [
+    134994
+   ]
+  },
+  {
+   "id": "dropped_080",
+   "text": "tcpUniqueID",
+   "tokens": 2,
+   "old_ids": [
+    136915
+   ]
+  },
+  {
+   "id": "dropped_081",
+   "text": "qttrvm",
+   "tokens": 2,
+   "old_ids": [
+    136932
+   ]
+  },
+  {
+   "id": "dropped_082",
+   "text": "MakeRectInCM",
+   "tokens": 2,
+   "old_ids": [
+    136946
+   ]
+  },
+  {
+   "id": "dropped_083",
+   "text": "matchStudentNo",
+   "tokens": 2,
+   "old_ids": [
+    140975
+   ]
+  },
+  {
+   "id": "dropped_084",
+   "text": " SrvGroupClass",
+   "tokens": 2,
+   "old_ids": [
+    140976
+   ]
+  },
+  {
+   "id": "dropped_085",
+   "text": " GoSRP",
+   "tokens": 2,
+   "old_ids": [
+    141003
+   ]
+  },
+  {
+   "id": "dropped_086",
+   "text": " RUTAREAL",
+   "tokens": 2,
+   "old_ids": [
+    143245
+   ]
+  },
+  {
+   "id": "dropped_087",
+   "text": " RUTAREL",
+   "tokens": 2,
+   "old_ids": [
+    145613
+   ]
+  },
+  {
+   "id": "dropped_088",
+   "text": " YYYY",
+   "tokens": 3
+  },
+  {
+   "id": "dropped_089",
+   "text": " YYYY",
+   "tokens": 3
+  },
+  {
+   "id": "dropped_090",
+   "text": " scStudentVector",
+   "tokens": 2,
+   "old_ids": [
+    147560
+   ]
+  },
+  {
+   "id": "dropped_091",
+   "text": "angoloTocco",
+   "tokens": 2,
+   "old_ids": [
+    147627
+   ]
+  },
+  {
+   "id": "dropped_092",
+   "text": "tochyodikwa",
+   "tokens": 2,
+   "old_ids": [
+    147628
+   ]
+  },
+  {
+   "id": "dropped_093",
+   "text": " subTestPanorama",
+   "tokens": 2,
+   "old_ids": [
+    147981
+   ]
+  },
+  {
+   "id": "dropped_094",
+   "text": "KAKKIAINEN",
+   "tokens": 2,
+   "old_ids": [
+    152630
+   ]
+  },
+  {
+   "id": "dropped_095",
+   "text": "addKillPenalty",
+   "tokens": 2,
+   "old_ids": [
+    152634
+   ]
+  },
+  {
+   "id": "dropped_096",
+   "text": "chccgi",
+   "tokens": 2,
+   "old_ids": [
+    153374
+   ]
+  },
+  {
+   "id": "dropped_097",
+   "text": "squarePosVecchio",
+   "tokens": 2,
+   "old_ids": [
+    155266
+   ]
+  },
+  {
+   "id": "dropped_098",
+   "text": "addKillBonus",
+   "tokens": 2,
+   "old_ids": [
+    155281
+   ]
+  },
+  {
+   "id": "dropped_099",
+   "text": "foePlace",
+   "tokens": 2,
+   "old_ids": [
+    156020
+   ]
+  },
+  {
+   "id": "dropped_100",
+   "text": " totalBlockUsed",
+   "tokens": 2,
+   "old_ids": [
+    156046
+   ]
+  },
+  {
+   "id": "dropped_101",
+   "text": " addSBOM",
+   "tokens": 2,
+   "old_ids": [
+    156050
+   ]
+  },
+  {
+   "id": "dropped_102",
+   "text": " CAdxRtList",
+   "tokens": 2,
+   "old_ids": [
+    158028
+   ]
+  },
+  {
+   "id": "dropped_103",
+   "text": " yyyy",
+   "tokens": 3
+  },
+  {
+   "id": "dropped_104",
+   "text": " yyyy",
+   "tokens": 3
+  },
+  {
+   "id": "dropped_105",
+   "text": " LuaToJavaResult",
+   "tokens": 2,
+   "old_ids": [
+    163811
+   ]
+  },
+  {
+   "id": "dropped_106",
+   "text": " LuaToJavaResult",
+   "tokens": 2,
+   "old_ids": [
+    163811
+   ]
+  },
+  {
+   "id": "dropped_107",
+   "text": "DaysGE",
+   "tokens": 2,
+   "old_ids": [
+    163851
+   ]
+  },
+  {
+   "id": "dropped_108",
+   "text": "CollinToDO",
+   "tokens": 2,
+   "old_ids": [
+    165109
+   ]
+  },
+  {
+   "id": "dropped_109",
+   "text": "DenovoMis",
+   "tokens": 2,
+   "old_ids": [
+    165237
+   ]
+  },
+  {
+   "id": "dropped_110",
+   "text": " GoObjectTo",
+   "tokens": 2,
+   "old_ids": [
+    167051
+   ]
+  },
+  {
+   "id": "dropped_111",
+   "text": "wavedeltatdouble",
+   "tokens": 3,
+   "old_ids": [
+    167077
+   ]
+  },
+  {
+   "id": "dropped_112",
+   "text": "FoldoutGC",
+   "tokens": 2,
+   "old_ids": [
+    167093
+   ]
+  },
+  {
+   "id": "dropped_113",
+   "text": " ArchersUnit",
+   "tokens": 2,
+   "old_ids": [
+    168551
+   ]
+  },
+  {
+   "id": "dropped_114",
+   "text": "attupadani",
+   "tokens": 2,
+   "old_ids": [
+    169674
+   ]
+  },
+  {
+   "id": "dropped_115",
+   "text": "StarObjectBody",
+   "tokens": 2,
+   "old_ids": [
+    170333
+   ]
+  },
+  {
+   "id": "dropped_116",
+   "text": " PafHandle",
+   "tokens": 2,
+   "old_ids": [
+    172139
+   ]
+  },
+  {
+   "id": "dropped_117",
+   "text": " PafHandle",
+   "tokens": 2,
+   "old_ids": [
+    172139
+   ]
+  },
+  {
+   "id": "dropped_118",
+   "text": "GetParaPkg",
+   "tokens": 2,
+   "old_ids": [
+    173738
+   ]
+  },
+  {
+   "id": "dropped_119",
+   "text": "calcounterx",
+   "tokens": 2,
+   "old_ids": [
+    173819
+   ]
+  },
+  {
+   "id": "dropped_120",
+   "text": "calcountery",
+   "tokens": 2,
+   "old_ids": [
+    173820
+   ]
+  },
+  {
+   "id": "dropped_121",
+   "text": "calupcounter",
+   "tokens": 2,
+   "old_ids": [
+    173822
+   ]
+  },
+  {
+   "id": "dropped_122",
+   "text": "callowcounter",
+   "tokens": 2,
+   "old_ids": [
+    173823
+   ]
+  },
+  {
+   "id": "dropped_123",
+   "text": "calleftcounter",
+   "tokens": 2,
+   "old_ids": [
+    173824
+   ]
+  },
+  {
+   "id": "dropped_124",
+   "text": "calrightcounter",
+   "tokens": 2,
+   "old_ids": [
+    173825
+   ]
+  },
+  {
+   "id": "dropped_125",
+   "text": "MkvDir",
+   "tokens": 2,
+   "old_ids": [
+    175754
+   ]
+  },
+  {
+   "id": "dropped_126",
+   "text": "AllFilesInMkvDir",
+   "tokens": 3,
+   "old_ids": [
+    175762
+   ]
+  },
+  {
+   "id": "dropped_127",
+   "text": "RetJpegLen",
+   "tokens": 2,
+   "old_ids": [
+    177277
+   ]
+  },
+  {
+   "id": "dropped_128",
+   "text": "DTMakeRectInCM",
+   "tokens": 3,
+   "old_ids": [
+    177351
+   ]
+  },
+  {
+   "id": "dropped_129",
+   "text": "LuaToJavaResult",
+   "tokens": 2,
+   "old_ids": [
+    177352
+   ]
+  },
+  {
+   "id": "dropped_130",
+   "text": " evamadisu",
+   "tokens": 2,
+   "old_ids": [
+    178804
+   ]
+  },
+  {
+   "id": "dropped_131",
+   "text": " atthudd",
+   "tokens": 2,
+   "old_ids": [
+    178827
+   ]
+  },
+  {
+   "id": "dropped_132",
+   "text": "sorfinaly",
+   "tokens": 2,
+   "old_ids": [
+    179825
+   ]
+  },
+  {
+   "id": "dropped_133",
+   "text": " jinfoHome",
+   "tokens": 2,
+   "old_ids": [
+    181224
+   ]
+  },
+  {
+   "id": "dropped_134",
+   "text": " jinfoNext",
+   "tokens": 2,
+   "old_ids": [
+    181225
+   ]
+  },
+  {
+   "id": "dropped_135",
+   "text": " dSampleHeight",
+   "tokens": 2,
+   "old_ids": [
+    183650
+   ]
+  },
+  {
+   "id": "dropped_136",
+   "text": "TPASDW",
+   "tokens": 2,
+   "old_ids": [
+    183747
+   ]
+  },
+  {
+   "id": "dropped_137",
+   "text": "partialowner",
+   "tokens": 2,
+   "old_ids": [
+    183864
+   ]
+  },
+  {
+   "id": "dropped_138",
+   "text": "pJPEGBuf",
+   "tokens": 2,
+   "old_ids": [
+    185104
+   ]
+  },
+  {
+   "id": "dropped_139",
+   "text": "CustomGlare",
+   "tokens": 2,
+   "old_ids": [
+    185109
+   ]
+  },
+  {
+   "id": "dropped_140",
+   "text": "WithSizeInCM",
+   "tokens": 2,
+   "old_ids": [
+    185157
+   ]
+  },
+  {
+   "id": "dropped_141",
+   "text": " HRMClient",
+   "tokens": 2,
+   "old_ids": [
+    185167
+   ]
+  },
+  {
+   "id": "dropped_142",
+   "text": " dSampleWidth",
+   "tokens": 2,
+   "old_ids": [
+    187924
+   ]
+  },
+  {
+   "id": "dropped_143",
+   "text": "lastDamageTook",
+   "tokens": 2,
+   "old_ids": [
+    187925
+   ]
+  },
+  {
+   "id": "dropped_144",
+   "text": "CBCPksc",
+   "tokens": 2,
+   "old_ids": [
+    188005
+   ]
+  },
+  {
+   "id": "dropped_145",
+   "text": "salexpr",
+   "tokens": 2,
+   "old_ids": [
+    188051
+   ]
+  },
+  {
+   "id": "dropped_146",
+   "text": "CustomGlareDef",
+   "tokens": 3,
+   "old_ids": [
+    189287
+   ]
+  },
+  {
+   "id": "dropped_147",
+   "text": " diffformul",
+   "tokens": 4
+  },
+  {
+   "id": "dropped_148",
+   "text": " ja\u00fbnes",
+   "tokens": 2,
+   "old_ids": [
+    189817
+   ]
+  },
+  {
+   "id": "dropped_149",
+   "text": " mSwisTrackCore",
+   "tokens": 2,
+   "old_ids": [
+    192495
+   ]
+  },
+  {
+   "id": "dropped_150",
+   "text": "ControlPTV",
+   "tokens": 2,
+   "old_ids": [
+    192597
+   ]
+  },
+  {
+   "id": "dropped_151",
+   "text": " coiAlarm",
+   "tokens": 2,
+   "old_ids": [
+    192611
+   ]
+  },
+  {
+   "id": "dropped_152",
+   "text": "CYCLONEDB",
+   "tokens": 2,
+   "old_ids": [
+    192703
+   ]
+  },
+  {
+   "id": "dropped_153",
+   "text": " DTMakeRect",
+   "tokens": 2,
+   "old_ids": [
+    193766
+   ]
+  },
+  {
+   "id": "dropped_154",
+   "text": "posTocco",
+   "tokens": 2,
+   "old_ids": [
+    193798
+   ]
+  },
+  {
+   "id": "dropped_155",
+   "text": "adiganik",
+   "tokens": 2,
+   "old_ids": [
+    194961
+   ]
+  },
+  {
+   "id": "dropped_156",
+   "text": "adiganik",
+   "tokens": 2,
+   "old_ids": [
+    194961
+   ]
+  },
+  {
+   "id": "dropped_157",
+   "text": "edRightShape",
+   "tokens": 2,
+   "old_ids": [
+    195381
+   ]
+  },
+  {
+   "id": "dropped_158",
+   "text": "Uimcoords",
+   "tokens": 2,
+   "old_ids": [
+    197330
+   ]
+  },
+  {
+   "id": "dropped_159",
+   "text": "totalBlockFit",
+   "tokens": 2,
+   "old_ids": [
+    197415
+   ]
+  },
+  {
+   "id": "dropped_160",
+   "text": "GoObjectAllRef",
+   "tokens": 2,
+   "old_ids": [
+    198419
+   ]
+  },
+  {
+   "id": "dropped_161",
+   "text": "checkkatore",
+   "tokens": 2,
+   "old_ids": [
+    198456
+   ]
+  },
+  {
+   "id": "dropped_162",
+   "text": "faulseAns",
+   "tokens": 2,
+   "old_ids": [
+    202283
+   ]
+  },
+  {
+   "id": "dropped_163",
+   "text": " ControlPTV",
+   "tokens": 2,
+   "old_ids": [
+    202340
+   ]
+  },
+  {
+   "id": "dropped_164",
+   "text": " ControlPTV",
+   "tokens": 2,
+   "old_ids": [
+    202340
+   ]
+  },
+  {
+   "id": "dropped_165",
+   "text": "ENEMYPLACE",
+   "tokens": 2,
+   "old_ids": [
+    202378
+   ]
+  },
+  {
+   "id": "dropped_166",
+   "text": " ecoexpr",
+   "tokens": 2,
+   "old_ids": [
+    202404
+   ]
+  },
+  {
+   "id": "dropped_167",
+   "text": " ecoexpr",
+   "tokens": 2,
+   "old_ids": [
+    202404
+   ]
+  },
+  {
+   "id": "dropped_168",
+   "text": "StarServiceBody",
+   "tokens": 2,
+   "old_ids": [
+    203204
+   ]
+  },
+  {
+   "id": "dropped_169",
+   "text": "localinstrList",
+   "tokens": 2,
+   "old_ids": [
+    203239
+   ]
+  },
+  {
+   "id": "dropped_170",
+   "text": " NDIndexArray",
+   "tokens": 2,
+   "old_ids": [
+    206537
+   ]
+  },
+  {
+   "id": "dropped_171",
+   "text": "sadurdu",
+   "tokens": 2,
+   "old_ids": [
+    207736
+   ]
+  },
+  {
+   "id": "dropped_172",
+   "text": "ineedfollower",
+   "tokens": 2,
+   "old_ids": [
+    207758
+   ]
+  },
+  {
+   "id": "dropped_173",
+   "text": "\u0c35\u0c46\u0c1f\u0c4d\u200c\u0c38\u0c4d\u0c15\u0c40",
+   "tokens": 2,
+   "old_ids": [
+    207786
+   ]
+  },
+  {
+   "id": "dropped_174",
+   "text": "attuvasena",
+   "tokens": 2,
+   "old_ids": [
+    207788
+   ]
+  },
+  {
+   "id": "dropped_175",
+   "text": " suddhakatt",
+   "tokens": 2,
+   "old_ids": [
+    207791
+   ]
+  },
+  {
+   "id": "dropped_176",
+   "text": "testGetPopup",
+   "tokens": 2,
+   "old_ids": [
+    207812
+   ]
+  },
+  {
+   "id": "dropped_177",
+   "text": " morphOutputComp",
+   "tokens": 2,
+   "old_ids": [
+    207916
+   ]
+  },
+  {
+   "id": "dropped_178",
+   "text": "CaseMissense",
+   "tokens": 2,
+   "old_ids": [
+    207970
+   ]
+  },
+  {
+   "id": "dropped_179",
+   "text": "GTBaseAlert",
+   "tokens": 2,
+   "old_ids": [
+    208094
+   ]
+  },
+  {
+   "id": "dropped_180",
+   "text": "StarParaPkgBody",
+   "tokens": 2,
+   "old_ids": [
+    208662
+   ]
+  },
+  {
+   "id": "dropped_181",
+   "text": " RefToGoObject",
+   "tokens": 2,
+   "old_ids": [
+    208686
+   ]
+  },
+  {
+   "id": "dropped_182",
+   "text": "ZielPanel",
+   "tokens": 2,
+   "old_ids": [
+    208700
+   ]
+  },
+  {
+   "id": "dropped_183",
+   "text": "himqttrvm",
+   "tokens": 3,
+   "old_ids": [
+    208718
+   ]
+  },
+  {
+   "id": "dropped_184",
+   "text": " oLetterLocation",
+   "tokens": 2,
+   "old_ids": [
+    213596
+   ]
+  },
+  {
+   "id": "dropped_185",
+   "text": " totalBlockUsedA",
+   "tokens": 3,
+   "old_ids": [
+    213598
+   ]
+  },
+  {
+   "id": "dropped_186",
+   "text": " RUTARELATIV",
+   "tokens": 3,
+   "old_ids": [
+    213650
+   ]
+  },
+  {
+   "id": "dropped_187",
+   "text": "dfsonic",
+   "tokens": 2,
+   "old_ids": [
+    213759
+   ]
+  },
+  {
+   "id": "dropped_188",
+   "text": "dfsonic",
+   "tokens": 2,
+   "old_ids": [
+    213759
+   ]
+  },
+  {
+   "id": "dropped_189",
+   "text": ".\"+\"|\"+\"",
+   "tokens": 2,
+   "old_ids": [
+    213814
+   ]
+  },
+  {
+   "id": "dropped_190",
+   "text": "MyShopname",
+   "tokens": 2,
+   "old_ids": [
+    214127
+   ]
+  },
+  {
+   "id": "dropped_191",
+   "text": " mdlMeshVD",
+   "tokens": 2,
+   "old_ids": [
+    214220
+   ]
+  },
+  {
+   "id": "dropped_192",
+   "text": "startZielPanel",
+   "tokens": 3,
+   "old_ids": [
+    214224
+   ]
+  },
+  {
+   "id": "dropped_193",
+   "text": "mBlitzID",
+   "tokens": 2,
+   "old_ids": [
+    214244
+   ]
+  },
+  {
+   "id": "dropped_194",
+   "text": " Vuttab",
+   "tokens": 2,
+   "old_ids": [
+    215120
+   ]
+  },
+  {
+   "id": "dropped_195",
+   "text": " \u0c2c\u0c4d\u0c32\u0c3e\u0c35\u0c46\u0c1f\u0c4d\u200c\u0c38\u0c4d\u0c15\u0c40",
+   "tokens": 3,
+   "old_ids": [
+    215139
+   ]
+  },
+  {
+   "id": "dropped_196",
+   "text": " ControlMissense",
+   "tokens": 2,
+   "old_ids": [
+    219835
+   ]
+  },
+  {
+   "id": "dropped_197",
+   "text": "respArrayAll",
+   "tokens": 2,
+   "old_ids": [
+    219851
+   ]
+  },
+  {
+   "id": "dropped_198",
+   "text": "WeakTableMutex",
+   "tokens": 2,
+   "old_ids": [
+    220140
+   ]
+  },
+  {
+   "id": "dropped_199",
+   "text": " TermObjectDefer",
+   "tokens": 2,
+   "old_ids": [
+    220172
+   ]
+  },
+  {
+   "id": "dropped_200",
+   "text": " TermObjectDefer",
+   "tokens": 2,
+   "old_ids": [
+    220172
+   ]
+  },
+  {
+   "id": "dropped_201",
+   "text": " ::::::::",
+   "tokens": 3
+  },
+  {
+   "id": "dropped_202",
+   "text": " ::::::::",
+   "tokens": 3
+  },
+  {
+   "id": "dropped_203",
+   "text": "drawcounterx",
+   "tokens": 2,
+   "old_ids": [
+    220224
+   ]
+  },
+  {
+   "id": "dropped_204",
+   "text": "drawcountery",
+   "tokens": 2,
+   "old_ids": [
+    220225
+   ]
+  },
+  {
+   "id": "dropped_205",
+   "text": "selectTableY",
+   "tokens": 2,
+   "old_ids": [
+    220247
+   ]
+  },
+  {
+   "id": "dropped_206",
+   "text": " SIINFEKLC",
+   "tokens": 2,
+   "old_ids": [
+    222815
+   ]
+  },
+  {
+   "id": "dropped_207",
+   "text": " SIINFEKLC",
+   "tokens": 2,
+   "old_ids": [
+    222815
+   ]
+  },
+  {
+   "id": "dropped_208",
+   "text": " dhatussa",
+   "tokens": 2,
+   "old_ids": [
+    222926
+   ]
+  },
+  {
+   "id": "dropped_209",
+   "text": " dhatussa",
+   "tokens": 2,
+   "old_ids": [
+    222926
+   ]
+  },
+  {
+   "id": "dropped_210",
+   "text": " bhuvadigane",
+   "tokens": 2,
+   "old_ids": [
+    222934
+   ]
+  },
+  {
+   "id": "dropped_211",
+   "text": "atthavidu",
+   "tokens": 2,
+   "old_ids": [
+    222989
+   ]
+  },
+  {
+   "id": "dropped_212",
+   "text": " hetukatt",
+   "tokens": 2,
+   "old_ids": [
+    222991
+   ]
+  },
+  {
+   "id": "dropped_213",
+   "text": "colourCodeDict",
+   "tokens": 2,
+   "old_ids": [
+    226545
+   ]
+  },
+  {
+   "id": "dropped_214",
+   "text": "grafoExiste",
+   "tokens": 2,
+   "old_ids": [
+    226562
+   ]
+  },
+  {
+   "id": "dropped_215",
+   "text": "dwRetJpegLen",
+   "tokens": 3,
+   "old_ids": [
+    226563
+   ]
+  },
+  {
+   "id": "dropped_216",
+   "text": "drawingCodehint",
+   "tokens": 2,
+   "old_ids": [
+    226565
+   ]
+  },
+  {
+   "id": "dropped_217",
+   "text": "SRPSrvGroup",
+   "tokens": 2,
+   "old_ids": [
+    226594
+   ]
+  },
+  {
+   "id": "dropped_218",
+   "text": "SRPSrvGroup",
+   "tokens": 2,
+   "old_ids": [
+    226594
+   ]
+  },
+  {
+   "id": "dropped_219",
+   "text": " FuncParamNum",
+   "tokens": 2,
+   "old_ids": [
+    226597
+   ]
+  },
+  {
+   "id": "dropped_220",
+   "text": " FuncParamNum",
+   "tokens": 2,
+   "old_ids": [
+    226597
+   ]
+  },
+  {
+   "id": "dropped_221",
+   "text": "StructOfObject",
+   "tokens": 2,
+   "old_ids": [
+    226620
+   ]
+  },
+  {
+   "id": "dropped_222",
+   "text": " cytyle",
+   "tokens": 2,
+   "old_ids": [
+    226629
+   ]
+  },
+  {
+   "id": "dropped_223",
+   "text": " cytyle",
+   "tokens": 2,
+   "old_ids": [
+    226629
+   ]
+  },
+  {
+   "id": "dropped_224",
+   "text": " cytyle",
+   "tokens": 2,
+   "old_ids": [
+    226629
+   ]
+  },
+  {
+   "id": "dropped_225",
+   "text": "MalayMarks",
+   "tokens": 2,
+   "old_ids": [
+    226695
+   ]
+  },
+  {
+   "id": "dropped_226",
+   "text": "capturecpu",
+   "tokens": 2,
+   "old_ids": [
+    226697
+   ]
+  },
+  {
+   "id": "dropped_227",
+   "text": "selectTableX",
+   "tokens": 2,
+   "old_ids": [
+    226705
+   ]
+  },
+  {
+   "id": "dropped_228",
+   "text": "SameWordInterval",
+   "tokens": 2,
+   "old_ids": [
+    226709
+   ]
+  },
+  {
+   "id": "dropped_229",
+   "text": "gmzyh",
+   "tokens": 2,
+   "old_ids": [
+    231048
+   ]
+  },
+  {
+   "id": "dropped_230",
+   "text": " Atrayam",
+   "tokens": 2,
+   "old_ids": [
+    231617
+   ]
+  },
+  {
+   "id": "dropped_231",
+   "text": " Atrayam",
+   "tokens": 2,
+   "old_ids": [
+    231617
+   ]
+  },
+  {
+   "id": "dropped_232",
+   "text": " dittiyam",
+   "tokens": 2,
+   "old_ids": [
+    231626
+   ]
+  },
+  {
+   "id": "dropped_233",
+   "text": " matchStudentNo",
+   "tokens": 2,
+   "old_ids": [
+    233539
+   ]
+  },
+  {
+   "id": "dropped_234",
+   "text": " matchStudentNo",
+   "tokens": 2,
+   "old_ids": [
+    233539
+   ]
+  },
+  {
+   "id": "dropped_235",
+   "text": "StarBinBufBody",
+   "tokens": 2,
+   "old_ids": [
+    233586
+   ]
+  },
+  {
+   "id": "dropped_236",
+   "text": "VSLUATYPE",
+   "tokens": 2,
+   "old_ids": [
+    233656
+   ]
+  },
+  {
+   "id": "dropped_237",
+   "text": " LGAGEmoji",
+   "tokens": 2,
+   "old_ids": [
+    233661
+   ]
+  },
+  {
+   "id": "dropped_238",
+   "text": "TranscHist",
+   "tokens": 2,
+   "old_ids": [
+    234128
+   ]
+  }
+ ],
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 6672,
+  "sha256": "48b5eed7f771b7c6b74a3e0088a93aa1b6b8b7401a2f49b6741244136c5cc5a7",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "texts",
+   "dtype": "u8",
+   "shape": [
+    2705
+   ],
+   "offset": 0,
+   "bytes": 2705,
+   "sha256": "dab2a2a2b4c4989d4dbd93378eacf00307404ed9741665824495e58806969540",
+   "note": "UTF-8 of all case texts concatenated"
+  },
+  {
+   "name": "text_offsets",
+   "dtype": "i32",
+   "shape": [
+    240
+   ],
+   "offset": 2708,
+   "bytes": 960,
+   "sha256": "d30a1587204d1c76be674e2d355828804fbe1dc29b1616e363d3a669d555aab3",
+   "note": "case i = texts[text_offsets[i] .. text_offsets[i+1]-1]"
+  },
+  {
+   "name": "ids",
+   "dtype": "i32",
+   "shape": [
+    511
+   ],
+   "offset": 3668,
+   "bytes": 2044,
+   "sha256": "c0f2a8e431da5d01bada2928efea88e8cada21419878f9ec645f43979b193467",
+   "note": "all cases concatenated"
+  },
+  {
+   "name": "offsets",
+   "dtype": "i32",
+   "shape": [
+    240
+   ],
+   "offset": 5712,
+   "bytes": 960,
+   "sha256": "5de2103b12ae0e3b39f059ae13246c8e382b1b0c34b716241326b6dd29b96955",
+   "note": "case i = ids[offsets[i] .. offsets[i+1]-1]"
+  }
+ ]
+}

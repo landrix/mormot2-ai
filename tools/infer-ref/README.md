@@ -149,6 +149,30 @@ python tools/infer-ref/make_reference_d6b.py upcast-check
 LAI_THREADS=16 python tools/infer-ref/make_reference_d6b.py gemma4-12b gemma4-26b-a4b gemma4-31b
 ```
 
+## Gemma 4 from GGUF (phase D, D6d)
+
+`make_reference_d6d.py` writes three things, none of them with a model download:
+
+- `tiny-gemma4-gguf`: both tiny models of D6a as llama.cpp's converter writes the
+  architecture `gemma4` (followed in `conversion/gemma.py` of the llama.cpp commit
+  `2a4daf0…`), in BF16 and in Q8_0 (ggml's reference quantizer, as `llama-quantize` writes
+  it), 12 damaged files, a model with a full head of 44 (15 rotating pairs) and a tokenizer
+  alone (valid, and with a byte token that is no `<0xHH>`). Their expected values are those
+  of the tiny folders.
+- `gemma4-tokens-12b`: the tokenizer.json of `google/gemma-4-12B-it` at `43c9d01` - the file
+  its GGUF holds, 239 merges fewer than `4d7ae49` - gives other ids only where a dropped
+  merge would join two parts. One case per dropped merge, ids from the tokenizers library.
+  It needs that file in `$LAI_GEMMA4_12B_TOKENIZER` (sha256 pinned) and the 26B-A4B one in
+  `$LAI_GEMMA4_DIR`.
+- `gemma4-tokenizer-gguf`: `vendor/models/gemma-4-26B-A4B-it/tokenizer.gguf` (gitignored),
+  the metadata of `ggml-org/gemma-4-26B-A4B-it-GGUF` without its tensors (an HTTP range of the
+  pinned Q8_0 file, sha256 pinned) - the tokenizer of a published GGUF on every machine.
+
+```bash
+python tools/infer-ref/make_reference_d6d.py tiny-gemma4-gguf gemma4-tokenizer-gguf
+LAI_GEMMA4_12B_TOKENIZER=/path/to/tokenizer.json python tools/infer-ref/make_reference_d6d.py gemma4-tokens-12b
+```
+
 ## The tokenizer and chat format of Gemma 4 (phase D, D6c)
 
 `make_reference_d6c.py` reads only the tokenizer files of `google/gemma-4-26B-A4B-it`

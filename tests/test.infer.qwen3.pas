@@ -222,6 +222,17 @@ type
     // their safetensors in Q8_0 against transformers (the last row of every
     // state, the logits, greedy) - only where the folders were put
     procedure Gemma4Checkpoints;
+    /// D6d: both tiny Gemma 4 as GGUF (llama.cpp's converter layout) - the
+    // settings of the folder, BF16 its logits (the epsilon as float32), Q8_0
+    // every weight the bytes of Q8_0 at load
+    procedure Gemma4TinyGguf;
+    /// D6d: the damaged tiny GGUF files, each refused by its own check; a full
+    // head of 44 with 15 rotating pairs keeps its count
+    procedure Gemma4GgufRefused;
+    /// D6d: ggml-org/gemma-4-26B-A4B-it-GGUF, gemma-4-31B-it-GGUF and
+    // gemma-4-12B-it-GGUF (Q8_0) against the references of D6b - only where
+    // the files were put
+    procedure Gemma4GgufCheckpoints;
   end;
 
 const
@@ -4251,6 +4262,373 @@ begin
         'the reference', [k, cmp.Cosine]);
     finally
       tape.Free;
+    end;
+  end;
+end;
+
+/// every weight of aA and aB the same bytes: the matrices and experts in Q8_0,
+// the router, the norms, the scales and the layer scalars in F32 (the
+// embedding as stored left out: it may differ)
+function SameWeights(aA, aB: TDecoderModel): boolean;
+var
+  c: TDecoderConfig;
+  k, e, h, ff, fi, qw, kvw, hd: PtrInt;
+
+  function Same(const x, y: TInferWeight; aRows, aCols: PtrInt): boolean;
+  begin
+    result := (x.DType = idtQ8_0) and (y.DType = idtQ8_0) and
+      CompareMem(x.Data, y.Data, aRows * (aCols shr 5) * SizeOf(TInferBlockQ8_0));
+  end;
+
+  function SameF(x, y: PSingleArray; aCount: PtrInt): boolean;
+  begin
+    if (x = nil) or (y = nil) then
+      result := x = y
+    else
+      result := CompareMem(x, y, aCount * SizeOf(single));
+  end;
+
+begin
+  c := aA.Config;
+  h := c.Hidden;
+  ff := c.Intermediate;
+  fi := c.ExpertIntermediate;
+  result := Same(aA.Head, aB.Head, c.VocabSize, h) and
+    SameF(aA.FinalNorm, aB.FinalNorm, h);
+  for k := 0 to c.Layers - 1 do
+  begin
+    hd := c.Spec[k].HeadDim;
+    qw := c.Heads * hd;
+    kvw := c.Spec[k].KvHeads * hd;
+    if not Same(aA.Layers[k].Q, aB.Layers[k].Q, qw, h) or
+       not Same(aA.Layers[k].K, aB.Layers[k].K, kvw, h) or
+       not Same(aA.Layers[k].O, aB.Layers[k].O, h, qw) or
+       not Same(aA.Layers[k].Gate, aB.Layers[k].Gate, ff, h) or
+       not Same(aA.Layers[k].Up, aB.Layers[k].Up, ff, h) or
+       not Same(aA.Layers[k].Down, aB.Layers[k].Down, h, ff) or
+       (not c.Spec[k].KIsV and not Same(aA.Layers[k].V, aB.Layers[k].V, kvw, h)) or
+       not SameF(aA.Layers[k].QNorm, aB.Layers[k].QNorm, hd) or
+       not SameF(aA.Layers[k].KNorm, aB.Layers[k].KNorm, hd) or
+       not SameF(aA.Layers[k].InputNorm, aB.Layers[k].InputNorm, h) or
+       not SameF(aA.Layers[k].AttnNorm, aB.Layers[k].AttnNorm, h) or
+       not SameF(aA.Layers[k].PostNorm, aB.Layers[k].PostNorm, h) or
+       not SameF(aA.Layers[k].FfnNorm, aB.Layers[k].FfnNorm, h) or
+       not SameF(aA.Layers[k].Scalar, aB.Layers[k].Scalar, 1) then
+      result := false;
+    if c.Experts = 0 then
+      continue;
+    if (aA.Layers[k].Router.DType <> idtF32) or (aB.Layers[k].Router.DType <> idtF32) or
+       not SameF(aA.Layers[k].Router.Data, aB.Layers[k].Router.Data, c.Experts * h) or
+       not SameF(aA.Layers[k].RouterScale, aB.Layers[k].RouterScale, h) or
+       not SameF(aA.Layers[k].ExpertScale, aB.Layers[k].ExpertScale, c.Experts) or
+       not SameF(aA.Layers[k].DenseOutNorm, aB.Layers[k].DenseOutNorm, h) or
+       not SameF(aA.Layers[k].MoeInNorm, aB.Layers[k].MoeInNorm, h) or
+       not SameF(aA.Layers[k].MoeOutNorm, aB.Layers[k].MoeOutNorm, h) then
+      result := false;
+    for e := 0 to c.Experts - 1 do
+      if not Same(aA.Layers[k].ExpertGate[e], aB.Layers[k].ExpertGate[e], fi, h) or
+         not Same(aA.Layers[k].ExpertUp[e], aB.Layers[k].ExpertUp[e], fi, h) or
+         not Same(aA.Layers[k].ExpertDown[e], aB.Layers[k].ExpertDown[e], h, fi) then
+        result := false;
+  end;
+end;
+
+procedure TTestInferQwen3.Gemma4TinyGguf;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  folder, g, fq: TDecoderModel;
+  a, b: TDecoderConfig;
+  tape: TDecoderRouteTape;
+  ctx: TDecoderContext;
+  ids: PIntegerArray;
+  lf, lg: TSingleDynArray;
+  n, v, w, k: PtrInt;
+  cmp: TInferCompare;
+  sub, pre: RawUtf8;
+  same, bytes: boolean;
+
+  // the file holds its floats as float32 (rms_norm_eps 1e-6 as 9.99999997e-7)
+  function SameSingle(x, y: double): boolean;
+  var
+    sx, sy: single;
+  begin
+    sx := x;
+    sy := y;
+    result := sx = sy;
+  end;
+
+  procedure Run(aModel: TDecoderModel; aMode: TDecoderRouteMode; aLogits: pointer);
+  begin
+    tape.Mode := aMode;
+    aModel.RouteTape := tape;
+    ctx := aModel.NewContext;
+    try
+      aModel.Forward(ctx, ids, n, aLogits, true);
+    finally
+      ctx.Free;
+      aModel.RouteTape := nil;
+    end;
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-gemma4');
+  if CheckFailed(dir <> '', 'tiny-gemma4 found') then
+    exit;
+  tape := TDecoderRouteTape.Create;
+  try
+    // 0: experts, K=V and the proportional RoPE; 1: dense, from the defaults
+    for w := 0 to 1 do
+    begin
+      sub := '';
+      pre := '';
+      if w = 1 then
+      begin
+        sub := 'dense';
+        pre := 'dense-';
+      end;
+      ref := TInferRefSet.CreateFromFolder(MakePath([dir, sub], true));
+      folder := nil;
+      g := nil;
+      fq := nil;
+      try
+        folder := NewDecoderModel(MakePath([dir, sub]), fCpu);
+        g := NewDecoderModelFromGguf(MakePath([dir, 'gguf', pre + 'bf16.gguf']), fCpu);
+        Check(g.ClassType = TGemma4Model, 'gemma4: a TGemma4Model');
+        a := folder.Config;
+        b := g.Config;
+        CheckUtf8((a.Layers = b.Layers) and (a.Hidden = b.Hidden) and
+          (a.VocabSize = b.VocabSize) and (a.Heads = b.Heads) and
+          (a.HeadDim = b.HeadDim) and (a.KvHeads = b.KvHeads) and
+          (a.Intermediate = b.Intermediate) and (a.MaxPositions = b.MaxPositions) and
+          SameSingle(a.RmsEps, b.RmsEps) and (a.RopeTheta = b.RopeTheta) and
+          (a.Rope2Theta = b.Rope2Theta) and
+          (a.RopeDims = b.RopeDims) and (a.LogitSoftcap = b.LogitSoftcap) and
+          (a.EmbedScale = b.EmbedScale) and (a.AttentionScale = b.AttentionScale) and
+          (a.Activation = b.Activation) and (a.SandwichNorm = b.SandwichNorm) and
+          (a.ValueNorm = b.ValueNorm) and (a.TiedEmbeddings = b.TiedEmbeddings) and
+          (a.Experts = b.Experts) and (a.ExpertsUsed = b.ExpertsUsed) and
+          (a.ExpertIntermediate = b.ExpertIntermediate) and (a.NormTopK = b.NormTopK),
+          '% the settings of the folder', [sub]);
+        Check(folder.Extras = g.Extras, 'the same extras');
+        CheckEqual(g.Rope2HeadDim, folder.Rope2HeadDim, 'the second rotary head');
+        // the rotating pairs of the full head (rope_freqs: a count, no share)
+        CheckEqual(Trunc(b.Rope2Partial * g.Rope2HeadDim) shr 1,
+          Trunc(a.Rope2Partial * folder.Rope2HeadDim) shr 1, 'the rotating pairs');
+        for k := 0 to a.Layers - 1 do
+          CheckUtf8((a.Spec[k].Window = b.Spec[k].Window) and
+            (a.Spec[k].HeadDim = b.Spec[k].HeadDim) and
+            (a.Spec[k].KvHeads = b.Spec[k].KvHeads) and
+            (a.Spec[k].KIsV = b.Spec[k].KIsV) and (a.Spec[k].Rope2 = b.Spec[k].Rope2) and
+            (a.Spec[k].Ffn = b.Spec[k].Ffn), '% layer % kind', [sub, k]);
+        // BF16 widened as the folder widens it: the logits of the folder (dense
+        // bit for bit; with experts within 1e-6 - the file holds rms_norm_eps as
+        // float32, as transformers adds it)
+        ids := ref.I32('case2.ids', n);
+        v := a.VocabSize;
+        SetLength(lf, n * v);
+        SetLength(lg, n * v);
+        Run(folder, drmOff, pointer(lf));
+        Run(g, drmOff, pointer(lg));
+        same := CompareMem(pointer(lg), pointer(lf), n * v * SizeOf(single));
+        cmp := InferCompare(pointer(lg), pointer(lf), n * v, 1e-5, 1e-5);
+        AddConsole(FormatString('Gemma 4 % GGUF BF16 vs folder: %, same bits %',
+          [sub, InferCompareText(cmp), same]));
+        CheckUtf8(InferCompareOk(cmp), '% GGUF BF16 vs the folder: %',
+          [sub, InferCompareText(cmp)]);
+        for k := 0 to 2 do
+          CheckStates(g, ref, FormatUtf8('case%', [k]), 1e-4, 1e-4, true);
+        // Q8_0 as llama-quantize writes it: every matrix the bytes of Q8_0 at
+        // load (ggml's reference quantizer); only the embedding rows differ
+        // (Q8_0 in the file, BF16 in the folder)
+        FreeAndNil(g);
+        g := TGemma4Model.CreateFromGguf(MakePath([dir, 'gguf', pre + 'q8_0.gguf']), fCpu);
+        fq := TGemma4Model.Create(MakePath([dir, sub]), fCpu, idtQ8_0);
+        Check((g.Weights = idtQ8_0) and (g.Head.DType = idtQ8_0) and
+          (g.EmbedSource^.DType = idtQ8_0), 'the types of the Q8_0 file');
+        bytes := SameWeights(g, fq);
+        CheckUtf8(bytes, '% GGUF Q8_0: every weight as Q8_0 at load', [sub]);
+        for k := 0 to 2 do
+        begin
+          ids := ref.I32(FormatUtf8('case%.ids', [k]), n);
+          SetLength(lf, n * v);
+          SetLength(lg, n * v);
+          // the experts of Q8_0 at load given to the file: only the error of
+          // the Q8_0 embedding rows is left
+          tape.Clear;
+          Run(fq, drmRecord, pointer(lf));
+          Run(g, drmReplay, pointer(lg));
+          CheckEqual(tape.Pending, 0, 'every choice replayed');
+          // measured 2026-11-12: cosine 0.9992, 0.9926, 0.9914 with experts,
+          // 0.9975, 0.9836, 0.9909 dense (the tiny models are chaotic: Q8_0
+          // against F32 lands at 0.989 - Gemma4Quantized)
+          cmp := InferCompare(pointer(lg), pointer(lf), n * v, 0.8, 0);
+          AddConsole(FormatString('Gemma 4 % GGUF Q8_0 case % vs Q8_0 at load: %',
+            [sub, k, InferCompareText(cmp)]));
+          CheckUtf8(InferCompareOk(cmp) and (cmp.Cosine > 0.98),
+            '% GGUF Q8_0 case % vs Q8_0 at load: %', [sub, k, InferCompareText(cmp)]);
+        end;
+      finally
+        fq.Free;
+        g.Free;
+        folder.Free;
+        ref.Free;
+      end;
+    end;
+  finally
+    tape.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.Gemma4GgufRefused;
+var
+  dir: TFileName;
+  model: TDecoderModel;
+
+  function Refused(const aFile, aWhy: RawUtf8): boolean;
+  var
+    why: RawUtf8;
+  begin
+    why := 'accepted';
+    try
+      TGemma4Model.CreateFromGguf(dir + Utf8ToString(aFile), fCpu).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    result := PosEx(aWhy, why) > 0;
+    if not result then
+      AddConsole(FormatString('%: "%"', [aFile, why]));
+  end;
+
+begin
+  dir := FindInferRefDir('tiny-gemma4');
+  if CheckFailed(dir <> '', 'tiny-gemma4 found') then
+    exit;
+  dir := MakePath([dir, 'gguf'], true);
+  Check(Refused('bad-arch.gguf', 'architecture'), 'another architecture');
+  Check(Refused('bad-ple.gguf', 'per-layer embeddings'), 'per-layer embeddings');
+  Check(Refused('bad-shared.gguf', 'shared KV layers'), 'shared KV layers');
+  Check(Refused('bad-ffn.gguf', 'width per layer'), 'a feed-forward width per layer');
+  Check(Refused('bad-scaling.gguf', 'rope scaling'), 'a rope scaling');
+  Check(Refused('bad-rope.gguf', 'rotating 8'), 'a sliding rotary count of 8');
+  Check(Refused('bad-pattern.gguf', 'sliding_window_pattern'),
+    'a sliding_window_pattern of another count');
+  Check(Refused('bad-freqs.gguf', 'rope_freqs.weight[2]'),
+    'a rotating pair after one that does not');
+  Check(Refused('bad-head.gguf', 'untied head'), 'an output.weight');
+  Check(Refused('bad-missing.gguf', 'blk.1.ffn_down_exps.scale'), 'a missing tensor');
+  Check(Refused('bad-extra.gguf', 'understood'), 'an extra tensor');
+  Check(Refused('bad-swa-v.gguf', 'blk.2.attn_v.weight'), 'a sliding layer without V');
+  // 15 pairs of a head of 44: 2 * 15 / 44 * 44 = 29.999... in double
+  model := TGemma4Model.CreateFromGguf(dir + 'rope44.gguf', fCpu);
+  try
+    CheckEqual(model.Rope2HeadDim, 44, 'a full head of 44');
+    CheckEqual(Trunc(model.Config.Rope2Partial * model.Rope2HeadDim) shr 1, 15,
+      '15 rotating pairs');
+  finally
+    model.Free;
+  end;
+end;
+
+procedure TTestInferQwen3.Gemma4GgufCheckpoints;
+const
+  FILES: array[0..2] of RawUtf8 = ('gemma-4-26b-a4b-it-q8_0.gguf',
+    'gemma-4-31b-it-q8_0.gguf', 'gemma-4-12b-it-q8_0.gguf');
+  FOLDERS: array[0..2] of RawUtf8 = (
+    'gemma-4-26B-A4B-it', 'gemma-4-31B-it', 'gemma-4-12B-it');
+  DATASETS: array[0..2] of RawUtf8 = ('gemma4-26b-a4b', 'gemma4-31b', 'gemma4-12b');
+  LAYERS: array[0..2] of integer = (30, 60, 48);
+  // the thresholds of Gemma4Checkpoints (Q8_0 at load from the folders, the
+  // same for 26B-A4B and 31B) - but case 0 of the 12B: the raw text it loops
+  // on, where the Q8_0 embedding rows of the file (BF16 in the folder) move
+  // the states to 0.946 (measured 2026-11-12; the folder 0.988); checked so
+  // only where every other weight was shown byte-equal to the folder's
+  STATECOS: array[0..2] of double = (0.975, 0.995, 0.98);
+  LOGITCOS: array[0..2] of double = (0.99, 0.998, 0.995);
+  MAXABS: array[0..2] of double = (5.5, 2.5, 2.5);
+  STATECOS0: array[0..2] of double = (0.92, 0.995, 0.935);
+  LOGITCOS0: array[0..2] of double = (0.99, 0.998, 0.98);
+  MAXABS0: array[0..2] of double = (12, 2.5, 7.5);
+var
+  fn, refdir, dir: TFileName;
+  ref: TInferRefSet;
+  model, folder: TDecoderModel;
+  timer: TPrecisionTimer;
+  f: PtrInt;
+  same: boolean;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Gemma 4 GGUF checkpoints: a 64-bit process');
+  exit;
+  {$endif CPU32}
+  for f := 0 to high(FILES) do
+  begin
+    // large files of their own: only where they were put (not LAI_REQUIRE_MODEL)
+    fn := FindVendorModel(Utf8ToString(FILES[f]));
+    if fn = '' then
+    begin
+      AddConsole(FormatString('SKIP %: no vendor/models/% (revision in UPSTREAM_BASE)',
+        [FILES[f], FILES[f]]));
+      continue;
+    end;
+    refdir := FindInferRefDir(DATASETS[f]);
+    if CheckFailed(refdir <> '', Utf8ToString(DATASETS[f] + ' reference found')) then
+      continue;
+    ref := TInferRefSet.CreateFromFolder(refdir);
+    model := nil;
+    try
+      timer.Start;
+      model := NewDecoderModelFromGguf(fn, fFast);
+      AddConsole(FormatString('% loaded in %', [FILES[f], timer.Stop]));
+      Check(model.ClassType = TGemma4Model, 'gemma4');
+      CheckUtf8((model.Config.Layers = LAYERS[f]) and (model.Weights = idtQ8_0) and
+        (model.EmbedSource^.DType = idtQ8_0), '% layers in Q8_0',
+        [model.Config.Layers]);
+      Check((model.Config.Spec[5].Window = 0) and (model.Config.Spec[4].Window = 1024) and
+        model.Config.Spec[5].KIsV and (model.Config.Spec[5].HeadDim = 512) and
+        (Trunc(model.Config.Rope2Partial * 512) shr 1 = 64),
+        'a full layer (K=V, a quarter rotating) ' +
+        'after five sliding ones');
+      if f = 0 then
+        Check((model.Config.Experts = 128) and (model.Config.ExpertsUsed = 8),
+          '128 experts, 8 of them used')
+      else
+        Check(model.Config.Experts = 0, 'dense');
+      // where the folder was put too, first (both models resident for a
+      // moment: about twice the file): every weight of the file the bytes of
+      // Q8_0 at load (llama-quantize and ggml's quantizer, as ours) - only the
+      // embedding rows differ (Q8_0 in the file)
+      same := false;
+      dir := FindVendorModel(Utf8ToString(FOLDERS[f]) + PathDelim + 'config.json');
+      if dir <> '' then
+      begin
+        timer.Start;
+        folder := NewDecoderModel(ExtractFilePath(dir), fFast, idtQ8_0);
+        try
+          AddConsole(FormatString('% loaded in Q8_0 in % to compare',
+            [FOLDERS[f], timer.Stop]));
+          same := SameWeights(model, folder);
+          CheckUtf8(same, '% GGUF: every weight the bytes of Q8_0 at load',
+            [FILES[f]]);
+        finally
+          folder.Free;
+        end;
+      end;
+      if (f = 2) and not same then
+        AddConsole(FormatString('SKIP % case 0: its bounds need the folder ' +
+          'vendor/models/% (the embedding shown to be the only difference)',
+          [FILES[f], FOLDERS[f]]))
+      else
+        CheckLastRows(model, ref, FormatUtf8('% GGUF', [FILES[f]]), STATECOS0[f],
+          LOGITCOS0[f], MAXABS0[f], 1);
+      CheckLastRows(model, ref, FormatUtf8('% GGUF', [FILES[f]]), STATECOS[f],
+        LOGITCOS[f], MAXABS[f], 4, 1);
+      if f = 0 then
+        Gemma4RoutesReplayed(model, ref);
+    finally
+      model.Free;
+      ref.Free;
     end;
   end;
 end;

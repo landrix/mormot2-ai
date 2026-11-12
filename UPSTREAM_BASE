@@ -118,6 +118,17 @@ never a build input.
            llama.cpp commit 956591f4570aa6636895d90439892fef7c075b17 (2026-11-11)
            -> mormot.ai.infer.model.qwen35 and the tiny files of
            tools/infer-ref/make_reference_d7.py (tiny-qwen35-gguf).
+  Followed (backlog D6d, written anew - no code taken): how convert_hf_to_gguf.py writes
+           the architecture gemma4 (conversion/gemma.py: Gemma3Model.modify_tensors,
+           Gemma4Model.set_vocab / set_gguf_parameters / generate_extra_tensors -
+           rope_freqs, 1 for a rotating pair and 1e30 for the others - / filter_tensors /
+           modify_tensors; conversion/base.py: what stays F32), the key and tensor names
+           (src/llama-arch.cpp, src/models/gemma4.cpp) and the tokenizer model gemma4
+           (src/llama-vocab.cpp) of the llama.cpp commit
+           2a4daf0e08d6a9b6993ee0d4a9a3cfc35a6f405c (2026-11-12)
+           -> mormot.ai.infer.model.gemma4, mormot.ai.infer.tokenizer.spbpe
+           (CreateFromGguf) and the tiny files of tools/infer-ref/make_reference_d6d.py
+           (tiny-gemma4-gguf).
   Followed (backlog D5b, written anew - no code taken): the MXFP4 block (an E8M0
            exponent and 16 bytes of E2M1 nibbles, value j low and j + 16 high),
            kvalues_mxfp4 (the E2M1 values doubled) and GGML_E8M0_TO_FP32_HALF,
@@ -275,6 +286,30 @@ never a build input.
     torch 2.14.1+cpu, transformers 5.19.0 (requirements.txt), 16 threads, the BF16 matrices and
     experts taken to float32 inside their products (bit for bit a float32 load: checked on the
     12B and the tiny models).
+  Model:     ggml-org/gemma-4-26B-A4B-it-GGUF, gemma-4-31B-it-GGUF and gemma-4-12B-it-GGUF
+             (Apache-2.0; converted by llama.cpp, .src_sha in the repositories: PRIMARY
+             the revisions above for 26B-A4B and 31B, 43c9d014b231474fa7212dbb48a762566c2b255d
+             for 12B - the weights of 707f0a3, its tokenizer.json with 239 merges fewer,
+             sha256 9788bdb6a021b3170357cd3587b5d622b1177561ad3c5bf43d73728fd71aeacb; the
+             Q8_0 files llama-quantize of the BF16 conversion, the Q4_0 files of the QAT
+             checkpoints google/gemma-4-*-it-qat-q4_0-unquantized)
+  Revisions: 26B-A4B 1ca99aae748b4b01f609fa51eb23682ee5f00b85,
+             31B f39d380138390ea246513ff0f087352f3cfc3a1b,
+             12B 501d13dba70e3c02b1b12c78fd9e6b08ad413960
+  Files (sha256), in vendor/models (gitignored; only on the RTX computer):
+    gemma-4-26b-a4b-it-q8_0.gguf (gemma-4-26B-A4B-it-Q8_0.gguf)
+                                      b5108fd13147d1c866bb595295bc9d56f5fe744d7209f18421031d0cc47009c6
+    gemma-4-31b-it-q8_0.gguf (gemma-4-31B-it-Q8_0.gguf)
+                                      fcd52cebacb165a98df5abe6fb70dbf076835f4a06e064ffb33dd739b8835c9c
+    gemma-4-12b-it-q8_0.gguf (gemma-4-12B-it-Q8_0.gguf)
+                                      3730903965b3e57bcad0a387110322ce66409559c356a1ae1b61701024e5ce60
+    gemma-4-12b-it-q4_0.gguf (gemma-4-12B-it-Q4_0.gguf)
+                                      3712b9bd32cae83a22f67ee7a4466d8d7a4f21646ac8a07d19bf9418e8767a70
+  and vendor/models/gemma-4-26B-A4B-it/tokenizer.gguf (gitignored; the metadata of the
+  26B-A4B Q8_0 file without its tensors, tools/infer-ref/make_reference_d6d.py
+  gemma4-tokenizer-gguf):    e947d307c2a5471d292f8ab145f2ae878d71ee0d1e425738d1df00897484659c
+  Dataset gemma4-tokens/12b (make_reference_d6d.py, the 12B tokenizer.json of 43c9d01):
+    generated in the WSL reference (Linux aarch64), tokenizers 0.23.3.
   Datasets from it: gemma4-tokens and gemma4-chat (tools/infer-ref/make_reference_d6c.py,
     the tokenizer files and the template only); tiny-gemma4 (make_reference_d6.py) uses
     the modeling code of transformers only, no file of the model. Generated in the WSL

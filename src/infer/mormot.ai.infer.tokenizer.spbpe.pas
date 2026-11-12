@@ -21,7 +21,8 @@ unit mormot.ai.infer.tokenizer.spbpe;
   *****************************************************************************
 
     - TSpBpeTokenizer: load the BPE tokenizer.json of Gemma 4 (SentencePiece
-      style: U+2581 for a space, byte fallback), Normalize, Encode text to ids
+      style: U+2581 for a space, byte fallback) or its tables from a GGUF file
+      of llama.cpp, Normalize, Encode text to ids
       and Decode ids to bytes
 
   *****************************************************************************
@@ -89,7 +90,14 @@ type
     // special or not, are never matched in text (the tokenizers library would
     // match both)
     constructor Create(const aFileName: TFileName); override;
-    /// not supported yet (D6d): raises EInferError
+    /// load the tokenizer of a GGUF file of llama.cpp's converter
+    // (tokenizer.ggml.model gemma4): the tokens, their types (normal, byte,
+    // control and user-defined ones - the last two the added tokens) and the
+    // merges - the tables of tokenizer.json, encoded as from it
+    // - llama.cpp itself encodes otherwise: it cuts the text at newlines
+    // before the merges and matches the user-defined tokens (<|channel>,
+    // <|tool_call>, ...) in text; this class keeps the pipeline of the
+    // tokenizers library, which transformers runs
     constructor CreateFromGguf(aGguf: TGgufFile); override;
     /// the normalized text: invalid UTF-8 replaced, every space U+2581
     function Normalize(const aText: RawUtf8): RawUtf8;
@@ -278,10 +286,60 @@ begin
 end;
 
 constructor TSpBpeTokenizer.CreateFromGguf(aGguf: TGgufFile);
+var
+  tokens, merges, a, b, addedText: TRawUtf8DynArray;
+  addedId: TIntegerDynArray;
+  types: PIntegerArray;
+  count: Int64;
+  i: PtrInt;
+  t: RawUtf8;
 begin
   inherited CreateFromGguf(aGguf);
-  EInferError.RaiseUtf8('%: the tokenizer of a GGUF file is not supported yet',
-    [self]);
+  // llama.cpp's name of this pipeline (Gemma4Model.set_vocab of the
+  // converter): the vocabulary of tokenizer.json in id order, its merges as
+  // "a b", no space prefix - GGUF stores neither normalizer nor decoder
+  if aGguf.Str('tokenizer.ggml.model') <> 'gemma4' then
+    EInferError.RaiseUtf8('%: tokenizer model "%" is not gemma4',
+      [self, aGguf.Str('tokenizer.ggml.model')]);
+  if aGguf.BoolDef('tokenizer.ggml.add_space_prefix', false) then
+    EInferError.RaiseUtf8('%: add_space_prefix is set', [self]);
+  tokens := aGguf.Strings('tokenizer.ggml.tokens');
+  count := length(tokens);
+  types := aGguf.Ints32('tokenizer.ggml.token_type', count);
+  merges := aGguf.Strings('tokenizer.ggml.merges');
+  // every token is in the vocabulary (as in tokenizer.json, where the added
+  // tokens are too); normal (1) and byte (6) tokens as they are, control (3)
+  // and user-defined (4) ones the added tokens - reachable by TokenId only
+  for i := 0 to count - 1 do
+    case types^[i] of
+      1:
+        ;
+      6:
+        begin
+          t := tokens[i];
+          // the form TokenTextBytes decodes as one byte: "<0x" and two hex digits
+          if (length(t) <> 6) or (t[1] <> '<') or (t[2] <> '0') or (t[3] <> 'x') or
+             (t[6] <> '>') or (HexNibble(t[4]) < 0) or (HexNibble(t[5]) < 0) then
+            EInferError.RaiseUtf8('%: byte token % is "%"', [self, i, t]);
+        end;
+      3, 4:
+        begin
+          SetLength(addedText, length(addedText) + 1);
+          SetLength(addedId, length(addedId) + 1);
+          addedText[high(addedText)] := tokens[i];
+          addedId[high(addedId)] := i;
+        end;
+    else
+      EInferError.RaiseUtf8('%: token % "%" of type %', [self, i, tokens[i], types^[i]]);
+    end;
+  // "a b": no token text holds a space here (U+2581 stands for it)
+  SetLength(a, length(merges));
+  SetLength(b, length(merges));
+  for i := 0 to high(merges) do
+    if not Split(merges[i], ' ', a[i], b[i]) or (a[i] = '') or (b[i] = '') or
+       (PosEx(' ', b[i]) > 0) then
+      EInferError.RaiseUtf8('%: merge % is not "a b"', [self, i]);
+  Build(tokens, a, b, addedText, addedId);
 end;
 
 procedure TSpBpeTokenizer.Build(const aVocab, aLeft, aRight,

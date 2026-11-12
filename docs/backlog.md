@@ -390,8 +390,14 @@ In Scheiben:
   `gemma4_unified`, `TGemma4UnifiedModel`) aus safetensors in Q8_0 auf der CPU gegen
   transformers in float32; beim 26B-A4B die Abweichung im Rohtext-Fall als Expertenwahl an
   knappen Stellen nachgewiesen (`TDecoderRouteTape.Add`); 26B-A4B hinter `ILlmClient`.
-- *Offen:* D6d GGUF (auch der Tokenizer), D6e Vulkan und CUDA (Kopfdimension 512); E2B/E4B
-  danach.
+- *D6d erledigt 2026-11-12* (`native-inference.md`, Phase D): Gemma 4 aus den GGUF-Dateien
+  von ggml-org (26B-A4B, 31B, 12B; Q8_0 gegen die Referenzen aus D6b, 12B Q4_0 aus dem
+  QAT-Checkpoint hinter `ILlmClient`), der Tokenizer aus GGUF (die Tabellen von
+  `tokenizer.json`; beim 12B das korrigierte mit 239 Merges weniger); Tiny-GGUFs nach dem
+  Vorbild des Konverters.
+- *Offen:* D6e Vulkan und CUDA (Kopfdimension 512); E2B/E4B danach. `suppress_tokens` des
+  12B (`generation_config.json`, im GGUF `tokenizer.ggml.suppress_tokens`: `<image|>`,
+  `<audio|>`) wendet der Client nicht an - transformers verbietet sie bei `generate`.
 
 **D7 — Gated DeltaNet.** Rekurrenz, Convolution-Zustand, Gates, Normierung, Ausgangsgate der
 vollen Attention. Erst seriell auf der CPU, dann der Prefill auf allen Kernen, dann GPU. Prompt-Cache mit

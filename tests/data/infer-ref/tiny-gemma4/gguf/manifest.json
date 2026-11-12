@@ -1,0 +1,53 @@
+{
+ "dataset": "tiny-gemma4/gguf",
+ "environment": {
+  "created_utc": "2026-11-12T18:28:59Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 12,
+  "deterministic_algorithms": false,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "ggml": {
+  "dir": "vendor/sqlite-ext/aarch64-linux",
+  "sha256": {
+   "libggml-base.so": "8d31aa6de31be5e0203ade1dd71f04e4c32ce945e18ba15ff8626ea08baa0893",
+   "libggml-cpu.so": "c32ac3682a436f5df5a404623bd21d0b7f083694270520125c7882df35719659"
+  }
+ },
+ "llama_cpp_commit": "2a4daf0e08d6a9b6993ee0d4a9a3cfc35a6f405c",
+ "source": "tiny-gemma4, tiny-gemma4/dense",
+ "note": "tiny-gemma4 (bf16, q8_0) and tiny-gemma4/dense (dense-bf16, dense-q8_0) as llama.cpp's converter writes gemma4, with the keys of ggml-org/gemma-4-26B-A4B-it-GGUF: head_count_kv an array per layer where the full layers have their own KV heads (tiny-gemma4), a number otherwise (dense); sliding_window_pattern; key_length / rope.dimension_count the full head, *_swa the sliding one; rope_freqs 1 for the rotating pairs of the full head, 1e30 for the others; no attn_v in the full layers of tiny-gemma4 (attention_k_eq_v); the norms as they are, the router scale as ffn_gate_inp.scale, per_expert_scale as ffn_down_exps.scale, layer_scalar as layer_output_scale.weight, gate_up_proj and down_proj as ffn_gate_up_exps / ffn_down_exps; 1-D tensors, norms and the router in F32, the matrices in BF16 (the bits of the folder: exact) or Q8_0 (quantize_row_q8_0_ref row by row, token_embd and the experts too). The expected values are those of the source folders. bad-* (the first nine with the embedding, the last norm and rope_freqs only): another architecture, per-layer embeddings, shared KV layers, a feed-forward width per layer, a rope scaling, a sliding rotary count of 8, a sliding_window_pattern of 3 layers, rope_freqs with a rotating pair after one that does not, an output.weight (an untied head), a missing blk.1.ffn_down_exps.scale, an extra blk.0.ffn_gate_shexp.weight, a sliding layer 2 without attn_v. rope44: tiny-gemma4 with a full head of 44 (random weights in the full layers) and 15 rotating pairs - the count, not a share, must reach the RoPE (2 * 15 / 44 * 44 is 29.999... in double). tokenizer: a gemma4 tokenizer alone (the five controls, the 256 byte tokens, a, b, ab, U+2581, U+2581a, <|turn>; merges a b, U+2581 a); bad-tokenizer, bad-tokenizer-x: one more byte token <0xZZ>, <0X41> (the decoder reads <0x only)",
+ "files": {
+  "bad-arch.gguf": "c767b8ccf5b2290d4e2a9899c43686495e89abe10679314952d85b76c35472f3",
+  "bad-extra.gguf": "3912d9a33f1ccfaab800e62501d069dce5c84b40d853b8c23ea4d7c162f5efee",
+  "bad-ffn.gguf": "46a249f947e834d03723d527df1dc84432825d8de5cc006c7dc515c197372a27",
+  "bad-freqs.gguf": "eb4b04fef29bf5ef9aa53e8afeba0d40a9d735143840d52334fe176353640256",
+  "bad-head.gguf": "068f8378db3dca953a5b48e086e81efa75aa609d8ef6dc633b5ebc0677a97716",
+  "bad-missing.gguf": "5fbfacd60aa238f58d2bc582fe74d2faf909bac0a371a2bf603aca451821c69c",
+  "bad-pattern.gguf": "90c4c60bd616bb280e91d44c8a38fa0f8c169750a8cd014e3ee1878de1192119",
+  "bad-ple.gguf": "2d860d1cd9c150d55603c037fac352ed9cb97498478c78f174a41b1fe7abbd3f",
+  "bad-rope.gguf": "d1e9f38dc49ded1e8a3deadf9a53904ff2f7af97a66d508e24b811c818b4e733",
+  "bad-scaling.gguf": "c17234e36039a2c5a2baf573339a6ff47fcf25e59e166dc5a582a39cae82f727",
+  "bad-shared.gguf": "5dd3101a540339aacc2a5d4e3224c338f157550caf9815261d9bc199f4b99491",
+  "bad-swa-v.gguf": "274af4c1b380be5a0e267b8cde7c06e99679368cc50aa7d554941fb3e9aed647",
+  "bad-tokenizer-x.gguf": "4ecd3e8625d61b107ef78dbf67dcec2fdebca1885ca3077ec8d173065a7ebdea",
+  "bad-tokenizer.gguf": "b6d4354686ceeb6ddeac2e1b4c6ff2fb3f0b91dcbf0a0fc03a2aaf9447da625d",
+  "bf16.gguf": "e8f5d980054e51ba297e6b6602ccbe4830cadf75682920062d7629481bd0f0a7",
+  "dense-bf16.gguf": "8d4a9d4e49d4944fb472bf767db2a0c9f2ef54edb416ef4e9c93a16799def601",
+  "dense-q8_0.gguf": "fc1af194f7098f31e1f57891e8ec0edb97b83a8fcce197fac7da3d05898d3e2a",
+  "q8_0.gguf": "c66c5814a278dab02480f712d2278b8cd42c5361a36e4752132a3961d39ae2de",
+  "rope44.gguf": "9ce46b306975c77a988c35c1dad92bd49d0d6e1b687aff8fa2f0c2748e47803a",
+  "tokenizer.gguf": "88067fbda8b54c1e617dab6af3db70f32ea9390c3fc9c724599882aa9590e521"
+ }
+}

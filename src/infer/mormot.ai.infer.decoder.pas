@@ -846,6 +846,10 @@ type
     /// the language-model head, as used
     property Head: TInferWeight
       read fHead;
+    /// the embedding matrix as stored, read row by row per token (nil: none)
+    // - for diagnosis and tests
+    property EmbedSource: PInferTensor
+      read fEmbedSrc;
     /// the GGUF file of CreateFromGguf (nil after Create): its metadata holds
     // the tokenizer too
     property Gguf: TGgufFile

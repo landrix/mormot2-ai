@@ -27,6 +27,7 @@ uses
   mormot.ai.llm,
   mormot.ai.llm.native,
   mormot.ai.infer.tensor,
+  mormot.ai.infer.loader.gguf,
   mormot.ai.infer.tokenizer,
   mormot.ai.infer.tokenizer.spbpe,
   mormot.ai.infer.chat,
@@ -47,6 +48,13 @@ type
     /// every chat case through TGemma4ChatTemplate: the same text (aIds
     // false) or the same ids; a case transformers refused raises
     procedure CheckChat(aTokenizer: TInferTokenizer; aIds: boolean);
+    /// every case of the token dataset aDir: the ids of aTokenizer, and
+    // decoding gives the text back; at least aMinCases cases
+    procedure CheckRefIds(aTokenizer: TInferTokenizer; const aDir: TFileName;
+      aMinCases: PtrInt);
+    /// an answer (Paris), a tool call and its result (17), with aThinking a
+    // reasoning before the answer (391)
+    procedure CheckClientChat(aLlm: TNativeLlmClient; aThinking: boolean);
   published
     /// U+2581 for a space, the whole text one word, byte fallback, decoding;
     // foreign pipelines refused (no model needed)
@@ -73,6 +81,14 @@ type
     // answer, a tool call and its result, thinking on request - only where
     // its weights were put
     procedure Gemma4CheckpointChat;
+    /// D6d: the tokenizer of a GGUF file - the tables of tokenizer.json, every
+    // reference case (12B: its fixed file, 239 merges fewer) - where a file
+    // was put (tokenizer.gguf: the metadata of the 26B-A4B file alone)
+    procedure Gemma4GgufTokenizer;
+    /// D6d: the client from a GGUF file alone (26B-A4B Q8_0: an answer and a
+    // tool call; 12B Q4_0 from the QAT checkpoint: an answer) - only where
+    // the files were put
+    procedure Gemma4GgufChat;
   end;
 
 /// the folder of the gemma-4-26B-A4B-it files, '' when aFile is not in it
@@ -203,6 +219,9 @@ var
   err, vocab, merges, json: RawUtf8;
   ids: TIntegerDynArray;
   refused: boolean;
+  dir: TFileName;
+  g: TGgufFile;
+  i: PtrInt;
 begin
   // 256 a, 257 b, 258 c, 259 U+2581, 260 ab, 261 U+2581b, 262 bU+2581, 263 aa
   vocab := '"a":256,"b":257,"c":258,"' + SP_SPACE + '":259,"ab":260,"' + SP_SPACE +
@@ -330,20 +349,73 @@ begin
   finally
     t.Free;
   end;
+  // a GGUF file of another tokenizer model (t5 of tiny-gguf)
   refused := false;
-  try
-    TSpBpeTokenizer.CreateFromGguf(nil).Free;
-  except
-    on EInferError do
-      refused := true;
+  dir := FindInferRefDir('tiny-gguf');
+  if not CheckFailed(dir <> '', 'tiny-gguf found') then
+  begin
+    g := TGgufFile.Create(MakePath([dir, 'model.gguf']));
+    try
+      try
+        TSpBpeTokenizer.CreateFromGguf(g).Free;
+      except
+        on E: EInferError do
+          refused := PosEx('is not gemma4', StringToUtf8(E.Message)) > 0;
+      end;
+    finally
+      g.Free;
+    end;
+    Check(refused, 'a GGUF tokenizer of another model');
   end;
-  Check(refused, 'GGUF not supported yet');
+  // a gemma4 tokenizer alone (tiny-gemma4/gguf): 5..260 the bytes, 261 a,
+  // 262 b, 263 ab, 264 U+2581, 265 U+2581a, 266 <|turn>
+  dir := FindInferRefDir('tiny-gemma4');
+  if CheckFailed(dir <> '', 'tiny-gemma4 found') then
+    exit;
+  g := TGgufFile.Create(MakePath([dir, 'gguf', 'tokenizer.gguf']));
+  try
+    t := TSpBpeTokenizer.CreateFromGguf(g);
+    try
+      CheckEqual(IdsText(t.Encode('ab a')), '[263 265 ]', 'merged');
+      // U+2581 a b: "a b" (rank 0) before "U+2581 a" (rank 1)
+      CheckEqual(IdsText(t.Encode(' ab')), '[264 263 ]', 'merged by rank');
+      CheckEqual(t.Decode([263, 265]), 'ab a', 'decoded');
+      CheckEqual(t.TokenId('<|turn>'), 266, 'the added control');
+      // text stays text: the characters outside the vocabulary as bytes
+      CheckEqual(IdsText(t.Encode('<|turn>')), '[65 129 121 122 119 115 67 ]',
+        'a control literal is text');
+    finally
+      t.Free;
+    end;
+  finally
+    g.Free;
+  end;
+  // one more byte token that TokenTextBytes would not decode as a byte
+  for i := 0 to 1 do
+  begin
+    if i = 0 then
+      g := TGgufFile.Create(MakePath([dir, 'gguf', 'bad-tokenizer.gguf']))
+    else
+      g := TGgufFile.Create(MakePath([dir, 'gguf', 'bad-tokenizer-x.gguf']));
+    refused := false;
+    try
+      try
+        TSpBpeTokenizer.CreateFromGguf(g).Free;
+      except
+        on E: EInferError do
+          refused := PosEx('byte token', StringToUtf8(E.Message)) > 0;
+      end;
+    finally
+      g.Free;
+    end;
+    CheckUtf8(refused, 'byte token % refused', [i]);
+  end;
 end;
 
-procedure TTestInferGemma4.Gemma4TokenizerIds;
+procedure TTestInferGemma4.CheckRefIds(aTokenizer: TInferTokenizer;
+  const aDir: TFileName; aMinCases: PtrInt);
 var
   ref: TInferRefSet;
-  dir: TFileName;
   cases, c: PDocVariantData;
   ids, offsets, textOffsets: PIntegerArray;
   texts: PByteArray;
@@ -352,12 +424,7 @@ var
   text, want, failures: RawUtf8;
   same: boolean;
 begin
-  if not Ready then
-    exit;
-  dir := FindInferRefDir('gemma4-tokens');
-  if CheckFailed(dir <> '', 'gemma4-tokens found') then
-    exit;
-  ref := TInferRefSet.CreateFromFolder(dir);
+  ref := TInferRefSet.CreateFromFolder(aDir);
   try
     cases := ref.Manifest^.A['cases'];
     ids := ref.I32('ids', n);
@@ -371,7 +438,7 @@ begin
     begin
       c := _Safe(cases^.Values[i]);
       FastSetString(text, @texts^[textOffsets^[i]], textOffsets^[i + 1] - textOffsets^[i]);
-      mine := fTokenizer.Encode(text);
+      mine := aTokenizer.Encode(text);
       first := offsets^[i];
       count := offsets^[i + 1] - first;
       same := length(mine) = count;
@@ -387,16 +454,28 @@ begin
       end;
       if not c^.GetAsRawUtf8('decoded', want) then
         want := text;
-      if fTokenizer.Decode(mine) <> want then
+      if aTokenizer.Decode(mine) <> want then
         inc(decBad);
     end;
-    CheckUtf8(idsBad = 0, '% of % cases with other ids:%',
-      [idsBad, cases^.Count, failures]);
+    CheckUtf8(idsBad = 0, '% of % cases of % with other ids:%',
+      [idsBad, cases^.Count, ref.Manifest^.U['dataset'], failures]);
     CheckUtf8(decBad = 0, '% of % cases decode otherwise', [decBad, cases^.Count]);
-    CheckUtf8(cases^.Count > 3000, '% cases', [cases^.Count]);
+    CheckUtf8(cases^.Count >= aMinCases, '% cases', [cases^.Count]);
   finally
     ref.Free;
   end;
+end;
+
+procedure TTestInferGemma4.Gemma4TokenizerIds;
+var
+  dir: TFileName;
+begin
+  if not Ready then
+    exit;
+  dir := FindInferRefDir('gemma4-tokens');
+  if CheckFailed(dir <> '', 'gemma4-tokens found') then
+    exit;
+  CheckRefIds(fTokenizer, dir, 3000);
 end;
 
 procedure TTestInferGemma4.Gemma4TokenizerTokens;
@@ -1112,12 +1191,76 @@ begin
     (f.Parser = TGemma4OutputParser), 'gemma4_unified registered');
 end;
 
+procedure TTestInferGemma4.CheckClientChat(aLlm: TNativeLlmClient;
+  aThinking: boolean);
+var
+  r: TLlmChatRequest;
+  a: TLlmChatResponse;
+  timer: TPrecisionTimer;
+begin
+  Check(aLlm.Template is TGemma4ChatTemplate, 'the Gemma 4 template');
+  Check(not aLlm.EnableThinking, 'thinking only when asked');
+  Finalize(r);
+  FillCharFast(r, SizeOf(r), 0);
+  SetLength(r.Messages, 1);
+  r.Temperature := 0;
+  r.MaxTokens := 200;
+  r.Messages[0] := LlmMessage(lrUser,
+    'What is the capital of France? Answer with one word.');
+  timer.Start;
+  a := aLlm.ChatComplete(r);
+  AddConsole(FormatString('capital in %: "%" (% tokens)', [timer.Stop, a.Content,
+    a.Usage.CompletionTokens]));
+  Check(a.FinishReason = lfrStop, 'stopped by itself');
+  Check(PosEx('Paris', a.Content) > 0, 'the answer Paris');
+  CheckEqual(a.Reasoning, '', 'no reasoning');
+  // a tool call, then the answer with its result
+  SetLength(r.Tools, 1);
+  r.Tools[0].Name := 'get_weather';
+  r.Tools[0].Description := 'Get the current weather of a city';
+  r.Tools[0].ParametersJson := '{"type":"object","properties":{"city":' +
+    '{"type":"string"}},"required":["city"]}';
+  r.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
+  timer.Start;
+  a := aLlm.ChatComplete(r);
+  AddConsole(FormatString('weather in %: % calls, content "%"', [timer.Stop,
+    length(a.ToolCalls), a.Content]));
+  if not CheckFailed(length(a.ToolCalls) = 1, 'one tool call') then
+  begin
+    CheckEqual(a.ToolCalls[0].Name, 'get_weather', 'the tool');
+    CheckEqual(a.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
+    SetLength(r.Messages, 3);
+    r.Messages[1] := LlmMessage(lrAssistant, a.Content);
+    r.Messages[1].ToolCalls := a.ToolCalls;
+    r.Messages[2] := LlmMessage(lrTool, '{"temperature_c": 17, "sky": "rain"}');
+    r.Messages[2].ToolCallId := a.ToolCalls[0].Id;
+    timer.Start;
+    a := aLlm.ChatComplete(r);
+    AddConsole(FormatString('answer in %: "%"', [timer.Stop, copy(a.Content, 1, 200)]));
+    Check(a.FinishReason = lfrStop, 'answered');
+    Check(PosEx('17', a.Content) > 0, 'with the temperature of the tool');
+  end;
+  if not aThinking then
+    exit;
+  // thinking on by the request: the thought channel first
+  SetLength(r.Messages, 1);
+  r.Tools := nil;
+  r.Messages[0] := LlmMessage(lrUser, 'What is 17 times 23?');
+  r.Extra := _ObjFast(['chat_template_kwargs', _ObjFast(['enable_thinking', true])]);
+  r.MaxTokens := 1500;
+  timer.Start;
+  a := aLlm.ChatComplete(r);
+  AddConsole(FormatString('17 x 23 with thinking in %: reasoning "%" answer "%" ' +
+    '(% tokens)', [timer.Stop, copy(a.Reasoning, 1, 100), copy(a.Content, 1, 100),
+    a.Usage.CompletionTokens]));
+  Check(a.Reasoning <> '', 'with reasoning');
+  Check(PosEx('391', a.Content) > 0, 'the answer 391');
+end;
+
 procedure TTestInferGemma4.Gemma4CheckpointChat;
 var
   dir: TFileName;
   llm: TNativeLlmClient;
-  r: TLlmChatRequest;
-  a: TLlmChatResponse;
   timer: TPrecisionTimer;
 begin
   {$ifdef CPU32}
@@ -1136,65 +1279,131 @@ begin
   llm := TNativeLlmClient.Create(dir); // Q8_0 at load
   try
     AddConsole(FormatString('gemma-4-26B-A4B-it client loaded in %', [timer.Stop]));
-    Check(llm.Template is TGemma4ChatTemplate, 'the Gemma 4 template');
-    Check(not llm.EnableThinking, 'thinking only when asked');
-    Finalize(r);
-    FillCharFast(r, SizeOf(r), 0);
-    SetLength(r.Messages, 1);
-    r.Temperature := 0;
-    r.MaxTokens := 200;
-    r.Messages[0] := LlmMessage(lrUser,
-      'What is the capital of France? Answer with one word.');
-    timer.Start;
-    a := llm.ChatComplete(r);
-    AddConsole(FormatString('capital in %: "%" (% tokens)', [timer.Stop, a.Content,
-      a.Usage.CompletionTokens]));
-    Check(a.FinishReason = lfrStop, 'stopped by itself');
-    Check(PosEx('Paris', a.Content) > 0, 'the answer Paris');
-    CheckEqual(a.Reasoning, '', 'no reasoning');
-    // a tool call, then the answer with its result
-    SetLength(r.Tools, 1);
-    r.Tools[0].Name := 'get_weather';
-    r.Tools[0].Description := 'Get the current weather of a city';
-    r.Tools[0].ParametersJson := '{"type":"object","properties":{"city":' +
-      '{"type":"string"}},"required":["city"]}';
-    r.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
-    timer.Start;
-    a := llm.ChatComplete(r);
-    AddConsole(FormatString('weather in %: % calls, content "%"', [timer.Stop,
-      length(a.ToolCalls), a.Content]));
-    if not CheckFailed(length(a.ToolCalls) = 1, 'one tool call') then
-    begin
-      CheckEqual(a.ToolCalls[0].Name, 'get_weather', 'the tool');
-      CheckEqual(a.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
-      SetLength(r.Messages, 3);
-      r.Messages[1] := LlmMessage(lrAssistant, a.Content);
-      r.Messages[1].ToolCalls := a.ToolCalls;
-      r.Messages[2] := LlmMessage(lrTool, '{"temperature_c": 17, "sky": "rain"}');
-      r.Messages[2].ToolCallId := a.ToolCalls[0].Id;
-      timer.Start;
-      a := llm.ChatComplete(r);
-      AddConsole(FormatString('answer in %: "%"', [timer.Stop, copy(a.Content, 1, 200)]));
-      Check(a.FinishReason = lfrStop, 'answered');
-      Check(PosEx('17', a.Content) > 0, 'with the temperature of the tool');
-    end;
-    // thinking on by the request: the thought channel first
-    SetLength(r.Messages, 1);
-    r.Tools := nil;
-    r.Messages[0] := LlmMessage(lrUser, 'What is 17 times 23?');
-    r.Extra := _ObjFast(['chat_template_kwargs', _ObjFast(['enable_thinking', true])]);
-    r.MaxTokens := 1500;
-    timer.Start;
-    a := llm.ChatComplete(r);
-    AddConsole(FormatString('17 x 23 with thinking in %: reasoning "%" answer "%" ' +
-      '(% tokens)', [timer.Stop, copy(a.Reasoning, 1, 100), copy(a.Content, 1, 100),
-      a.Usage.CompletionTokens]));
-    Check(a.Reasoning <> '', 'with reasoning');
-    Check(PosEx('391', a.Content) > 0, 'the answer 391');
+    CheckClientChat(llm, true);
   finally
     llm.Free;
   end;
 end;
 
+procedure TTestInferGemma4.Gemma4GgufTokenizer;
+const
+  // the published files and the metadata of the 26B-A4B one alone
+  FILES: array[0..3] of RawUtf8 = ('tokenizer.gguf', 'gemma-4-26b-a4b-it-q8_0.gguf',
+    'gemma-4-31b-it-q8_0.gguf', 'gemma-4-12b-it-q8_0.gguf');
+  CONTROLS: array[0..9] of RawUtf8 = ('<pad>', '<eos>', '<bos>', '<|turn>',
+    '<turn|>', '<|think|>', '<|channel>', '<|tool_call>', '<|"|>', '<|video|>');
+var
+  fn, dir, dir12: TFileName;
+  g: TGgufFile;
+  t: TSpBpeTokenizer;
+  f, i, bad, found: PtrInt;
+  is12: boolean;
+begin
+  if not Ready then
+    exit;
+  dir := FindInferRefDir('gemma4-tokens');
+  if CheckFailed(dir <> '', 'gemma4-tokens found') then
+    exit;
+  dir12 := MakePath([dir, '12b']);
+  found := 0;
+  for f := 0 to high(FILES) do
+  begin
+    {$ifdef CPU32}
+    // a published file is mapped whole: too large for a 32-bit process
+    if f > 0 then
+    begin
+      AddConsole('SKIP Gemma 4 GGUF tokenizer of %: a 64-bit process', [FILES[f]]);
+      continue;
+    end;
+    {$endif CPU32}
+    if f = 0 then
+      fn := FindVendorModel('gemma-4-26B-A4B-it' + PathDelim + 'tokenizer.gguf')
+    else
+      fn := FindVendorModel(Utf8ToString(FILES[f]));
+    if fn = '' then
+      continue;
+    inc(found);
+    is12 := f = 3;
+    g := TGgufFile.Create(fn);
+    try
+      t := TSpBpeTokenizer.CreateFromGguf(g);
+      try
+        // the tables of tokenizer.json: the same tokens, bytes and controls
+        CheckUtf8((t.VocabSize = fTokenizer.VocabSize) and
+          (t.BpeCount = fTokenizer.BpeCount), '% vocabulary % / %',
+          [FILES[f], t.VocabSize, t.BpeCount]);
+        bad := 0;
+        for i := 0 to fTokenizer.VocabSize - 1 do
+          if t.TokenBytes(i) <> fTokenizer.TokenBytes(i) then
+            inc(bad);
+        CheckUtf8(bad = 0, '% tokens of % decode otherwise', [bad, FILES[f]]);
+        for i := 0 to high(CONTROLS) do
+          CheckUtf8((t.TokenId(CONTROLS[i]) >= 0) and
+            (t.TokenId(CONTROLS[i]) = fTokenizer.TokenId(CONTROLS[i])),
+            '% control token %', [FILES[f], CONTROLS[i]]);
+        // 12B: the tokenizer.json of 43c9d01, 239 merges dropped
+        if is12 then
+          CheckEqual(t.MergeCount, fTokenizer.MergeCount - 239, '12B merges')
+        else
+          CheckEqual(t.MergeCount, fTokenizer.MergeCount, 'merges');
+        // none of the 3197 cases changes with the dropped merges
+        CheckRefIds(t, dir, 3000);
+        if is12 then
+          CheckRefIds(t, dir12, 239);
+      finally
+        t.Free;
+      end;
+    finally
+      g.Free;
+    end;
+  end;
+  if found = 0 then
+    {$ifdef CPU32}
+    AddConsole('SKIP Gemma 4 GGUF tokenizer: no vendor/models/' +
+      'gemma-4-26B-A4B-it/tokenizer.gguf (make_reference_d6d.py gemma4-tokenizer-gguf)')
+    {$else}
+    AddConsole('SKIP Gemma 4 GGUF tokenizer: neither vendor/models/' +
+      'gemma-4-26B-A4B-it/tokenizer.gguf nor a published file (make_reference_d6d.py ' +
+      'gemma4-tokenizer-gguf)');
+    {$endif CPU32}
+end;
+
+procedure TTestInferGemma4.Gemma4GgufChat;
+const
+  FILES: array[0..1] of RawUtf8 = ('gemma-4-26b-a4b-it-q8_0.gguf',
+    'gemma-4-12b-it-q4_0.gguf');
+var
+  fn: TFileName;
+  llm: TNativeLlmClient;
+  timer: TPrecisionTimer;
+  f: PtrInt;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Gemma 4 GGUF chat: a 64-bit process');
+  exit;
+  {$endif CPU32}
+  for f := 0 to high(FILES) do
+  begin
+    // large models of their own: only where they were put (not LAI_REQUIRE_MODEL)
+    fn := FindVendorModel(Utf8ToString(FILES[f]));
+    if fn = '' then
+    begin
+      AddConsole(FormatString('SKIP Gemma 4 GGUF chat: no vendor/models/% (revision ' +
+        'in UPSTREAM_BASE)', [FILES[f]]));
+      continue;
+    end;
+    timer.Start;
+    llm := TNativeLlmClient.CreateFromGguf(fn);
+    try
+      AddConsole(FormatString('% client loaded in %', [FILES[f], timer.Stop]));
+      Check((llm.Family.Tokenizer = TSpBpeTokenizer) and (llm.Model.Gguf <> nil),
+        'the tokenizer of the file');
+      // the 12B Q4_0 file: the QAT checkpoint, its Q4_0 weights trained for it
+      CheckClientChat(llm, false);
+    finally
+      llm.Free;
+    end;
+  end;
+end;
 
 end.

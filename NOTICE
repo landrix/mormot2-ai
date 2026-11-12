@@ -159,7 +159,13 @@ Gemma 4  (Google)  (MODEL INTERFACE, NOT CODE)
   modeling_gemma4_unified.py) are read at runtime and not part of this
   repository; tests/data/infer-ref/gemma4-26b-a4b, gemma4-31b and gemma4-12b
   hold token ids, logits, states and router choices computed with them, no
-  weights.
+  weights. The GGUF files of ggml-org/gemma-4-26B-A4B-it-GGUF, gemma-4-31B-it-GGUF
+  and gemma-4-12B-it-GGUF (converted from these checkpoints by llama.cpp; the
+  12B from 43c9d014b231474fa7212dbb48a762566c2b255d, whose tokenizer.json drops
+  239 merges) are read at runtime and not part of this repository;
+  tests/data/infer-ref/tiny-gemma4/gguf holds the seeded models in their
+  layout, tests/data/infer-ref/gemma4-tokens/12b token ids computed with the
+  tokenizer.json of that 12B revision.
   License: Apache-2.0.
   https://huggingface.co/google/gemma-4-26B-A4B-it
   https://huggingface.co/google/gemma-4-31B-it
