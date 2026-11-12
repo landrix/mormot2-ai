@@ -1,0 +1,1315 @@
+{
+ "dataset": "qwen38-parse",
+ "note": "per case a prompt (the conversation, tools and options through chat_template.jinja with the generation prompt) and an answer as the model would write it, both tokenized by the HF tokenizer; parsed: what transformers' parse_response makes of the answer with the response_template of tokenizer_config.json, the prompt as prefix and the tools of the case (their schemas type the arguments); content, reasoning and calls (name, arguments as json.dumps) taken from it",
+ "model": {
+  "id": "Qwen/Qwen3.8-27B",
+  "revision": "37561816e66b5b9153b1b64c10968c18c1e6f4a0",
+  "files": {
+   "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+   "tokenizer_config.json": "207c03c41a06a9c3b0cc527d8a56115159c1eac6b59a4ffae85b646e773d074e",
+   "chat_template.jinja": "af16f654968d47d09a6c604e00370b12dbc21f76456f59c9e98b82e84d9f6375"
+  }
+ },
+ "environment": {
+  "created_utc": "2026-11-12T13:10:44Z",
+  "platform": "Linux aarch64",
+  "python": "3.12.13",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.19.0",
+  "tokenizers": "0.23.3",
+  "safetensors": "0.8.0",
+  "sentencepiece": "0.2.2",
+  "numpy": "2.5.4",
+  "device": "cpu",
+  "dtype": "float32",
+  "threads": 12,
+  "deterministic_algorithms": false,
+  "attn_implementation": "eager",
+  "mode": "eval (dropout off)",
+  "generator": "tools/infer-ref/make_reference.py"
+ },
+ "response_template": {
+  "defaults": {
+   "role": "assistant"
+  },
+  "start_anchor": "<|im_start|>assistant\n",
+  "fields": {
+   "reasoning_content": {
+    "open": "<think>",
+    "close_pattern": "</think>|(?=<tool_call>)",
+    "content": "text"
+   },
+   "tool_calls": {
+    "open_pattern": "<tool_call>\\s*<function=(?P<name>[^>\\n]+)>",
+    "close_pattern": "</tool_call>|(?=<tool_call>)",
+    "repeats": true,
+    "content": "xml-inline",
+    "content_args": {
+     "tag_pattern": "<parameter=(?P<key>[^>\\n]+)>\\n?(?P<value>.*?)\\n?(?:</parameter>|(?=<parameter=)|(?=</function>))"
+    },
+    "transform": {
+     "type": "function",
+     "function": {
+      "name": "{name}",
+      "arguments": "{content}"
+     }
+    }
+   },
+   "content": {
+    "close": [
+     "<|im_end|>",
+     "<|endoftext|>"
+    ],
+    "content": "text",
+    "repeats": true,
+    "join": ""
+   }
+  }
+ },
+ "cases": [
+  {
+   "id": "answer_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "Es ist sonnig.<|im_end|>",
+   "content": "Es ist sonnig.",
+   "reasoning": "",
+   "calls": [],
+   "parsed": {
+    "role": "assistant",
+    "content": "Es ist sonnig."
+   }
+  },
+  {
+   "id": "answer_off_trailing",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "Es ist sonnig.  \n<|im_end|>",
+   "content": "Es ist sonnig.",
+   "reasoning": "",
+   "calls": [],
+   "parsed": {
+    "role": "assistant",
+    "content": "Es ist sonnig."
+   }
+  },
+  {
+   "id": "answer_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [],
+   "options": {},
+   "answer": "Kurz nachdenken.\n</think>\n\nEs ist sonnig.<|im_end|>",
+   "content": "Es ist sonnig.",
+   "reasoning": "Kurz nachdenken.",
+   "calls": [],
+   "parsed": {
+    "role": "assistant",
+    "reasoning_content": "Kurz nachdenken.",
+    "content": "Es ist sonnig."
+   }
+  },
+  {
+   "id": "answer_think_empty",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [],
+   "options": {},
+   "answer": "\n</think>\n\nSonnig.<|im_end|>",
+   "content": "Sonnig.",
+   "reasoning": "",
+   "calls": [],
+   "parsed": {
+    "role": "assistant",
+    "content": "Sonnig."
+   }
+  },
+  {
+   "id": "answer_think_cut",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [],
+   "options": {},
+   "answer": "Ich denke noch",
+   "content": "",
+   "reasoning": "Ich denke noch",
+   "calls": [],
+   "parsed": {
+    "role": "assistant",
+    "reasoning_content": "Ich denke noch"
+   }
+  },
+  {
+   "id": "answer_no_stop",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "Es ist",
+   "content": "Es ist",
+   "reasoning": "",
+   "calls": [],
+   "parsed": {
+    "role": "assistant",
+    "content": "Es ist"
+   }
+  },
+  {
+   "id": "call_off",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {},
+   "answer": "Ich frage das Wetter ab.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "Ich frage das Wetter ab.",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "reasoning_content": "Ich frage das Wetter ab.",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "Ich schaue nach.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "Ich schaue nach.",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "content": "Ich schaue nach.",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_two",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBonn\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\"}"
+    },
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Bonn\", \"unit\": \"celsius\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Bonn",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_no_think_end",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {},
+   "answer": "Ich frage das Wetter ab.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "Ich frage das Wetter ab.",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "reasoning_content": "Ich frage das Wetter ab.",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_no_call_end",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\nUlm\n</parameter>\n</function>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBonn\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Ulm\"}"
+    },
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Bonn\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Ulm"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Bonn"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_multiline",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\nZeile 1\nZeile 2\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Zeile 1\\nZeile 2\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Zeile 1\nZeile 2"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_spaces",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\n  Berlin  \n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"  Berlin  \"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "  Berlin  "
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_no_args",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "now",
+     "description": "Uhrzeit",
+     "parameters": ""
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=now>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "now",
+     "arguments": "{}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "now",
+       "arguments": {}
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_unknown_tool",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_time",
+     "arguments": "{\"zone\": \"UTC\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_time",
+       "arguments": {
+        "zone": "UTC"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_unknown_key",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=town>\nBerlin\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"town\": \"Berlin\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "town": "Berlin"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "call_no_tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "typed",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "typed",
+     "description": "Typen",
+     "parameters": "{\"type\": \"object\", \"properties\": {\"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}, \"s\": {\"type\": \"string\"}, \"ni\": {\"type\": [\"integer\", \"null\"]}, \"any\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}]}, \"u\": {}}}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=typed>\n<parameter=i>\n42\n</parameter>\n<parameter=n>\n2.5\n</parameter>\n<parameter=b>\ntrue\n</parameter>\n<parameter=o>\n{\"k\": [1, 2]}\n</parameter>\n<parameter=a>\n[1, \"x\"]\n</parameter>\n<parameter=s>\n007\n</parameter>\n<parameter=ni>\nnull\n</parameter>\n<parameter=any>\n7\n</parameter>\n<parameter=u>\nfrei\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "typed",
+     "arguments": "{\"i\": 42, \"n\": 2.5, \"b\": true, \"o\": {\"k\": [1, 2]}, \"a\": [1, \"x\"], \"s\": \"007\", \"ni\": null, \"any\": 7, \"u\": \"frei\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "typed",
+       "arguments": {
+        "i": 42,
+        "n": 2.5,
+        "b": true,
+        "o": {
+         "k": [
+          1,
+          2
+         ]
+        },
+        "a": [
+         1,
+         "x"
+        ],
+        "s": "007",
+        "ni": null,
+        "any": 7,
+        "u": "frei"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "typed_whitespace",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "typed",
+     "description": "Typen",
+     "parameters": "{\"type\": \"object\", \"properties\": {\"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}, \"s\": {\"type\": \"string\"}, \"ni\": {\"type\": [\"integer\", \"null\"]}, \"any\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}]}, \"u\": {}}}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=typed>\n<parameter=i>\n 42 \n</parameter>\n<parameter=b>\n True \n</parameter>\n<parameter=n>\n -0.5 \n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "typed",
+     "arguments": "{\"i\": 42, \"b\": true, \"n\": -0.5}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "typed",
+       "arguments": {
+        "i": 42,
+        "b": true,
+        "n": -0.5
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "typed_number_int",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "typed",
+     "description": "Typen",
+     "parameters": "{\"type\": \"object\", \"properties\": {\"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}, \"s\": {\"type\": \"string\"}, \"ni\": {\"type\": [\"integer\", \"null\"]}, \"any\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}]}, \"u\": {}}}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=typed>\n<parameter=n>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "typed",
+     "arguments": "{\"n\": 3}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "typed",
+       "arguments": {
+        "n": 3
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "typed_string_null",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "typed",
+     "description": "Typen",
+     "parameters": "{\"type\": \"object\", \"properties\": {\"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}, \"s\": {\"type\": \"string\"}, \"ni\": {\"type\": [\"integer\", \"null\"]}, \"any\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}]}, \"u\": {}}}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=typed>\n<parameter=s>\nnull\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "typed",
+     "arguments": "{\"s\": \"null\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "typed",
+       "arguments": {
+        "s": "null"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "typed_object_bad",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "typed",
+     "description": "Typen",
+     "parameters": "{\"type\": \"object\", \"properties\": {\"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}, \"s\": {\"type\": \"string\"}, \"ni\": {\"type\": [\"integer\", \"null\"]}, \"any\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}]}, \"u\": {}}}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=typed>\n<parameter=o>\n{kein json}\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "typed",
+     "arguments": "{\"o\": \"{kein json}\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "typed",
+       "arguments": {
+        "o": "{kein json}"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "typed_integer_bad",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "typed",
+     "description": "Typen",
+     "parameters": "{\"type\": \"object\", \"properties\": {\"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}, \"s\": {\"type\": \"string\"}, \"ni\": {\"type\": [\"integer\", \"null\"]}, \"any\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}]}, \"u\": {}}}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=typed>\n<parameter=i>\nzw\u00f6lf\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "typed",
+     "arguments": "{\"i\": \"zw\u00f6lf\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "typed",
+       "arguments": {
+        "i": "zw\u00f6lf"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "typed_unicode",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "typed",
+     "description": "Typen",
+     "parameters": "{\"type\": \"object\", \"properties\": {\"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}, \"s\": {\"type\": \"string\"}, \"ni\": {\"type\": [\"integer\", \"null\"]}, \"any\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}]}, \"u\": {}}}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=typed>\n<parameter=s>\nGr\u00f6\u00dfe 30\u00d760 \u20ac \ud83d\ude00\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "typed",
+     "arguments": "{\"s\": \"Gr\u00f6\u00dfe 30\u00d760 \u20ac \ud83d\ude00\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "typed",
+       "arguments": {
+        "s": "Gr\u00f6\u00dfe 30\u00d760 \u20ac \ud83d\ude00"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "text_tool_call_tag",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "Das Tag <tool_call> ist hier Text.<|im_end|>",
+   "content": "Das Tag <tool_call> ist hier Text.",
+   "reasoning": "",
+   "calls": [],
+   "parsed": {
+    "role": "assistant",
+    "content": "Das Tag <tool_call> ist hier Text."
+   }
+  },
+  {
+   "id": "open_end_function",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "open_end_next",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\", \"unit\": \"celsius\"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "open_end_typed",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "typed",
+     "description": "Typen",
+     "parameters": "{\"type\": \"object\", \"properties\": {\"i\": {\"type\": \"integer\"}, \"n\": {\"type\": \"number\"}, \"b\": {\"type\": \"boolean\"}, \"o\": {\"type\": \"object\"}, \"a\": {\"type\": \"array\"}, \"s\": {\"type\": \"string\"}, \"ni\": {\"type\": [\"integer\", \"null\"]}, \"any\": {\"anyOf\": [{\"type\": \"integer\"}, {\"type\": \"string\"}]}, \"u\": {}}}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=typed>\n<parameter=i>\n7\n<parameter=o>\n{\"k\": 1}\n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "typed",
+     "arguments": "{\"i\": 7, \"o\": {\"k\": 1}}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "typed",
+       "arguments": {
+        "i": 7,
+        "o": {
+         "k": 1
+        }
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "open_end_spaces",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call>\n<function=get_weather>\n<parameter=city>\n  Ulm  \n</function>\n</tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"  Ulm  \"}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "  Ulm  "
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "id": "open_end_compact",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Wie ist das Wetter in Berlin?"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Aktuelles Wetter f\u00fcr einen Ort",
+     "parameters": "{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\",\"description\":\"Stadt, z. B. M\u00fcnchen\"},\"unit\":{\"type\":\"string\",\"enum\":[\"celsius\",\"fahrenheit\"]}},\"required\":[\"city\"]}"
+    },
+    {
+     "name": "now",
+     "description": "Uhrzeit",
+     "parameters": ""
+    }
+   ],
+   "options": {
+    "enable_thinking": false
+   },
+   "answer": "<tool_call><function=get_weather><parameter=city>Berlin</function><tool_call><function=now></function></tool_call><|im_end|>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": "{\"city\": \"Berlin\"}"
+    },
+    {
+     "name": "now",
+     "arguments": "{}"
+    }
+   ],
+   "parsed": {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Berlin"
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "now",
+       "arguments": {}
+      }
+     }
+    ]
+   }
+  }
+ ],
+ "format": 1,
+ "blob": {
+  "file": "tensors.bin",
+  "bytes": 35940,
+  "sha256": "37c6a4769f43e6416c42787a4620eb91e6cdb8155548ac4d522cfe9fdca76790",
+  "byte_order": "little",
+  "layout": "row-major (C order)"
+ },
+ "tensors": [
+  {
+   "name": "ids",
+   "dtype": "i32",
+   "shape": [
+    8922
+   ],
+   "offset": 0,
+   "bytes": 35688,
+   "sha256": "b2f73007e92525f945ab132cc9432223c9f0aeb36c86724ddd89531f2b49da35",
+   "note": "prompt and answer of every case"
+  },
+  {
+   "name": "offsets",
+   "dtype": "i32",
+   "shape": [
+    63
+   ],
+   "offset": 35688,
+   "bytes": 252,
+   "sha256": "6c5f1b559a05ef25b188a5b6a9926bf61285edbae06cb0423c34182e57806137",
+   "note": "case i: prompt ids[offsets[2i] .. offsets[2i+1]-1], answer ids[offsets[2i+1] .. offsets[2i+2]-1]"
+  }
+ ]
+}

@@ -1,4 +1,5 @@
-/// tests for the tokenizer and the chat format of Qwen3.5 - phase D, slices D7c, D7f
+/// tests for the tokenizer and the chat format of Qwen3.5 and Qwen3.8 - phase D,
+// slices D7c, D7f, D7h
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - the gates: tests/data/infer-ref/qwen35-tokens (ids, NFC text, pre-tokenizer
@@ -11,6 +12,13 @@
 // - D7f: the tokenizer of ggml-org/Qwen3.5-0.8B-GGUF against tokenizer.json and
 //   the reference ids, the client over that file (vendor/models/
 //   qwen3.5-0.8b-q8_0.gguf, SKIP without it)
+// - D7h (TTestInferQwen38Chat): the template of Qwen3.8 against
+//   tests/data/infer-ref/qwen38-chat, its parser against what transformers'
+//   parse_response makes of an answer with the response_template of the model
+//   (qwen38-parse), both written by tools/infer-ref/make_reference_d7h.py; the
+//   ids with the tokenizer of Qwen3.5 (that of Qwen3.8 adds seven audio tokens
+//   at the end, no id of the reference is one of them); how the client tells
+//   Qwen3.8 from Qwen3.5 (the template of the files)
 unit test.infer.qwen35chat;
 
 interface
@@ -50,9 +58,6 @@ type
     procedure CleanUp; override;
     /// false (and SKIP or a failure) when tokenizer.json is not there
     function Ready: boolean;
-    /// every chat case through TQwen35ChatTemplate: the same text (aIds
-    // false) or the same ids; a case transformers refused raises
-    procedure CheckChat(aTokenizer: TInferTokenizer; aIds: boolean);
     /// every case of qwen35-tokens: the ids of the reference, decoded to the
     // NFC text
     procedure CheckIds(aTokenizer: TBpeTokenizer; const aLabel: RawUtf8);
@@ -88,6 +93,39 @@ type
     // point, a tool call
     procedure Qwen35GgufChat;
   end;
+
+  /// D7h: the chat format of Qwen3.8 against the reference
+  TTestInferQwen38Chat = class(TSynTestCase)
+  protected
+    fTokenizer: TBpeTokenizer;
+    procedure Setup; override;
+    procedure CleanUp; override;
+    /// false (and SKIP or a failure) when the Qwen3.5 tokenizer.json is not
+    // there
+    function Ready: boolean;
+  published
+    /// every chat case of qwen38-chat: the text of transformers (a tiny
+    // tokenizer: no model needed)
+    procedure Qwen38TemplateText;
+    /// every chat case: the ids of the HF tokenizer
+    procedure Qwen38TemplateIds;
+    /// the defaults, the template told apart from that of Qwen3.5 (the client
+    // picks the family by it), the options of a request
+    procedure Qwen38TemplateRules;
+    /// TQwen38OutputParser: a <tool_call> ends the reasoning and the call
+    // before it (no model needed)
+    procedure Qwen38Parser;
+    /// every case of qwen38-parse: reasoning, content and calls as
+    // transformers' parse_response gives them, but for the differences by
+    // design
+    procedure Qwen38ParserMatchesReference;
+  end;
+
+/// Qwen3.8 behind ILlmClient (D7h), on whatever aClient computes: the template
+// and parser picked by the template of the file, thinking by default (an
+// answer after a reasoning), thinking off, a tool call and its result
+procedure CheckQwen38Client(aTest: TSynTestCase; aClient: TNativeLlmClient;
+  const aLabel: RawUtf8);
 
 
 implementation
@@ -365,11 +403,34 @@ begin
   end;
 end;
 
-procedure TTestInferQwen35Chat.CheckChat(aTokenizer: TInferTokenizer; aIds: boolean);
+/// the options of a chat case: those it names, else the defaults of
+// aTemplate - for the template an option the case does not name is undefined
+function QwenCaseOptions(aCase: PDocVariantData;
+  aTemplate: TChatTemplateClass): TChatTemplateOptions;
+var
+  o: PDocVariantData;
+begin
+  o := aCase^.O['options'];
+  if o^.Exists('enable_thinking') then
+    result := ChatTemplateOptions(o^.B['enable_thinking'])
+  else
+    result := ChatTemplateOptions(aTemplate.DefaultEnableThinking);
+  if o^.Exists('preserve_thinking') then
+    result.PreserveThinking := o^.B['preserve_thinking']
+  else
+    result.PreserveThinking := aTemplate.DefaultPreserveThinking;
+  result.ReasoningEffort := o^.U['reasoning_effort'];
+end;
+
+/// every chat case of aDataset through aTemplate: the same text (aIds false)
+// or the same ids; a case transformers refused raises
+procedure CheckQwenChat(aTest: TSynTestCase; aTokenizer: TInferTokenizer;
+  aIds: boolean; const aDataset: RawUtf8; aTemplate: TChatTemplateClass);
 var
   ref: TInferRefSet;
   dir: TFileName;
-  tpl: TQwen35ChatTemplate;
+  tpl: TChatTemplate;
+  options: TChatTemplateOptions;
   cases, c: PDocVariantData;
   ids, offsets: PIntegerArray;
   n, i, j, first, count, bad, refused, literals, literalControls: PtrInt;
@@ -378,11 +439,11 @@ var
   text, failures: RawUtf8;
   raised, same: boolean;
 begin
-  dir := FindInferRefDir('qwen35-chat');
-  if CheckFailed(dir <> '', 'qwen35-chat found') then
+  dir := FindInferRefDir(aDataset);
+  if aTest.CheckFailed(dir <> '', Utf8ToString(aDataset + ' found')) then
     exit;
   ref := TInferRefSet.CreateFromFolder(dir);
-  tpl := TQwen35ChatTemplate.Create(aTokenizer);
+  tpl := aTemplate.Create(aTokenizer);
   try
     cases := ref.Manifest^.A['cases'];
     ids := ref.I32('ids', n);
@@ -398,15 +459,14 @@ begin
       raised := false;
       text := '';
       mine := nil;
+      options := QwenCaseOptions(c, aTemplate);
       try
         if aIds then
           mine := tpl.EncodeWith(ChatCaseMessages(c), ChatCaseTools(c),
-            c^.B['add_generation_prompt'],
-            ChatTemplateOptions(c^.O['options']^.B['enable_thinking']))
+            c^.B['add_generation_prompt'], options)
         else
           text := tpl.RenderWith(ChatCaseMessages(c), ChatCaseTools(c),
-            c^.B['add_generation_prompt'],
-            ChatTemplateOptions(c^.O['options']^.B['enable_thinking']));
+            c^.B['add_generation_prompt'], options);
       except
         on E: EInferError do
         begin
@@ -456,15 +516,15 @@ begin
           failures := failures + ' ' + c^.U['id'] + ' [' + text + ']';
       end;
     end;
-    CheckUtf8(bad = 0, '% of % cases differ:%', [bad, cases^.Count, failures]);
-    CheckEqual(refused, ref.Manifest^.I['errors'], 'the refused cases');
+    aTest.CheckUtf8(bad = 0, '% of % cases differ:%', [bad, cases^.Count, failures]);
+    aTest.CheckEqual(refused, ref.Manifest^.I['errors'], 'the refused cases');
     if aIds then
     begin
-      CheckEqual(literals, ref.Manifest^.I['literals'], 'the literal cases');
-      CheckUtf8(literalControls > 0, 'literals kept as text: % control tokens fewer',
+      aTest.CheckEqual(literals, ref.Manifest^.I['literals'], 'the literal cases');
+      aTest.CheckUtf8(literalControls > 0, 'literals kept as text: % control tokens fewer',
         [literalControls]);
     end;
-    CheckUtf8(cases^.Count > 200, '% cases', [cases^.Count]);
+    aTest.CheckUtf8(cases^.Count > 200, '% cases', [cases^.Count]);
   finally
     tpl.Free;
     ref.Free;
@@ -478,7 +538,7 @@ begin
   // the text needs only the control tokens: a tiny tokenizer, no model
   tok := TinyQwen35Tokenizer;
   try
-    CheckChat(tok, false);
+    CheckQwenChat(self, tok, false, 'qwen35-chat', TQwen35ChatTemplate);
   finally
     tok.Free;
   end;
@@ -487,7 +547,7 @@ end;
 procedure TTestInferQwen35Chat.Qwen35TemplateIds;
 begin
   if Ready then
-    CheckChat(fTokenizer, true);
+    CheckQwenChat(self, fTokenizer, true, 'qwen35-chat', TQwen35ChatTemplate);
 end;
 
 function Q35Raises(aTemplate: TChatTemplate; const aMessages: TLlmMessageDynArray;
@@ -1140,6 +1200,411 @@ begin
     end;
   finally
     llm.Free;
+  end;
+end;
+
+procedure CheckQwen38Client(aTest: TSynTestCase; aClient: TNativeLlmClient;
+  const aLabel: RawUtf8);
+var
+  r: TLlmChatRequest;
+  a: TLlmChatResponse;
+  timer: TPrecisionTimer;
+begin
+  aTest.Check(aClient.Template is TQwen38ChatTemplate, 'the Qwen3.8 template');
+  aTest.Check(aClient.Family.Parser = TQwen38OutputParser, 'the Qwen3.8 parser');
+  aTest.Check(aClient.EnableThinking, 'thinking by default');
+  Finalize(r);
+  FillCharFast(r, SizeOf(r), 0);
+  SetLength(r.Messages, 1);
+  r.Temperature := 0;
+  r.MaxTokens := 3000;
+  // thinking (the default) with the short effort: a reasoning, then 391
+  r.Extra := _ObjFast(['reasoning_effort', 'low']);
+  r.Messages[0] := LlmMessage(lrUser, 'What is 17 times 23? Answer with the number.');
+  timer.Start;
+  a := aClient.ChatComplete(r);
+  aTest.AddConsole(FormatString('%: 17 x 23 in %: reasoning "%" answer "%" ' +
+    '(% tokens)', [aLabel, timer.Stop, copy(a.Reasoning, 1, 100), a.Content,
+    a.Usage.CompletionTokens]));
+  aTest.Check(a.FinishReason = lfrStop, 'stopped by itself');
+  aTest.Check(a.Reasoning <> '', 'with reasoning');
+  aTest.Check(PosEx('391', a.Content) > 0, 'the answer 391');
+  // thinking off: no reasoning
+  r.Extra := _ObjFast(['chat_template_kwargs', _ObjFast(['enable_thinking', false])]);
+  r.Messages[0] := LlmMessage(lrUser,
+    'What is the capital of France? Answer with one word.');
+  timer.Start;
+  a := aClient.ChatComplete(r);
+  aTest.AddConsole(FormatString('%: capital without thinking in %: "%"',
+    [aLabel, timer.Stop, a.Content]));
+  aTest.CheckEqual(a.Reasoning, '', 'no reasoning');
+  aTest.Check(PosEx('Paris', a.Content) > 0, 'the answer Paris');
+  // a tool call, the result back with the reasoning before it (kept by the
+  // template's default), an answer that uses it
+  r.Extra := _ObjFast(['reasoning_effort', 'low']);
+  SetLength(r.Tools, 1);
+  r.Tools[0].Name := 'get_weather';
+  r.Tools[0].Description := 'Get the current weather of a city';
+  r.Tools[0].ParametersJson := '{"type":"object","properties":{"city":' +
+    '{"type":"string"}},"required":["city"]}';
+  r.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
+  timer.Start;
+  a := aClient.ChatComplete(r);
+  aTest.AddConsole(FormatString('%: weather in %: % calls, reasoning "%" content "%"',
+    [aLabel, timer.Stop, length(a.ToolCalls), copy(a.Reasoning, 1, 100), a.Content]));
+  if aTest.CheckFailed(length(a.ToolCalls) = 1, 'one tool call') then
+    exit;
+  aTest.CheckEqual(a.ToolCalls[0].Name, 'get_weather', 'the tool');
+  aTest.CheckEqual(a.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
+  aTest.Check(a.FinishReason = lfrToolCalls, 'finish tool_calls');
+  SetLength(r.Messages, 3);
+  r.Messages[1] := LlmMessage(lrAssistant, a.Content);
+  r.Messages[1].ToolCalls := a.ToolCalls;
+  r.Messages[1].Reasoning := a.Reasoning;
+  r.Messages[2] := LlmMessage(lrTool, '{"temperature_c": 17, "sky": "rain"}');
+  r.Messages[2].ToolCallId := a.ToolCalls[0].Id;
+  timer.Start;
+  a := aClient.ChatComplete(r);
+  aTest.AddConsole(FormatString('%: answer in %: "%"', [aLabel, timer.Stop,
+    copy(a.Content, 1, 200)]));
+  aTest.Check(a.FinishReason = lfrStop, 'answered');
+  aTest.Check(PosEx('17', a.Content) > 0, 'with the temperature of the tool');
+end;
+
+
+{ TTestInferQwen38Chat }
+
+procedure TTestInferQwen38Chat.Setup;
+var
+  dir: TFileName;
+begin
+  dir := FindQwen35Folder('tokenizer.json');
+  if dir <> '' then
+    fTokenizer := TBpeTokenizer.Create(dir + 'tokenizer.json');
+end;
+
+procedure TTestInferQwen38Chat.CleanUp;
+begin
+  FreeAndNil(fTokenizer);
+end;
+
+function TTestInferQwen38Chat.Ready: boolean;
+begin
+  result := fTokenizer <> nil;
+  if result then
+    exit;
+  CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+    'LAI_REQUIRE_MODEL=1 but no vendor/models/%/tokenizer.json', [QWEN35_MODEL]);
+  AddConsole('SKIP Qwen3.8 ids: no vendor/models/' + QWEN35_MODEL +
+    '/tokenizer.json (the tokenizer of Qwen3.8 without its audio tokens)');
+end;
+
+procedure TTestInferQwen38Chat.Qwen38TemplateText;
+var
+  tok: TBpeTokenizer;
+begin
+  tok := TinyQwen35Tokenizer;
+  try
+    CheckQwenChat(self, tok, false, 'qwen38-chat', TQwen38ChatTemplate);
+  finally
+    tok.Free;
+  end;
+end;
+
+procedure TTestInferQwen38Chat.Qwen38TemplateIds;
+begin
+  if Ready then
+    CheckQwenChat(self, fTokenizer, true, 'qwen38-chat', TQwen38ChatTemplate);
+end;
+
+/// the prompt text of aRequest through aTemplate, or "raised" and the message
+// of the ELlmClient it raised
+function Q38Prompt(aTemplate: TChatTemplate; const aRequest: TLlmChatRequest): RawUtf8;
+begin
+  try
+    result := aTemplate.Tokenizer.Decode(NativeChatPrompt(aTemplate, aRequest,
+      aTemplate.DefaultEnableThinking));
+  except
+    on E: ELlmClient do
+      result := 'raised ' + StringToUtf8(E.Message);
+  end;
+end;
+
+procedure TTestInferQwen38Chat.Qwen38TemplateRules;
+var
+  dir, tmp: TFileName;
+  ref: TInferRefSet;
+  j38, j35, text: RawUtf8;
+  f: TNativeFamily;
+  tok: TBpeTokenizer;
+  tpl: TChatTemplate;
+  r: TLlmChatRequest;
+  m: TLlmMessageDynArray;
+begin
+  Check(TQwen38ChatTemplate.DefaultEnableThinking, 'thinking unless told not to');
+  Check(TQwen38ChatTemplate.DefaultPreserveThinking, 'the reasoning preserved');
+  Check(not TQwen35ChatTemplate.DefaultPreserveThinking, 'Qwen3.5: no such option');
+  // the templates of the files, as the reference has them
+  dir := FindInferRefDir('qwen38-chat');
+  if CheckFailed(dir <> '', 'qwen38-chat found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  try
+    j38 := ref.Manifest^.U['chat_template'];
+    j35 := ref.Manifest^.U['qwen35_chat_template'];
+  finally
+    ref.Free;
+  end;
+  Check((length(j38) > 8000) and (length(j35) > 7000), 'both templates');
+  Check(TQwen38ChatTemplate.Recognizes(j38), 'the Qwen3.8 template recognized');
+  Check(not TQwen38ChatTemplate.Recognizes(j35), 'not that of Qwen3.5');
+  Check(not TQwen38ChatTemplate.Recognizes(''), 'nor none');
+  // each of its three marks is needed
+  Check(not TQwen38ChatTemplate.Recognizes(StringReplaceAll(j38,
+    'preserve_thinking', 'keep_thinking')), 'without preserve_thinking');
+  Check(not TQwen38ChatTemplate.Recognizes(StringReplaceAll(j38,
+    '''xhigh''', '''high''')), 'without the effort xhigh');
+  Check(not TQwen38ChatTemplate.Recognizes(StringReplaceAll(j38,
+    'reasoning_effort', 'effort')), 'without reasoning_effort');
+  Check(not TQwen38ChatTemplate.Recognizes(StringReplaceAll(j38,
+    '<function=', '<fn=')), 'without <function= blocks');
+  Check(not TQwen35ChatTemplate.Recognizes(j35), 'Qwen3.5: the family default');
+  // the family of the files: the variant whose template they carry
+  Check(NativeFamilyForTemplate(TQwen35Model, j38, f) and (f.Template = TQwen38ChatTemplate) and
+    (f.Parser = TQwen38OutputParser) and (f.Tokenizer = TBpeTokenizer),
+    'qwen3_5 with the Qwen3.8 template');
+  Check(NativeFamilyForTemplate(TQwen35TextModel, j38, f) and (f.Template = TQwen38ChatTemplate),
+    'qwen3_5_text with the Qwen3.8 template');
+  Check(NativeFamilyForTemplate(TQwen35Model, j35, f) and (f.Template = TQwen35ChatTemplate) and
+    (f.Parser = TQwen35OutputParser), 'qwen3_5 with its own template');
+  Check(NativeFamilyForTemplate(TQwen35Model, '', f) and (f.Template = TQwen35ChatTemplate),
+    'without a template: the first family');
+  Check(NativeFamily(TQwen35Model, f) and (f.Template = TQwen35ChatTemplate),
+    'the first family');
+  // where a folder keeps its template
+  tmp := TemporaryFileName;
+  DeleteFile(tmp);
+  Check(CreateDir(tmp), 'a folder');
+  tmp := IncludeTrailingPathDelimiter(tmp);
+  try
+    CheckEqual(NativeChatTemplateOfFolder(tmp), '', 'no template');
+    FileFromString('{"chat_template": "string form"}', tmp + 'tokenizer_config.json');
+    CheckEqual(NativeChatTemplateOfFolder(tmp), 'string form',
+      'the string of tokenizer_config.json');
+    FileFromString('{"chat_template": [{"name": "tool_use", "template": "t"}, ' +
+      '{"name": "default", "template": "d"}]}', tmp + 'tokenizer_config.json');
+    CheckEqual(NativeChatTemplateOfFolder(tmp), 'd', 'the default of the list');
+    FileFromString(j38, tmp + 'chat_template.jinja');
+    CheckEqual(NativeChatTemplateOfFolder(tmp), j38, 'chat_template.jinja first');
+  finally
+    DeleteFile(tmp + 'chat_template.jinja');
+    DeleteFile(tmp + 'tokenizer_config.json');
+    RemoveDir(ExcludeTrailingPathDelimiter(tmp));
+  end;
+  // the options of a request
+  tok := TinyQwen35Tokenizer;
+  tpl := TQwen38ChatTemplate.Create(tok);
+  try
+    Finalize(r);
+    FillCharFast(r, SizeOf(r), 0);
+    SetLength(r.Messages, 1);
+    r.Messages[0] := LlmMessage(lrUser, 'x');
+    text := Q38Prompt(tpl, r);
+    CheckEqual(text, '<|im_start|>system'#10'Reasoning effort is set to xhigh. ' +
+      'Please think carefully through the task, validate key assumptions, ' +
+      'consider plausible alternatives, and prioritize correctness, consistency, ' +
+      'and clarity in the final answer.<|im_end|>'#10'<|im_start|>user'#10 +
+      'x<|im_end|>'#10'<|im_start|>assistant'#10'<think>'#10, 'thinking, xhigh');
+    r.Extra := _ObjFast(['reasoning_effort', 'medium']);
+    CheckEqual(Q38Prompt(tpl, r), '<|im_start|>user'#10'x<|im_end|>'#10 +
+      '<|im_start|>assistant'#10'<think>'#10, 'medium: no instruction');
+    r.Extra := _ObjFast(['reasoning_effort', '']);
+    CheckEqual(Q38Prompt(tpl, r), text, 'an empty effort is the default');
+    r.Extra := _ObjFast(['reasoning_effort', 'high']);
+    Check(PosEx('raised', Q38Prompt(tpl, r)) = 1, 'high: no effort of Qwen3.8');
+    r.Extra := _ObjFast(['reasoning_effort', 'high', 'chat_template_kwargs',
+      _ObjFast(['enable_thinking', false])]);
+    CheckEqual(Q38Prompt(tpl, r), '<|im_start|>user'#10'x<|im_end|>'#10 +
+      '<|im_start|>assistant'#10'<think>'#10#10'</think>'#10#10,
+      'thinking off: the effort is not read');
+    // preserve_thinking: the reasoning before the last query
+    SetLength(r.Messages, 3);
+    r.Messages[1] := LlmMessage(lrAssistant, 'b');
+    r.Messages[1].Reasoning := 'r';
+    r.Messages[2] := LlmMessage(lrUser, 'c');
+    r.Extra := _ObjFast(['reasoning_effort', 'medium']);
+    Check(PosEx('<|im_start|>assistant'#10'<think>'#10'r'#10'</think>'#10#10'b',
+      Q38Prompt(tpl, r)) > 0, 'kept by default');
+    r.Extra := _ObjFast(['reasoning_effort', 'medium', 'chat_template_kwargs',
+      _ObjFast(['preserve_thinking', false])]);
+    Check(PosEx('<|im_start|>assistant'#10'b<|im_end|>', Q38Prompt(tpl, r)) > 0,
+      'dropped on request');
+    // Render takes the defaults of the template too
+    SetLength(m, 3);
+    m[0] := LlmMessage(lrUser, 'a');
+    m[1] := r.Messages[1];
+    m[2] := LlmMessage(lrUser, 'c');
+    Check(PosEx('<think>'#10'r'#10'</think>', tpl.Render(m, nil, false, false)) > 0,
+      'Render: the reasoning preserved');
+  finally
+    tpl.Free;
+    tok.Free;
+  end;
+end;
+
+/// the Qwen3.8 parser after aPrompt, fed aText (control tokens as their ids)
+function Q38Parsed(aTokenizer: TInferTokenizer; const aPrompt, aText: RawUtf8;
+  aCut: boolean): TQwen35OutputParser;
+var
+  ids: TIntegerDynArray;
+  i: PtrInt;
+begin
+  result := TQwen38OutputParser.Create(aTokenizer);
+  result.Tools := Q35Tools;
+  result.Prompt(ControlIds(aTokenizer, aPrompt, Q35_TOKENS));
+  ids := ControlIds(aTokenizer, aText, Q35_TOKENS);
+  for i := 0 to high(ids) do
+    if result.Push(ids[i]) then
+      break;
+  result.Finish(aCut, 10);
+end;
+
+procedure TTestInferQwen38Chat.Qwen38Parser;
+const
+  ON = '<|im_start|>assistant'#10'<think>'#10;
+  OFF = '<|im_start|>assistant'#10'<think>'#10#10'</think>'#10#10;
+  CALL_F = '<tool_call>'#10'<function=f>'#10'<parameter=i>'#10'3'#10'</parameter>'#10 +
+    '</function>'#10;
+var
+  tok: TBpeTokenizer;
+  p: TQwen35OutputParser;
+begin
+  tok := TinyQwen35Tokenizer;
+  try
+    // no </think>: the call ends the reasoning (the 3.5 parser keeps it there)
+    p := Q38Parsed(tok, ON, 'Erst denken.'#10#10 + CALL_F + '</tool_call><|im_end|>',
+      false);
+    try
+      CheckEqual(p.Reasoning, 'Erst denken.', 'the reasoning up to the call');
+      CheckEqual(p.Response.Content, '', 'no content');
+      if not CheckFailed(length(p.Response.ToolCalls) = 1, 'the call') then
+        CheckEqual(p.Response.ToolCalls[0].ArgumentsJson, '{"i": 3}', 'typed');
+    finally
+      p.Free;
+    end;
+    p := Q35Parsed(tok, ON, 'Erst denken.'#10#10 + CALL_F + '</tool_call><|im_end|>',
+      false);
+    try
+      Check(p.Response.ToolCalls = nil, 'Qwen3.5: no call in the reasoning');
+    finally
+      p.Free;
+    end;
+    // no </tool_call> before the next call: two calls
+    p := Q38Parsed(tok, OFF, CALL_F + CALL_F + '</tool_call><|im_end|>', false);
+    try
+      CheckEqual(length(p.Response.ToolCalls), 2, 'two calls');
+      CheckEqual(p.Response.Content, '', 'no text left');
+    finally
+      p.Free;
+    end;
+    // a broken block before the next call stays text
+    p := Q38Parsed(tok, OFF, '<tool_call>kaputt' + CALL_F + '</tool_call><|im_end|>',
+      false);
+    try
+      CheckEqual(length(p.Response.ToolCalls), 1, 'the good call');
+      CheckEqual(p.Response.Content, '<tool_call>kaputt', 'the broken one as text');
+    finally
+      p.Free;
+    end;
+    // the rest as Qwen3.5: </think> ends the reasoning, a cut call is text
+    p := Q38Parsed(tok, ON, 'r'#10'</think>'#10#10'Ja.<|im_end|>', false);
+    try
+      CheckEqual(p.Reasoning, 'r', 'reasoning');
+      CheckEqual(p.Response.Content, 'Ja.', 'content');
+    finally
+      p.Free;
+    end;
+    p := Q38Parsed(tok, OFF, CALL_F, true);
+    try
+      Check(p.Response.ToolCalls = nil, 'a cut call');
+      CheckEqual(p.Response.Content, CALL_F, 'as text');
+    finally
+      p.Free;
+    end;
+  finally
+    tok.Free;
+  end;
+end;
+
+/// aIds[aFirst .. aLast - 1] as a dynamic array
+function Q38Ids(aIds: PIntegerArray; aFirst, aLast: PtrInt): TIntegerDynArray;
+begin
+  SetLength(result, aLast - aFirst);
+  if aLast > aFirst then
+    MoveFast(aIds^[aFirst], result[0], (aLast - aFirst) * SizeOf(integer));
+end;
+
+procedure TTestInferQwen38Chat.Qwen38ParserMatchesReference;
+var
+  dir: TFileName;
+  ref: TInferRefSet;
+  cases, c, calls: PDocVariantData;
+  ids, offsets: PIntegerArray;
+  n, i, j, bad: PtrInt;
+  p: TQwen38OutputParser;
+  stopped: boolean;
+  got, want, failures: RawUtf8;
+begin
+  if not Ready then
+    exit;
+  dir := FindInferRefDir('qwen38-parse');
+  if CheckFailed(dir <> '', 'qwen38-parse found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  try
+    cases := ref.Manifest^.A['cases'];
+    ids := ref.I32('ids', n);
+    offsets := ref.I32('offsets', n);
+    bad := 0;
+    failures := '';
+    for i := 0 to cases^.Count - 1 do
+    begin
+      c := _Safe(cases^.Values[i]);
+      p := TQwen38OutputParser.Create(fTokenizer);
+      try
+        p.Tools := ChatCaseTools(c);
+        p.Prompt(Q38Ids(ids, offsets^[2 * i], offsets^[2 * i + 1]));
+        stopped := false;
+        for j := offsets^[2 * i + 1] to offsets^[2 * i + 2] - 1 do
+          if p.Push(ids^[j]) then
+          begin
+            stopped := true;
+            break;
+          end;
+        p.Finish(not stopped, 0);
+        // transformers strips every text; the calls as name and arguments
+        got := PythonStrip(p.Reasoning) + '|' + PythonStrip(p.Response.Content);
+        for j := 0 to high(p.Response.ToolCalls) do
+          got := got + '|' + p.Response.ToolCalls[j].Name + ' ' +
+            p.Response.ToolCalls[j].ArgumentsJson;
+        want := c^.U['reasoning'] + '|' + c^.U['content'];
+        calls := c^.A['calls'];
+        for j := 0 to calls^.Count - 1 do
+          want := want + '|' + _Safe(calls^.Values[j])^.U['name'] + ' ' +
+            _Safe(calls^.Values[j])^.U['arguments'];
+      finally
+        p.Free;
+      end;
+      if got <> want then
+      begin
+        inc(bad);
+        failures := failures + #10'  ' + c^.U['id'] + ': [' + got + '] want [' +
+          want + ']';
+      end;
+    end;
+    CheckUtf8(bad = 0, '% of % cases differ:%', [bad, cases^.Count, failures]);
+  finally
+    ref.Free;
   end;
 end;
 

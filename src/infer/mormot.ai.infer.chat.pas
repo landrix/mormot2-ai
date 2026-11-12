@@ -15,7 +15,12 @@
 //   chat_template.jinja - the same file in gemma-4-31B-it and gemma-4-12B-it),
 //   gate tests/data/infer-ref/gemma4-chat; TQwen35ChatTemplate that of Qwen3.5
 //   (Qwen/Qwen3.5-0.8B revision 2fc06364715b967f1860aea9cf38778875588b17,
-//   chat_template.jinja), gate tests/data/infer-ref/qwen35-chat
+//   chat_template.jinja), gate tests/data/infer-ref/qwen35-chat; TQwen38ChatTemplate
+//   that of Qwen3.8 (Qwen/Qwen3.8-27B revision
+//   37561816e66b5b9153b1b64c10968c18c1e6f4a0, chat_template.jinja - the same
+//   file in ggml-org/Qwen3.8-27B-GGUF revision
+//   8ccda149192dec5f41450a402e66889e5fd25a24), gate
+//   tests/data/infer-ref/qwen38-chat
 // - one difference by design: the template emits the control tokens
 //   (<|im_start|> <|im_end|> <think> </think> <tool_call> </tool_call>
 //   <tool_response> </tool_response>) as ids, and every message text is text.
@@ -36,6 +41,7 @@ unit mormot.ai.infer.chat;
     - THarmonyChatTemplate: the template of gpt-oss (Harmony)
     - TGemma4ChatTemplate: the template of Gemma 4
     - TQwen35ChatTemplate: the template of Qwen3.5
+    - TQwen38ChatTemplate: the template of Qwen3.8
 
   *****************************************************************************
 }
@@ -65,7 +71,8 @@ type
     /// false asks the model to answer without reasoning first (Qwen3: an empty
     // <think> block); gpt-oss always reasons and ignores it
     EnableThinking: boolean;
-    /// gpt-oss: 'low', 'medium' or 'high' - '' for the template's medium
+    /// gpt-oss: 'low', 'medium' or 'high' - '' for the template's medium;
+    // Qwen3.8: 'xhigh', 'medium' or 'low' - '' for the template's xhigh
     ReasoningEffort: RawUtf8;
     /// gpt-oss: the first line of the system message - '' for the template's
     // own ("You are ChatGPT, a large language model trained by OpenAI.")
@@ -74,7 +81,9 @@ type
     // (local time, as the template's strftime_now)
     CurrentDate: RawUtf8;
     /// Gemma 4: the reasoning of an assistant turn with tool calls is written
-    // back also before the last user message (preserve_thinking)
+    // back also before the last user message (preserve_thinking); Qwen3.8:
+    // the reasoning of every assistant turn is (the template's default -
+    // DefaultPreserveThinking)
     PreserveThinking: boolean;
   end;
 
@@ -113,10 +122,17 @@ type
     /// whether the family thinks when a request does not say (enable_thinking)
     // - true by default; false for a template that thinks only on request
     class function DefaultEnableThinking: boolean; virtual;
+    /// whether the reasoning of earlier turns is written back when a request
+    // does not say (preserve_thinking) - false by default
+    class function DefaultPreserveThinking: boolean; virtual;
+    /// true when aJinja, the chat template a model file carries, is the one
+    // this class writes - how a variant of a family is told apart (Qwen3.8
+    // from Qwen3.5: the same model class); false by default
+    class function Recognizes(const aJinja: RawUtf8): boolean; virtual;
     /// the token ids of a conversation
     // - aAddGenerationPrompt opens the assistant turn; aEnableThinking = false
     // asks the model to answer without reasoning first (Qwen3: an empty
-    // <think> block)
+    // <think> block); the other options are the template's defaults
     // - raises EInferError for a tool whose JSON is invalid or not supported
     function Encode(const aMessages: TLlmMessageDynArray;
       const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
@@ -291,6 +307,7 @@ type
   protected
     fImStart, fImEnd, fThink, fThinkEnd, fToolCall, fToolCallEnd,
     fToolResponse, fToolResponseEnd: integer;
+    fQwen38: boolean; // the rules of TQwen38ChatTemplate
     procedure Build(var aOut: TChatSegments; const aMessages: TLlmMessageDynArray;
       const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
       const aOptions: TChatTemplateOptions); override;
@@ -302,7 +319,41 @@ type
     class function DefaultEnableThinking: boolean; override;
   end;
 
+  /// the chat template of Qwen3.8: that of Qwen3.5 with these differences
+  // - thinking is on unless a request turns it off; then the system turn
+  // starts with the instruction of the ReasoningEffort ('' or 'xhigh': the
+  // long one, 'low': the short one, 'medium': none - anything else raises;
+  // with thinking off there is no instruction and the effort is not read,
+  // as in the template)
+  // - a system turn only when there are tools, a system text or such an
+  // instruction (Qwen3.5 writes an empty one for an empty system message)
+  // - PreserveThinking (the default): every assistant turn has its <think>
+  // block, not only those after the last user query
+  // - a </think> in the content of an assistant message is text: only its
+  // Reasoning is its reasoning
+  // - the values of a call's arguments: a string as it is, anything else as
+  // tojson writes it (true, null, 100000.0)
+  // - the template's {% generation %} marks are no output
+  TQwen38ChatTemplate = class(TQwen35ChatTemplate)
+  public
+    /// look up the control tokens in aTokenizer (not owned) - raises
+    // EInferError when one is missing
+    constructor Create(aTokenizer: TInferTokenizer); override;
+    /// true: the template thinks unless told not to
+    class function DefaultEnableThinking: boolean; override;
+    /// true: the reasoning of every assistant turn is written back
+    class function DefaultPreserveThinking: boolean; override;
+    /// true for the template of Qwen3.8: it names reasoning_effort, the effort
+    // 'xhigh' and preserve_thinking, and writes the calls as <function=...>
+    // blocks (Qwen3.5: none of the first three; gpt-oss: no xhigh, no
+    // <function=)
+    class function Recognizes(const aJinja: RawUtf8): boolean; override;
+  end;
+
 /// the options of a request that only sets EnableThinking
+// - every other option is off or empty: PreserveThinking false too, whatever
+// the template's DefaultPreserveThinking (Qwen3.8: true) - set it from there
+// for the template's own default, as Encode, Render and NativeChatPrompt do
 function ChatTemplateOptions(aEnableThinking: boolean): TChatTemplateOptions;
 
 /// re-serialize JSON the way Python json.dumps(json.loads(aJson)) writes it
@@ -319,6 +370,11 @@ function ChatTemplateOptions(aEnableThinking: boolean): TChatTemplateOptions;
 // every other rule stays, an exponent of more than six digits still raises
 function PythonJson(const aJson: RawUtf8;
   aKeepInexactFloats: boolean = false): RawUtf8;
+
+/// Python str.strip() - the trim filter of Jinja: the white space of
+// str.isspace() removed at both ends
+// - also how transformers' parse_response strips a text it parsed
+function PythonStrip(const s: RawUtf8): RawUtf8;
 
 /// a JSON string literal the way Python json.dumps writes it (see PythonJson)
 // - raises EInferError for invalid UTF-8
@@ -901,6 +957,16 @@ end;
 class function TChatTemplate.DefaultEnableThinking: boolean;
 begin
   result := true;
+end;
+
+class function TChatTemplate.DefaultPreserveThinking: boolean;
+begin
+  result := false;
+end;
+
+class function TChatTemplate.Recognizes(const aJinja: RawUtf8): boolean;
+begin
+  result := false;
 end;
 
 function TChatTemplate.Need(const aContent: RawUtf8): integer;
@@ -1844,7 +1910,6 @@ begin
   end;
 end;
 
-/// Python str.strip() - the trim filter of Jinja
 function PythonStrip(const s: RawUtf8): RawUtf8;
 var
   cp: TCardinalDynArray;
@@ -2499,17 +2564,23 @@ end;
 function TChatTemplate.Encode(const aMessages: TLlmMessageDynArray;
   const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
   aEnableThinking: boolean): TIntegerDynArray;
+var
+  o: TChatTemplateOptions;
 begin
-  result := EncodeWith(aMessages, aTools, aAddGenerationPrompt,
-    ChatTemplateOptions(aEnableThinking));
+  o := ChatTemplateOptions(aEnableThinking);
+  o.PreserveThinking := DefaultPreserveThinking;
+  result := EncodeWith(aMessages, aTools, aAddGenerationPrompt, o);
 end;
 
 function TChatTemplate.Render(const aMessages: TLlmMessageDynArray;
   const aTools: TLlmToolDynArray; aAddGenerationPrompt: boolean;
   aEnableThinking: boolean): RawUtf8;
+var
+  o: TChatTemplateOptions;
 begin
-  result := RenderWith(aMessages, aTools, aAddGenerationPrompt,
-    ChatTemplateOptions(aEnableThinking));
+  o := ChatTemplateOptions(aEnableThinking);
+  o.PreserveThinking := DefaultPreserveThinking;
+  result := RenderWith(aMessages, aTools, aAddGenerationPrompt, o);
 end;
 
 function TChatTemplate.EncodeWith(const aMessages: TLlmMessageDynArray;
@@ -2577,6 +2648,15 @@ const
     'available, answer the question like normal with your current knowledge ' +
     'and do not tell the user about function calls'#10'</IMPORTANT>';
 
+  /// the instructions of Qwen3.8 for the reasoning efforts xhigh and low
+  QWEN38_EFFORT_XHIGH =
+    'Reasoning effort is set to xhigh. Please think carefully through the ' +
+    'task, validate key assumptions, consider plausible alternatives, and ' +
+    'prioritize correctness, consistency, and clarity in the final answer.';
+  QWEN38_EFFORT_LOW =
+    'Reasoning effort is set to low. Keep your thinking brief and focused, ' +
+    'moving directly to the conclusion without unnecessary elaboration.';
+
 constructor TQwen35ChatTemplate.Create(aTokenizer: TInferTokenizer);
 begin
   inherited Create(aTokenizer);
@@ -2607,21 +2687,34 @@ procedure TQwen35ChatTemplate.Build(var aOut: TChatSegments;
   const aMessages: TLlmMessageDynArray; const aTools: TLlmToolDynArray;
   aAddGenerationPrompt: boolean; const aOptions: TChatTemplateOptions);
 var
-  n, i, j, k, lastQuery, v: PtrInt;
+  n, i, j, k, lastQuery, v, members: PtrInt;
   multiStep: boolean;
-  content, reasoning: RawUtf8;
+  content, reasoning, effort: RawUtf8;
   m: ^TLlmMessage;
   T: THarmonyJson;
 begin
   n := length(aMessages);
   if n = 0 then
     EInferError.RaiseUtf8('%: no messages', [self]);
+  // Qwen3.8: the instruction of the reasoning effort, when thinking is on
+  effort := '';
+  if fQwen38 and aOptions.EnableThinking then
+    if (aOptions.ReasoningEffort = '') or (aOptions.ReasoningEffort = 'xhigh') then
+      effort := QWEN38_EFFORT_XHIGH
+    else if aOptions.ReasoningEffort = 'low' then
+      effort := QWEN38_EFFORT_LOW
+    else if aOptions.ReasoningEffort <> 'medium' then
+      EInferError.RaiseUtf8('%: ReasoningEffort "%" is not xhigh, medium or low',
+        [self, aOptions.ReasoningEffort]);
   // the system turn, with the tool list and its instructions when there are
   // tools
   if aTools <> nil then
   begin
     aOut.Control(fImStart, '<|im_start|>');
-    aOut.Add('system'#10 + QWEN35_TOOLS_INTRO);
+    aOut.Add('system'#10);
+    if effort <> '' then
+      aOut.Add(effort + #10#10);
+    aOut.Add(QWEN35_TOOLS_INTRO);
     for i := 0 to high(aTools) do
       aOut.Add(#10 + ToolJson(aTools[i]));
     aOut.Add(QWEN35_TOOLS_FORMAT);
@@ -2640,6 +2733,24 @@ begin
     end;
     aOut.Control(fImEnd, '<|im_end|>');
     aOut.Add(#10);
+  end
+  else if fQwen38 then
+  begin
+    // a system turn for a system text or the effort instruction, or both
+    content := '';
+    if aMessages[0].Role = lrSystem then
+      content := PythonStrip(aMessages[0].Content);
+    if (content <> '') and (effort <> '') then
+      content := effort + #10#10 + content
+    else if content = '' then
+      content := effort;
+    if content <> '' then
+    begin
+      aOut.Control(fImStart, '<|im_start|>');
+      aOut.Add('system'#10 + content);
+      aOut.Control(fImEnd, '<|im_end|>');
+      aOut.Add(#10);
+    end;
   end
   else if aMessages[0].Role = lrSystem then
   begin
@@ -2678,9 +2789,9 @@ begin
       lrAssistant:
         begin
           // the reasoning of the message (reasoning_content) - else a <think>
-          // block its content still holds
+          // block its content still holds (not for Qwen3.8: text there)
           reasoning := m^.Reasoning;
-          if (reasoning = '') and (PosEx('</think>', content) > 0) then
+          if not fQwen38 and (reasoning = '') and (PosEx('</think>', content) > 0) then
           begin
             reasoning := StripNewlines(SplitLast(StripNewlines(
               SplitFirst(content, '</think>'), false, true), '<think>'), true, false);
@@ -2688,7 +2799,7 @@ begin
           end;
           reasoning := PythonStrip(reasoning);
           aOut.Control(fImStart, '<|im_start|>');
-          if i > lastQuery then
+          if (i > lastQuery) or (fQwen38 and aOptions.PreserveThinking) then
           begin
             aOut.Add('assistant'#10);
             aOut.Control(fThink, '<think>');
@@ -2710,14 +2821,27 @@ begin
             begin
               // the members of the object in their order (|items)
               T.Parse(m^.ToolCalls[j].ArgumentsJson, {keepinexactfloats=}true);
-              if T.Nodes[0].Kind <> hjObject then
+              members := 0;
+              // Qwen3.8 skips arguments that are '' (tool_call.arguments != '')
+              if fQwen38 and (T.Nodes[0].Kind = hjString) and (T.Nodes[0].Text = '') then
+                // nothing written
+              else if T.Nodes[0].Kind <> hjObject then
                 EInferError.RaiseUtf8('%: the arguments of call % are no JSON ' +
-                  'object', [self, m^.ToolCalls[j].Name]);
-              for k := 0 to T.Nodes[0].Count - 1 do
+                  'object', [self, m^.ToolCalls[j].Name])
+              else
+                members := T.Nodes[0].Count;
+              for k := 0 to members - 1 do
               begin
                 v := T.Item(0, k);
                 aOut.Add('<parameter=' + T.Keys[T.Nodes[0].First + k] + '>'#10);
-                if T.Nodes[v].Kind in [hjObject, hjArray] then
+                // Qwen3.5: an object or array as tojson, else str(); Qwen3.8:
+                // a string as it is, else tojson
+                if fQwen38 then
+                  if T.Nodes[v].Kind = hjString then
+                    aOut.Add(T.Str(v, 'an argument'))
+                  else
+                    aOut.Add(T.Json(v))
+                else if T.Nodes[v].Kind in [hjObject, hjArray] then
                   aOut.Add(T.Json(v))
                 else
                   aOut.Add(T.Str(v, 'an argument'));
@@ -2765,6 +2889,33 @@ begin
     end;
   end;
   aOut.Flush;
+end;
+
+
+{ TQwen38ChatTemplate }
+
+constructor TQwen38ChatTemplate.Create(aTokenizer: TInferTokenizer);
+begin
+  inherited Create(aTokenizer);
+  fQwen38 := true;
+end;
+
+class function TQwen38ChatTemplate.DefaultEnableThinking: boolean;
+begin
+  result := true;
+end;
+
+class function TQwen38ChatTemplate.DefaultPreserveThinking: boolean;
+begin
+  result := true;
+end;
+
+class function TQwen38ChatTemplate.Recognizes(const aJinja: RawUtf8): boolean;
+begin
+  result := (PosEx('reasoning_effort', aJinja) > 0) and
+    (PosEx('''xhigh''', aJinja) > 0) and
+    (PosEx('preserve_thinking', aJinja) > 0) and
+    (PosEx('<function=', aJinja) > 0);
 end;
 
 end.

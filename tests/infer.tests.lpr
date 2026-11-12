@@ -52,6 +52,7 @@ begin
     TTestInferQwen3,
     TTestInferQwen35,
     TTestInferQwen35Chat,
+    TTestInferQwen38Chat,
     TTestInferLlmNative,
     TTestInferVulkan,
     TTestInferCuda

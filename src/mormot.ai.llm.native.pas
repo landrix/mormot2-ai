@@ -7,7 +7,10 @@
 // - a decoder family registers its model, tokenizer, chat template and output
 //   parser classes (RegisterNativeFamily); the client picks them by the
 //   model_type of config.json or the architecture of a GGUF file - Qwen3,
-//   Qwen2.5, gpt-oss, Gemma 4 and Qwen3.5 are registered here
+//   Qwen2.5, gpt-oss, Gemma 4 and Qwen3.5 are registered here; a family
+//   registered twice for one model class is told apart by the chat template
+//   the files carry (TChatTemplate.Recognizes): Qwen3.8 is the model class of
+//   Qwen3.5 with its own template and parser
 // - the prompt is the model's chat template (TChatTemplate); the answer is
 //   parsed token by token (TNativeOutputParser) - for Qwen3 a leading <think>
 //   block becomes reasoning (returned like vLLM does, as reasoning_content in
@@ -17,7 +20,9 @@
 //   call, the final channel the content; for Gemma 4 the thought channel
 //   becomes reasoning, every <|tool_call> block a tool call
 //   (TGemma4OutputParser); for Qwen3.5 the <think> block reasoning, every
-//   <tool_call><function=...> block a tool call (TQwen35OutputParser)
+//   <tool_call><function=...> block a tool call (TQwen35OutputParser), for
+//   Qwen3.8 as well, the reasoning also ended by a <tool_call>
+//   (TQwen38OutputParser)
 // - ChatComplete and ChatStream share one decoding path, so a streamed answer
 //   is the complete answer cut into pieces - nothing else
 // - only the ids the tokenizer knows are drawn: a padded embedding (gpt-oss
@@ -40,6 +45,7 @@ unit mormot.ai.llm.native;
     - THarmonyOutputParser: the parser of gpt-oss (Harmony)
     - TGemma4OutputParser: the parser of Gemma 4
     - TQwen35OutputParser: the parser of Qwen3.5
+    - TQwen38OutputParser: the parser of Qwen3.8
     - NativeChatPrompt: a TLlmChatRequest as prompt ids
     - RegisterNativeFamily: the classes of a decoder family
     - TNativeLlmClient: ILlmClient over a model folder or a GGUF file
@@ -234,6 +240,19 @@ type
     procedure Prompt(const aIds: TIntegerDynArray); override;
   end;
 
+  /// the output parser of Qwen3.8: that of Qwen3.5, as the response_template
+  // of its tokenizer_config.json reads an answer - a <tool_call> also ends
+  // the reasoning (a model that skips </think>), and one also ends the
+  // call before it (a model that skips </tool_call>: that block is parsed
+  // as it stands); a value may end without </parameter> (before the next
+  // <parameter= or </function>, ParseQwen35ToolCall with aOpenEnd)
+  TQwen38OutputParser = class(TQwen35OutputParser)
+  protected
+    function Token(aId: integer): boolean; override;
+    /// ParseQwen35ToolCall with aOpenEnd: a value may end without </parameter>
+    procedure EndToolCall; override;
+  end;
+
   /// the output parser of Qwen2.5: that of Qwen3 without reasoning - the same
   // <tool_call> blocks, no <think> (the tokenizer has none)
   TQwen2OutputParser = class(TQwen3OutputParser)
@@ -352,16 +371,18 @@ function NativeEnableThinking(const aRequest: TLlmChatRequest;
 // vLLM reads it (Extra.chat_template_kwargs), else aDefaultEffort;
 // model_identity of chat_template_kwargs; an empty string is no value (the
 // default stays - transformers would write it as it is); preserve_thinking of
-// chat_template_kwargs (Gemma 4), a boolean
+// chat_template_kwargs (Gemma 4, Qwen3.8), a boolean, else aDefaultPreserve
 // - raises ELlmClient for a value that is no string (no boolean for
 // preserve_thinking), or two efforts that differ,
 // whatever the family (Qwen ignores both options, but refuses such a request
 // too, as vLLM does)
 function NativeTemplateOptions(const aRequest: TLlmChatRequest;
-  aDefaultThinking: boolean; const aDefaultEffort: RawUtf8 = ''): TChatTemplateOptions;
+  aDefaultThinking: boolean; const aDefaultEffort: RawUtf8 = '';
+  aDefaultPreserve: boolean = false): TChatTemplateOptions;
 
 /// the prompt ids of a request: its messages and tools through aTemplate, with
 // the assistant turn opened and the options of NativeTemplateOptions
+// (preserve_thinking by default as aTemplate.DefaultPreserveThinking)
 // - raises ELlmClient for what the engine cannot honour (no messages, images,
 // ResponseFormat) and for a tool or an option the template refuses
 function NativeChatPrompt(aTemplate: TChatTemplate;
@@ -398,10 +419,16 @@ function ParseQwen3ToolCall(const aBody: RawUtf8;
 // the format has no escape for it)
 // - aArguments is the object as Python json.dumps writes it, a float of more
 // than 15 digits or beyond the double range kept verbatim
+// - aOpenEnd (Qwen3.8, as the response_template of the model reads a call): a
+// value may also end without </parameter>, before the next <parameter= or
+// the final </function> - a </parameter> after the next <parameter= does not
+// end it, so a value holding "<parameter=" is cut there, as the model's own
+// parser cuts it; the layout stays strict (a </function> inside an open value
+// leaves text after it: no call, where the model's parser drops that text)
 // - false (the block stays text) for any other layout, an empty name or key,
 // white space or "<" in one, or a key twice
 function ParseQwen35ToolCall(const aBody: RawUtf8; const aTools: TLlmToolDynArray;
-  out aName, aArguments: RawUtf8): boolean;
+  out aName, aArguments: RawUtf8; aOpenEnd: boolean = false): boolean;
 
 /// parse the body of a Gemma 4 tool call (between <|tool_call> and
 // <tool_call|>), each <|"|> token as a #1 byte
@@ -550,7 +577,8 @@ type
     fSampling: TInferSampling;
     procedure Generate(const aRequest: TLlmChatRequest; aParser: TNativeOutputParser);
     procedure SetDevice(aDevice: TDecoderDevice);
-    procedure SetFamily(aModel: TDecoderModelClass; const aSource: TFileName);
+    procedure SetFamily(aModel: TDecoderModelClass; const aSource: TFileName;
+      const aJinja: RawUtf8);
   public
     /// load tokenizer.json, config.json and model.safetensors of aFolder, with
     // the family its config.json names (model_type)
@@ -635,14 +663,32 @@ type
 /// make a decoder family known to TNativeLlmClient: the tokenizer, chat
 // template and output parser classes of its model class
 // - call it from an initialization section: the list is not locked; a model
-// class registered twice is listed twice, NativeFamily finds the first entry
+// class registered twice is listed twice, NativeFamily finds the first entry,
+// NativeFamilyForTemplate the first whose template recognizes the template of
+// the files: register
+// the family of the model class first, then its variants
 procedure RegisterNativeFamily(aModel: TDecoderModelClass;
   aTokenizer: TInferTokenizerClass; aTemplate: TChatTemplateClass;
   aParser: TNativeOutputParserClass);
 
 /// the registered classes of a model class - false when it has none
+// - the first family registered for it
 function NativeFamily(aModel: TDecoderModelClass;
   out aFamily: TNativeFamily): boolean;
+
+/// the registered classes of a model class whose chat template the files
+// carry as aJinja: the first family of aModel whose Template recognizes it
+// (TChatTemplate.Recognizes), else the first family of aModel - false when it
+// has none
+function NativeFamilyForTemplate(aModel: TDecoderModelClass;
+  const aJinja: RawUtf8; out aFamily: TNativeFamily): boolean;
+
+/// the chat template a model folder carries: chat_template.jinja, else the
+// chat_template of tokenizer_config.json (a string, or of a list of named
+// templates the one named "default") - '' when there is none, also for a
+// tokenizer_config.json that is no JSON (the client then takes the first
+// family of the model class, as for an unknown template)
+function NativeChatTemplateOfFolder(const aFolder: TFileName): RawUtf8;
 
 
 implementation
@@ -1043,6 +1089,50 @@ var
   name, args: RawUtf8;
 begin
   if ParseQwen35ToolCall(fToolBody, fTools, name, args) then
+    AddToolCall(name, args)
+  else
+    // not a call the agent could run: keep it visible as text
+    SendContent(fContent.Add(Bytes(fToolCall) + fToolBody + Bytes(fToolCallEnd)));
+end;
+
+
+{ TQwen38OutputParser }
+
+function TQwen38OutputParser.Token(aId: integer): boolean;
+var
+  name, args: RawUtf8;
+begin
+  result := false;
+  if aId = fToolCall then
+    case fState of
+      qpsReasoning:
+        begin
+          // the model skipped </think>: the reasoning ends, the call begins
+          SendReasoning(fReasoning.Flush(true));
+          fToolBody := '';
+          fState := qpsToolCall;
+          exit;
+        end;
+      qpsToolCall:
+        begin
+          // the model skipped </tool_call>: the block so far is that call -
+          // or text as it was written, without an end it did not write
+          if ParseQwen35ToolCall(fToolBody, fTools, name, args, {openend=}true) then
+            AddToolCall(name, args)
+          else
+            SendContent(fContent.Add(Bytes(fToolCall) + fToolBody));
+          fToolBody := '';
+          exit;
+        end;
+    end;
+  result := inherited Token(aId);
+end;
+
+procedure TQwen38OutputParser.EndToolCall;
+var
+  name, args: RawUtf8;
+begin
+  if ParseQwen35ToolCall(fToolBody, fTools, name, args, {openend=}true) then
     AddToolCall(name, args)
   else
     // not a call the agent could run: keep it visible as text
@@ -1563,7 +1653,8 @@ begin
 end;
 
 function NativeTemplateOptions(const aRequest: TLlmChatRequest;
-  aDefaultThinking: boolean; const aDefaultEffort: RawUtf8): TChatTemplateOptions;
+  aDefaultThinking: boolean; const aDefaultEffort: RawUtf8;
+  aDefaultPreserve: boolean): TChatTemplateOptions;
 var
   x, kw: PDocVariantData;
   top, inner: RawUtf8;
@@ -1604,6 +1695,7 @@ begin
   else
     result.ReasoningEffort := aDefaultEffort;
   Text(kw, 'model_identity', 'chat_template_kwargs.', result.ModelIdentity);
+  result.PreserveThinking := aDefaultPreserve;
   i := kw^.GetValueIndex('preserve_thinking');
   if (i >= 0) and not VarIsEmptyOrNull(kw^.Values[i]) then
     if TVarData(kw^.Values[i]).VType <> varBoolean then
@@ -1629,7 +1721,8 @@ begin
   if aRequest.ResponseFormat <> '' then
     ELlmClient.RaiseUtf8('NativeChatPrompt: ResponseFormat is not supported ' +
       'by the native engine yet (no constrained decoding)', []);
-  options := NativeTemplateOptions(aRequest, aDefaultThinking, aDefaultEffort);
+  options := NativeTemplateOptions(aRequest, aDefaultThinking, aDefaultEffort,
+    aTemplate.DefaultPreserveThinking);
   try
     result := aTemplate.EncodeWith(aRequest.Messages, aRequest.Tools,
       {addgenerationprompt=}true, options);
@@ -1840,7 +1933,7 @@ begin
 end;
 
 function ParseQwen35ToolCall(const aBody: RawUtf8; const aTools: TLlmToolDynArray;
-  out aName, aArguments: RawUtf8): boolean;
+  out aName, aArguments: RawUtf8; aOpenEnd: boolean): boolean;
 const
   FUNC = '<function=';
   FUNC_END = '</function>';
@@ -1848,7 +1941,7 @@ const
   PARAM_END = '</parameter>';
 var
   body, rest, key, value, json, name, after, typ: RawUtf8;
-  p, e, n, i, first: PtrInt;
+  p, e, n, i, first, next, skip: PtrInt;
   nullable: boolean;
   schema: TDocVariantData;
   props, prop: PDocVariantData;
@@ -1881,7 +1974,12 @@ begin
   rest := copy(body, p + 1, n - length(FUNC_END) - p);
   json := '{';
   repeat
-    rest := TrimU(rest);
+    // white space before a parameter, or up to </function>: only on the left,
+    // the right is that of an open last value (aOpenEnd)
+    i := 1;
+    while (i <= length(rest)) and (rest[i] <= ' ') do
+      inc(i);
+    rest := copy(rest, i, maxInt);
     if rest = '' then
       break;
     if copy(rest, 1, length(PARAM)) <> PARAM then
@@ -1903,7 +2001,13 @@ begin
     // object or array the first such end where it is that JSON, else the
     // first such end
     first := 0;
+    // aOpenEnd: no end after the next parameter - the value ends before it
+    next := 0;
+    if aOpenEnd then
+      next := PosEx(PARAM, rest, p + 1);
     e := PosEx(PARAM_END, rest, p + 1);
+    if (next > 0) and (e > next) then
+      e := 0;
     while e > 0 do
     begin
       after := TrimU(copy(rest, e + length(PARAM_END), maxInt));
@@ -1917,16 +2021,27 @@ begin
           break;
       end;
       e := PosEx(PARAM_END, rest, e + 1);
+      if (next > 0) and (e > next) then
+        e := 0;
     end;
     if e = 0 then
       e := first;
+    skip := length(PARAM_END);
+    if (e = 0) and aOpenEnd then
+    begin
+      // no </parameter>: up to the next parameter, else to </function>
+      e := next;
+      if e = 0 then
+        e := length(rest) + 1;
+      skip := 0;
+    end;
     if e = 0 then
       exit;
     value := Qwen35Unwrap(copy(rest, p + 1, e - p - 1));
     if json <> '{' then
       json := json + ', ';
     json := json + QuotedStrJson(key) + ': ' + Qwen35Value(value, prop);
-    rest := copy(rest, e + length(PARAM_END), maxInt);
+    rest := copy(rest, e + skip, maxInt);
   until false;
   try
     // a key twice is refused here
@@ -2257,7 +2372,8 @@ begin
     fOwnBackend := true;
   end;
   // the family of config.json: its tokenizer and template before the weights
-  SetFamily(DecoderModelClassOfFolder(dir), dir + 'config.json');
+  SetFamily(DecoderModelClassOfFolder(dir), dir + 'config.json',
+    NativeChatTemplateOfFolder(dir));
   fEnableThinking := fFamily.Template.DefaultEnableThinking;
   fTokenizer := fFamily.Tokenizer.Create(dir + 'tokenizer.json');
   fTemplate := fFamily.Template.Create(fTokenizer);
@@ -2274,6 +2390,8 @@ end;
 
 constructor TNativeLlmClient.CreateFromGguf(const aFileName: TFileName;
   const aModelName: RawUtf8; aBackend: TInferBackend);
+var
+  jinja: RawUtf8;
 begin
   inherited Create;
   fMaxTokens := NATIVE_LLM_DEFAULT_MAX_TOKENS;
@@ -2285,7 +2403,9 @@ begin
     fOwnBackend := true;
   end;
   fModel := NewDecoderModelFromGguf(aFileName, fBackend);
-  SetFamily(TDecoderModelClass(fModel.ClassType), aFileName);
+  if fModel.Gguf.Has('tokenizer.chat_template') then
+    jinja := fModel.Gguf.Str('tokenizer.chat_template');
+  SetFamily(TDecoderModelClass(fModel.ClassType), aFileName, jinja);
   fEnableThinking := fFamily.Template.DefaultEnableThinking;
   fTokenizer := fFamily.Tokenizer.CreateFromGguf(fModel.Gguf);
   if fTokenizer.VocabSize > fModel.Config.VocabSize then
@@ -2303,9 +2423,9 @@ begin
 end;
 
 procedure TNativeLlmClient.SetFamily(aModel: TDecoderModelClass;
-  const aSource: TFileName);
+  const aSource: TFileName; const aJinja: RawUtf8);
 begin
-  if not NativeFamily(aModel, fFamily) then
+  if not NativeFamilyForTemplate(aModel, aJinja, fFamily) then
     ELlmClient.RaiseUtf8('%: no chat family registered for % (%)',
       [self, aModel.ModelType, aSource]);
 end;
@@ -2454,6 +2574,53 @@ begin
   NativeFamilies[n].Parser := aParser;
 end;
 
+function NativeFamilyForTemplate(aModel: TDecoderModelClass;
+  const aJinja: RawUtf8; out aFamily: TNativeFamily): boolean;
+var
+  i: PtrInt;
+begin
+  if aJinja <> '' then
+    for i := 0 to high(NativeFamilies) do
+      if (NativeFamilies[i].Model = aModel) and
+         NativeFamilies[i].Template.Recognizes(aJinja) then
+      begin
+        aFamily := NativeFamilies[i];
+        result := true;
+        exit;
+      end;
+  result := NativeFamily(aModel, aFamily);
+end;
+
+function NativeChatTemplateOfFolder(const aFolder: TFileName): RawUtf8;
+var
+  dir: TFileName;
+  doc: TDocVariantData;
+  list: PDocVariantData;
+  i: PtrInt;
+begin
+  dir := IncludeTrailingPathDelimiter(aFolder);
+  result := StringFromFile(dir + 'chat_template.jinja');
+  if (result <> '') or not FileExists(dir + 'tokenizer_config.json') then
+    exit;
+  if not doc.InitJsonFromFile(dir + 'tokenizer_config.json', JSON_FAST) then
+    exit;
+  i := doc.GetValueIndex('chat_template');
+  if i < 0 then
+    exit;
+  if VarIsString(doc.Values[i]) then
+    VariantToUtf8(doc.Values[i], result)
+  else
+  begin
+    list := _Safe(doc.Values[i]);
+    for i := 0 to list^.Count - 1 do
+      if _Safe(list^.Values[i])^.U['name'] = 'default' then
+      begin
+        result := _Safe(list^.Values[i])^.U['template'];
+        exit;
+      end;
+  end;
+end;
+
 function NativeFamily(aModel: TDecoderModelClass;
   out aFamily: TNativeFamily): boolean;
 var
@@ -2488,5 +2655,10 @@ initialization
     TQwen35OutputParser);
   RegisterNativeFamily(TGemma4TextModel, TSpBpeTokenizer, TGemma4ChatTemplate,
     TGemma4OutputParser);
+  // Qwen3.8: the model class of Qwen3.5, told apart by its chat template
+  RegisterNativeFamily(TQwen35Model, TBpeTokenizer, TQwen38ChatTemplate,
+    TQwen38OutputParser);
+  RegisterNativeFamily(TQwen35TextModel, TBpeTokenizer, TQwen38ChatTemplate,
+    TQwen38OutputParser);
 
 end.

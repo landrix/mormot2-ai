@@ -331,6 +331,12 @@ never a build input.
     3.12.13, torch 2.14.1+cpu, transformers 5.19.0 (requirements.txt), one thread, the BF16
     matrices taken to float32 inside their products (bit for bit the float32 load, checked
     on Qwen3.5-0.8B).
+  Datasets from its tokenizer files (D7h, the hashes above; the weights not needed):
+    qwen38-chat and qwen38-parse (tools/infer-ref/make_reference_d7h.py) read
+    tokenizer.json, tokenizer_config.json (its response_template too) and
+    chat_template.jinja, in the reference environment (WSL aarch64, transformers 5.19.0,
+    tokenizers 0.23.3). chat_template.jinja is byte for byte the tokenizer.chat_template
+    of both GGUF files above (sha256 checked 2026-11-12).
 
   Rule: a new revision, model or environment means regenerating every dataset and
         updating this section in the same commit.

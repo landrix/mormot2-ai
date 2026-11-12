@@ -436,11 +436,13 @@ In Scheiben (aufgeteilt 2026-10-21, nachdem Qwen3.5 gelesen war: eigener Pre-Tok
   (Referenz auf dem RTX-Rechner, BF16-Matrizen erst im Produkt nach float32); Q8_0 Logits
   >= 0,9987, Q4_K_M im Chat-Fall 0,967 (der Fehler der Q4_K-Gewichte, auf allen drei Wegen
   gleich); auf der RTX 5090 Decode 31,5 (CUDA) bis 39,4 Tokens/s (Vulkan) in Q4_K_M.
-- *Offen:* D7h - das Chat-Template von Qwen3.8 (Thinking per Vorgabe an, Reasoning-Effort
-  xhigh/medium/low als Anweisung im System-Turn, `preserve_thinking`, `{% generation %}`),
-  gegen das Rendering von transformers wie D7c; dazu die Wahl des Templates (dieselbe
-  Modellklasse wie Qwen3.5, also nach dem Template der Datei) und der Client mit
-  Qwen3.8-27B auf dem Gerät.
+- *D7h erledigt 2026-11-12* (`native-inference.md`, Phase D): Qwen3.8 als Chat-Modell - das
+  Template (`TQwen38ChatTemplate`: Thinking per Vorgabe an, Reasoning-Effort als Anweisung
+  im System-Turn, `preserve_thinking` per Vorgabe an; 257 Fälle gegen transformers), der
+  Parser nach dem `response_template` des Modells (`TQwen38OutputParser`; 31 Antworten wie
+  `parse_response`), die Wahl der Familie nach dem Template der Dateien
+  (`TChatTemplate.Recognizes`, `NativeFamilyForTemplate`), der Client mit Qwen3.8-27B auf
+  CUDA und Vulkan. Damit ist D7 abgeschlossen.
 
 **D8 — Kolibri-1.** FP8 E4M3 mit 128×128-Skalen (oder eine geprüfte Umwandlung nach Q4_K/Q8_0
 beim Laden; ein GGUF von Dritten nur nach Prüfung gegen die Referenz), Sigmoid-Router mit Bias-Korrektur nur für die Auswahl,

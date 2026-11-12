@@ -37,6 +37,7 @@ uses
   test.infer.qwen3,
   test.infer.fast,
   test.infer.bpe,
+  test.infer.qwen35chat,
   mormot.ai.infer.sampler;
 
 type
@@ -2760,7 +2761,11 @@ var
   dev: TQwen3Vulkan;
   timer: TPrecisionTimer;
   f: PtrInt;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+  clientDone: boolean;
 begin
+  clientDone := false;
   if not HasDevice then
     exit;
   {$ifdef CPU32}
@@ -2797,8 +2802,22 @@ begin
       model.Device := nil;
       FreeAndNil(dev);
       FreeAndNil(model);
+      // D7h: the first file through TNativeLlmClient on the device
+      if not clientDone then
+      begin
+        timer.Start;
+        client := TNativeLlmClient.CreateFromGguf(fn, '', gpu);
+        llm := client; // the interface frees the client, and with it its Device
+        client.Device := TQwen3Vulkan.Create(client.Model, gpu);
+        AddConsole(FormatString('% through the client on the device in %',
+          [FILES[f], timer.Stop]));
+        CheckQwen38Client(self, client, 'Qwen3.8-27B ' + FILES[f]);
+        llm := nil;
+        clientDone := true;
+      end;
     end;
   finally
+    llm := nil;
     if model <> nil then
       model.Device := nil;
     dev.Free;

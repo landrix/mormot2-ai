@@ -213,6 +213,35 @@ python tools/infer-ref/make_reference_d7c.py                 # both
 python tools/infer-ref/make_reference_d7c.py qwen35-chat     # one of them
 ```
 
+## Qwen3.8 as a chat model (phase D, D7h)
+
+`make_reference_d7h.py` reads the tokenizer files of `Qwen/Qwen3.8-27B` (`$LAI_QWEN38_DIR`,
+else `vendor/models/qwen3.8-27b`, checked against the pinned hashes) and those of
+Qwen3.5 (`make_reference_d7c.py`); the weights are not needed. It checks that the tokenizer
+of Qwen3.8 is that of Qwen3.5 with seven audio tokens appended, so the tests encode with
+the Qwen3.5 tokenizer.
+
+- `qwen38-chat`: the cases of `qwen35-chat` and 52 of its own (the reasoning efforts with
+  thinking on, off and undefined, with and without a system text or tools,
+  `preserve_thinking`, a `</think>` in a content, the argument values the template writes
+  as `tojson`, `''` as arguments) and the same 134 tool schemas, rendered by transformers
+  through `chat_template.jinja`, and their ids; an option a case does not name is undefined
+  for the template (thinking on, effort xhigh, reasoning preserved). The manifest also
+  keeps both templates (`chat_template`, `qwen35_chat_template`): the client tells them
+  apart. Left out: an empty `reasoning_effort` (transformers refuses it, the client takes
+  it as no value) and a float of more than 15 digits in the arguments (transformers rounds
+  it, the native template keeps it as written - see `make_reference_d7c.py`).
+- `qwen38-parse`: answers as the model would write them (with and without thinking, a call
+  without `</think>` before it, two calls without `</tool_call>` between them, values of
+  every schema type, a broken value) after their prompt, both as ids, and what
+  transformers' `parse_response` makes of them with the `response_template` of
+  `tokenizer_config.json` and the tools of the case.
+
+```bash
+python tools/infer-ref/make_reference_d7h.py                 # both
+python tools/infer-ref/make_reference_d7h.py qwen38-parse    # one of them
+```
+
 ## Decoder stacks (backlog B14)
 
 `make_reference_b14.py` needs only Python: it creates `tiny-qwen3/stack/` - the weights of

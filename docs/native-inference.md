@@ -1818,6 +1818,101 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D7h erledigt (2026-11-12): Qwen3.8 als Chat-Modell.** Qwen3.8 hat die Modellklasse von
+Qwen3.5 (`qwen3_5`), aber ein eigenes Chat-Template und ein eigenes `response_template` in
+`tokenizer_config.json` (Revision `3756181…`). Beides nachgebaut, kein Code übernommen. Die
+GGUF-Dateien von `ggml-org` tragen byte-genau dasselbe Template (`tokenizer.chat_template`,
+SHA-256 geprüft).
+
+- *Template* (`TQwen38ChatTemplate`, eine Variante von `TQwen35ChatTemplate`):
+  - Thinking ist an, solange eine Anfrage es nicht abschaltet.
+  - Mit Thinking beginnt der System-Turn mit der Anweisung des Reasoning-Efforts: `xhigh`
+    (die Vorgabe, auch für `''`) und `low` haben je einen Text, `medium` keinen. Ein anderer
+    Wert wird abgelehnt wie bei transformers; ohne Thinking wird der Effort nicht gelesen.
+  - Ein System-Turn nur mit Tools, System-Text oder dieser Anweisung (Qwen3.5 schreibt für
+    eine leere System-Nachricht einen leeren Turn).
+  - `preserve_thinking` (Vorgabe an): jeder Assistenten-Turn bekommt seinen `<think>`-Block,
+    nicht nur die nach der letzten Nutzerfrage.
+  - Ein `</think>` im Inhalt bleibt Text; das Reasoning kommt nur aus `Reasoning`.
+  - Argumentwerte: ein String roh, alles andere als `tojson` (`true`, `null`, `100000.0`;
+    Qwen3.5 schreibt Pythons `str()`). `""` als Argumente schreibt nichts.
+  - Die `{% generation %}`-Marken geben nichts aus.
+  - Neu für alle Templates: `DefaultPreserveThinking` (falsch außer für Qwen3.8);
+    `Encode`/`Render` und `NativeChatPrompt` nehmen es als Vorgabe von `preserve_thinking`.
+- *Wahl des Templates:* `TChatTemplate.Recognizes` sagt, ob ein Template-Text der eigene
+  ist; Qwen3.8 erkennt seinen an vier Merkmalen (`reasoning_effort`, `'xhigh'`,
+  `preserve_thinking`, `<function=`; Qwen3.5 hat die ersten drei nicht, gpt-oss kein
+  xhigh). Für eine Modellklasse dürfen mehrere Familien
+  registriert sein: `NativeFamilyForTemplate` nimmt die erste, deren Template den
+  Text erkennt, sonst die erste. Der Client liest den Text aus `chat_template.jinja`, sonst
+  aus `tokenizer_config.json` (ein String, oder aus einer Liste der mit dem Namen
+  `default`; `NativeChatTemplateOfFolder`), bei GGUF aus `tokenizer.chat_template`.
+  Ein unbekanntes Template gibt wie bisher die Familie der Modellklasse.
+- *Parser* (`TQwen38OutputParser`, vom Parser von Qwen3.5 abgeleitet): wie das
+  `response_template` des Modells eine Antwort liest, beendet ein `<tool_call>` auch das
+  Reasoning (das Modell ließ `</think>` aus) und einen Aufruf davor (es ließ `</tool_call>`
+  aus; der Block wird geparst, wie er dasteht, ein kaputter bleibt ohne erfundenes Endtag
+  Text). Ein Wert darf ohne `</parameter>` enden, vor dem nächsten `<parameter=` oder vor
+  `</function>` (`ParseQwen35ToolCall` mit `aOpenEnd`); ein `</parameter>` hinter dem
+  nächsten Parameter beendet ihn dann nicht mehr. Das Layout bleibt streng: Text, den der
+  Parser des Modells überginge, macht den Block zu Text. Die Werte typt er weiter nach dem
+  Schema wie in D7c - in allen Fällen der Referenz dasselbe wie die Typisierung von
+  transformers.
+- *Referenz* (`make_reference_d7h.py`, WSL aarch64, transformers 5.19.0):
+  - `qwen38-chat`: die 71 Gespräche von `qwen35-chat` mit den Vorgaben von Qwen3.8, 52
+    eigene (jeder Effort mit Thinking an, aus und ohne Angabe, mit und ohne System-Text oder
+    Tools, ein abgelehnter Effort, `preserve_thinking`, `</think>` im Inhalt, Argumentwerte,
+    `""` als Argumente) und die 134 Schemas: 257 Fälle, 12 abgelehnt. Der Tokenizer von
+    Qwen3.8 ist der von Qwen3.5 mit sieben angehängten Audio-Tokens (geprüft); keine Id der
+    Referenz ist eines davon, die Tests nehmen den Tokenizer von Qwen3.5.
+  - `qwen38-parse`: 31 Antworten mit ihrem Prompt als Ids und dem, was `parse_response` von
+    transformers mit dem `response_template` daraus macht (Reasoning, Inhalt, Aufrufe mit
+    den nach dem Schema getypten Werten).
+  - Bewusst weggelassen: ein leerer `reasoning_effort` (transformers lehnt ihn ab, bei uns
+    ist ein leerer String wie bei allen Familien kein Wert) und ein Float mit mehr als 15
+    Stellen in den Argumenten (transformers rundet ihn, der Nachbau behält ihn wörtlich -
+    siehe den Nachtrag zu D7c).
+- *Tests* (`TTestInferQwen38Chat` in `test.infer.qwen35chat`):
+  - Das Template lehnt die 12 Fälle ab, die transformers ablehnt; die übrigen 245 sind
+    textgleich und, bis auf die 12 mit einem Kontrolltoken als Literal im Text, idgleich.
+  - Der Parser gibt in allen 31 Fällen Reasoning, Inhalt und Aufrufe wie `parse_response`.
+  - Die Regeln: Vorgaben, Erkennen der beiden Templates (jedes der vier Merkmale nötig), die
+    Wahl der Familie, wo ein Ordner sein Template hat, die Optionen einer Anfrage.
+  - Der Client mit Qwen3.8-27B (Q4_K_M) auf CUDA und Vulkan (`CheckQwen38Client`, in
+    `Qwen38OnDevice`): Template und Parser nach der Datei, mit Thinking und Effort `low`
+    Reasoning und dann 391 (rund 2 s), ohne Thinking „Paris“, ein Aufruf `get_weather` mit
+    `{"city": "Berlin"}`, die Antwort mit dem Ergebnis (das Reasoning vor dem Aufruf
+    zurückgegeben).
+- *Gegenprobe:* 29 eingebaute Fehler, alle scheitern: im Template der Effort (fehlt, falscher
+  Text, ungeprüft, auch ohne Thinking, nicht vor den Tools), der System-Turn (leer wie bei
+  Qwen3.5, ohne Effort), `</think>` im Inhalt geteilt, `preserve_thinking` übergangen,
+  Argumente als `str()`, `""` abgelehnt, beide Vorgaben aus, `Recognizes` mit einem
+  Merkmal weniger oder für alles, `Render` ohne die Vorgabe; im Parser der Aufruf im
+  Reasoning, kein Aufruf vor dem nächsten, ein erfundenes Endtag, das offene Wertende (aus,
+  über den nächsten Parameter hinaus, ein Zeichen verschluckt); die Wahl der Familie, beide
+  Formen von `tokenizer_config.json`, die Vorgabe von `preserve_thinking` in der Anfrage
+  und im Prompt; für Qwen3.5 das Teilen am `</think>` und der leere System-Turn.
+- *Review:* Claude-Finder und Codex in drei Runden. Übernommen:
+  - das offene Wertende des `response_template` (Codex);
+  - dabei der Leerraum am Ende eines offenen letzten Werts (Codex);
+  - `Recognizes` mit einzelnen Merkmalen statt eines festen Textstücks;
+  - Doku zu `ChatTemplateOptions` (ohne die Vorgabe von `preserve_thinking`) und zu
+    `NativeChatTemplateOfFolder`;
+  - ein Merker statt des freigegebenen Clients in den Gerätetests.
+
+  Bewusst gelassen:
+  - Ein `</function>` mitten in einem offenen Wert macht den Block zu Text (strenges Layout,
+    der Parser des Modells überginge den Rest).
+  - Ein leerer `<tool_call>` direkt vor einem weiteren bleibt Text.
+- *Läufe:* RTX-Rechner FPC und Delphi 13 je 10574 Assertions (mit Qwen3.8-27B und dem Client
+  auf CUDA und Vulkan), Delphi 7 5651 (32 Bit, ohne das 27B-Modell); Mac M2 Infer 7359 und
+  LLM 730 (MoltenVK). In WSL nur die betroffenen Klassen (Qwen3.5- und Qwen3.8-Chat, 229):
+  der volle Lauf brach zweimal ab, weil dem Laptop gerade der Speicher fehlte (die WSL-VM
+  startete neu), kein Testfehler; die volle FPC-Suite lief dafür auf dem Mac.
+- *Nebenbei:* `PythonStrip` steht jetzt in der Schnittstelle von `mormot.ai.infer.chat`. Für
+  die Wahl der Familie gibt es statt einer Überladung von `NativeFamily` den eigenen Namen
+  `NativeFamilyForTemplate`: Delphi 7 löst einen `nil`-Aufruf der Überladung nicht auf.
+
 **D7g erledigt (2026-11-11): Qwen3.8-27B.** Das Modell (`Qwen/Qwen3.8-27B`, Revision
 `3756181…`, `model_type` `qwen3_5`) ist Qwen3.5 in groß: 64 Layer (16 × drei Gated DeltaNet
 und eine volle Attention), Hidden 5120, volle Attention mit 24 Köpfen der Breite 256 auf 4
@@ -1857,7 +1952,7 @@ auf dem RTX-Rechner (96 GB, RTX 5090).
   liegt im Repo.
 - *Chat:* Das Template von Qwen3.8 ist ein anderes als das von Qwen3.5 (Thinking per Vorgabe
   an, Reasoning-Effort xhigh/medium/low als Anweisung im System-Turn, `preserve_thinking`);
-  `TNativeLlmClient` nähme bis dahin das Qwen3.5-Template. Eigene Scheibe D7h.
+  `TNativeLlmClient` nahm bis dahin das Qwen3.5-Template. Erledigt in D7h (oben).
 - *Nebenbei:* `demos/infer/llm-bench` baute seit D7a nicht mehr (`Rope` ohne `aRotDim`, kein
   `DeltaRule` im Zeitmess-Backend) und kannte Qwen3.5 und Gemma 4 nicht.
 - *Gegenprobe:* `LinGroup` ohne die gekachelte Reihenfolge - auf der CPU ab Layer 0 daneben
