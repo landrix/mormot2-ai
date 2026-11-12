@@ -1818,6 +1818,82 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D6b erledigt (2026-11-12): die veröffentlichten Gemma-4-Checkpoints auf der CPU.**
+`google/gemma-4-26B-A4B-it` (Revision `4d7ae49…`, MoE: 30 Layer, 128 Experten, 8 davon je
+Token), `gemma-4-31B-it` (`842da37…`, dicht: 60 Layer, Hidden 5376) und `gemma-4-12B-it`
+(`707f0a3…`, dicht: 48 Layer) aus ihren safetensors in Q8_0, gegen transformers 5.19 in
+float32. Die Rechnung ist die aus D6a; neu ist nur das Layout des 12B. Nur auf dem
+RTX-Rechner.
+
+- *12B:* `Gemma4UnifiedForConditionalGeneration`, `model_type` `gemma4_unified`
+  (`modeling_gemma4_unified.py`): das Layout von `gemma4`, das Textmodell ein dichtes Gemma 4
+  (dieselben Schichten, Normen, Layer-Skalar, K=V in den vollen Layern) - `TGemma4UnifiedModel`
+  mit eigener Chat-Familie (Template und Parser von Gemma 4, `tokenizer.json` und
+  `chat_template.jinja` sind dieselben). Neu abgelehnt: `use_double_wide_mlp` (alle drei
+  Modelle haben es aus).
+- *Referenz* (`make_reference_d6b.py`, auf dem RTX-Rechner, 16 Threads): vier Prompts wie bei
+  Qwen3.5 (Rohtext, deutsch, Code, ein Chat-Turn mit Template, Thinking aus), je die Ids, die
+  Logits der letzten Position, die letzte Zeile jedes Zustands, 24 Greedy-Tokens. Das Modell
+  wird in BF16 geladen, jede Matrix erst im Produkt nach float32 genommen (`upcast_gemma`):
+  Linear, die Embedding-Matrix mit ihrer Skala (ein BF16-Laden rundet sqrt(hidden), beim 31B
+  73,32 auf 73,5), die Experten (`Gemma4TextExperts` nimmt seine 3D-Tensoren scheibenweise,
+  das fängt der Linear-Patch nicht); die übrigen Parameter des Textmodells in ihrem
+  gespeicherten Typ aus den Dateien, die Puffer in float32. Nachweis: die Tiny-Modelle aus D6a
+  (mit und ohne Experten) und das echte 12B (48 GB in float32) geben auf beiden Ladewegen
+  dieselben Bits; eine Expertenrechnung in BF16 fällt dem Vergleich auf.
+- *`<bos>`:* Der Tokenizer von Gemma 4 setzt keines (sein `post_processor` ist leer), nur das
+  Chat-Template schreibt es. Der erste Lauf hatte die Rohtexte ohne `<bos>` und lief beim 31B
+  in Schleifen („France is France is …“, „LLLL…“), während der Chat-Fall stimmte - ein
+  Fable-Reviewer fand die Ursache, Codex und ein Blick in `src/models/gemma4.cpp` von llama.cpp schlossen einen
+  Rechenfehler aus. Jetzt setzt der Generator `<bos>` selbst davor.
+- *Die Instruct-Modelle auf Rohtext:* auch mit `<bos>` antworten 12B und 26B-A4B auf die
+  Prosa-Anfänge in Schleifen oder mit einem eigenen Thought-Kanal (12B: „athought …
+  <|channel>thought … The capital of France is **Paris**“), Code und Chat sind sauber; das
+  31B setzt den Rohtext sinnvoll fort. Echtes Verhalten (dieselbe Rechnung in float32), die
+  Fälle bleiben als Referenz - verglichen wird, was transformers rechnet; wo die Referenz
+  selbst knapp entschied, darf Greedy abweichen.
+- *Genauigkeit (Q8_0, CPU, 22 Threads):*
+  - 31B: Zustände >= 0,997, Logits >= 0,9986, größter Fehler 1,8, Greedy überall gleich.
+  - 12B: Zustände >= 0,988, Logits >= 0,9906 und größter Fehler 4,1 im Rohtext-Fall 0 (der
+    Chat-Fall 0,9995), Greedy gleich bis auf Schritte, an denen die Referenz unsicher war.
+  - 26B-A4B: Logits >= 0,992, Zustände >= 0,98 - außer im Rohtext-Fall 0, wo sie ab Layer 24
+    bis 0,933 fallen (größter Fehler 10,5); der Chat-Fall 0,996. Nachgewiesen, dass es die
+    Wahl unter 128 Experten ist, die Q8_0 an knappen Stellen kippt: Die Referenz schreibt die
+    Wahl des Routers von transformers mit (`route_ids`, `route_weights` je Layer und Token),
+    der Test spielt sie ein (`TDecoderRouteTape.Add`, neu) - dann liegen alle vier Fälle bei
+    Zuständen >= 0,996 und Logits >= 0,9994 (Fall 0: 0,9959 und 0,9994), und die eigene Wahl
+    wiche bei 7 bis 11 % der gerouteten Tokens ab, immer bei einem Router-Abstand von
+    höchstens 0,17 (Logits).
+  - Laden in Q8_0: 26B-A4B 36 s, 31B 53 s, 12B 23 s; Prefill von 26 Tokens 1,1 s (26B-A4B)
+    bis 4,2 s (31B).
+- *Tests:* `TTestInferQwen3.Gemma4Checkpoints` (alle drei Modelle: Form, jeder Zustand der
+  letzten Zeile, Logits, Greedy; Schwellen je Modell nach den Messungen, für den Rohtext-Fall
+  0 eigene; beim 26B-A4B dazu `Gemma4RoutesReplayed` mit der Expertenwahl der Referenz;
+  `CheckLastRows` nimmt dafür einen ersten Fall),
+  `TTestInferGemma4.Gemma4CheckpointChat` (26B-A4B hinter `ILlmClient` auf der CPU: „Paris“
+  in 1,7 s, ein Aufruf `get_weather` mit `{"city": "Berlin"}`, die Antwort „17°C with rain“,
+  mit Thinking ein Reasoning und „391“ - 310 Tokens in einer Minute), in `Gemma4Refused` das
+  Layout `gemma4_unified` mit dem Tiny-Modell (dieselben Zustände) und das abgelehnte
+  doppelt breite MLP, in `Gemma4RequestOptions` die Familie. Wie beim 27B nur dort, wo die
+  Gewichte liegen, nicht unter `LAI_REQUIRE_MODEL`; die Referenzen (5,5, 9,2 und 7,0 MiB)
+  liegen im Repo.
+- *Gegenprobe:* vier eingebaute Fehler (Unified liest `config.json` oben statt
+  `text_config`, das doppelt breite MLP angenommen, `gemma4_unified` nicht registriert,
+  keine Chat-Familie dafür) - alle scheitern.
+- *Nebenbei:* `CheckLastRows` nimmt einen ersten Fall (`aFirst`) und prüft jetzt auch, dass
+  Zustände und Logits endlich sind (`NonFinite = 0`); `TDecoderRouteTape.Add` ist öffentlich
+  (der Router einer Referenz, an diese Engine gereicht).
+- *Läufe:* RTX-Rechner FPC 13 834, Delphi 13 13 834, Delphi 7 5 673 (die großen Modelle nur
+  64 Bit) - alle grün; Mac M2 Infer 7 786, LLM 730 grün (ohne die Gewichte); auf der WSL
+  dieses Rechners nur die betroffenen Klassen (2 649 grün), der volle Lauf reicht hier nicht
+  in den Speicher.
+- *Review:* Claude-Finder und Codex in drei Runden. Runde 1: Codex ohne Befund; der Finder
+  wollte Schwellen je Fall statt einer für alle (umgesetzt: eigene für den Rohtext-Fall 0) und
+  einen Nachweis, dass die Abweichung des 26B-A4B die Expertenwahl ist (umgesetzt:
+  `Gemma4RoutesReplayed`). Runde 2: Codex fand, dass `NonFinite` nicht geprüft wurde (in
+  beiden Prozeduren nachgezogen), der Finder die fehlende Größenprüfung von `route_weights`
+  (nachgezogen). Runde 3: ohne Befund.
+
 **D7h erledigt (2026-11-12): Qwen3.8 als Chat-Modell.** Qwen3.8 hat die Modellklasse von
 Qwen3.5 (`qwen3_5`), aber ein eigenes Chat-Template und ein eigenes `response_template` in
 `tokenizer_config.json` (Revision `3756181…`). Beides nachgebaut, kein Code übernommen. Die

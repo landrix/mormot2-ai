@@ -351,6 +351,11 @@ type
   public
     /// forget the recorded choices and the counters
     procedure Clear;
+    /// record the choice of one routed token from elsewhere - aUsed experts
+    // and their weights (renormed, times any per-expert scale), in the order
+    // a run takes them (layer by layer, the rows of a chunk in order): the
+    // router of a reference handed to this engine
+    procedure Add(aChosen: PIntegerArray; aWeights: PSingleArray; aUsed: PtrInt);
     /// drmRecord before the reference run, drmReplay before the other one -
     // a recording starts over once everything recorded was replayed
     property Mode: TDecoderRouteMode
@@ -2820,6 +2825,12 @@ begin
   fRoutes := 0;
   fDiffers := 0;
   fDiffersGap := 0;
+end;
+
+procedure TDecoderRouteTape.Add(aChosen: PIntegerArray; aWeights: PSingleArray;
+  aUsed: PtrInt);
+begin
+  Put(aChosen, aWeights, aUsed);
 end;
 
 function TDecoderRouteTape.Pending: PtrInt;

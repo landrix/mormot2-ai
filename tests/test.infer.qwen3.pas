@@ -48,11 +48,13 @@ type
     fStates: array of TSingleDynArray;
     procedure Setup; override;
     procedure CleanUp; override;
-    /// the cases of a real model's reference on aModel (case0 .. case<aCases
-    // - 1>, last rows): the last row of every state, the logits, greedy (a
-    // step may differ only where the reference itself was less than 1 sure)
+    /// the cases of a real model's reference on aModel (case<aFirst> ..
+    // case<aCases - 1>, last rows): the last row of every state, the logits,
+    // greedy (a step may differ only where the reference itself was less than
+    // 1 sure)
     procedure CheckLastRows(aModel: TDecoderModel; aRef: TInferRefSet;
-      const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double; aCases: PtrInt = 4);
+      const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double; aCases: PtrInt = 4;
+      aFirst: PtrInt = 0);
     /// TOnQwen3State: copy every state, the model reuses its buffers
     procedure KeepState(const aName: RawUtf8; aValues: PSingleArray;
       aRows, aCols: PtrInt);
@@ -85,6 +87,10 @@ type
     /// the folder of Qwen2.5-0.5B-Instruct, '' (SKIP, or a failure with
     // LAI_REQUIRE_MODEL=1) when absent or in a 32-bit process
     function Qwen25Folder: TFileName;
+    /// D6b: aModel (gemma-4-26B-A4B-it) given the router choices of the
+    // reference: the states and logits of every case, and how often the
+    // engine would have chosen otherwise
+    procedure Gemma4RoutesReplayed(aModel: TDecoderModel; aRef: TInferRefSet);
   published
     /// the tiny Qwen3 (BF16 weights): every state and all logits
     procedure TinyForwardMatchesReference;
@@ -212,6 +218,10 @@ type
     procedure Gemma4Quantized;
     /// D6a: the settings of a Gemma 4 config.json refused
     procedure Gemma4Refused;
+    /// D6b: google/gemma-4-26B-A4B-it, gemma-4-31B-it and gemma-4-12B-it from
+    // their safetensors in Q8_0 against transformers (the last row of every
+    // state, the logits, greedy) - only where the folders were put
+    procedure Gemma4Checkpoints;
   end;
 
 const
@@ -4013,6 +4023,8 @@ begin
     Check(Refused('text_config.attention_k_eq_v', false, 'k_proj'),
       'K = V turned off');
     Check(Refused('model_type', 'gemma3', 'model_type'), 'another model_type');
+    Check(Refused('text_config.use_double_wide_mlp', true, 'double-wide'),
+      'the double-wide MLP');
     Check(Refused('text_config.per_layer_config', _ObjFast(['7', _ObjFast(['head_dim',
       32])]), 'names no layer'), 'per_layer_config of a layer that is not there');
     Check(Refused('text_config.per_layer_config', _ObjFast(['1', _ObjFast(['sliding_window',
@@ -4044,6 +4056,17 @@ begin
       finally
         model.Free;
       end;
+      // gemma-4-12B's layout (gemma4_unified): the same model, the same states
+      c.InitJsonFromFile(dir + 'config.json', JSON_FAST_FLOAT);
+      c.SetValueByPath('model_type', 'gemma4_unified', true, '.');
+      FileFromString(c.ToJson, tmp + 'config.json');
+      model := NewDecoderModel(tmp, fCpu);
+      try
+        Check(model is TGemma4UnifiedModel, 'gemma4_unified: TGemma4UnifiedModel');
+        CheckStates(model, ref, 'case0', 1e-4, 1e-4, true);
+      finally
+        model.Free;
+      end;
     finally
       ref.Free;
     end;
@@ -4067,6 +4090,168 @@ begin
   finally
     DirectoryDeleteAll(tmp);
     RemoveDir(tmp);
+  end;
+end;
+
+procedure TTestInferQwen3.Gemma4Checkpoints;
+const
+  FOLDERS: array[0..2] of RawUtf8 = (
+    'gemma-4-26B-A4B-it', 'gemma-4-31B-it', 'gemma-4-12B-it');
+  DATASETS: array[0..2] of RawUtf8 = ('gemma4-26b-a4b', 'gemma4-31b', 'gemma4-12b');
+  LAYERS: array[0..2] of integer = (30, 60, 48);
+  // the thresholds of cases 1-3, then those of case 0 (raw text)
+  STATECOS: array[0..2] of double = (0.975, 0.995, 0.98);
+  LOGITCOS: array[0..2] of double = (0.99, 0.998, 0.995);
+  MAXABS: array[0..2] of double = (5.5, 2.5, 2.5);
+  STATECOS0: array[0..2] of double = (0.92, 0.995, 0.98);
+  LOGITCOS0: array[0..2] of double = (0.99, 0.998, 0.985);
+  MAXABS0: array[0..2] of double = (12, 2.5, 5);
+var
+  dir, refdir: TFileName;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  timer: TPrecisionTimer;
+  f: PtrInt;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Gemma 4 checkpoints: a 64-bit process');
+  exit;
+  {$endif CPU32}
+  for f := 0 to high(FOLDERS) do
+  begin
+    // large models of their own: only where they were put (not LAI_REQUIRE_MODEL)
+    dir := FindVendorModel(Utf8ToString(FOLDERS[f]) + PathDelim + 'config.json');
+    if (dir = '') or not (FileExists(ExtractFilePath(dir) + 'model.safetensors') or
+       FileExists(ExtractFilePath(dir) + 'model.safetensors.index.json')) then
+    begin
+      AddConsole(FormatString('SKIP %: no weights in vendor/models/% (revision in ' +
+        'UPSTREAM_BASE)', [FOLDERS[f], FOLDERS[f]]));
+      continue;
+    end;
+    dir := ExtractFilePath(dir);
+    refdir := FindInferRefDir(DATASETS[f]);
+    if CheckFailed(refdir <> '', Utf8ToString(DATASETS[f] + ' reference found')) then
+      continue;
+    ref := TInferRefSet.CreateFromFolder(refdir);
+    model := nil;
+    try
+      timer.Start;
+      model := NewDecoderModel(dir, fFast, idtQ8_0);
+      AddConsole(FormatString('% loaded in Q8_0 in %', [FOLDERS[f], timer.Stop]));
+      CheckUtf8(model.Config.Layers = LAYERS[f], '% layers', [model.Config.Layers]);
+      Check((model.Config.Spec[5].Window = 0) and (model.Config.Spec[4].Window = 1024),
+        'a full layer after five sliding ones');
+      if f = 0 then
+        Check((model.Config.Experts = 128) and (model.Config.ExpertsUsed = 8),
+          '128 experts, 8 of them used')
+      else
+        Check(model.Config.Experts = 0, 'dense');
+      if f = 2 then
+        Check(model is TGemma4UnifiedModel, 'gemma4_unified');
+      // measured 2026-11-12 on the RTX computer (FPC, 22 threads) against
+      // transformers in float32: 31B states >= 0.997, logits >= 0.9986 and max
+      // 1.8; 12B states >= 0.988, logits >= 0.9906 and max 4.1 (case 0, the
+      // raw text an instruction-tuned model loops on; else >= 0.9977 and 2.1);
+      // 26B-A4B states >= 0.98, logits >= 0.992 and max 4.8, but in case 0
+      // states 0.933 from layer 24 on and max 10.5 - the choice among 128
+      // experts tipped where the router is close (Gemma4RoutesReplayed shows
+      // it); greedy as the reference where it was sure
+      CheckLastRows(model, ref, FormatUtf8('% Q8_0', [FOLDERS[f]]), STATECOS0[f],
+        LOGITCOS0[f], MAXABS0[f], 1);
+      CheckLastRows(model, ref, FormatUtf8('% Q8_0', [FOLDERS[f]]), STATECOS[f],
+        LOGITCOS[f], MAXABS[f], 4, 1);
+      if f = 0 then
+        Gemma4RoutesReplayed(model, ref);
+    finally
+      model.Free;
+      ref.Free;
+    end;
+  end;
+end;
+
+procedure TTestInferQwen3.Gemma4RoutesReplayed(aModel: TDecoderModel; aRef: TInferRefSet);
+var
+  tape: TDecoderRouteTape;
+  ctx: TDecoderContext;
+  ids, rid: PIntegerArray;
+  rw, last: PSingleArray;
+  prompt: TIntegerDynArray;
+  logits: TSingleDynArray;
+  k, n, m, l, t, s, h, used, layers: PtrInt;
+  cmp: TInferCompare;
+  worst: double;
+  name: RawUtf8;
+begin
+  // the choice of transformers' router handed to the engine: what is left is
+  // the error of Q8_0 in the arithmetic, and the choices the engine would
+  // have made otherwise are counted (Differs) with their router gap
+  h := aModel.Config.Hidden;
+  used := aModel.Config.ExpertsUsed;
+  layers := aModel.Config.Layers;
+  SetLength(logits, aModel.Config.VocabSize);
+  for k := 0 to 3 do
+  begin
+    ids := aRef.I32(FormatUtf8('case%.ids', [k]), n);
+    SetLength(prompt, n);
+    MoveFast(ids^, prompt[0], n * SizeOf(integer));
+    rid := aRef.I32(FormatUtf8('case%.route_ids', [k]), m);
+    if CheckFailed(m = layers * n * used, 'the routes of every layer and token') then
+      exit;
+    rw := aRef.F32(FormatUtf8('case%.route_weights', [k]), m);
+    if CheckFailed(m = layers * n * used, 'a weight for every route') then
+      exit;
+    tape := TDecoderRouteTape.Create;
+    try
+      for l := 0 to layers - 1 do
+        for t := 0 to n - 1 do
+          tape.Add(@rid^[(l * n + t) * used], @rw^[(l * n + t) * used], used);
+      tape.Mode := drmReplay;
+      aModel.RouteTape := tape;
+      fNames := nil;
+      fStates := nil;
+      ctx := aModel.NewContext;
+      try
+        aModel.Forward(ctx, pointer(prompt), n, pointer(logits), false, KeepState);
+      finally
+        ctx.Free;
+        aModel.RouteTape := nil;
+      end;
+      worst := 1;
+      for s := 0 to layers + 1 do
+      begin
+        if s = 0 then
+          name := 'embed'
+        else if s <= 10 then
+          name := FormatUtf8('layer0%', [s - 1])
+        else if s <= layers then
+          name := FormatUtf8('layer%', [s - 1])
+        else
+          name := 'norm';
+        last := aRef.F32(FormatUtf8('case%.last.%', [k, name]), m);
+        if CheckFailed(State(name) <> nil, Utf8ToString('state ' + name)) then
+          continue;
+        cmp := InferCompare(@State(name)^[(n - 1) * h], last, h, 1, 1);
+        CheckUtf8(cmp.NonFinite = 0, 'case % % finite', [k, name]);
+        if cmp.Cosine < worst then
+          worst := cmp.Cosine;
+      end;
+      cmp := InferCompare(pointer(logits), aRef.F32(FormatUtf8('case%.logits_last',
+        [k]), m), aModel.Config.VocabSize, 1, 0);
+      AddConsole(FormatString('Gemma 4 26B-A4B case % with the routes of the ' +
+        'reference: states cosine >= %, logits cos % maxabs %; the engine would have ' +
+        'chosen otherwise for % of % routed tokens, router gap up to %',
+        [k, worst, cmp.Cosine, cmp.MaxAbs, tape.Differs, tape.Routes, tape.DiffersGap]));
+      CheckUtf8(cmp.NonFinite = 0, 'case % logits finite', [k]);
+      CheckEqual(tape.Routes, layers * n, 'every route replayed');
+      // measured 2026-11-12: states >= 0.995 in every case with the reference's
+      // routes - case 0 included, which falls to 0.933 with its own
+      CheckUtf8(worst >= 0.985, 'case %: states cosine % with the routes of the ' +
+        'reference', [k, worst]);
+      CheckUtf8(cmp.Cosine >= 0.995, 'case %: logits cosine % with the routes of ' +
+        'the reference', [k, cmp.Cosine]);
+    finally
+      tape.Free;
+    end;
   end;
 end;
 
@@ -4366,7 +4551,7 @@ begin
 end;
 
 procedure TTestInferDecoder.CheckLastRows(aModel: TDecoderModel; aRef: TInferRefSet;
-  const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double; aCases: PtrInt);
+  const aLabel: RawUtf8; aStateCos, aCos, aMaxAbs: double; aCases, aFirst: PtrInt);
 var
   ctx: TDecoderContext;
   ids, want: PIntegerArray;
@@ -4380,7 +4565,7 @@ var
   timer: TPrecisionTimer;
 begin
   h := aModel.Config.Hidden;
-  for k := 0 to aCases - 1 do
+  for k := aFirst to aCases - 1 do
   begin
     ids := aRef.I32(FormatUtf8('case%.ids', [k]), n);
     SetLength(prompt, n);
@@ -4411,6 +4596,7 @@ begin
       if CheckFailed(State(name) <> nil, Utf8ToString('state ' + name)) then
         continue;
       cmp := InferCompare(@State(name)^[(n - 1) * h], last, h, 1, 1);
+      CheckUtf8(cmp.NonFinite = 0, '% case % % finite', [aLabel, k, name]);
       if cmp.Cosine < worst then
         worst := cmp.Cosine;
       CheckUtf8(cmp.Cosine >= aStateCos, '% case % % cosine %',
@@ -4438,6 +4624,7 @@ begin
     AddConsole(FormatString('% case %: states cosine >= %, logits cos % maxabs %, ' +
       'greedy equal for % of % tokens (reference margin there %)',
       [aLabel, k, worst, cmp.Cosine, cmp.MaxAbs, diff, m, margin]));
+    CheckUtf8(cmp.NonFinite = 0, '% case % logits finite', [aLabel, k]);
     CheckUtf8(cmp.Cosine >= aCos, '% case % logits cosine %', [aLabel, k, cmp.Cosine]);
     CheckUtf8(cmp.MaxAbs <= aMaxAbs, '% case % logits max error %',
       [aLabel, k, cmp.MaxAbs]);

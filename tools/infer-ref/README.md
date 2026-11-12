@@ -128,6 +128,27 @@ pinned hashes, no weights needed) and loads no model:
 LAI_GPTOSS_DIR=/path/to/gpt-oss-20b python tools/infer-ref/make_reference_d5c.py
 ```
 
+## The published Gemma 4 checkpoints (phase D, D6b)
+
+`make_reference_d6b.py` writes `gemma4-26b-a4b`, `gemma4-31b` and `gemma4-12b` from
+`google/gemma-4-26B-A4B-it`, `gemma-4-31B-it` and `gemma-4-12B-it` in their pinned revisions
+(`$LAI_GEMMA4_26B_DIR`, `$LAI_GEMMA4_31B_DIR`, `$LAI_GEMMA4_12B_DIR`, by default
+`vendor/models/<name>`; nothing is downloaded, the pinned hashes are checked). It runs only
+on the RTX computer (96 GB) and only for the targets named. A model is loaded in BF16 and
+every matrix - each Linear, the embedding with its scale, the experts of
+`Gemma4TextExperts` - goes to float32 only inside its product (`upcast_gemma`); the other
+parameters of the text model are read again from the files in their stored type, the
+buffers are made float32. The target `upcast-check` shows on the tiny models of D6a that
+this is a float32 load bit for bit; `LAI_GEMMA_F32=1` loads in float32 instead (the 12B fits:
+its two datasets are the same bits). The raw-text prompts get `<bos>` from the script - the
+tokenizer of Gemma 4 adds none. For a model with experts the choice of its router is kept
+too. `LAI_THREADS` sets the torch threads (the datasets: 16).
+
+```bash
+python tools/infer-ref/make_reference_d6b.py upcast-check
+LAI_THREADS=16 python tools/infer-ref/make_reference_d6b.py gemma4-12b gemma4-26b-a4b gemma4-31b
+```
+
 ## The tokenizer and chat format of Gemma 4 (phase D, D6c)
 
 `make_reference_d6c.py` reads only the tokenizer files of `google/gemma-4-26B-A4B-it`

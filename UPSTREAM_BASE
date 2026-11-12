@@ -250,15 +250,31 @@ never a build input.
   Model:     google/gemma-4-26B-A4B-it (Apache-2.0) -
              https://huggingface.co/google/gemma-4-26B-A4B-it
   Revision:  4d7ae4984b7db7de8f8457170b3f1a419ee76d52
-  Files (sha256), in vendor/models/gemma-4-26B-A4B-it (gitignored; the tokenizer
-  files only, no weights yet):
+  Files (sha256), in vendor/models/gemma-4-26B-A4B-it (gitignored; the weights only
+  on the RTX computer):
+    model-00001-of-00002.safetensors  1127684971bbca40465435a5cad69d67ad603bf5e61c6dfd5561fae4a3bcfdb3
+    model-00002-of-00002.safetensors  aab47033e1e8a492ef8e581efae1cf36478d0433567e7729b3c1728bc8970db7
+    config.json                       ed0c1eb3633de771906e9ba004a44cc5635bcc06ee2062077c3d2e88a50707d3
     tokenizer.json                    cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f
     tokenizer_config.json             9f4fec4b1dc6ecddf8f4a92e9caea5971c0e67d81309f3f9066a2bee8c362633
     chat_template.jinja               ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4
     generation_config.json            d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de
   google/gemma-4-31B-it (842da3794eaa0b77d5f08bae87a17459d91ff475) and
   google/gemma-4-12B-it (707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7) ship the same
-  tokenizer.json and chat_template.jinja.
+  tokenizer.json and chat_template.jinja. Their files (sha256), in
+  vendor/models/gemma-4-31B-it and gemma-4-12B-it (gitignored; only on the RTX computer):
+    31B model-00001-of-00002.safetensors  eeef8791537bc04f110967c513149e037d2a9ae97d49add7291ebfa62806bbfa
+    31B model-00002-of-00002.safetensors  018912220f559f7025d60333e0996183cd538aa77ad6f4988a89ce47be681f10
+    31B config.json                       e967dd38bc5cfd38bd09a995a7bf4a754075df2b46aba68f7fbb5a791e6d8dd1
+    12B model.safetensors                 5a84cb313260ac447237b890387116dfa8682e49a6b44bc585ae8353abbff18d
+    12B config.json                       478c46e8d2c52d5c2d85bf67e3b3e8c90e7c9d91086cee27e3c267907e936bd9
+    12B tokenizer_config.json             a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9
+    12B generation_config.json            a8349d9bd64cc5841297fcb5002f0fdc4749c473c8f1b10ea337f9ce4ee7014e
+  Datasets gemma4-26b-a4b, gemma4-31b and gemma4-12b (tools/infer-ref/make_reference_d6b.py, the
+    safetensors above): generated on the RTX computer (Windows x86_64, 96 GB), Python 3.12.13,
+    torch 2.14.1+cpu, transformers 5.19.0 (requirements.txt), 16 threads, the BF16 matrices and
+    experts taken to float32 inside their products (bit for bit a float32 load: checked on the
+    12B and the tiny models).
   Datasets from it: gemma4-tokens and gemma4-chat (tools/infer-ref/make_reference_d6c.py,
     the tokenizer files and the template only); tiny-gemma4 (make_reference_d6.py) uses
     the modeling code of transformers only, no file of the model. Generated in the WSL

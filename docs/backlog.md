@@ -385,9 +385,13 @@ In Scheiben:
   Tokenizer (BPE im Stil von SentencePiece mit Byte-Fallback, 3197 Fälle idgleich), das
   Chat-Template (452 Gespräche und Schemas textgleich, 391 davon idgleich mit transformers), der Parser
   (Thought-Channel, Aufrufe im Dialekt von transformers), die Familie hinter `ILlmClient`.
-- *Offen:* D6b die echten Modelle (31B, 26B-A4B; `gemma-4-12B-it` mit prüfen), D6d GGUF
-  (auch der Tokenizer), D6e Vulkan und CUDA (Kopfdimension 512); E2B/E4B danach. Nach der
-  Reihenfolge vom 2026-10-20 kommt zuerst D7.
+- *D6b erledigt 2026-11-12* (`native-inference.md`, Phase D): die veröffentlichten Checkpoints
+  `gemma-4-26B-A4B-it`, `gemma-4-31B-it` und `gemma-4-12B-it` (eigenes Layout
+  `gemma4_unified`, `TGemma4UnifiedModel`) aus safetensors in Q8_0 auf der CPU gegen
+  transformers in float32; beim 26B-A4B die Abweichung im Rohtext-Fall als Expertenwahl an
+  knappen Stellen nachgewiesen (`TDecoderRouteTape.Add`); 26B-A4B hinter `ILlmClient`.
+- *Offen:* D6d GGUF (auch der Tokenizer), D6e Vulkan und CUDA (Kopfdimension 512); E2B/E4B
+  danach.
 
 **D7 — Gated DeltaNet.** Rekurrenz, Convolution-Zustand, Gates, Normierung, Ausgangsgate der
 vollen Attention. Erst seriell auf der CPU, dann der Prefill auf allen Kernen, dann GPU. Prompt-Cache mit

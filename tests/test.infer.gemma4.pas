@@ -21,6 +21,7 @@ uses
   mormot.core.text,
   mormot.core.variants,
   mormot.core.json,
+  mormot.core.perf,
   mormot.core.test,
   mormot.ai.llm.types,
   mormot.ai.llm,
@@ -68,6 +69,10 @@ type
     procedure Gemma4Parser;
     /// preserve_thinking and the registered family
     procedure Gemma4RequestOptions;
+    /// D6b: gemma-4-26B-A4B-it behind ILlmClient on the CPU (Q8_0): an
+    // answer, a tool call and its result, thinking on request - only where
+    // its weights were put
+    procedure Gemma4CheckpointChat;
   end;
 
 /// the folder of the gemma-4-26B-A4B-it files, '' when aFile is not in it
@@ -1103,6 +1108,92 @@ begin
     'gemma4 registered');
   Check(NativeFamily(TGemma4TextModel, f) and (f.Template = TGemma4ChatTemplate),
     'gemma4_text registered');
+  Check(NativeFamily(TGemma4UnifiedModel, f) and (f.Template = TGemma4ChatTemplate) and
+    (f.Parser = TGemma4OutputParser), 'gemma4_unified registered');
+end;
+
+procedure TTestInferGemma4.Gemma4CheckpointChat;
+var
+  dir: TFileName;
+  llm: TNativeLlmClient;
+  r: TLlmChatRequest;
+  a: TLlmChatResponse;
+  timer: TPrecisionTimer;
+begin
+  {$ifdef CPU32}
+  AddConsole('SKIP Gemma 4 26B-A4B chat: a 64-bit process');
+  exit;
+  {$endif CPU32}
+  // a large model of its own: only where it was put (not LAI_REQUIRE_MODEL)
+  dir := FindGemma4Folder('model.safetensors.index.json');
+  if dir = '' then
+  begin
+    AddConsole('SKIP Gemma 4 26B-A4B chat: no weights in vendor/models/' +
+      'gemma-4-26B-A4B-it (revision in UPSTREAM_BASE)');
+    exit;
+  end;
+  timer.Start;
+  llm := TNativeLlmClient.Create(dir); // Q8_0 at load
+  try
+    AddConsole(FormatString('gemma-4-26B-A4B-it client loaded in %', [timer.Stop]));
+    Check(llm.Template is TGemma4ChatTemplate, 'the Gemma 4 template');
+    Check(not llm.EnableThinking, 'thinking only when asked');
+    Finalize(r);
+    FillCharFast(r, SizeOf(r), 0);
+    SetLength(r.Messages, 1);
+    r.Temperature := 0;
+    r.MaxTokens := 200;
+    r.Messages[0] := LlmMessage(lrUser,
+      'What is the capital of France? Answer with one word.');
+    timer.Start;
+    a := llm.ChatComplete(r);
+    AddConsole(FormatString('capital in %: "%" (% tokens)', [timer.Stop, a.Content,
+      a.Usage.CompletionTokens]));
+    Check(a.FinishReason = lfrStop, 'stopped by itself');
+    Check(PosEx('Paris', a.Content) > 0, 'the answer Paris');
+    CheckEqual(a.Reasoning, '', 'no reasoning');
+    // a tool call, then the answer with its result
+    SetLength(r.Tools, 1);
+    r.Tools[0].Name := 'get_weather';
+    r.Tools[0].Description := 'Get the current weather of a city';
+    r.Tools[0].ParametersJson := '{"type":"object","properties":{"city":' +
+      '{"type":"string"}},"required":["city"]}';
+    r.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
+    timer.Start;
+    a := llm.ChatComplete(r);
+    AddConsole(FormatString('weather in %: % calls, content "%"', [timer.Stop,
+      length(a.ToolCalls), a.Content]));
+    if not CheckFailed(length(a.ToolCalls) = 1, 'one tool call') then
+    begin
+      CheckEqual(a.ToolCalls[0].Name, 'get_weather', 'the tool');
+      CheckEqual(a.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
+      SetLength(r.Messages, 3);
+      r.Messages[1] := LlmMessage(lrAssistant, a.Content);
+      r.Messages[1].ToolCalls := a.ToolCalls;
+      r.Messages[2] := LlmMessage(lrTool, '{"temperature_c": 17, "sky": "rain"}');
+      r.Messages[2].ToolCallId := a.ToolCalls[0].Id;
+      timer.Start;
+      a := llm.ChatComplete(r);
+      AddConsole(FormatString('answer in %: "%"', [timer.Stop, copy(a.Content, 1, 200)]));
+      Check(a.FinishReason = lfrStop, 'answered');
+      Check(PosEx('17', a.Content) > 0, 'with the temperature of the tool');
+    end;
+    // thinking on by the request: the thought channel first
+    SetLength(r.Messages, 1);
+    r.Tools := nil;
+    r.Messages[0] := LlmMessage(lrUser, 'What is 17 times 23?');
+    r.Extra := _ObjFast(['chat_template_kwargs', _ObjFast(['enable_thinking', true])]);
+    r.MaxTokens := 1500;
+    timer.Start;
+    a := llm.ChatComplete(r);
+    AddConsole(FormatString('17 x 23 with thinking in %: reasoning "%" answer "%" ' +
+      '(% tokens)', [timer.Stop, copy(a.Reasoning, 1, 100), copy(a.Content, 1, 100),
+      a.Usage.CompletionTokens]));
+    Check(a.Reasoning <> '', 'with reasoning');
+    Check(PosEx('391', a.Content) > 0, 'the answer 391');
+  finally
+    llm.Free;
+  end;
 end;
 
 

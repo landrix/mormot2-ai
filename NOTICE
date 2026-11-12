@@ -153,8 +153,17 @@ Gemma 4  (Google)  (MODEL INTERFACE, NOT CODE)
   the turn and channel markers) are reproduced because the model only works
   with them. tests/data/infer-ref/gemma4-chat holds conversations rendered by
   transformers with that template, and their token ids.
+  The published checkpoints google/gemma-4-26B-A4B-it (revision above),
+  gemma-4-31B-it (842da3794eaa0b77d5f08bae87a17459d91ff475) and gemma-4-12B-it
+  (707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7, the gemma4_unified layout of
+  modeling_gemma4_unified.py) are read at runtime and not part of this
+  repository; tests/data/infer-ref/gemma4-26b-a4b, gemma4-31b and gemma4-12b
+  hold token ids, logits, states and router choices computed with them, no
+  weights.
   License: Apache-2.0.
   https://huggingface.co/google/gemma-4-26B-A4B-it
+  https://huggingface.co/google/gemma-4-31B-it
+  https://huggingface.co/google/gemma-4-12B-it
 
 Qwen3.5  (Qwen team, Alibaba Cloud)  (MODEL INTERFACE, NOT CODE)
   The native decoder implements the Qwen3.5 architecture (Gated DeltaNet beside

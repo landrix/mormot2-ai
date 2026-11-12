@@ -28,7 +28,10 @@
 // - the checkpoints of Gemma4ForConditionalGeneration (model_type gemma4): the
 //   settings in text_config, the tensors under model.language_model. (the
 //   vision and audio towers are left alone); Gemma4ForCausalLM (gemma4_text):
-//   the settings at the top, the tensors under model.
+//   the settings at the top, the tensors under model.; that of
+//   gemma-4-12B (Gemma4UnifiedForConditionalGeneration, model_type
+//   gemma4_unified, modeling_gemma4_unified.py): the layout of gemma4, its text
+//   model a dense Gemma 4
 // - the family of mormot.ai.infer.decoder: this unit reads config.json and
 //   maps the tensors; the forward pass is TDecoderModel's
 // - not yet (backlog D6): per-layer embeddings and shared KV layers (E2B,
@@ -40,6 +43,7 @@ unit mormot.ai.infer.model.gemma4;
 
     - TGemma4Model: the gemma4 family of TDecoderModel (Gemma 4 checkpoints)
     - TGemma4TextModel: the same over a gemma4_text checkpoint
+    - TGemma4UnifiedModel: the same over a gemma4_unified checkpoint (12B)
 
   *****************************************************************************
 }
@@ -75,8 +79,9 @@ type
   // top_k_experts and moe_intermediate_size
   // - refused: per-layer embeddings (hidden_size_per_layer_input > 0) and
   // shared KV layers (num_kv_shared_layers > 0) - E2B and E4B -, an untied
-  // head, attention_bias, bidirectional attention over all tokens, another
-  // activation than gelu_pytorch_tanh, another rope_type
+  // head, attention_bias, bidirectional attention over all tokens, the
+  // double-wide MLP (use_double_wide_mlp), another activation than
+  // gelu_pytorch_tanh, another rope_type
   // - the router stays F32 when the matrices are quantized at load
   TGemma4Model = class(TDecoderModel)
   protected
@@ -97,6 +102,8 @@ type
       aFirst, aRows, aCols: Int64; const aName: RawUtf8): TInferWeight;
     /// the tensor prefix of the layout in place of "model."
     class function Prefix: RawUtf8; virtual;
+    /// true when config.json keeps the text settings in text_config
+    class function InTextConfig: boolean; virtual;
   public
     /// 'gemma4'
     class function ModelType: RawUtf8; override;
@@ -109,8 +116,18 @@ type
   TGemma4TextModel = class(TGemma4Model)
   protected
     class function Prefix: RawUtf8; override;
+    class function InTextConfig: boolean; override;
   public
     /// 'gemma4_text'
+    class function ModelType: RawUtf8; override;
+  end;
+
+  /// gemma-4-12B (Gemma4UnifiedForConditionalGeneration, model_type
+  // gemma4_unified): the layout of TGemma4Model, a dense text model (its
+  // config has no experts and no per-layer embeddings)
+  TGemma4UnifiedModel = class(TGemma4Model)
+  public
+    /// 'gemma4_unified'
     class function ModelType: RawUtf8; override;
   end;
 
@@ -128,6 +145,11 @@ end;
 class function TGemma4Model.Architecture: RawUtf8;
 begin
   result := 'gemma4';
+end;
+
+class function TGemma4Model.InTextConfig: boolean;
+begin
+  result := true;
 end;
 
 class function TGemma4Model.Prefix: RawUtf8;
@@ -276,6 +298,8 @@ begin
     EInferError.RaiseUtf8('%: attention_bias not supported', [self]);
   if d^.U['use_bidirectional_attention'] = 'all' then
     EInferError.RaiseUtf8('%: bidirectional attention not supported', [self]);
+  if BoolOr(d^, 'use_double_wide_mlp', false) then
+    EInferError.RaiseUtf8('%: the double-wide MLP not supported', [self]);
   if not BoolOr(d^, 'tie_word_embeddings', true) then
     EInferError.RaiseUtf8('%: an untied head not supported', [self]);
   fConfig.VocabSize := d^.I['vocab_size'];
@@ -410,7 +434,7 @@ begin
     // the tensors of the text model under their prefix (a stack of the file)
     fStackPrefix := Prefix;
     fStackEmbed := Prefix + 'embed_tokens.weight';
-    if ModelType = 'gemma4' then
+    if InTextConfig then
     begin
       if not BoolOr(d^, 'tie_word_embeddings', true) then
         EInferError.RaiseUtf8('%: an untied head not supported', [self]);
@@ -574,9 +598,23 @@ begin
   result := 'model.';
 end;
 
+class function TGemma4TextModel.InTextConfig: boolean;
+begin
+  result := false;
+end;
+
+
+{ TGemma4UnifiedModel }
+
+class function TGemma4UnifiedModel.ModelType: RawUtf8;
+begin
+  result := 'gemma4_unified';
+end;
+
 
 initialization
   RegisterDecoderModel(TGemma4Model);
   RegisterDecoderModel(TGemma4TextModel);
+  RegisterDecoderModel(TGemma4UnifiedModel);
 
 end.

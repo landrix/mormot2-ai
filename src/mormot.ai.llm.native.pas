@@ -2655,6 +2655,8 @@ initialization
     TQwen35OutputParser);
   RegisterNativeFamily(TGemma4TextModel, TSpBpeTokenizer, TGemma4ChatTemplate,
     TGemma4OutputParser);
+  RegisterNativeFamily(TGemma4UnifiedModel, TSpBpeTokenizer, TGemma4ChatTemplate,
+    TGemma4OutputParser);
   // Qwen3.8: the model class of Qwen3.5, told apart by its chat template
   RegisterNativeFamily(TQwen35Model, TBpeTokenizer, TQwen38ChatTemplate,
     TQwen38OutputParser);
