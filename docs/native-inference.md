@@ -1818,6 +1818,86 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D6e2 erledigt (2026-11-13): Gemma 4 auf Vulkan.** `TQwen3Vulkan` nimmt Gemma 4 an, mit
+denselben Schritten wie CUDA in D6e1.
+
+- *Shader* (`tools/vk/`):
+  - **`attention.comp`:** Die Zahl der Queries je Work Group (`MAXQ`) und der
+    Ausgabewerte je Invocation (`NV`) sind Defines. Der Standard-Build bleibt bei 8 und 2.
+    `SPV_ATTENTION512` (und `_F16`) ist mit 4 und 4 gebaut und nimmt Köpfe bis 512 in
+    12 KB Shared Memory; die 16 KB, die jedes Gerät bietet, reichen nicht für 8 Queries von
+    512.
+  - **Skala:** Eine Push-Konstante `scale` gibt den Faktor der Scores an (0 heißt
+    1/sqrt(d)). `flash.comp` und `attndec.comp` kennen keine und laufen deshalb nur bei
+    Köpfen bis 128 und der Standard-Skala.
+  - **`qkrope.comp`:** Köpfe bis 512 und `vnorm`. Die Reduktion der Value-Norm rechnet
+    jede Work Group (die Barrieren stehen in einheitlichem Kontrollfluss), verwendet wird
+    sie von denen eines KV-Kopfes.
+  - **`route.comp`:** die Skala je Experte (Bindung 3).
+  - **`linear8.comp -DIDS`:** ein Start-Byte `base`, wo die Experten beginnen.
+  - **Neue Shader:** `geglu.comp` (das Argument von tanh auf ±20 begrenzt; die CPU setzt
+    jenseits davon tanh = ±1) und `scale.comp`.
+- *Host:*
+  - **`Plan`:** wählt je Layer Shader, Köpfe und Zeilen je Work Group und die Teilung der
+    Keys.
+  - **Zweiter RoPE-Satz:** Seine Faktoren liegen in einem eigenen Puffer `fDevCos2`. Ein
+    Offset in `fDevCos` müsste auf die Ausrichtung der Bindungen fallen.
+  - **Gate und Up aus GGUF:** Wie in D6e1 liegen sie als ein Puffer vor. Jeder Experte wird
+    an seinem Offset gebunden; eine Scheibe muss ein Vielfaches von
+    `MinStorageAlignment` sein, sonst greift der alte Weg. Auf dem Gerät gewählt, liest
+    `RecordLinearIds` (neu: `aBase`) die Up-Zeilen ab der ersten Up-Scheibe.
+  - **Platz im Stapel:** Vor der zweiten Hälfte eines Layers mit dichtem Block und Experten
+    wird erneut Platz geprüft (`DENSEMOE_ROOM`). Nach den Experten und
+    nach jedem Feed-Forward-Block wird noch einmal geprüft (`DENSEMOE_TAIL`; Codex-Review:
+    `RecordMoe` kann mit zwei freien Sätzen enden, wenn der Host die Experten wählt). `LAYER_ROOM` bleibt 32; der erste Versuch mit 48 sprengte einen
+    bestehenden Test mit Stapeln von 40.
+- *Nebenbei, auch auf CUDA:* Die `FfnNorm` gilt für einen dichten Block mit Sandwich-Norms
+  und für den dichten Block neben den Experten, nie für einen reinen Experten-Block (wie
+  `MoeBlock` auf der CPU; Review).
+- *Genauigkeit (RTX 5090, Q8_0 aus GGUF gegen transformers in float32):* wie auf CUDA bis auf
+  die letzten Stellen.
+  - **12B:** Kosinus 0,98856 im Rohtext-Fall 0, 0,9992–0,99995 sonst.
+  - **26B-A4B:** 0,9984–0,9997.
+  - **Greedy:** gleich, wo die Referenz sicher war.
+  - **Client:** Das 12B beantwortet über den Client auf dem Gerät die Frage nach der
+    Hauptstadt (Paris), ruft `get_weather` auf und antwortet mit 17 °C.
+- *Tempo (RTX 5090, Vulkan):*
+  - **26B-A4B Q8_0:** 24 Tokens in 0,64–0,68 s, gut 35 Tokens/s, die Experten auf dem
+    Gerät gewählt (CUDA: gut 40).
+  - **12B Q8_0:** 24 Tokens in 0,68–0,71 s.
+- *Tests* (`test.infer.vulkan`):
+  - **`Gemma4OpsMatchCpu`:** die Shader gegen die CPU.
+    - Köpfe von 512 mit K=V, Value-Norm, Skala 1, mit Float- und Halbfloat-Cache, mit
+      Blöcken aus mehreren Zeilen, mit Fenster und in Bereichen.
+    - Köpfe von 256 mit Fenster und von 384 mit Skala 0,3.
+    - `geglu` und `scale`.
+  - **`Gemma4MatchesCpu`:**
+    - Die Fälle von D6e1.
+    - Ob das Gerät routet, hängt hier von der Offset-Ausrichtung des Geräts ab (die Q8_0-GGUF
+      hat Scheiben von 2176 Bytes).
+    - Q8_0 beim Laden in Stapeln von 51 Sätzen: Die Gegenprobe ohne die zweite
+      Platzprüfung scheitert.
+  - **`Gemma4OnDevice`:** wie auf CUDA.
+  - **`RouteMatchesHost`:** mit Expertenskalen.
+- *Läufe:*
+  - **RTX 5090 (Windows x64):** FPC 0 / 16.641, Delphi 13 0 / 16.641, Delphi 7 0 / 6.060
+    (ohne CUDA, wie immer).
+  - **Mac M2 Pro (MoltenVK):** Inferenz 0 / 8.216, LLM 0 / 730. `Gemma4OpsMatchCpu` und
+    `Gemma4MatchesCpu` (Tiny-Modelle) laufen dort auf der GPU; die großen Modelle fehlen auf dem
+    Mac und werden übersprungen.
+- *Review* (Claude-Finder und Codex):
+  - **Runde 1:**
+    - Codex: Nach `RecordMoe` fehlte im Layer mit dichtem Block die zweite Platzprüfung
+      (behoben, `DENSEMOE_TAIL`).
+    - Claude: Zeilenenden CR CR LF in 55 Kommentarzeilen (behoben); die `FfnNorm` eines reinen
+      Experten-Blocks mit Sandwich-Norms (behoben, auch auf CUDA); Testlücken bei Köpfen von 512
+      mit Blöcken aus mehreren Zeilen und mit Fenster (drei Fälle ergänzt); ein Kommentar.
+  - **Runde 2:**
+    - Claude: Nach einem reinen Experten-Block mit Layer-Skalar fehlte ebenfalls Platz (behoben,
+      dieselbe Prüfung nach jedem Feed-Forward-Block).
+    - Codex: kein Test für einen reinen Experten-Block mit Sandwich-Norms (kein heutiges Modell
+      hat ihn; im Backlog).
+
 **D6e1 erledigt (2026-11-13): Gemma 4 auf CUDA.** `TQwen3Cuda` nimmt Gemma 4 an
 (`DECODER_EXTRAS_GEMMA4`): aus dem Ordner wie aus GGUF, dicht und mit Experten.
 

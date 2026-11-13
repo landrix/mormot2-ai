@@ -29,6 +29,7 @@ uses
   mormot.ai.infer.model.qwen3,
   mormot.ai.infer.model.gptoss,
   mormot.ai.infer.model.qwen35,
+  mormot.ai.infer.model.gemma4,
   mormot.ai.infer.model.qwen3.vulkan,
   mormot.ai.llm.types,
   mormot.ai.llm,
@@ -38,6 +39,7 @@ uses
   test.infer.fast,
   test.infer.bpe,
   test.infer.qwen35chat,
+  test.infer.gemma4,
   mormot.ai.infer.sampler;
 
 type
@@ -181,6 +183,22 @@ type
     // TNativeLlmClient: an answer, a tool call, the next turn from a restore
     // point as without the cache - skipped on a CPU implementation
     procedure Qwen35OnDevice;
+    /// D6e2: the shaders of Gemma 4 against the CPU - qkrope.comp with heads
+    // of 512, the value norm and K=V, attention.comp of heads of 512
+    // (SPV_ATTENTION512) and with a scale of its own, both with a cache of
+    // floats and of half floats; geglu.comp and scale.comp
+    procedure Gemma4OpsMatchCpu;
+    /// D6e2: tiny Gemma 4 on the device against the CPU - the model with
+    // experts beside the dense block in F32 (a cache of floats and of half
+    // floats), Q8_0 at load, the dense model, the tiny GGUF files (routed on
+    // the device where the device binds their slices); a prompt over two
+    // chunks, decode steps with and without the route read back, a branch
+    // behind the window; heads of 44 (15 pairs rotating)
+    procedure Gemma4MatchesCpu;
+    /// D6e2: Gemma 4 12B and 26B-A4B (Q8_0 GGUF) on the device against
+    // transformers (the references of D6b), the 12B through TNativeLlmClient
+    // on the device
+    procedure Gemma4OnDevice;
   end;
 
 
@@ -1862,17 +1880,18 @@ end;
 
 procedure TTestInferVulkan.RouteMatchesHost;
 const
-  // experts, chosen, renormed
-  CASES: array[0..3, 0..2] of integer = ((128, 8, 1), (128, 8, 0), (8, 2, 1), (64, 4, 1));
+  // experts, chosen, renormed, scaled per expert (Gemma 4)
+  CASES: array[0..4, 0..3] of integer = ((128, 8, 1, 0), (128, 8, 0, 0), (8, 2, 1, 0),
+    (64, 4, 1, 0), (128, 8, 1, 1));
   ROWS = 24;
 type
   TRoutePush = record
-    Experts, K, Norm: cardinal;
+    Experts, K, Norm, HasScale: cardinal;
   end;
 var
   pipe: TInferVkPipeline;
-  bl, bi, bw: TInferVkBuffer;
-  logits, w, ww: TSingleDynArray;
+  bl, bi, bw, bs: TInferVkBuffer;
+  logits, w, ww, sc: TSingleDynArray;
   ids, wids: TIntegerDynArray;
   c, r, j, ne, k, bad: PtrInt;
   seed: cardinal;
@@ -1881,15 +1900,21 @@ var
 begin
   if not HasDevice then
     exit;
-  pipe := TInferVkPipeline.Create(fVk, @SPV_ROUTE, length(SPV_ROUTE), 3,
+  pipe := TInferVkPipeline.Create(fVk, @SPV_ROUTE, length(SPV_ROUTE), 4,
     SizeOf(TRoutePush));
   bl := nil;
   bi := nil;
   bw := nil;
+  bs := nil;
   try
     bl := TInferVkBuffer.Create(fVk, 128 * 4, true);
     bi := TInferVkBuffer.Create(fVk, 64 * 4, true);
     bw := TInferVkBuffer.Create(fVk, 64 * 4, true);
+    bs := TInferVkBuffer.Create(fVk, 128 * 4, true);
+    SetLength(sc, 128);
+    for j := 0 to 127 do
+      sc[j] := 0.5 + (j mod 7) * 0.25;
+    fVk.Upload(bs, 0, pointer(sc), 128 * 4);
     SetLength(logits, 128);
     SetLength(ids, 64);
     SetLength(w, 64);
@@ -1923,11 +1948,16 @@ begin
             end;
         end;
         RouteRef(pointer(logits), ne, k, CASES[c, 2] <> 0, pointer(ids), pointer(w));
+        // the scale of each chosen expert after the renorm (TDecoderModel.Route)
+        if CASES[c, 3] <> 0 then
+          for j := 0 to k - 1 do
+            w[j] := w[j] * sc[ids[j]];
         fVk.Upload(bl, 0, pointer(logits), ne * 4);
         push.Experts := ne;
         push.K := k;
         push.Norm := CASES[c, 2];
-        fVk.Run(pipe, [bl, bi, bw], @push, 1);
+        push.HasScale := CASES[c, 3];
+        fVk.Run(pipe, [bl, bi, bw, bs], @push, 1);
         fVk.Download(bi, 0, pointer(wids), k * 4);
         fVk.Download(bw, 0, pointer(ww), k * 4);
         for j := 0 to k - 1 do
@@ -1942,10 +1972,12 @@ begin
         end;
       end;
       // the same experts; the weights in float on the device, in double here
-      CheckUtf8((bad = 0) and (worst <= 1e-6), 'route % of % (renormed %): % ids ' +
-        'otherwise, weights within %', [k, ne, CASES[c, 2], bad, worst]);
+      CheckUtf8((bad = 0) and (worst <= 1e-6), 'route % of % (renormed %, scaled %): ' +
+        '% ids otherwise, weights within %', [k, ne, CASES[c, 2], CASES[c, 3], bad,
+        worst]);
     end;
   finally
+    bs.Free;
     bw.Free;
     bi.Free;
     bl.Free;
@@ -3263,5 +3295,628 @@ begin
   end;
 end;
 
+
+procedure TTestInferVulkan.Gemma4OpsMatchCpu;
+type
+  // the push constants of qkrope.comp, attention.comp, attnmerge.comp and
+  // scale.comp
+  TQkPush = record
+    Rows, Heads, KvHeads, HeadDim, Past: cardinal;
+    Eps: single;
+    Norm, Rope, Rot, VNorm: cardinal;
+  end;
+  TAttPush = record
+    Rows, Heads, HeadDim, KvHeads, Past, Splits, HeadBlock, RowBlock: cardinal;
+    Window, HasSinks: cardinal;
+    Scale: single;
+  end;
+  TMergePush = record
+    Rows, Heads, HeadDim, Splits, HasSinks: cardinal;
+  end;
+  TScalePush = record
+    N: cardinal;
+    S: single;
+  end;
+var
+  ref: TInferCpuBackend;
+  pQk, pQk16, pAtt, pAtt16, pAtt512, pAtt512_16, pMerge, pGeGlu, pScale: TInferVkPipeline;
+
+  function Up(const v: TSingleDynArray): TInferVkBuffer;
+  begin
+    result := TInferVkBuffer.Create(fVk, length(v) * 4 + 4, true);
+    if v <> nil then
+      fVk.Upload(result, 0, pointer(v), length(v) * 4);
+  end;
+
+  procedure Near(const a, b: TSingleDynArray; aTol: double; const aWhat: RawUtf8);
+  var
+    e: double;
+  begin
+    e := RelError(pointer(a), pointer(b), length(b));
+    CheckUtf8(e <= aTol, '%: relative error %', [aWhat, e]);
+  end;
+
+  // qkrope of aRows new rows after aPast cached ones, then the attention of
+  // those rows over the whole cache, against the CPU - as the CUDA test; aF16:
+  // the cache in half floats (its new rows within the rounding of a half
+  // float, the attention over the halves as stored)
+  procedure AttentionCase(aRows, aHeads, aKvHeads, aHeadDim, aPast, aHeadBlock,
+    aSplits, aRot, aWindow: PtrInt; aVNorm, aKIsV: boolean; aScale: single;
+    aF16: boolean);
+  var
+    q, k, v, qn, kn, cs, cosv, sinv, keys, values, y, qc, yc, ones, kc,
+      vc: TSingleDynArray;
+    kh, vh: TWordDynArray;
+    bq, bk, bv, bqn, bkn, bcs, bkc, bvc, by, bpart, bsk: TInferVkBuffer;
+    qk: TQkPush;
+    att: TAttPush;
+    mp: TMergePush;
+    att0, qk0: TInferVkPipeline;
+    half, kvw, cp, r, i, rb, first: PtrInt;
+    es: PtrInt;
+  begin
+    half := aHeadDim shr 1;
+    if aRot > 0 then
+      half := aRot shr 1;
+    kvw := aKvHeads * aHeadDim;
+    cp := aPast + aRows + 3;
+    Fill(q, aRows * aHeads * aHeadDim, 51, 2);
+    Fill(k, aRows * kvw, 52, 2);
+    Fill(v, aRows * kvw, 53, 2);
+    if aKIsV then
+      v := copy(k);
+    Fill(qn, aHeadDim, 54, 1);
+    Fill(kn, aHeadDim, 55, 1);
+    SetLength(cosv, aRows * half);
+    SetLength(sinv, aRows * half);
+    for r := 0 to aRows - 1 do
+      for i := 0 to half - 1 do
+      begin
+        cosv[r * half + i] := Cos((aPast + r) * (i + 1) * 0.01);
+        sinv[r * half + i] := Sin((aPast + r) * (i + 1) * 0.01);
+      end;
+    cs := copy(cosv);
+    SetLength(cs, 2 * aRows * half);
+    MoveFast(pointer(sinv)^, cs[aRows * half], aRows * half * 4);
+    Fill(keys, cp * kvw, 56, 1);
+    Fill(values, cp * kvw, 57, 1);
+    // the rows before a window are never read: NaN there would show
+    first := 0;
+    if aWindow > 0 then
+      first := MaxPtrInt(aPast - aWindow + 1, 0);
+    for i := 0 to first * kvw - 1 do
+    begin
+      PCardinal(@keys[i])^ := $7fc00000;
+      PCardinal(@values[i])^ := $7fc00000;
+    end;
+    es := 4;
+    if aF16 then
+      es := 2;
+    rb := 8 div aHeadBlock;
+    att0 := pAtt;
+    if aHeadDim > 256 then
+    begin
+      rb := 4 div aHeadBlock;
+      att0 := pAtt512;
+    end;
+    qk0 := pQk;
+    if aF16 then
+    begin
+      qk0 := pQk16;
+      if aHeadDim > 256 then
+        att0 := pAtt512_16
+      else
+        att0 := pAtt16;
+    end;
+    if aWindow > 0 then
+      rb := 1; // a layer with a window: one row per work group
+    bq := Up(q);
+    bk := Up(k);
+    bv := Up(v);
+    bqn := Up(qn);
+    bkn := Up(kn);
+    bcs := Up(cs);
+    bkc := TInferVkBuffer.Create(fVk, cp * kvw * es, true);
+    bvc := TInferVkBuffer.Create(fVk, cp * kvw * es, true);
+    SetLength(y, aRows * aHeads * aHeadDim);
+    by := Up(y);
+    bpart := TInferVkBuffer.Create(fVk, aHeads * aRows * aSplits * (aHeadDim + 2) * 4 + 4,
+      true);
+    bsk := Up(cs); // no sinks: any buffer
+    try
+      if aF16 then
+      begin
+        SetLength(kh, cp * kvw);
+        SetLength(vh, cp * kvw);
+        for i := 0 to cp * kvw - 1 do
+        begin
+          kh[i] := InferSingleToHalf(keys[i]);
+          vh[i] := InferSingleToHalf(values[i]);
+        end;
+        fVk.Upload(bkc, 0, pointer(kh), cp * kvw * 2);
+        fVk.Upload(bvc, 0, pointer(vh), cp * kvw * 2);
+      end
+      else
+      begin
+        fVk.Upload(bkc, 0, pointer(keys), cp * kvw * 4);
+        fVk.Upload(bvc, 0, pointer(values), cp * kvw * 4);
+      end;
+      qk.Rows := aRows;
+      qk.Heads := aHeads;
+      qk.KvHeads := aKvHeads;
+      qk.HeadDim := aHeadDim;
+      qk.Past := aPast;
+      qk.Eps := 1e-6;
+      qk.Norm := 1;
+      qk.Rope := 1;
+      qk.Rot := aRot;
+      qk.VNorm := ord(aVNorm);
+      if aKIsV then
+        fVk.Run(qk0, [bq, bk, bk, bqn, bkn, bcs, bkc, bvc], @qk, aHeads + aKvHeads, aRows)
+      else
+        fVk.Run(qk0, [bq, bk, bv, bqn, bkn, bcs, bkc, bvc], @qk, aHeads + aKvHeads, aRows);
+      att.Rows := aRows;
+      att.Heads := aHeads;
+      att.HeadDim := aHeadDim;
+      att.KvHeads := aKvHeads;
+      att.Past := aPast;
+      att.Splits := aSplits;
+      att.HeadBlock := aHeadBlock;
+      att.RowBlock := rb;
+      att.Window := aWindow;
+      att.HasSinks := 0;
+      att.Scale := aScale;
+      fVk.Run(att0, [bq, bkc, bvc, by, bpart, bsk], @att, aHeads div aHeadBlock,
+        (aRows + rb - 1) div rb, aSplits);
+      if aSplits > 1 then
+      begin
+        mp.Rows := aRows;
+        mp.Heads := aHeads;
+        mp.HeadDim := aHeadDim;
+        mp.Splits := aSplits;
+        mp.HasSinks := 0;
+        fVk.Run(pMerge, [bpart, by, bsk], @mp, aHeads, aRows);
+      end;
+      SetLength(qc, length(q));
+      SetLength(yc, length(y));
+      fVk.Download(bq, 0, pointer(qc), length(q) * 4);
+      fVk.Download(by, 0, pointer(yc), length(y) * 4);
+      SetLength(kc, cp * kvw);
+      SetLength(vc, cp * kvw);
+      if aF16 then
+      begin
+        fVk.Download(bkc, 0, pointer(kh), cp * kvw * 2);
+        fVk.Download(bvc, 0, pointer(vh), cp * kvw * 2);
+        for i := 0 to cp * kvw - 1 do
+        begin
+          kc[i] := InferHalfToSingle(kh[i]);
+          vc[i] := InferHalfToSingle(vh[i]);
+        end;
+      end
+      else
+      begin
+        fVk.Download(bkc, 0, pointer(kc), cp * kvw * 4);
+        fVk.Download(bvc, 0, pointer(vc), cp * kvw * 4);
+      end;
+    finally
+      bsk.Free;
+      bpart.Free;
+      by.Free;
+      bvc.Free;
+      bkc.Free;
+      bcs.Free;
+      bkn.Free;
+      bqn.Free;
+      bv.Free;
+      bk.Free;
+      bq.Free;
+    end;
+    // the CPU: the norms (the value norm without weight), rotary positions
+    if aVNorm then
+    begin
+      SetLength(ones, aHeadDim);
+      for i := 0 to aHeadDim - 1 do
+        ones[i] := 1;
+      ref.RmsNorm(pointer(v), aRows * aKvHeads, aHeadDim, pointer(ones), 1e-6,
+        pointer(v));
+    end;
+    ref.RmsNorm(pointer(q), aRows * aHeads, aHeadDim, pointer(qn), 1e-6, pointer(q));
+    ref.RmsNorm(pointer(k), aRows * aKvHeads, aHeadDim, pointer(kn), 1e-6, pointer(k));
+    ref.Rope(pointer(q), aRows, aHeads, aHeadDim, pointer(cosv), pointer(sinv), aRot);
+    ref.Rope(pointer(k), aRows, aKvHeads, aHeadDim, pointer(cosv), pointer(sinv), aRot);
+    Near(qc, q, 1e-5, FormatUtf8('qkrope q % heads of % (F16 %)',
+      [aHeads, aHeadDim, aF16]));
+    Near(copy(kc, aPast * kvw, aRows * kvw), k, 1e-5 + ord(aF16) * 1e-3,
+      FormatUtf8('qkrope keys of % after % (F16 %)', [aHeadDim, aPast, aF16]));
+    Near(copy(vc, aPast * kvw, aRows * kvw), v, 1e-5 + ord(aF16) * 1e-3,
+      FormatUtf8('qkrope values of % after % (vnorm %, K=V %, F16 %)',
+      [aHeadDim, aPast, aVNorm, aKIsV, aF16]));
+    // the attention over the cache as stored (the NaN rows are not read)
+    ref.CausalAttention(pointer(qc), aRows, aHeads, aHeadDim, pointer(kc),
+      pointer(vc), aPast, aKvHeads, pointer(y), aWindow, nil, aScale);
+    Near(yc, y, 2e-5, FormatUtf8('attention % rows after %, % heads / % KV heads ' +
+      'of %, % per block, % splits, window %, scale %, F16 %', [aRows, aPast, aHeads,
+      aKvHeads, aHeadDim, aHeadBlock, aSplits, aWindow, aScale, aF16]));
+  end;
+
+  procedure GeGluAndScale(aCount: PtrInt);
+  var
+    g, u, gc: TSingleDynArray;
+    bg, bu: TInferVkBuffer;
+    n: cardinal;
+    sp: TScalePush;
+    i: PtrInt;
+  begin
+    Fill(g, aCount, 25, 6);
+    Fill(u, aCount, 26, 2);
+    g[0] := 30; // tanh 1 beyond 20 on the CPU
+    g[1] := -30;
+    bg := Up(g);
+    bu := Up(u);
+    try
+      n := aCount;
+      fVk.Run(pGeGlu, [bg, bu], @n, (n + 127) div 128);
+      SetLength(gc, aCount);
+      fVk.Download(bg, 0, pointer(gc), aCount * 4);
+      ref.GeluTanhGlu(pointer(g), pointer(u), aCount);
+      Near(gc, g, 1e-5, FormatUtf8('geglu %', [aCount]));
+      sp.N := aCount;
+      sp.S := 0.37;
+      fVk.Run(pScale, [bg], @sp, (n + 127) div 128);
+      fVk.Download(bg, 0, pointer(gc), aCount * 4);
+      for i := 0 to aCount - 1 do
+        g[i] := g[i] * sp.S;
+      Near(gc, g, 1e-6, FormatUtf8('scale %', [aCount]));
+    finally
+      bu.Free;
+      bg.Free;
+    end;
+  end;
+
+begin
+  if not HasDevice then
+    exit;
+  ref := TInferCpuBackend.Create;
+  pQk := TInferVkPipeline.Create(fVk, @SPV_QKROPE, length(SPV_QKROPE), 8,
+    SizeOf(TQkPush));
+  pQk16 := TInferVkPipeline.Create(fVk, @SPV_QKROPE_F16, length(SPV_QKROPE_F16), 8,
+    SizeOf(TQkPush));
+  pAtt := TInferVkPipeline.Create(fVk, @SPV_ATTENTION, length(SPV_ATTENTION), 6,
+    SizeOf(TAttPush));
+  pAtt16 := TInferVkPipeline.Create(fVk, @SPV_ATTENTION_F16, length(SPV_ATTENTION_F16),
+    6, SizeOf(TAttPush));
+  pAtt512 := TInferVkPipeline.Create(fVk, @SPV_ATTENTION512, length(SPV_ATTENTION512),
+    6, SizeOf(TAttPush));
+  pAtt512_16 := TInferVkPipeline.Create(fVk, @SPV_ATTENTION512_F16,
+    length(SPV_ATTENTION512_F16), 6, SizeOf(TAttPush));
+  pMerge := TInferVkPipeline.Create(fVk, @SPV_ATTNMERGE, length(SPV_ATTNMERGE), 3,
+    SizeOf(TMergePush));
+  pGeGlu := TInferVkPipeline.Create(fVk, @SPV_GEGLU, length(SPV_GEGLU), 2, 4);
+  pScale := TInferVkPipeline.Create(fVk, @SPV_SCALE, length(SPV_SCALE), 1,
+    SizeOf(TScalePush));
+  try
+    GeGluAndScale(100003);
+    // heads of 512: 16 of 2 KV heads, K=V and a quarter rotating, as the full
+    // layers of the 26B-A4B; one KV head of 4 with the value norm
+    AttentionCase(7, 16, 2, 512, 0, 4, 1, 128, 0, true, true, 1, false);
+    AttentionCase(1, 16, 2, 512, 300, 4, 5, 128, 0, true, true, 1, false);
+    AttentionCase(3, 4, 1, 512, 20, 4, 2, 0, 0, true, false, 1, false);
+    AttentionCase(7, 16, 2, 512, 0, 4, 1, 128, 0, true, true, 1, true);
+    AttentionCase(1, 16, 2, 512, 300, 4, 5, 128, 0, true, true, 1, true);
+    // heads of 512 in blocks of 2 heads times 2 rows; with a window, a
+    // prompt and a decoded token in ranges
+    AttentionCase(5, 4, 1, 512, 20, 2, 1, 128, 0, true, false, 1, false);
+    AttentionCase(5, 16, 2, 512, 40, 4, 1, 128, 16, true, true, 1, true);
+    AttentionCase(1, 16, 2, 512, 300, 4, 3, 128, 64, true, true, 1, false);
+    // heads of 256 with a window (the sliding layers), the value norm
+    AttentionCase(5, 16, 8, 256, 40, 2, 1, 0, 16, true, false, 1, false);
+    AttentionCase(1, 16, 8, 256, 300, 2, 4, 0, 64, true, false, 1, true);
+    // a head of 384, a scale of its own
+    AttentionCase(2, 4, 4, 384, 5, 1, 1, 0, 0, false, false, 0.3, false);
+    // the plain heads as before (vnorm 0, scale 0)
+    AttentionCase(3, 8, 2, 128, 20, 4, 2, 0, 0, false, false, 0, true);
+  finally
+    pScale.Free;
+    pGeGlu.Free;
+    pMerge.Free;
+    pAtt512_16.Free;
+    pAtt512.Free;
+    pAtt16.Free;
+    pAtt.Free;
+    pQk16.Free;
+    pQk.Free;
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferVulkan.Gemma4MatchesCpu;
+const
+  PROMPT = 300; // more than one chunk of the device forward pass (256)
+  /// the relative error of the F32 logits: a cache of floats, of half floats
+  // (measured 2026-11-13 on the RTX 5090 up to 9.5e-3: the keys of 16 and 32
+  // values in half floats, the softcap of 3 steep around the logits)
+  TOL: array[boolean] of double = (1e-4, 1.5e-2);
+  /// the logit cosine of Q8_0 against the CPU, which computes with Q8_0
+  // activations: a prompt (and a branch) over all its rows, one decode step
+  // over the 96 logits of a row - measured 2026-11-13 down to 0.985 and 0.956
+  QCOS: array[boolean] of double = (0.975, 0.94);
+  NAMES: array[0..7] of RawUtf8 = ('F32', 'F32 KvF16', 'Q8_0 at load', 'dense F32',
+    'BF16 GGUF', 'Q8_0 GGUF', 'dense Q8_0 GGUF', 'a head of 44 GGUF');
+var
+  dir: TFileName;
+  gpu: TInferVulkanBackend;
+  ref: TInferCpuFastBackend;
+  model: TDecoderModel;
+  dev: TQwen3Vulkan;
+  c1, c3: TQwen3Context;
+  c2, c4: TQwen3VkContext;
+  ids: TIntegerDynArray;
+  l1, l2, l3: TSingleDynArray;
+  i, k, v: PtrInt;
+  seed: cardinal;
+  e: double;
+  cmp: TInferCompare;
+  id: integer;
+  quant: boolean;
+  slice: Int64;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-gemma4');
+  if CheckFailed(dir <> '', 'tiny-gemma4 found') then
+    exit;
+  // 0, 1: tiny-gemma4 (sliding layers with a window of 5 and heads of 16, full
+  // ones with heads of 32, K=V and a quarter rotating, the dense block beside
+  // 8 experts, the layer scalars, the softcap) in F32, the cache in floats and
+  // in half floats - the experts of a layer one widened tensor, gate and up
+  // rows of an expert after each other: routed on the device; 2: Q8_0 at load
+  // (each expert its own buffer: routed on the host); 3: the dense model (K
+  // and V apart); 4..6: the tiny GGUF files of D6d (the experts one tensor per
+  // layer as well); 7: full layers with heads of 44 values, 15 pairs of them
+  // rotating
+  for k := 0 to high(NAMES) do
+  begin
+    gpu := TInferVulkanBackend.Create;
+    ref := TInferCpuFastBackend.Create;
+    model := nil;
+    dev := nil;
+    c1 := nil;
+    c2 := nil;
+    c3 := nil;
+    c4 := nil;
+    try
+      case k of
+        2:
+          model := NewDecoderModel(dir, ref, idtQ8_0);
+        3:
+          model := NewDecoderModel(MakePath([dir, 'dense']), ref);
+        4:
+          model := NewDecoderModelFromGguf(MakePath([dir, 'gguf', 'bf16.gguf']), ref);
+        5:
+          model := NewDecoderModelFromGguf(MakePath([dir, 'gguf', 'q8_0.gguf']), ref);
+        6:
+          model := NewDecoderModelFromGguf(MakePath([dir, 'gguf', 'dense-q8_0.gguf']),
+            ref);
+        7:
+          model := NewDecoderModelFromGguf(MakePath([dir, 'gguf', 'rope44.gguf']),
+            ref);
+      else
+        model := NewDecoderModel(dir, ref);
+      end;
+      CheckUtf8(model.Extras * DECODER_EXTRAS_GEMMA4 = model.Extras,
+        '% Gemma 4 extras', [NAMES[k]]);
+      CheckUtf8((dxDenseMoe in model.Extras) = (k in [0, 1, 2, 4, 5, 7]),
+        '% experts beside the dense block', [NAMES[k]]);
+      v := model.Config.VocabSize;
+      SetLength(ids, PROMPT);
+      seed := 31 + k;
+      for i := 0 to PROMPT - 1 do
+      begin
+        seed := seed * 1103515245 + 12345;
+        ids[i] := 3 + PtrInt(seed shr 16) mod (v - 4);
+      end;
+      // the CPU computes Q8_0 matrices with Q8_0 activations, the device in
+      // float: compared by cosine
+      quant := k in [2, 5, 6];
+      dev := TQwen3Vulkan.Create(model, gpu);
+      dev.KvF16 := k = 1;
+      // the experts chosen on the host in batches of 51 sets: after the router
+      // a batch begins, fill0 takes 1 set and each of the 8 experts 6 (room
+      // for 8 checked) - the last one ends at 49, 2 sets to spare before the
+      // rest of the layer (Codex review: it needs its own NeedRoom)
+      if k = 2 then
+        gpu.Vulkan.BatchMaxSets := 51;
+      // gate and up one buffer: bound at offsets, so a slice of the experts
+      // a multiple of the device's offset alignment (the Q8_0 GGUF: 2176
+      // bytes)
+      slice := 0;
+      if model.Config.Experts > 0 then
+        slice := Int64(model.Config.ExpertIntermediate) *
+          (model.Config.Hidden div INFER_DTYPE_BLOCK[model.Layers[0].ExpertGate[0].DType]) *
+          INFER_DTYPE_SIZE[model.Layers[0].ExpertGate[0].DType];
+      CheckUtf8(dev.DeviceRoutable = ((k in [0, 1, 4, 5, 7]) and
+        (slice mod MaxPtrInt(fVk.MinStorageAlignment, 4) = 0)),
+        '% routable on the device: % (slices of %, alignment %)',
+        [NAMES[k], dev.DeviceRoutable, slice, fVk.MinStorageAlignment]);
+      c1 := model.NewContext;
+      c2 := dev.NewContext;
+      SetLength(l1, PROMPT * v);
+      SetLength(l2, PROMPT * v);
+      SetLength(l3, v);
+      model.Forward(c1, pointer(ids), PROMPT, pointer(l1), true);
+      dev.Forward(c2, pointer(ids), PROMPT, pointer(l2), true);
+      if quant then
+      begin
+        cmp := InferCompare(pointer(l2), pointer(l1), PROMPT * v, 0.5, 0.5);
+        AddConsole(FormatString('Gemma 4 % prompt: %', [NAMES[k], InferCompareText(cmp)]));
+        CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= QCOS[false]),
+          'Gemma 4 % prompt logits: %', [NAMES[k], InferCompareText(cmp)]);
+      end
+      else
+      begin
+        e := RelError(pointer(l2), pointer(l1), PROMPT * v);
+        CheckUtf8(e <= TOL[dev.KvF16], 'Gemma 4 % prompt logits: relative error %',
+          [NAMES[k], e]);
+      end;
+      // decoding: one batch per token (c2) against the same with the device's
+      // choice of the experts read back and compared with the host's in every
+      // layer (c4, the same prompt first) - one range and ranges of 64 keys
+      c4 := dev.NewContext;
+      dev.Forward(c4, pointer(ids), PROMPT, nil);
+      dev.CheckRoute := false;
+      for i := 0 to 5 do
+      begin
+        id := ids[i];
+        dev.SplitKeys := (i and 1) * 64;
+        model.Forward(c1, @id, 1, pointer(l1));
+        dev.CheckRoute := true; // submits in every layer with experts
+        dev.Forward(c4, @id, 1, pointer(l3));
+        dev.CheckRoute := false;
+        dev.Forward(c2, @id, 1, pointer(l2));
+        CheckUtf8(CompareMem(pointer(l2), pointer(l3), v * 4),
+          'Gemma 4 % decode step %: one batch the bits of the checked one',
+          [NAMES[k], i]);
+        if quant then
+        begin
+          cmp := InferCompare(pointer(l2), pointer(l1), v, 0.5, 0.5);
+          CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= QCOS[true]),
+            'Gemma 4 % decode step %: %', [NAMES[k], i, InferCompareText(cmp)]);
+        end
+        else
+        begin
+          e := RelError(pointer(l2), pointer(l1), v);
+          CheckUtf8(e <= TOL[dev.KvF16], 'Gemma 4 % decode step %: relative error %',
+            [NAMES[k], i, e]);
+        end;
+      end;
+      if dev.DeviceRoutable then
+        CheckUtf8((dev.RouteChecks > 0) and (dev.RouteMismatches = 0) and
+          (dev.RouteMaxDiff <= 1e-6), 'Gemma 4 % route on the device: % of % rows ' +
+          'otherwise, weights within %', [NAMES[k], dev.RouteMismatches,
+          dev.RouteChecks, dev.RouteMaxDiff]);
+      // back to 3 tokens, far behind the window of 5: the device keeps every
+      // row, the CPU computes the branch afresh
+      c2.Truncate(3);
+      SetLength(l1, 20 * v);
+      SetLength(l2, 20 * v);
+      dev.Forward(c2, @ids[100], 20, pointer(l2), true);
+      c3 := model.NewContext;
+      model.Forward(c3, pointer(ids), 3, nil);
+      model.Forward(c3, @ids[100], 20, pointer(l1), true);
+      if quant then
+      begin
+        cmp := InferCompare(pointer(l2), pointer(l1), 20 * v, 0.5, 0.5);
+        CheckUtf8((cmp.NonFinite = 0) and (cmp.Cosine >= QCOS[false]),
+          'Gemma 4 % branch at 3: %', [NAMES[k], InferCompareText(cmp)]);
+      end
+      else
+      begin
+        e := RelError(pointer(l2), pointer(l1), 20 * v);
+        CheckUtf8(e <= TOL[dev.KvF16], 'Gemma 4 % branch at 3: relative error %',
+          [NAMES[k], e]);
+      end;
+    finally
+      c4.Free;
+      c3.Free;
+      c2.Free;
+      c1.Free;
+      dev.Free;
+      model.Free;
+      ref.Free;
+      gpu.Free;
+    end;
+  end;
+end;
+
+procedure TTestInferVulkan.Gemma4OnDevice;
+const
+  FILES: array[0..1] of RawUtf8 = ('gemma-4-12b-it-q8_0.gguf',
+    'gemma-4-26b-a4b-it-q8_0.gguf');
+  DATASETS: array[0..1] of RawUtf8 = ('gemma4-12b', 'gemma4-26b-a4b');
+  // the bounds of the raw text case 0 of the CPU from the same file (D6d):
+  // 12B logits cosine 0.9854 and max 6.9, 26B-A4B 0.9953 - the other cases
+  // closer; the reference was float32 transformers, the device computes in
+  // float from the Q8_0 weights
+  COS: array[0..1] of double = (0.98, 0.99);
+  MAXABS: array[0..1] of double = (8, 12);
+var
+  fn, refdir: TFileName;
+  gpu: TInferVulkanBackend;
+  cpu: TInferCpuFastBackend;
+  ref: TInferRefSet;
+  model: TDecoderModel;
+  dev: TQwen3Vulkan;
+  timer: TPrecisionTimer;
+  f: PtrInt;
+  client: TNativeLlmClient;
+  llm: ILlmClient;
+begin
+  if not HasDevice then
+    exit;
+  {$ifdef CPU32}
+  AddConsole('SKIP Gemma 4 on the device: a 32-bit process');
+  exit;
+  {$endif CPU32}
+  gpu := TInferVulkanBackend.Create;
+  cpu := TInferCpuFastBackend.Create;
+  model := nil;
+  dev := nil;
+  try
+    for f := 0 to high(FILES) do
+    begin
+      // large models of their own: only where they were put (not
+      // LAI_REQUIRE_MODEL)
+      fn := FindVendorModel(Utf8ToString(FILES[f]));
+      if fn = '' then
+      begin
+        AddConsole(FormatString('SKIP Gemma 4 on the device: no vendor/models/%',
+          [FILES[f]]));
+        continue;
+      end;
+      refdir := FindInferRefDir(DATASETS[f]);
+      if CheckFailed(refdir <> '', Utf8ToString(DATASETS[f] + ' reference found')) then
+        continue;
+      ref := TInferRefSet.CreateFromFolder(refdir);
+      try
+        timer.Start;
+        model := NewDecoderModelFromGguf(fn, cpu);
+        dev := TQwen3Vulkan.Create(model, gpu);
+        AddConsole(FormatString('% loaded and on % in % (routed on the device: %)',
+          [FILES[f], fVk.DeviceName, timer.Stop, dev.DeviceRoutable]));
+        CheckUtf8(dev.DeviceRoutable = (model.Config.Experts > 0),
+          '% routed on the device', [FILES[f]]);
+        model.Device := dev;
+        CheckDeviceCases(self, model, ref, FormatUtf8('% on the device', [FILES[f]]),
+          COS[f], MAXABS[f]);
+        model.Device := nil;
+        FreeAndNil(dev);
+        FreeAndNil(model);
+      finally
+        ref.Free;
+      end;
+      // the 12B through TNativeLlmClient on the device (Q4_0 has no shader on
+      // the GPUs yet)
+      if f = 0 then
+      begin
+        timer.Start;
+        client := TNativeLlmClient.CreateFromGguf(fn, '', gpu);
+        llm := client; // the interface frees the client, and with it its Device
+        client.Device := TQwen3Vulkan.Create(client.Model, gpu);
+        AddConsole(FormatString('% through the client on the device in %',
+          [FILES[f], timer.Stop]));
+        CheckGemma4Client(self, client, false);
+        llm := nil;
+      end;
+    end;
+  finally
+    llm := nil; // the client and its device before the backend they compute with
+    if model <> nil then
+      model.Device := nil;
+    dev.Free;
+    model.Free;
+    cpu.Free;
+    gpu.Free;
+  end;
+end;
 
 end.

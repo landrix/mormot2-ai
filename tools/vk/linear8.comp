@@ -22,8 +22,9 @@
 //   are the same for the whole work group)
 // - with -DIDS (SPV_LINEAR8_IDS, _IDS_SG; slice D3c): one token row through
 //   the k experts a route shader chose - work group y is slot s, its expert
-//   id ids[s] (binding 4), the expert's matrix at byte ids[s] * stride of w
-//   (the experts of a layer one buffer); x is row s when xslot, else row 0;
+//   id ids[s] (binding 4), the expert's matrix at byte base + ids[s] * stride
+//   of w (the experts of a layer one buffer; base: the up rows behind the
+//   gate rows of an expert, Gemma 4); x is row s when xslot, else row 0;
 //   y receives row s. The arithmetic of one row of the plain build
 #version 450
 #ifdef SUBGROUP
@@ -49,6 +50,7 @@ layout(push_constant) uniform Push {
   uint rows, nin, nout, dtype, hasBias;
 #ifdef IDS
   uint stride, xslot; // the bias of slot s: row ids[s] of [experts, nout]
+  uint base; // the byte of expert 0 in w
 #else
   uint biasOff; // the first bias of the matrix (slice D5d2: an expert's row)
 #endif
@@ -251,7 +253,7 @@ void main()
   uint r0 = gl_WorkGroupID.y;
   uint nr = 1u;
   uint xrow = p.xslot != 0u ? r0 : 0u;
-  uint wbase = uint(ids[r0]) * p.stride;
+  uint wbase = p.base + uint(ids[r0]) * p.stride;
 #else
   uint r0 = gl_WorkGroupID.y * ROWS;
   uint nr = min(uint(ROWS), p.rows - r0);

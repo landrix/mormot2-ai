@@ -37,6 +37,11 @@ for n in qkrope attention flash; do
   "$GLSLANG" -V --target-env vulkan1.0 -Os -DKVF16 -o "$TMP/${n}_f16.spv" $n.comp > "$TMP/${n}_f16.log" || { cat "$TMP/${n}_f16.log"; exit 1; }
   ARGS+=("SPV_$(echo "$n" | tr a-z A-Z)_F16=$TMP/${n}_f16.spv")
 done
+# attention.comp for heads of up to 512 values (Gemma 4, slice D6e2): blocks
+# of 4 queries with 4 output values per invocation, a float or a half-float cache
+"$GLSLANG" -V --target-env vulkan1.0 -Os -DMAXQ=4 -DNV=4 -o "$TMP/attention512.spv" attention.comp > "$TMP/attention512.log" || { cat "$TMP/attention512.log"; exit 1; }
+"$GLSLANG" -V --target-env vulkan1.0 -Os -DMAXQ=4 -DNV=4 -DKVF16 -o "$TMP/attention512_f16.spv" attention.comp > "$TMP/attention512_f16.log" || { cat "$TMP/attention512_f16.log"; exit 1; }
+ARGS+=("SPV_ATTENTION512=$TMP/attention512.spv" "SPV_ATTENTION512_F16=$TMP/attention512_f16.spv")
 # matvec8.comp once per weight type (2 Q8_0, 3 Q4_K, 4 Q6_K), with and without
 # subgroup reductions
 for t in 2:Q8 3:Q4K 4:Q6K; do

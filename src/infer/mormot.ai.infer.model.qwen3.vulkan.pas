@@ -45,6 +45,20 @@
 //   points of TDecoderContext (SaveStates, LoadStates) -, the output gate of
 //   the full attention (splitgate.comp, gatemul.comp) and the partial rotary
 //   share (qkrope.comp with rot); the KV cache only for the attention layers
+// - Gemma 4 (phase D, slice D6e2): heads of their own shape per layer (the
+//   buffers sized for the widest, the cache per layer, the attention planned
+//   per layer), heads of 512 values (attention.comp built with 4 queries per
+//   work group and 4 outputs per invocation: SPV_ATTENTION512), K=V (v bound
+//   to the raw keys), the value norm (qkrope.comp with vnorm), the second
+//   rotary set (its factors in fDevCos2), the attention scale, the norms
+//   around both blocks (SandwichNorm), GeGLU (geglu.comp), the dense block
+//   beside the experts (dfDenseMoe: the router on its own norm in fDevH2, the
+//   experts' sum in fDevMoeOut), the expert scales (route.comp, or
+//   TDecoderModel.Route on the host), the layer scalar (scale.comp) and the
+//   logit softcap on the logits read back; gate and up of the experts of a
+//   GGUF file (one tensor, per expert its gate rows then its up rows) one
+//   buffer, so a decode step routes on the device (linear8.comp -DIDS from a
+//   base byte)
 unit mormot.ai.infer.model.qwen3.vulkan;
 
 {
@@ -120,6 +134,9 @@ type
       fDevCore: TInferVkBuffer;
     fDevConv, fDevState: TInferVkBufferDynArray;
     fDevSlotConv, fDevSlotState: array of TInferVkBufferDynArray;
+    // Gemma 4: the rotary factors of the second set, the router input
+    // (dfDenseMoe), the experts' sum
+    fDevCos2, fDevH2, fDevMoeOut: TInferVkBuffer;
     procedure FreeScratch;
     procedure FreeCache;
     procedure FreeStates;
@@ -133,6 +150,14 @@ type
     // allocated)
     property KvF16: boolean
       read fKvF16;
+  end;
+
+  /// how the attention of one layer runs (TQwen3Vulkan.Plan): its shader, the
+  // heads and rows of a work group and the key ranges of a row - for every
+  // layer, and for one with a sliding window (W...)
+  TVkAttentionPlan = record
+    Att, WAtt: TInferVkPipeline;
+    Hb, Rb, Splits, WHb, WSplits: PtrInt;
   end;
 
   /// the forward pass of a TQwen3Model on the device of a TInferVulkanBackend
@@ -174,8 +199,21 @@ type
     // VocabSize, the head runs in parts
     fHeadPart: PtrInt;
     fSplitKeys: integer;
+    // Gemma 4: attention.comp for heads of up to 512, GeGLU, the layer scalar;
+    // the widest query and KV rows and head of all layers, and the rotary
+    // factors per row of the second set (Rope2HeadDim / 2, 0 without)
+    fAttention512, fAttention512_16, fGeGlu, fScale: TInferVkPipeline;
+    fMaxQw, fMaxKvw, fMaxHeadDim, fHalf2: PtrInt;
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TInferVkBuffer;
+    /// the attention of a layer whose KV heads serve aGroup heads each, its
+    // heads of aHeadDim values, for aRows rows after aPast cached ones
+    procedure Plan(aCtx: TQwen3VkContext; aGroup, aHeadDim, aRows, aPast: PtrInt;
+      out aPlan: TVkAttentionPlan);
+    /// SwiGLU or GeGLU (Config.Activation) of aCount values
+    procedure RecordGlu(aGate, aUp: TInferVkBuffer; aCount: PtrInt);
+    /// the dense feed-forward block of layer aLayer: fDevH in, fDevTmp out
+    procedure RecordDense(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
     function ChunkRows(aCount: PtrInt; aAllLogits: boolean): PtrInt;
     /// the buffers of a chunk: aOutRows rows of logits, aNormed the normed
     // last row read back too
@@ -201,15 +239,18 @@ type
     // without
     procedure ExpertBiases(const aLayer: TQwen3Layer; out aGate, aUp,
       aDown: TInferVkBuffer);
-    /// the dfMoe block of layer aLayer: fDevH in, fDevTmp out - submits the
-    // batch so far and begins the next one
-    procedure RecordMoe(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
+    /// the experts of layer aLayer: the router on aRouterIn, the experts on
+    // fDevH, their weighted sum into aOut - submits the batch so far and
+    // begins the next one
+    procedure RecordMoe(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt;
+      aRouterIn, aOut: TInferVkBuffer);
     /// the same for one token row, the experts chosen on the device - no
     // submit in between
-    procedure RecordMoeDevice(aCtx: TQwen3VkContext; aLayer: PtrInt);
+    procedure RecordMoeDevice(aCtx: TQwen3VkContext; aLayer: PtrInt;
+      aRouterIn, aOut: TInferVkBuffer);
     /// CheckRoute: submit, compare the device's choice with
     // TDecoderModel.Route on the same logits, begin the next batch
-    procedure CheckDeviceRoute(aCtx: TQwen3VkContext);
+    procedure CheckDeviceRoute(aCtx: TQwen3VkContext; aLayer: PtrInt);
     /// submit the batch being recorded and begin the next one when it has
     // room for fewer than aSets dispatches (TInferVulkan.BatchRoom)
     procedure NeedRoom(aSets: PtrInt);
@@ -334,6 +375,7 @@ type
     Rows, Heads, HeadDim, KvHeads, Past, Splits, HeadBlock, RowBlock: cardinal;
     Window: cardinal; // > 0: the keys of the last Window positions only
     HasSinks: cardinal; // 1: the attention sinks of binding 5 (gpt-oss)
+    Scale: single; // attention.comp: the factor of the scores, 0: 1 / sqrt(d)
   end;
 
   TMergePush = record
@@ -353,6 +395,7 @@ type
     Norm: cardinal; // 1: RMSNorm of every Q and K head (QNorm, KNorm)
     Rope: cardinal; // 0: no rotary positions (a NoPE layer)
     Rot: cardinal; // the rotated share of a head (Qwen3.5), 0: all of it
+    VNorm: cardinal; // 1: the value norm (Gemma 4)
   end;
 
   /// dnconv.comp
@@ -387,6 +430,8 @@ const
   /// the queries of one attention.comp work group at most (MAXQ there): the
   // heads of one KV head times rows, which share every key and value read
   ATTENTION_QUERIES = 8;
+  /// the same for heads of more than 256 values (SPV_ATTENTION512: MAXQ 4)
+  ATTENTION_QUERIES_512 = 4;
   /// attention.comp cuts the keys of a row into ranges of about SPLIT_KEYS
   // when there are few work groups - decoding one token - at most
   // SPLIT_GROUPS work groups in all (then attnmerge.comp combines them)
@@ -408,6 +453,13 @@ const
   // room left is submitted first - a model of hundreds of experts fills the
   // 4096 descriptor sets of a batch within one layer
   LAYER_ROOM = 32;
+  /// the dispatches of the feed-forward half of a Gemma 4 layer with the
+  // dense block beside the experts (routed on the device: about 20), checked
+  // again before it
+  DENSEMOE_ROOM = 24;
+  /// the dispatches after its experts: their norm, the sum, the FFN norm,
+  // the residual, the layer scalar and the next input norm
+  DENSEMOE_TAIL = 8;
   EXPERT_ROOM = 8;
 
 /// a device buffer of at least aBytes, reallocated (content lost) when smaller
@@ -474,6 +526,9 @@ begin
   FreeAndNil(fDevBeta);
   FreeAndNil(fDevDecay);
   FreeAndNil(fDevCore);
+  FreeAndNil(fDevCos2);
+  FreeAndNil(fDevH2);
+  FreeAndNil(fDevMoeOut);
   fRows := 0;
 end;
 
@@ -597,7 +652,7 @@ end;
 
 constructor TQwen3Vulkan.Create(aModel: TDecoderModel; aBackend: TInferVulkanBackend);
 var
-  l: PtrInt;
+  l, hd: PtrInt;
 begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
@@ -620,9 +675,9 @@ begin
   for l := 0 to high(aModel.Config.Spec) do
     if aModel.Config.Spec[l].Ffn <> dfDense then
       fMoe := true;
-  // what Gemma 4 computes beyond gpt-oss and Qwen3.5 is not here yet (slice
-  // D6e)
-  if aModel.Extras - DECODER_EXTRAS_GPTOSS - [dxOutputGate, dxPartialRope] <> [] then
+  // gpt-oss, Qwen3.5 and Gemma 4 (slice D6e2)
+  if aModel.Extras - DECODER_EXTRAS_GPTOSS - DECODER_EXTRAS_GEMMA4 -
+     [dxOutputGate, dxPartialRope] <> [] then
     EInferError.RaiseUtf8('%: % computes what this device does not', [self, aModel]);
   // deltarule.comp keeps a column of S in 32 invocations of 8 values each,
   // dnconv.comp the inputs of a channel in one
@@ -632,10 +687,23 @@ begin
     EInferError.RaiseUtf8('%: a Gated DeltaNet of key dim % and kernel % not ' +
       'supported', [self, aModel.Config.LinKeyDim, aModel.Config.LinConv]);
   // qkrope.comp keeps one normalized head in shared memory
-  // and attention.comp reads it as vec4
-  if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
-    EInferError.RaiseUtf8('%: head dimension % not supported', [self,
-      aModel.Config.HeadDim]);
+  // and attention.comp reads it as vec4 (SPV_ATTENTION512 for a head of more
+  // than 256 values)
+  fMaxQw := 0;
+  fMaxKvw := 0;
+  fMaxHeadDim := 0;
+  for l := 0 to high(aModel.Config.Spec) do
+  begin
+    if aModel.Config.Spec[l].Mixer <> dmAttention then
+      continue;
+    hd := aModel.Config.Spec[l].HeadDim;
+    if (hd > 512) or (hd and 3 <> 0) then
+      EInferError.RaiseUtf8('%: head dimension % not supported', [self, hd]);
+    fMaxQw := MaxPtrInt(fMaxQw, aModel.Config.Heads * hd);
+    fMaxKvw := MaxPtrInt(fMaxKvw, aModel.Config.Spec[l].KvHeads * hd);
+    fMaxHeadDim := MaxPtrInt(fMaxHeadDim, hd);
+  end;
+  fHalf2 := aModel.Rope2HeadDim shr 1;
   fModel := aModel;
   fBackend := aBackend;
   fSplitKeys := SPLIT_KEYS;
@@ -651,7 +719,10 @@ begin
     length(SPV_ATTENTION_F16), 6, SizeOf(TAttentionPush));
   fMerge := TInferVkPipeline.Create(fVk, @SPV_ATTNMERGE, length(SPV_ATTNMERGE), 3,
     SizeOf(TMergePush));
-  if (aModel.Config.HeadDim <= 128) and (fVk.MaxInvocations >= 256) and
+  // flash.comp and attndec.comp: heads of up to 128 values, the scale of
+  // 1 / sqrt(headDim)
+  if (fMaxHeadDim <= 128) and (aModel.Config.AttentionScale = 0) and
+     (fVk.MaxInvocations >= 256) and
      (fVk.MaxGroupSizeX >= 256) and (fVk.MaxSharedMemory >= FLASH_SHARED) then
   begin
     fFlash := TInferVkPipeline.Create(fVk, @SPV_FLASH, length(SPV_FLASH), 6,
@@ -666,7 +737,7 @@ begin
   // makes it so on Apple and NVIDIA GPUs
   if fBackend.SubgroupLinear and (fVk.SubgroupSize = 32) and
      ((fVk.VendorId = $106B) or (fVk.VendorId = $10DE)) and
-     (aModel.Config.HeadDim <= 128) then
+     (fMaxHeadDim <= 128) and (aModel.Config.AttentionScale = 0) then
   begin
     fDecode := TInferVkPipeline.Create(fVk, @SPV_ATTNDEC, length(SPV_ATTNDEC), 6,
       SizeOf(TAttentionPush));
@@ -683,7 +754,7 @@ begin
     SizeOf(TRowsPush));
   fScatter := TInferVkPipeline.Create(fVk, @SPV_SCATTERADD, length(SPV_SCATTERADD),
     4, SizeOf(TRowsPush));
-  fRouteP := TInferVkPipeline.Create(fVk, @SPV_ROUTE, length(SPV_ROUTE), 3, 12);
+  fRouteP := TInferVkPipeline.Create(fVk, @SPV_ROUTE, length(SPV_ROUTE), 4, 16);
   fCombine := TInferVkPipeline.Create(fVk, @SPV_MOECOMBINE, length(SPV_MOECOMBINE),
     3, 8);
   fRouteP.Name := 'route';
@@ -718,6 +789,16 @@ begin
   fQkRope.Name := 'qkrope';
   fQkRope16.Name := 'qkrope';
   fAddNorm.Name := 'addnorm';
+  fAttention512 := TInferVkPipeline.Create(fVk, @SPV_ATTENTION512,
+    length(SPV_ATTENTION512), 6, SizeOf(TAttentionPush));
+  fAttention512_16 := TInferVkPipeline.Create(fVk, @SPV_ATTENTION512_F16,
+    length(SPV_ATTENTION512_F16), 6, SizeOf(TAttentionPush));
+  fGeGlu := TInferVkPipeline.Create(fVk, @SPV_GEGLU, length(SPV_GEGLU), 2, 4);
+  fScale := TInferVkPipeline.Create(fVk, @SPV_SCALE, length(SPV_SCALE), 1, 8);
+  fAttention512.Name := 'attention';
+  fAttention512_16.Name := 'attention';
+  fGeGlu.Name := 'geglu';
+  fScale.Name := 'scale';
   fNorm.Name := 'rmsnorm';
   fSwiGlu.Name := 'swiglu';
   fAttention.Name := 'attention';
@@ -771,6 +852,10 @@ begin
   // frees later may come back at the same address with other weights
   if (fModel <> nil) and (fBackend <> nil) then
     fModel.ForgetWeights(fBackend);
+  fScale.Free;
+  fGeGlu.Free;
+  fAttention512_16.Free;
+  fAttention512.Free;
   fGateMul.Free;
   fSplitGate.Free;
   fGatedNorm.Free;
@@ -824,8 +909,15 @@ end;
 procedure TQwen3Vulkan.UploadWeights;
 var
   c: TQwen3Config;
-  l, qw, kvw, cd, vd: PtrInt;
+  l, qw, kvw, cd, vd, hd: PtrInt;
   ly: ^TQwen3Layer;
+
+  // a vector that may be absent
+  procedure Maybe(v: PSingleArray; aCount: PtrInt);
+  begin
+    if v <> nil then
+      Vector(v, aCount);
+  end;
 
   // a layer matrix in one binding; the head (aParts) also in several
   function Matrix(const w: TInferWeight; aRows, aCols: PtrInt;
@@ -897,13 +989,67 @@ var
       end;
   end;
 
+  // gate and up of the experts of a layer as one GGUF tensor stores them
+  // (Gemma 4, ffn_gate_up_exps): per expert its gate rows, then its up rows -
+  // one buffer for both, each bound at its offset and every expert 2 slices
+  // on; false (nothing uploaded) when they do not lie so in host memory, or a
+  // slice is no multiple of the offset alignment of the device
+  function GateUp(aLayer: PtrInt): boolean;
+  var
+    e: PtrInt;
+    slice, align: Int64;
+    buf: TInferVkBuffer;
+    g, u: ^TInferWeightDynArray;
+  begin
+    result := false;
+    g := @fModel.Layers[aLayer].ExpertGate;
+    u := @fModel.Layers[aLayer].ExpertUp;
+    if (length(g^) = 0) or (length(u^) <> length(g^)) or
+       not fBackend.GpuLinear(g^[0].DType, c.Hidden) or
+       (fBackend.LinearPart(g^[0].DType, c.Hidden, c.ExpertIntermediate) <
+        c.ExpertIntermediate) then
+      exit;
+    slice := Int64(c.ExpertIntermediate) * (c.Hidden div INFER_DTYPE_BLOCK[g^[0].DType]) *
+      INFER_DTYPE_SIZE[g^[0].DType];
+    align := fVk.MinStorageAlignment;
+    if align < 4 then
+      align := 4;
+    if slice mod align <> 0 then
+      exit;
+    for e := 0 to high(g^) do
+      if (g^[e].DType <> g^[0].DType) or (u^[e].DType <> g^[0].DType) or
+         (PtrUInt(g^[e].Data) <> PtrUInt(g^[0].Data) + PtrUInt(e * 2 * slice)) or
+         (PtrUInt(u^[e].Data) <> PtrUInt(g^[e].Data) + PtrUInt(slice)) then
+        exit;
+    buf := fBackend.DeviceWeight(g^[0].Data, g^[0].DType, 2 * slice * length(g^));
+    SetLength(fExpertGate[aLayer], length(g^));
+    SetLength(fExpertUp[aLayer], length(g^));
+    SetLength(fExpertGateAt[aLayer], length(g^));
+    SetLength(fExpertUpAt[aLayer], length(g^));
+    for e := 0 to high(g^) do
+    begin
+      fExpertGate[aLayer][e] := buf;
+      fExpertUp[aLayer][e] := buf;
+      fExpertGateAt[aLayer][e] := e * 2 * slice;
+      fExpertUpAt[aLayer][e] := e * 2 * slice + slice;
+    end;
+    // RecordLinearIds binds the whole buffer, an expert at its base plus id
+    // times the stride
+    fStrideGate[aLayer] := 0;
+    fStrideUp[aLayer] := 0;
+    if fBackend.GpuLinearIds(g^[0].DType, c.Hidden, buf) then
+    begin
+      fStrideGate[aLayer] := 2 * slice;
+      fStrideUp[aLayer] := 2 * slice;
+    end;
+    result := true;
+  end;
+
 begin
   // everything up front: a batch cannot upload (and the first token would
   // otherwise carry the whole transfer)
   // the caller holds GpuLock
   c := fModel.Config;
-  qw := c.Heads * c.HeadDim;
-  kvw := c.KvHeads * c.HeadDim;
   fExpertGate := nil;
   fExpertUp := nil;
   fExpertDown := nil;
@@ -927,6 +1073,10 @@ begin
   for l := 0 to c.Layers - 1 do
   begin
     ly := @fModel.Layers[l];
+    // the shape of the heads of this layer (Gemma 4: per layer)
+    hd := c.Spec[l].HeadDim;
+    qw := c.Heads * hd;
+    kvw := c.Spec[l].KvHeads * hd;
     if c.Spec[l].Mixer = dmDeltaNet then
     begin
       // the four projections, the output, the convolution and the factors
@@ -950,22 +1100,26 @@ begin
       else
         Matrix(ly^.Q, qw, c.Hidden);
       Matrix(ly^.K, kvw, c.Hidden);
-      Matrix(ly^.V, kvw, c.Hidden);
+      if not c.Spec[l].KIsV then // K=V: the raw keys are the values
+        Matrix(ly^.V, kvw, c.Hidden);
       Matrix(ly^.O, c.Hidden, qw);
     end;
-    if c.Spec[l].Ffn = dfMoe then
+    if c.Spec[l].Ffn in [dfMoe, dfDenseMoe] then
     begin
       Matrix(ly^.Router, c.Experts, c.Hidden);
-      Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l],
-        fExpertGateAt[l], fStrideGate[l]);
-      Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l],
-        fExpertUpAt[l], fStrideUp[l]);
+      if not GateUp(l) then
+      begin
+        Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l],
+          fExpertGateAt[l], fStrideGate[l]);
+        Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l],
+          fExpertUpAt[l], fStrideUp[l]);
+      end;
       Experts(ly^.ExpertDown, c.Hidden, c.ExpertIntermediate, fExpertDown[l],
         fExpertDownAt[l], fStrideDown[l]);
       if (fStrideGate[l] = 0) or (fStrideUp[l] = 0) or (fStrideDown[l] = 0) then
         fDeviceRoutable := false;
-    end
-    else
+    end;
+    if c.Spec[l].Ffn in [dfDense, dfDenseMoe] then
     begin
       Matrix(ly^.Gate, c.Intermediate, c.Hidden);
       Matrix(ly^.Up, c.Intermediate, c.Hidden);
@@ -975,9 +1129,18 @@ begin
     Vector(ly^.PostNorm, c.Hidden);
     if ly^.QNorm <> nil then
     begin
-      Vector(ly^.QNorm, c.HeadDim);
-      Vector(ly^.KNorm, c.HeadDim);
+      Vector(ly^.QNorm, hd);
+      Vector(ly^.KNorm, hd);
     end;
+    // Gemma 4: the norms around both blocks, those of the dense block beside
+    // the experts, the router scale and the expert scales
+    Maybe(ly^.AttnNorm, c.Hidden);
+    Maybe(ly^.FfnNorm, c.Hidden);
+    Maybe(ly^.DenseOutNorm, c.Hidden);
+    Maybe(ly^.MoeInNorm, c.Hidden);
+    Maybe(ly^.MoeOutNorm, c.Hidden);
+    Maybe(ly^.RouterScale, c.Hidden);
+    Maybe(ly^.ExpertScale, c.Experts);
     if ly^.QBias <> nil then
     begin
       Vector(ly^.QBias, qw);
@@ -1034,11 +1197,11 @@ begin
     widest := c.ExpertIntermediate;
   if c.Hidden > widest then
     widest := c.Hidden;
-  if Int64(c.Heads) * (c.HeadDim shr 1) > widest then
-    widest := Int64(c.Heads) * (c.HeadDim shr 1);
+  if Int64(fMaxQw) shr 1 > widest then
+    widest := Int64(fMaxQw) shr 1;
   // the output gate: splitgate.comp and gatemul.comp per value of the queries
-  if (dxOutputGate in fModel.Extras) and (Int64(c.Heads) * c.HeadDim > widest) then
-    widest := Int64(c.Heads) * c.HeadDim;
+  if (dxOutputGate in fModel.Extras) and (fMaxQw > widest) then
+    widest := fMaxQw;
   if Int64(result) * widest > Int64(65535) * 128 then
     result := (Int64(65535) * 128) div widest;
   // the per-head norms take one work group per row and head
@@ -1062,8 +1225,8 @@ var
   keys, values: TInferVkBufferDynArray;
 begin
   c := fModel.Config;
-  kvw := c.KvHeads * c.HeadDim;
-  half := c.RopeDims shr 1; // the rotary factors of a row
+  kvw := MaxPtrInt(fMaxKvw, 1); // the widest layer
+  half := c.RopeDims shr 1; // the rotary factors of a row (of the first set)
   // the states of the DeltaNet layers: each one that is not there yet (an
   // allocation that failed is tried again)
   if fRecurrent then
@@ -1117,6 +1280,8 @@ begin
       for l := 0 to c.Layers - 1 do
         if c.Spec[l].Mixer = dmAttention then // a DeltaNet layer: its state
         begin
+          // the width of this layer (Gemma 4: per layer)
+          kvw := c.Spec[l].KvHeads * c.Spec[l].HeadDim;
           keys[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * es, true);
           values[l] := TInferVkBuffer.Create(fVk, Int64(cap) * kvw * es, true);
         end;
@@ -1127,6 +1292,7 @@ begin
           for l := 0 to c.Layers - 1 do
             if keys[l] <> nil then
             begin
+              kvw := c.Spec[l].KvHeads * c.Spec[l].HeadDim;
               fVk.BatchCopy(aCtx.fDevKeys[l], 0, keys[l], 0,
                 Int64(aCtx.fLength) * kvw * es);
               fVk.BatchCopy(aCtx.fDevValues[l], 0, values[l], 0,
@@ -1163,21 +1329,32 @@ begin
     NeedDevice(fVk, aCtx.fDevX, Int64(aRows) * c.Hidden * 4);
     NeedDevice(fVk, aCtx.fDevH, Int64(aRows) * c.Hidden * 4);
     NeedDevice(fVk, aCtx.fDevTmp, Int64(aRows) * c.Hidden * 4);
-    NeedDevice(fVk, aCtx.fDevQ, Int64(aRows) * c.Heads * c.HeadDim * 4);
-    NeedDevice(fVk, aCtx.fDevAttn, Int64(aRows) * c.Heads * c.HeadDim * 4);
-    NeedDevice(fVk, aCtx.fDevK, Int64(aRows) * kvw * 4);
-    NeedDevice(fVk, aCtx.fDevV, Int64(aRows) * kvw * 4);
+    // (a model of DeltaNet layers alone has no attention: a word each)
+    NeedDevice(fVk, aCtx.fDevQ, Int64(aRows) * MaxPtrInt(fMaxQw, 1) * 4);
+    NeedDevice(fVk, aCtx.fDevAttn, Int64(aRows) * MaxPtrInt(fMaxQw, 1) * 4);
+    NeedDevice(fVk, aCtx.fDevK, Int64(aRows) * MaxPtrInt(fMaxKvw, 1) * 4);
+    NeedDevice(fVk, aCtx.fDevV, Int64(aRows) * MaxPtrInt(fMaxKvw, 1) * 4);
     NeedDevice(fVk, aCtx.fDevGate, Int64(aRows) *
       MaxPtrInt(c.Intermediate, c.ExpertIntermediate) * 4);
     NeedDevice(fVk, aCtx.fDevUp, Int64(aRows) *
       MaxPtrInt(c.Intermediate, c.ExpertIntermediate) * 4);
-    NeedDevice(fVk, aCtx.fDevCos, Int64(aRows) * half * 2 * 4); // cos, then sin
-    // host-visible: embeddings, then cos, then sin
-    aCtx.fIn := TInferVkBuffer.Create(fVk, Int64(aRows) * (c.Hidden + 2 * half) * 4);
+    NeedDevice(fVk, aCtx.fDevCos, Int64(aRows) * MaxPtrInt(half, 1) * 2 * 4); // cos, sin
+    // host-visible: embeddings, then cos, then sin - of both sets
+    aCtx.fIn := TInferVkBuffer.Create(fVk, Int64(aRows) *
+      (c.Hidden + 2 * half + 2 * fHalf2) * 4);
     if dxOutputGate in fModel.Extras then
     begin
-      NeedDevice(fVk, aCtx.fDevQg, Int64(aRows) * 2 * c.Heads * c.HeadDim * 4);
-      NeedDevice(fVk, aCtx.fDevGateQ, Int64(aRows) * c.Heads * c.HeadDim * 4);
+      NeedDevice(fVk, aCtx.fDevQg, Int64(aRows) * 2 * MaxPtrInt(fMaxQw, 1) * 4);
+      NeedDevice(fVk, aCtx.fDevGateQ, Int64(aRows) * MaxPtrInt(fMaxQw, 1) * 4);
+    end;
+    // Gemma 4: the factors of the second rotary set; the router input and the
+    // experts' sum of a dfDenseMoe layer
+    if fHalf2 > 0 then
+      NeedDevice(fVk, aCtx.fDevCos2, Int64(aRows) * fHalf2 * 2 * 4);
+    if dxDenseMoe in fModel.Extras then
+    begin
+      NeedDevice(fVk, aCtx.fDevH2, Int64(aRows) * c.Hidden * 4);
+      NeedDevice(fVk, aCtx.fDevMoeOut, Int64(aRows) * c.Hidden * 4);
     end;
     if fRecurrent then
     begin
@@ -1273,7 +1450,8 @@ begin
   fVk.BatchBegin;
 end;
 
-procedure TQwen3Vulkan.RecordMoe(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
+procedure TQwen3Vulkan.RecordMoe(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt;
+  aRouterIn, aOut: TInferVkBuffer);
 var
   ly: ^TQwen3Layer;
   n, h, fi, k, ne, r, j, e, cnt, total: PtrInt;
@@ -1291,14 +1469,16 @@ begin
   ne := fModel.Config.Experts;
   ExpertBiases(ly^, gb, ub, db);
   // the router logits down: the batch so far submitted and waited for
-  fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Router, ne, aCtx.fDevRoute, true,
+  fBackend.RecordLinear(aRouterIn, n, h, ly^.Router, ne, aCtx.fDevRoute, true,
     nil, ly^.RouterBias);
   fVk.BatchCopy(aCtx.fDevRoute, 0, aCtx.fRouteOut, 0, Int64(n) * ne * 4);
   fVk.BatchSubmit;
   MoveFast(aCtx.fRouteOut.Mapped^, pointer(aCtx.fRoute)^, n * ne * SizeOf(single));
-  // the choice on the host, as on the CPU
+  // the choice on the host, as on the CPU - with the scale of every expert
+  // (Gemma 4)
   for r := 0 to n - 1 do
-    fModel.Route(@aCtx.fRoute[r * ne], @aCtx.fChosen[r * k], @aCtx.fChosenW[r * k]);
+    fModel.Route(@aCtx.fRoute[r * ne], @aCtx.fChosen[r * k], @aCtx.fChosenW[r * k],
+      ly^.ExpertScale);
   // the token rows and weights of every expert, expert by expert (no batch is
   // pending: fMoeIn may be written)
   idx := aCtx.fMoeIn.Mapped;
@@ -1321,7 +1501,7 @@ begin
   fVk.BatchCopy(aCtx.fMoeIn, 0, aCtx.fDevIdx, 0, Int64(total) * 4);
   fVk.BatchCopy(aCtx.fMoeIn, Int64(n) * k * 4, aCtx.fDevW, 0, Int64(total) * 4);
   count := n * h;
-  fVk.BatchDispatch(fFill0, [aCtx.fDevTmp], @count, (count + 127) div 128);
+  fVk.BatchDispatch(fFill0, [aOut], @count, (count + 127) div 128);
   push.Cols := h;
   for e := 0 to ne - 1 do
   begin
@@ -1338,12 +1518,12 @@ begin
     fBackend.RecordLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertUp[e].DType,
       fExpertUp[aLayer][e], fExpertUpAt[aLayer][e], fi, aCtx.fDevUp, true,
       ub, e * fi);
-    RecordSwiGlu(aCtx.fDevGate, aCtx.fDevUp, cnt * fi);
+    RecordGlu(aCtx.fDevGate, aCtx.fDevUp, cnt * fi);
     fBackend.RecordLinearAt(aCtx.fDevGate, cnt, fi, ly^.ExpertDown[e].DType,
       fExpertDown[aLayer][e], fExpertDownAt[aLayer][e], h, aCtx.fDevExpOut, true,
       db, e * h);
     fVk.BatchDispatch(fScatter, [aCtx.fDevExpOut, aCtx.fDevIdx, aCtx.fDevW,
-      aCtx.fDevTmp], @push, cnt);
+      aOut], @push, cnt);
   end;
 end;
 
@@ -1351,18 +1531,20 @@ type
   /// the push constants of route.comp and moecombine.comp
   TRoutePush = record
     Experts, K, Norm: cardinal;
+    HasScale: cardinal; // 1: the scale of every expert (binding 3, Gemma 4)
   end;
   TCombinePush = record
     K, N: cardinal;
   end;
 
-procedure TQwen3Vulkan.RecordMoeDevice(aCtx: TQwen3VkContext; aLayer: PtrInt);
+procedure TQwen3Vulkan.RecordMoeDevice(aCtx: TQwen3VkContext; aLayer: PtrInt;
+  aRouterIn, aOut: TInferVkBuffer);
 var
   ly: ^TQwen3Layer;
   h, fi, k: PtrInt;
   rp: TRoutePush;
   cp: TCombinePush;
-  gb, ub, db: TInferVkBuffer;
+  gb, ub, db, scale: TInferVkBuffer;
 begin
   ly := @fModel.Layers[aLayer];
   ExpertBiases(ly^, gb, ub, db);
@@ -1370,33 +1552,40 @@ begin
   fi := fModel.Config.ExpertIntermediate;
   k := fModel.Config.ExpertsUsed;
   // the router logits, the choice into fDevKIds / fDevKW - no submit
-  fBackend.RecordLinear(aCtx.fDevH, 1, h, ly^.Router, fModel.Config.Experts,
+  fBackend.RecordLinear(aRouterIn, 1, h, ly^.Router, fModel.Config.Experts,
     aCtx.fDevRoute, true, nil, ly^.RouterBias);
   rp.Experts := fModel.Config.Experts;
   rp.K := k;
   rp.Norm := ord(fModel.Config.NormTopK);
-  fVk.BatchDispatch(fRouteP, [aCtx.fDevRoute, aCtx.fDevKIds, aCtx.fDevKW], @rp, 1);
+  // the scale of every expert (Gemma 4); without, any buffer is bound
+  rp.HasScale := ord(ly^.ExpertScale <> nil);
+  scale := aCtx.fDevRoute;
+  if ly^.ExpertScale <> nil then
+    scale := Vector(ly^.ExpertScale, fModel.Config.Experts);
+  fVk.BatchDispatch(fRouteP, [aCtx.fDevRoute, aCtx.fDevKIds, aCtx.fDevKW, scale],
+    @rp, 1);
   if fCheckRoute then
-    CheckDeviceRoute(aCtx);
-  // gate and up of the k experts side by side, SwiGLU, down per slot
+    CheckDeviceRoute(aCtx, aLayer);
+  // gate and up of the k experts side by side, the activation, down per slot
+  // - each from its first expert's byte on (Gemma 4: up behind gate)
   fBackend.RecordLinearIds(aCtx.fDevH, h, ly^.ExpertGate[0].DType,
     fExpertGate[aLayer][0], fStrideGate[aLayer], fi, aCtx.fDevKIds, k, false,
-    aCtx.fDevKGate, false, gb);
+    aCtx.fDevKGate, false, gb, fExpertGateAt[aLayer][0]);
   fBackend.RecordLinearIds(aCtx.fDevH, h, ly^.ExpertUp[0].DType,
     fExpertUp[aLayer][0], fStrideUp[aLayer], fi, aCtx.fDevKIds, k, false,
-    aCtx.fDevKUp, true, ub);
-  RecordSwiGlu(aCtx.fDevKGate, aCtx.fDevKUp, k * fi);
+    aCtx.fDevKUp, true, ub, fExpertUpAt[aLayer][0]);
+  RecordGlu(aCtx.fDevKGate, aCtx.fDevKUp, k * fi);
   fBackend.RecordLinearIds(aCtx.fDevKGate, fi, ly^.ExpertDown[0].DType,
     fExpertDown[aLayer][0], fStrideDown[aLayer], h, aCtx.fDevKIds, k, true,
-    aCtx.fDevKDown, true, db);
-  // the weighted sum in id order into fDevTmp
+    aCtx.fDevKDown, true, db, fExpertDownAt[aLayer][0]);
+  // the weighted sum in id order into aOut
   cp.K := k;
   cp.N := h;
-  fVk.BatchDispatch(fCombine, [aCtx.fDevKDown, aCtx.fDevKW, aCtx.fDevTmp], @cp,
+  fVk.BatchDispatch(fCombine, [aCtx.fDevKDown, aCtx.fDevKW, aOut], @cp,
     (h + 127) div 128);
 end;
 
-procedure TQwen3Vulkan.CheckDeviceRoute(aCtx: TQwen3VkContext);
+procedure TQwen3Vulkan.CheckDeviceRoute(aCtx: TQwen3VkContext; aLayer: PtrInt);
 var
   k, ne, j, t, id: PtrInt;
   v: single;
@@ -1413,7 +1602,8 @@ begin
   MoveFast(aCtx.fKOut.Mapped^, pointer(aCtx.fKIds)^, k * SizeOf(integer));
   MoveFast(PAnsiChar(aCtx.fKOut.Mapped)[k * 4], pointer(aCtx.fKW)^, k * SizeOf(single));
   fVk.BatchBegin;
-  fModel.Route(pointer(aCtx.fRoute), pointer(aCtx.fChosen), pointer(aCtx.fChosenW));
+  fModel.Route(pointer(aCtx.fRoute), pointer(aCtx.fChosen), pointer(aCtx.fChosenW),
+    fModel.Layers[aLayer].ExpertScale);
   // the host's choice by id, as the shader writes it
   for j := 1 to k - 1 do
   begin
@@ -1503,15 +1693,148 @@ begin
   fBackend.RecordLinear(aCtx.fDevCore, aRows, vd, ly^.LinOut, h, aCtx.fDevTmp);
 end;
 
+procedure TQwen3Vulkan.Plan(aCtx: TQwen3VkContext; aGroup, aHeadDim, aRows,
+  aPast: PtrInt; out aPlan: TVkAttentionPlan);
+var
+  queries, blocks, most, group: PtrInt;
+  f16: boolean;
+begin
+  f16 := aCtx.fKvF16;
+  group := aGroup;
+  // the shaders of the cache format of aCtx (set by Prepare); a head of more
+  // than 256 values (Gemma 4): attention.comp in blocks of 4 queries
+  if aHeadDim > 256 then
+  begin
+    aPlan.Att := fAttention512;
+    if f16 then
+      aPlan.Att := fAttention512_16;
+    queries := ATTENTION_QUERIES_512;
+  end
+  else
+  begin
+    aPlan.Att := fAttention;
+    if f16 then
+      aPlan.Att := fAttention16;
+    queries := ATTENTION_QUERIES;
+    // flash.comp for FLASH_ROWS rows or more
+    if fUseFlash and (fFlash <> nil) and (aRows >= FLASH_ROWS) then
+    begin
+      aPlan.Att := fFlash;
+      if f16 then
+        aPlan.Att := fFlash16;
+      queries := FLASH_QUERIES;
+    end;
+  end;
+  // the attention work groups: hb heads of one KV head (hb divides the
+  // group) times rb rows, the keys of a row cut into splits ranges unless
+  // there are enough work groups without
+  aPlan.Hb := group;
+  while (aPlan.Hb > queries) or (group mod aPlan.Hb <> 0) do
+    dec(aPlan.Hb);
+  aPlan.Rb := queries div aPlan.Hb;
+  blocks := (aRows + aPlan.Rb - 1) div aPlan.Rb;
+  aPlan.Splits := 1;
+  if fSplitKeys > 0 then
+    aPlan.Splits := (aPast + aRows + fSplitKeys - 1) div fSplitKeys;
+  most := SPLIT_GROUPS div ((fModel.Config.Heads div aPlan.Hb) * blocks);
+  if aPlan.Splits > most then
+    aPlan.Splits := most;
+  // a decoded token: attndec.comp in DECODE_GROUPS work groups
+  if (aHeadDim <= 256) and fUseDecode and (fDecode <> nil) and (aRows = 1) and
+     (aPast + aRows >= fDecodeKeys) then
+  begin
+    aPlan.Att := fDecode;
+    if f16 then
+      aPlan.Att := fDecode16;
+    if fSplitKeys > 0 then // else one range, as attention.comp
+      aPlan.Splits := DECODE_GROUPS div (fModel.Config.Heads div aPlan.Hb);
+    if aPlan.Splits > aPast + aRows then
+      aPlan.Splits := aPast + aRows;
+  end;
+  if aPlan.Splits < 1 then
+    aPlan.Splits := 1;
+  // a layer with a sliding window: one token row per work group, so all its
+  // queries share one key range - the others' rows would sum values outside
+  // their window with a weight of 0, and 0 times a NaN or infinite value is
+  // NaN (attention.comp, not flash.comp: a block of one row)
+  aPlan.WAtt := aPlan.Att;
+  aPlan.WSplits := aPlan.Splits;
+  aPlan.WHb := aPlan.Hb;
+  if aRows > 1 then
+  begin
+    queries := ATTENTION_QUERIES;
+    if aHeadDim > 256 then
+    begin
+      aPlan.WAtt := fAttention512;
+      if f16 then
+        aPlan.WAtt := fAttention512_16;
+      queries := ATTENTION_QUERIES_512;
+    end
+    else
+    begin
+      aPlan.WAtt := fAttention;
+      if f16 then
+        aPlan.WAtt := fAttention16;
+    end;
+    // the head block of attention.comp (hb may be sized for flash.comp)
+    aPlan.WHb := group;
+    while (aPlan.WHb > queries) or (group mod aPlan.WHb <> 0) do
+      dec(aPlan.WHb);
+    aPlan.WSplits := 1;
+    if fSplitKeys > 0 then
+      aPlan.WSplits := (aPast + aRows + fSplitKeys - 1) div fSplitKeys;
+    most := SPLIT_GROUPS div ((fModel.Config.Heads div aPlan.WHb) * aRows);
+    if aPlan.WSplits > most then
+      aPlan.WSplits := most;
+    if aPlan.WSplits < 1 then
+      aPlan.WSplits := 1;
+  end;
+end;
+
+procedure TQwen3Vulkan.RecordGlu(aGate, aUp: TInferVkBuffer; aCount: PtrInt);
+var
+  n: cardinal;
+begin
+  if fModel.Config.Activation = daGeluTanh then
+  begin
+    n := aCount;
+    fVk.BatchDispatch(fGeGlu, [aGate, aUp], @n, (aCount + 127) div 128);
+  end
+  else
+    RecordSwiGlu(aGate, aUp, aCount);
+end;
+
+procedure TQwen3Vulkan.RecordDense(aCtx: TQwen3VkContext; aLayer, aRows: PtrInt);
+var
+  ly: ^TQwen3Layer;
+  h, f: PtrInt;
+begin
+  ly := @fModel.Layers[aLayer];
+  h := fModel.Config.Hidden;
+  f := fModel.Config.Intermediate;
+  // gate and up side by side, the activation, down
+  fBackend.RecordLinear(aCtx.fDevH, aRows, h, ly^.Gate, f, aCtx.fDevGate, false);
+  fBackend.RecordLinear(aCtx.fDevH, aRows, h, ly^.Up, f, aCtx.fDevUp);
+  RecordGlu(aCtx.fDevGate, aCtx.fDevUp, aRows * f);
+  fBackend.RecordLinear(aCtx.fDevGate, aRows, f, ly^.Down, h, aCtx.fDevTmp);
+end;
+
+type
+  /// scale.comp
+  TScalePush = record
+    N: cardinal;
+    S: single;
+  end;
+
 procedure TQwen3Vulkan.Chunk(aCtx: TQwen3VkContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
   aNormed: PSingleArray);
 var
   c: TQwen3Config;
-  n, h, f, qw, kvw, half, past, l, outRows, splits, most, hb, rb, blocks,
-    queries, wsplits, whb, last: PtrInt;
-  attention, qkrope, wattention, layerAtt: TInferVkPipeline;
-  qn, kn: TInferVkBuffer;
+  n, h, qw, kvw, hd, half, past, l, outRows, most, last: PtrInt;
+  pl: TVkAttentionPlan;
+  layerAtt: TInferVkPipeline;
+  qn, kn, vb, cs: TInferVkBuffer;
   ly: ^TQwen3Layer;
   p: PSingleArray;
   qk: TQkRopePush;
@@ -1519,16 +1842,15 @@ var
   att: TAttentionPush;
   merge: TMergePush;
   split: TSplitGatePush;
+  sc: TScalePush;
   sinks: TInferVkBuffer;
   part: TInferVkBuffer;
+  device: boolean;
 begin
   c := fModel.Config;
   n := aCount;
   h := c.Hidden;
-  f := c.Intermediate;
-  qw := c.Heads * c.HeadDim;
-  kvw := c.KvHeads * c.HeadDim;
-  half := c.RopeDims shr 1; // the rotary factors of a row
+  half := c.RopeDims shr 1; // the rotary factors of a row (of the first set)
   past := aCtx.fLength;
   outRows := 0;
   if aLogits <> nil then
@@ -1537,97 +1859,47 @@ begin
     else
       outRows := 1;
   Prepare(aCtx, past + n, n, outRows, aNormed <> nil);
-  // the attention work groups: hb heads of one KV head (hb divides the
-  // group) times rb rows, the keys of a row cut into splits ranges unless
-  // there are enough work groups without
-  // - flash.comp for FLASH_ROWS rows or more
-  // - the shaders of the cache format of aCtx (set by Prepare)
-  attention := fAttention;
-  qkrope := fQkRope;
-  if aCtx.fKvF16 then
+  // the key ranges of the widest split of any layer (Gemma 4: the layers
+  // group their heads differently)
+  most := 1;
+  for l := 0 to c.Layers - 1 do
+    if c.Spec[l].Mixer = dmAttention then
+    begin
+      Plan(aCtx, c.Heads div c.Spec[l].KvHeads, c.Spec[l].HeadDim, n, past, pl);
+      most := MaxPtrInt(most, MaxPtrInt(pl.Splits, pl.WSplits));
+    end;
+  if most > 1 then
   begin
-    attention := fAttention16;
-    qkrope := fQkRope16;
-  end;
-  queries := ATTENTION_QUERIES;
-  if fUseFlash and (fFlash <> nil) and (n >= FLASH_ROWS) then
-  begin
-    attention := fFlash;
-    if aCtx.fKvF16 then
-      attention := fFlash16;
-    queries := FLASH_QUERIES;
-  end;
-  hb := c.Heads div c.KvHeads;
-  while (hb > queries) or (c.Heads div c.KvHeads mod hb <> 0) do
-    dec(hb);
-  rb := queries div hb;
-  blocks := (n + rb - 1) div rb;
-  splits := 1;
-  if fSplitKeys > 0 then
-    splits := (past + n + fSplitKeys - 1) div fSplitKeys;
-  most := SPLIT_GROUPS div ((c.Heads div hb) * blocks);
-  if splits > most then
-    splits := most;
-  // a decoded token: attndec.comp in DECODE_GROUPS work groups
-  if fUseDecode and (fDecode <> nil) and (n = 1) and (past + n >= fDecodeKeys) then
-  begin
-    attention := fDecode;
-    if aCtx.fKvF16 then
-      attention := fDecode16;
-    if fSplitKeys > 0 then // else one range, as attention.comp
-      splits := DECODE_GROUPS div (c.Heads div hb);
-    if splits > past + n then
-      splits := past + n;
-  end;
-  if splits < 1 then
-    splits := 1;
-  // a layer with a sliding window: one token row per work group, so all its
-  // queries share one key range - the others' rows would sum values outside
-  // their window with a weight of 0, and 0 times a NaN or infinite value is
-  // NaN (attention.comp, not flash.comp: a block of one row)
-  wattention := attention;
-  wsplits := splits;
-  whb := hb;
-  if n > 1 then
-  begin
-    wattention := fAttention;
-    if aCtx.fKvF16 then
-      wattention := fAttention16;
-    // the head block of attention.comp: at most ATTENTION_QUERIES (hb may be
-    // sized for flash.comp)
-    whb := c.Heads div c.KvHeads;
-    while (whb > ATTENTION_QUERIES) or (c.Heads div c.KvHeads mod whb <> 0) do
-      dec(whb);
-    wsplits := 1;
-    if fSplitKeys > 0 then
-      wsplits := (past + n + fSplitKeys - 1) div fSplitKeys;
-    most := SPLIT_GROUPS div ((c.Heads div whb) * n);
-    if wsplits > most then
-      wsplits := most;
-    if wsplits < 1 then
-      wsplits := 1;
-  end;
-  if (splits > 1) or (wsplits > 1) then
-  begin
-    NeedDevice(fVk, aCtx.fPart, Int64(c.Heads) * n * MaxPtrInt(splits, wsplits) *
-      (c.HeadDim + 2) * 4);
+    NeedDevice(fVk, aCtx.fPart, Int64(c.Heads) * n * most * (fMaxHeadDim + 2) * 4);
     part := aCtx.fPart;
   end
   else
     part := aCtx.fDevAttn; // bound, but not accessed by attention.comp
-  // the inputs, written into the host-visible buffer before the batch
+  // the inputs, written into the host-visible buffer before the batch: the
+  // embeddings, then the rotary factors (cos, then sin) of the first set and
+  // of the second (Gemma 4)
   p := aCtx.fIn.Mapped;
   if aIds <> nil then
     fModel.Embed(aIds, n, p)
   else
     MoveFast(aEmbeds^[0], p^[0], n * h * SizeOf(single));
   fModel.Rotary(past, n, @p^[n * h], @p^[n * h + n * half]);
+  if fHalf2 > 0 then
+    fModel.Rotary2(past, n, @p^[n * h + 2 * n * half],
+      @p^[n * h + 2 * n * half + n * fHalf2]);
+  // a single token with experts chosen on the device: no submit in between,
+  // unless a RouteTape needs the host's choice (TDecoderModel.Route)
+  device := (n = 1) and fRouteOnDevice and fDeviceRoutable and
+    (fModel.RouteTape = nil);
   // the states move on from here: undone until the batch went through
   aCtx.fStateOk := false;
   fVk.BatchBegin;
   try
     fVk.BatchCopy(aCtx.fIn, 0, aCtx.fDevX, 0, Int64(n) * h * 4);
     fVk.BatchCopy(aCtx.fIn, Int64(n) * h * 4, aCtx.fDevCos, 0, Int64(n) * half * 2 * 4);
+    if fHalf2 > 0 then
+      fVk.BatchCopy(aCtx.fIn, (Int64(n) * h + Int64(n) * half * 2) * 4, aCtx.fDevCos2, 0,
+        Int64(n) * fHalf2 * 2 * 4);
     // a new sequence: the states of the DeltaNet layers start at 0
     if fRecurrent and (past = 0) then
       for l := 0 to c.Layers - 1 do
@@ -1639,28 +1911,19 @@ begin
         end;
     qk.Rows := n;
     qk.Heads := c.Heads;
-    qk.KvHeads := c.KvHeads;
-    qk.HeadDim := c.HeadDim;
     qk.Past := past;
     qk.Eps := c.RmsEps;
-    qk.Rot := c.RopeDims; // the whole head unless Qwen3.5 rotates a share
+    qk.VNorm := ord(c.ValueNorm);
     split.N := n * c.Heads;
-    split.D := c.HeadDim;
     norm.Rows := n;
     norm.Cols := h;
     norm.Eps := c.RmsEps;
     att.Rows := n;
     att.Heads := c.Heads;
-    att.HeadDim := c.HeadDim;
-    att.KvHeads := c.KvHeads;
     att.Past := past;
-    att.Splits := splits;
-    att.HeadBlock := hb;
-    att.RowBlock := rb;
+    att.Scale := c.AttentionScale; // 0: 1 / sqrt(headDim) in the shader
     merge.Rows := n;
     merge.Heads := c.Heads;
-    merge.HeadDim := c.HeadDim;
-    merge.Splits := splits;
     // the input norm of layer 0; every later one comes with the residual of
     // the layer before (addnorm) - the zeroing may have filled the batch
     NeedRoom(1);
@@ -1673,6 +1936,17 @@ begin
         RecordDeltaNet(aCtx, l, n)
       else
       begin
+        // the shape of the heads of this layer (Gemma 4: per layer)
+        hd := c.Spec[l].HeadDim;
+        qw := c.Heads * hd;
+        kvw := c.Spec[l].KvHeads * hd;
+        qk.KvHeads := c.Spec[l].KvHeads;
+        qk.HeadDim := hd;
+        split.D := hd;
+        att.HeadDim := hd;
+        att.KvHeads := c.Spec[l].KvHeads;
+        merge.HeadDim := hd;
+        Plan(aCtx, c.Heads div c.Spec[l].KvHeads, hd, n, past, pl);
         // attention block: the three projections side by side (no barrier
         // between them: they only read fDevH), then per head the norms, rotary
         // positions and the store of k and v into the cache
@@ -1682,10 +1956,22 @@ begin
         else
           fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, false, nil,
             ly^.QBias);
-        fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, false, nil,
-          ly^.KBias);
-        fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, true, nil,
-          ly^.VBias);
+        // K=V (Gemma 4): the raw keys are the values, read before qkrope.comp
+        // norms the keys (it only reads k)
+        if c.Spec[l].KIsV then
+        begin
+          fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, true, nil,
+            ly^.KBias);
+          vb := aCtx.fDevK;
+        end
+        else
+        begin
+          fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, false, nil,
+            ly^.KBias);
+          fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, true, nil,
+            ly^.VBias);
+          vb := aCtx.fDevV;
+        end;
         if c.Spec[l].OutputGate then
           fVk.BatchDispatch(fSplitGate, [aCtx.fDevQg, aCtx.fDevQ, aCtx.fDevGateQ], @split,
             (n * qw + 127) div 128);
@@ -1693,33 +1979,48 @@ begin
         // the rotary factors, any buffer would do
         qk.Norm := ord(ly^.QNorm <> nil);
         qk.Rope := ord(not c.Spec[l].NoRope);
+        // the rotary set: the first (maybe a share of the head), or the second
+        // over the whole head (its factors 0 beyond the rotated share); a
+        // layer without rotary positions may have a head of its own width:
+        // rot never beyond it
+        cs := aCtx.fDevCos;
+        qk.Rot := c.RopeDims; // the whole head unless a share of it rotates
+        if c.Spec[l].Rope2 or c.Spec[l].NoRope then
+        begin
+          if c.Spec[l].Rope2 then
+            cs := aCtx.fDevCos2;
+          qk.Rot := 0;
+        end;
         att.Window := c.Spec[l].Window;
-        layerAtt := attention;
-        att.Splits := splits;
-        att.HeadBlock := hb;
-        att.RowBlock := rb;
-        merge.Splits := splits;
+        layerAtt := pl.Att;
+        att.Splits := pl.Splits;
+        att.HeadBlock := pl.Hb;
+        att.RowBlock := pl.Rb;
+        merge.Splits := pl.Splits;
         if c.Spec[l].Window > 0 then
         begin
-          layerAtt := wattention;
-          att.Splits := wsplits;
-          att.HeadBlock := whb;
+          layerAtt := pl.WAtt;
+          att.Splits := pl.WSplits;
+          att.HeadBlock := pl.WHb;
           att.RowBlock := 1;
-          merge.Splits := wsplits;
+          merge.Splits := pl.WSplits;
         end;
         if ly^.QNorm <> nil then
         begin
-          qn := Vector(ly^.QNorm, c.HeadDim);
-          kn := Vector(ly^.KNorm, c.HeadDim);
+          qn := Vector(ly^.QNorm, hd);
+          kn := Vector(ly^.KNorm, hd);
         end
         else
         begin
-          qn := aCtx.fDevCos;
-          kn := aCtx.fDevCos;
+          qn := cs;
+          kn := cs;
         end;
-        fVk.BatchDispatch(qkrope, [aCtx.fDevQ, aCtx.fDevK, aCtx.fDevV, qn, kn,
-          aCtx.fDevCos, aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk,
-          c.Heads + c.KvHeads, n);
+        if aCtx.fKvF16 then
+          fVk.BatchDispatch(fQkRope16, [aCtx.fDevQ, aCtx.fDevK, vb, qn, kn, cs,
+            aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk, c.Heads + c.Spec[l].KvHeads, n)
+        else
+          fVk.BatchDispatch(fQkRope, [aCtx.fDevQ, aCtx.fDevK, vb, qn, kn, cs,
+            aCtx.fDevKeys[l], aCtx.fDevValues[l]], @qk, c.Heads + c.Spec[l].KvHeads, n);
         // the attention sinks of gpt-oss; without, any buffer is bound
         att.HasSinks := ord(ly^.Sinks <> nil);
         merge.HasSinks := att.HasSinks;
@@ -1736,34 +2037,68 @@ begin
           RecordElementwise(fGateMul, [aCtx.fDevAttn, aCtx.fDevGateQ], n * qw);
         fBackend.RecordLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp, true, nil,
           ly^.OBias);
+        // Gemma: the attention output normed before the residual
+        if c.SandwichNorm then
+          RecordNorm(aCtx.fDevTmp, n, h, ly^.AttnNorm, aCtx.fDevTmp);
       end;
-      // residual and the feed-forward pre-norm, gate and up side by side,
-      // SwiGLU, down
+      // residual and the feed-forward pre-norm, then the block
       fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp, Vector(ly^.PostNorm, h),
         aCtx.fDevH], @norm, n);
-      if c.Spec[l].Ffn = dfMoe then
-      begin
-        // one token row: chosen on the device, unless a RouteTape needs the
-        // host's choice (TDecoderModel.Route)
-        if (n = 1) and fRouteOnDevice and fDeviceRoutable and
-           (fModel.RouteTape = nil) then
-          RecordMoeDevice(aCtx, l)
-        else
-          RecordMoe(aCtx, l, n);
-      end
+      case c.Spec[l].Ffn of
+        dfMoe:
+          if device then
+            RecordMoeDevice(aCtx, l, aCtx.fDevH, aCtx.fDevTmp)
+          else
+            RecordMoe(aCtx, l, n, aCtx.fDevH, aCtx.fDevTmp);
+        dfDenseMoe:
+          begin
+            // Gemma 4: the dense block on the pre-FFN norm, its output normed;
+            // the router on its own norm of the residual, the experts on
+            // theirs, their sum normed; both added
+            NeedRoom(DENSEMOE_ROOM);
+            RecordDense(aCtx, l, n);
+            RecordNorm(aCtx.fDevTmp, n, h, ly^.DenseOutNorm, aCtx.fDevTmp);
+            RecordNorm(aCtx.fDevX, n, h, ly^.RouterScale, aCtx.fDevH2);
+            RecordNorm(aCtx.fDevX, n, h, ly^.MoeInNorm, aCtx.fDevH);
+            if device then
+              RecordMoeDevice(aCtx, l, aCtx.fDevH2, aCtx.fDevMoeOut)
+            else
+              RecordMoe(aCtx, l, n, aCtx.fDevH2, aCtx.fDevMoeOut);
+            // the rest of the layer: RecordMoe may leave a batch with 2 sets
+            // to spare (Codex review)
+            NeedRoom(DENSEMOE_TAIL);
+            RecordNorm(aCtx.fDevMoeOut, n, h, ly^.MoeOutNorm, aCtx.fDevMoeOut);
+            RecordElementwise(fAdd, [aCtx.fDevTmp, aCtx.fDevMoeOut, aCtx.fDevTmp], n * h);
+          end;
       else
-      begin
-        fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate, false);
-        fBackend.RecordLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
-        RecordSwiGlu(aCtx.fDevGate, aCtx.fDevUp, n * f);
-        fBackend.RecordLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
+        RecordDense(aCtx, l, n);
       end;
-      // the residual, and the input norm of the next layer
-      if l < c.Layers - 1 then
+      // the rest of the layer (the experts may have left a batch with 2 sets
+      // to spare)
+      NeedRoom(DENSEMOE_TAIL);
+      // Gemma: the feed-forward output normed before the residual - of a
+      // dense block with SandwichNorm, of the sum of a dfDenseMoe block always
+      // (TDecoderModel.DenseBlock, DenseMoeBlock; MoeBlock has none)
+      if (c.SandwichNorm and (c.Spec[l].Ffn = dfDense)) or
+         (c.Spec[l].Ffn = dfDenseMoe) then
+        RecordNorm(aCtx.fDevTmp, n, h, ly^.FfnNorm, aCtx.fDevTmp);
+      // the residual, and the input norm of the next layer - Gemma 4 scales
+      // the whole state by the layer scalar in between
+      if (l < c.Layers - 1) and (ly^.Scalar = nil) then
         fVk.BatchDispatch(fAddNorm, [aCtx.fDevX, aCtx.fDevTmp,
           Vector(fModel.Layers[l + 1].InputNorm, h), aCtx.fDevH], @norm, n)
       else
+      begin
         RecordElementwise(fAdd, [aCtx.fDevX, aCtx.fDevTmp, aCtx.fDevX], n * h);
+        if ly^.Scalar <> nil then
+        begin
+          sc.N := n * h;
+          sc.S := ly^.Scalar^[0];
+          fVk.BatchDispatch(fScale, [aCtx.fDevX], @sc, (n * h + 127) div 128);
+          if l < c.Layers - 1 then
+            RecordNorm(aCtx.fDevX, n, h, fModel.Layers[l + 1].InputNorm, aCtx.fDevH);
+        end;
+      end;
       // the device starts on the first layer, then gets every fourth while
       // the host records the rest (BatchFlush: at most 7 per batch)
       if (l = 0) or (l and 3 = 3) then
@@ -1802,8 +2137,13 @@ begin
     raise;
   end;
   fVk.BatchSubmit;
+  // Gemma caps the logits
   if outRows > 0 then
+  begin
     MoveFast(aCtx.fOut.Mapped^, aLogits^, outRows * c.VocabSize * SizeOf(single));
+    if c.LogitSoftcap > 0 then
+      InferSoftcap(aLogits, outRows * c.VocabSize, c.LogitSoftcap);
+  end;
   if aNormed <> nil then
     MoveFast(PSingleArray(aCtx.fOut.Mapped)^[outRows * c.VocabSize], aNormed^[0],
       h * SizeOf(single));

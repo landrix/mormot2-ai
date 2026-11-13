@@ -2,9 +2,13 @@
 // of docs/native-inference.md; CausalRows of the CPU backend in float)
 // - y[r, h] = softmax(q[r, h] . keys[0 .. past + r] / sqrt(d)) . values, the
 //   keys and values of the KV head h / (heads / kvHeads), rows at kvWidth
-// - headDim a multiple of 4 and at most 256 (the queries are kept in shared
-//   memory as vec4, the keys read as vec4; each invocation owns the output
-//   dimensions t and t + 128)
+// - headDim a multiple of 4 and at most 128 * NV (the queries are kept in
+//   shared memory as vec4, the keys read as vec4; each invocation owns the
+//   output dimensions t, t + 128 .. t + 128 (NV - 1)): the default build up
+//   to 256 with blocks of MAXQ 8 queries; -DMAXQ=4 -DNV=4 (SPV_ATTENTION512,
+//   _512_F16; Gemma 4, slice D6e2) up to 512 with blocks of 4 - 12 KB of
+//   shared memory, within the 16 KB of the default build
+// - scale: the factor of the scores, 0 for 1 / sqrt(headDim) (Gemma 4: 1)
 // - phase 4e, flash attention: one work group of 128 per (head block, row
 //   block, split); a block holds up to MAXQ queries - headBlock heads of one
 //   KV head times rowBlock rows - so every key and value read serves all of
@@ -27,7 +31,12 @@
 //   values with a weight of 0, as since phase 4c
 #version 450
 
+#ifndef MAXQ
 #define MAXQ 8
+#endif
+#ifndef NV
+#define NV 2
+#endif
 #define NEG -3.402823e38
 
 layout(local_size_x = 128) in;
@@ -53,9 +62,10 @@ layout(push_constant) uniform Push {
   uint rows, heads, headDim, kvHeads, past, splits, headBlock, rowBlock;
   uint window; // > 0: a row sees only its last window keys, itself included
   uint hasSinks; // 1: sinks[] (binding 5)
+  float scale; // the factor of the scores, 0: 1 / sqrt(headDim)
 } p;
 
-shared vec4 qs[MAXQ * 64];      // the queries
+shared vec4 qs[MAXQ * 32 * NV]; // the queries
 shared float ps[MAXQ * 128];    // the scores, then the weights of a tile
 shared float red[MAXQ * 128];   // the maximum of a tile
 
@@ -98,13 +108,13 @@ void main()
   uint g = h0 / (p.heads / p.kvHeads);
   // query i: head h0 + i % hb, row r0 + i / hb
   uint nq = hb * min(p.rowBlock, p.rows - r0);
-  float scale = 1.0 / sqrt(float(d));
+  float scale = p.scale != 0.0 ? p.scale : 1.0 / sqrt(float(d));
   for (uint i = t; i < nq * d4; i += 128u)
   {
     uint qi = i / d4;
     uint k = i - qi * d4;
     uint qb = (r0 + qi / hb) * qw + (h0 + qi % hb) * d + 4u * k;
-    qs[qi * 64u + k] = vec4(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]);
+    qs[qi * (32u * NV) + k] = vec4(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]);
   }
   // the keys j0 .. j1 - 1 of each query in this split (empty for a late
   // split of an early row); both grow with the row, the block reads lo .. hi
@@ -128,13 +138,13 @@ void main()
     }
   }
   barrier();
-  float m[MAXQ], l[MAXQ], acc0[MAXQ], acc1[MAXQ];
+  float m[MAXQ], l[MAXQ], acc[MAXQ * NV];
   for (uint i = 0u; i < MAXQ; i++)
   {
     m[i] = NEG;
     l[i] = 0.0;
-    acc0[i] = 0.0;
-    acc1[i] = 0.0;
+    for (uint c = 0u; c < NV; c++)
+      acc[i * NV + c] = 0.0;
   }
   uint vk = g * d + t;
   for (uint base = lo; base < hi; base += 128u)
@@ -152,7 +162,7 @@ void main()
         vec4 kv = key4(kb + k);
         for (uint i = 0u; i < MAXQ; i++)
           if (i < nq)
-            sv[i] += dot(qs[i * 64u + k], kv);
+            sv[i] += dot(qs[i * (32u * NV) + k], kv);
       }
     }
     for (uint i = 0u; i < MAXQ; i++)
@@ -176,8 +186,8 @@ void main()
     {
       float mn = max(m[i], red[i * 128u]);
       float f = exp(m[i] - mn);
-      acc0[i] *= f;
-      acc1[i] *= f;
+      for (uint c = 0u; c < NV; c++)
+        acc[i * NV + c] *= f;
       l[i] *= f;
       m[i] = mn;
       float e = 0.0;
@@ -191,18 +201,19 @@ void main()
     for (uint jj = 0u; jj < n; jj++)
     {
       uint vb = (base + jj) * kvw + vk;
-      float v0 = 0.0;
-      float v1 = 0.0;
-      if (t < d)
-        v0 = val(vb);
-      if (t + 128u < d)
-        v1 = val(vb + 128u);
+      float vv[NV];
+      for (uint c = 0u; c < NV; c++)
+      {
+        vv[c] = 0.0;
+        if (t + 128u * c < d)
+          vv[c] = val(vb + 128u * c);
+      }
       for (uint i = 0u; i < MAXQ; i++)
       {
         float w = ps[i * 128u + jj];
         l[i] += w;
-        acc0[i] += w * v0;
-        acc1[i] += w * v1;
+        for (uint c = 0u; c < NV; c++)
+          acc[i * NV + c] += w * vv[c];
       }
     }
     barrier(); // ps and red are refilled by the next tile
@@ -223,18 +234,16 @@ void main()
           f = exp(m[i] - mm);
           den = l[i] * f + exp(sinks[h] - mm); // a share without a value
         }
-        if (t < d)
-          y[yb] = acc0[i] * f / den;
-        if (t + 128u < d)
-          y[yb + 128u] = acc1[i] * f / den;
+        for (uint c = 0u; c < NV; c++)
+          if (t + 128u * c < d)
+            y[yb + 128u * c] = acc[i * NV + c] * f / den;
       }
       else
       {
         uint pb = ((h * p.rows + r) * p.splits + s) * (d + 2u);
-        if (t < d)
-          part[pb + t] = acc0[i];
-        if (t + 128u < d)
-          part[pb + t + 128u] = acc1[i];
+        for (uint c = 0u; c < NV; c++)
+          if (t + 128u * c < d)
+            part[pb + t + 128u * c] = acc[i * NV + c];
         if (t == 0u)
         {
           part[pb + d] = m[i];

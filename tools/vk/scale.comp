@@ -1,0 +1,16 @@
+// LandrixAI - x[i] *= s over n values: the layer scalar of Gemma 4 (phase D
+// slice D6e2; the whole state times Layers[l].Scalar on the CPU)
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer BufX { float x[]; };
+
+layout(push_constant) uniform Push { uint n; float s; } p;
+
+void main()
+{
+  uint i = gl_GlobalInvocationID.x;
+  if (i < p.n)
+    x[i] = x[i] * p.s;
+}

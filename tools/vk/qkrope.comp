@@ -6,7 +6,9 @@
 // stored into the KV cache at position past + row - what were six dispatches
 // (two norms, two RoPE, two copies); arithmetic as rmsnorm.comp and rope.comp
 // - one work group of 128 per (row, head): heads first, then the KV heads
-// (which also store v); headDim <= 256, even
+// (which also store v); headDim <= 512, even
+// - vnorm (Gemma 4, slice D6e2): v stored as an RMSNorm without weight of
+//   each KV head; v may be bound to k (K=V: the raw keys, which are only read)
 // - rot: the first rot values of a head rotate (rotate_half within them, cs
 //   holds rot / 2 per row), the others pass as normed (Qwen3.5, slice D7e2);
 //   0: all of them
@@ -37,10 +39,11 @@ layout(push_constant) uniform Push {
   uint norm;
   uint rope; // 0: no rotary positions in this layer (NoPE), q and k as they are
   uint rot; // the rotated share of a head, 0: all of it
+  uint vnorm; // 1: the value norm (Gemma 4)
 } p;
 
 shared float partial[128];
-shared float normed[256];
+shared float normed[512];
 
 void main()
 {
@@ -74,6 +77,28 @@ void main()
     normed[c] = p.norm != 0u ? (isQ ? qn[c] : kn[c]) * (a * inv) : a;
   }
   barrier();
+  // the value norm: the sum of squares of the head of v - in every work group
+  // (the barriers in uniform control flow), used by those of a KV head
+  float vinv = 1.0;
+  if (p.vnorm != 0u)
+  {
+    float sv = 0.0;
+    if (!isQ)
+      for (uint c = t; c < d; c += 128u)
+      {
+        float a = v[src + c];
+        sv += a * a;
+      }
+    partial[t] = sv;
+    barrier();
+    for (uint w = 64u; w > 0u; w >>= 1)
+    {
+      if (t < w)
+        partial[t] += partial[t + w];
+      barrier();
+    }
+    vinv = inversesqrt(partial[0] / float(d) + p.eps);
+  }
   // rotary positions: the halves rotated by the factors of the row
   uint cbase = r * half_;
   uint sbase = p.rows * half_ + r * half_;
@@ -105,7 +130,7 @@ void main()
       kc[(dst + c) >> 1] = packHalf2x16(o);
     }
     for (uint c = 2u * t; c < d; c += 256u)
-      vc[(dst + c) >> 1] = packHalf2x16(vec2(v[src + c], v[src + c + 1u]));
+      vc[(dst + c) >> 1] = packHalf2x16(vec2(v[src + c], v[src + c + 1u]) * vinv);
     return;
   }
 #endif
@@ -144,6 +169,6 @@ void main()
       kc[dst + c] = normed[c];
   if (!isQ)
     for (uint c = t; c < d; c += 128u)
-      vc[dst + c] = v[src + c];
+      vc[dst + c] = v[src + c] * vinv;
 #endif
 }

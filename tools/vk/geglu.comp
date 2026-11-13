@@ -1,0 +1,23 @@
+// LandrixAI - g[i] = gelu_tanh(g[i]) * u[i] over n values: the GeGLU of Gemma
+// (phase D slice D6e2; TInferCpuBackend.GeluTanhGlu in float)
+// - the argument of tanh clamped to +-20, where the CPU takes +-1 (and a
+//   tanh built from exp would overflow to inf / inf on some drivers)
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer BufG { float g[]; };
+layout(std430, binding = 1) readonly buffer BufU { float u[]; };
+
+layout(push_constant) uniform Push { uint n; } p;
+
+void main()
+{
+  uint i = gl_GlobalInvocationID.x;
+  if (i < p.n)
+  {
+    float a = g[i];
+    float t = tanh(clamp(0.7978845608028654 * (a + 0.044715 * a * a * a), -20.0, 20.0));
+    g[i] = (0.5 * a * (1.0 + t)) * u[i];
+  }
+}

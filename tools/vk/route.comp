@@ -4,6 +4,8 @@
 // - the k highest logits, the lower id on a tie - the same experts as the
 //   host for the same logits; the weights softmax / renorm in float (Vulkan
 //   need not have doubles): within a few float steps of the host's
+// - hasScale (Gemma 4, slice D6e2): every weight after the renorm times the
+//   scale of its expert (binding 3), as TDecoderModel.Route
 // - written sorted by id, so the experts are summed in id order as the CPU
 //   does; one invocation (experts <= 4096, k <= 64, checked by the host)
 #version 450
@@ -13,8 +15,9 @@ layout(local_size_x = 32) in;
 layout(std430, binding = 0) readonly buffer BufL { float logits[]; };
 layout(std430, binding = 1) writeonly buffer BufI { int ids[]; };
 layout(std430, binding = 2) writeonly buffer BufW { float w[]; };
+layout(std430, binding = 3) readonly buffer BufS { float scale[]; };
 
-layout(push_constant) uniform Push { uint experts; uint k; uint norm; } p;
+layout(push_constant) uniform Push { uint experts; uint k; uint norm; uint hasScale; } p;
 
 void main()
 {
@@ -47,6 +50,9 @@ void main()
   if (p.norm != 0u)
     for (uint j = 0u; j < p.k; j++)
       wt[j] = wt[j] / picked;
+  if (p.hasScale != 0u)
+    for (uint j = 0u; j < p.k; j++)
+      wt[j] = wt[j] * scale[chosen[j]];
   // by id: an insertion sort of k entries
   for (uint j = 1u; j < p.k; j++)
   {

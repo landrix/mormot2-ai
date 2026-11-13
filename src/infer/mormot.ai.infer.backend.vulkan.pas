@@ -137,10 +137,12 @@ type
     // one buffer, bound whole); x is row s of x when aXPerSlot, else row 0;
     // y receives row s - linear8.comp built with -DIDS
     // - aBias: [experts, aOut] floats, slot s adds row aIds[s]; nil for none
+    // - aBase: the byte of expert 0 in aWeight (Gemma 4: the up rows of an
+    // expert behind its gate rows, both in one buffer); a multiple of 4
     procedure RecordLinearIds(x: TInferVkBuffer; aIn: PtrInt; aType: TInferDType;
       aWeight: TInferVkBuffer; aStride: Int64; aOut: PtrInt; aIds: TInferVkBuffer;
       aSlots: PtrInt; aXPerSlot: boolean; y: TInferVkBuffer; aBarrier: boolean = true;
-      aBias: TInferVkBuffer = nil);
+      aBias: TInferVkBuffer = nil; aBase: Int64 = 0);
     /// the output features of one part of an aOut x aIn matrix of aType on
     // the device: aOut when its bytes fit one binding (maxStorageBufferRange,
     // or MaxLinearBytes), else as many as do - e.g. the 165 MB head of
@@ -200,7 +202,7 @@ type
 
   /// the push constants of linear8.comp built with -DIDS
   TLinearIdsPush = record
-    Rows, InCount, OutCount, DType, HasBias, Stride, XSlot: cardinal;
+    Rows, InCount, OutCount, DType, HasBias, Stride, XSlot, Base: cardinal;
   end;
 
 
@@ -562,7 +564,7 @@ end;
 procedure TInferVulkanBackend.RecordLinearIds(x: TInferVkBuffer; aIn: PtrInt;
   aType: TInferDType; aWeight: TInferVkBuffer; aStride: Int64; aOut: PtrInt;
   aIds: TInferVkBuffer; aSlots: PtrInt; aXPerSlot: boolean; y: TInferVkBuffer;
-  aBarrier: boolean; aBias: TInferVkBuffer);
+  aBarrier: boolean; aBias: TInferVkBuffer; aBase: Int64);
 var
   push: TLinearIdsPush;
   pipe: TInferVkPipeline;
@@ -572,7 +574,8 @@ begin
   // the byte address of a weight is a 32-bit value in the shader
   if not GpuLinearIds(aType, aIn, aWeight) or (aSlots < 1) or (aSlots > 65535) or
      (aOut < 1) or (aStride <= 0) or (aStride > aWeight.Size) or
-     (aStride and 3 <> 0) or (aIds = nil) then
+     (aStride and 3 <> 0) or (aBase < 0) or (aBase >= aWeight.Size) or
+     (aBase and 3 <> 0) or (aIds = nil) then
     raise EInferVulkan.CreateUtf8('%.RecordLinearIds: % slots of % % into %',
       [self, aSlots, aIn, INFER_DTYPE_NAME[aType], aOut]);
   push.Rows := 1;
@@ -582,6 +585,7 @@ begin
   push.HasBias := ord(aBias <> nil);
   push.Stride := aStride;
   push.XSlot := ord(aXPerSlot);
+  push.Base := aBase;
   bias := fNoBias;
   if aBias <> nil then
     bias := aBias;

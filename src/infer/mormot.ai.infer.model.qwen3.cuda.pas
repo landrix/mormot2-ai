@@ -1575,9 +1575,11 @@ begin
       else
         EnqueueDense(aCtx, l, n);
       end;
-      // Gemma: the feed-forward output normed before the residual (the sum
-      // of a dfDenseMoe block always, as TDecoderModel.DenseMoeBlock)
-      if c.SandwichNorm or (c.Spec[l].Ffn = dfDenseMoe) then
+      // Gemma: the feed-forward output normed before the residual - of a
+      // dense block with SandwichNorm, of the sum of a dfDenseMoe block always
+      // (TDecoderModel.DenseBlock, DenseMoeBlock; MoeBlock has none)
+      if (c.SandwichNorm and (c.Spec[l].Ffn = dfDense)) or
+         (c.Spec[l].Ffn = dfDenseMoe) then
         EnqueueNorm(aCtx.fDevTmp, n, h, ly^.FfnNorm, aCtx.fDevTmp);
       // the residual, and the input norm of the next layer - Gemma 4 scales
       // the whole state by the layer scalar in between
