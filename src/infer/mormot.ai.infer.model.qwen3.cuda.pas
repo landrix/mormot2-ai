@@ -319,6 +319,8 @@ const
   SPLIT_GROUPS = 2048;
   /// the threads of a block of tools/cuda/ops.cu
   OPS_BLOCK = 128;
+  // rmsnorm and addnorm: one block of 1024 threads per row (backlog B20)
+  NORM_BLOCK = 1024;
 
 /// a device buffer of at least aBytes, reallocated (content lost) when smaller
 procedure NeedDevice(aCu: TInferCuda; var aBuffer: TInferCuBuffer; aBytes: Int64);
@@ -1012,7 +1014,7 @@ begin
   py := y.Ptr;
   cols := aCols;
   eps := fModel.Config.RmsEps;
-  fCu.Enqueue(fNorm, [@px, @pw, @py, @cols, @eps], aRows, OPS_BLOCK);
+  fCu.Enqueue(fNorm, [@px, @pw, @py, @cols, @eps], aRows, NORM_BLOCK);
 end;
 
 procedure TQwen3Cuda.EnqueueAddNorm(x, t: TInferCuBuffer; aRows, aCols: PtrInt;
@@ -1028,7 +1030,7 @@ begin
   py := y.Ptr;
   cols := aCols;
   eps := fModel.Config.RmsEps;
-  fCu.Enqueue(fAddNorm, [@px, @pt, @pw, @py, @cols, @eps], aRows, OPS_BLOCK);
+  fCu.Enqueue(fAddNorm, [@px, @pt, @pw, @py, @cols, @eps], aRows, NORM_BLOCK);
 end;
 
 // the device address of row aRow of aWidth floats in aBias, 0 for no bias

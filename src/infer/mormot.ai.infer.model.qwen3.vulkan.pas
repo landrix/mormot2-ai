@@ -656,6 +656,7 @@ end;
 constructor TQwen3Vulkan.Create(aModel: TDecoderModel; aBackend: TInferVulkanBackend);
 var
   l, hd: PtrInt;
+  wide: cardinal;
 begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
@@ -712,8 +713,25 @@ begin
   fSplitKeys := SPLIT_KEYS;
   fKvF16 := true;
   fVk := aBackend.Vulkan;
-  fNorm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM, length(SPV_RMSNORM), 3,
-    SizeOf(TNormPush));
+  // the row norms with work groups of 1024 or 512 where the device has them:
+  // a decode step norms one row, so one work group waits out the latency of
+  // its loads (backlog B20: 4 of 25 ms per token of Qwen3.8-27B with 128)
+  wide := 128;
+  if (fVk.MaxInvocations >= 1024) and (fVk.MaxGroupSizeX >= 1024) then
+    wide := 1024
+  else if (fVk.MaxInvocations >= 512) and (fVk.MaxGroupSizeX >= 512) then
+    wide := 512;
+  case wide of
+    1024:
+      fNorm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM1024, length(SPV_RMSNORM1024),
+        3, SizeOf(TNormPush));
+    512:
+      fNorm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM512, length(SPV_RMSNORM512),
+        3, SizeOf(TNormPush));
+  else
+    fNorm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM, length(SPV_RMSNORM), 3,
+      SizeOf(TNormPush));
+  end;
   fSwiGlu := TInferVkPipeline.Create(fVk, @SPV_SWIGLU, length(SPV_SWIGLU), 2,
     SizeOf(TSwiGluPush));
   fAttention := TInferVkPipeline.Create(fVk, @SPV_ATTENTION, length(SPV_ATTENTION),
@@ -787,8 +805,17 @@ begin
     SizeOf(TQkRopePush));
   fQkRope16 := TInferVkPipeline.Create(fVk, @SPV_QKROPE_F16,
     length(SPV_QKROPE_F16), 8, SizeOf(TQkRopePush));
-  fAddNorm := TInferVkPipeline.Create(fVk, @SPV_ADDNORM, length(SPV_ADDNORM), 4,
-    SizeOf(TNormPush));
+  case wide of
+    1024:
+      fAddNorm := TInferVkPipeline.Create(fVk, @SPV_ADDNORM1024,
+        length(SPV_ADDNORM1024), 4, SizeOf(TNormPush));
+    512:
+      fAddNorm := TInferVkPipeline.Create(fVk, @SPV_ADDNORM512, length(SPV_ADDNORM512),
+        4, SizeOf(TNormPush));
+  else
+    fAddNorm := TInferVkPipeline.Create(fVk, @SPV_ADDNORM, length(SPV_ADDNORM), 4,
+      SizeOf(TNormPush));
+  end;
   fQkRope.Name := 'qkrope';
   fQkRope16.Name := 'qkrope';
   fAddNorm.Name := 'addnorm';

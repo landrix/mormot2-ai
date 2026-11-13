@@ -9,6 +9,11 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-13 - B20, part 1: row norms with wide groups.** A decode step norms one row, so one
+  work group of 128 waited out the latency of its loads (`addnorm` 4 of 25 ms per token of
+  Qwen3.8-27B). `rmsnorm` and `addnorm` now run with 1024 threads on CUDA and with 1024 or 512
+  invocations on Vulkan where the device allows it: Qwen3.8-27B decode on an RTX 5090 from 36.1
+  to 40.6 tokens/s (CUDA, Q4_K_M) and from 39.4 to 44.6 (Vulkan).
 - **2026-11-13 - B18 (issue #1): several heads on the device, a head index per call.**
   `CreateStack` takes a list of heads, `ForwardEmbeds(..., aHead)` picks one per call on the
   CPU, Vulkan and CUDA - the product stays in the pass. Qwen3-TTS's code predictor runs its

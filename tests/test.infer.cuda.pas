@@ -902,7 +902,9 @@ var
     CheckUtf8(e <= aTol, '%: relative error %', [aWhat, e]);
   end;
 
-  procedure NormAndAdd(aRows, aCols: PtrInt);
+  // aBlock threads per row: any multiple of 32 (TQwen3Cuda starts 1024,
+  // backlog B20)
+  procedure NormAndAdd(aRows, aCols, aBlock: PtrInt);
   var
     x, t, w, y, xc, yc: TSingleDynArray;
     px, pt, pw, py: TCuDevicePtr;
@@ -920,20 +922,20 @@ var
     px := Up(x);
     pw := Up(w);
     py := Up(y);
-    fCu.Enqueue(kNorm, [@px, @pw, @py, @cols, @eps], aRows, 128);
+    fCu.Enqueue(kNorm, [@px, @pw, @py, @cols, @eps], aRows, aBlock);
     Down(py, yc);
     ref.RmsNorm(pointer(x), aRows, aCols, pointer(w), eps, pointer(y));
-    Near(yc, y, 1e-5, FormatUtf8('rmsnorm % x %', [aRows, aCols]));
+    Near(yc, y, 1e-5, FormatUtf8('rmsnorm % x % by %', [aRows, aCols, aBlock]));
     // addnorm: x += t, then the norm of x
     pt := Up(t);
-    fCu.Enqueue(kAdd, [@px, @pt, @pw, @py, @cols, @eps], aRows, 128);
+    fCu.Enqueue(kAdd, [@px, @pt, @pw, @py, @cols, @eps], aRows, aBlock);
     SetLength(xc, aRows * aCols);
     Down(px, xc);
     Down(py, yc);
     ref.Add(pointer(x), pointer(t), aRows * aCols);
     ref.RmsNorm(pointer(x), aRows, aCols, pointer(w), eps, pointer(y));
-    Near(xc, x, 1e-6, FormatUtf8('addnorm residual % x %', [aRows, aCols]));
-    Near(yc, y, 1e-5, FormatUtf8('addnorm % x %', [aRows, aCols]));
+    Near(xc, x, 1e-6, FormatUtf8('addnorm residual % x % by %', [aRows, aCols, aBlock]));
+    Near(yc, y, 1e-5, FormatUtf8('addnorm % x % by %', [aRows, aCols, aBlock]));
   end;
 
   // aLimit > 0: the clamped SwiGLU of gpt-oss
@@ -1357,8 +1359,11 @@ begin
     kQk16 := ops.Kernel('qkrope16');
     kAtt16 := ops.Kernel('attention16');
     kAtt512_16 := ops.Kernel('attention512_16');
-    NormAndAdd(5, 1024);
-    NormAndAdd(3, 100); // no multiple of the block
+    NormAndAdd(5, 1024, 128);
+    NormAndAdd(3, 100, 128); // no multiple of the block
+    NormAndAdd(1, 5120, 1024); // a decode step as TQwen3Cuda runs it
+    NormAndAdd(3, 1000, 512);
+    NormAndAdd(2, 77, 160); // fewer values than threads, 5 warps
     SwiGluCase(100003);
     SwiGluCase(100003, 1.702, 7);   // gpt-oss
     SwiGluCase(1000, 1.702, 0.8);   // the tiny model: most values clamped

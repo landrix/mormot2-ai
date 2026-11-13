@@ -26,18 +26,24 @@ CHANGELOG nennt den erledigten Teil, hier steht der offene Rest unter derselben 
 
 ---
 
-## B20 — Decode großer Modelle weit unter der Bandbreite der GPU (aufgenommen 2026-11-13)
+## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teil 1 erledigt)
 
-Anlass: B19. Qwen3.8-27B dekodiert auf der RTX 5090 (1,8 TB/s) in Q4_K_M mit 27,7 ms je Token
-(CUDA) bzw. 25,4 ms (Vulkan), in Q8_0 mit 27,4 bzw. 25,3 ms. Q4_K_M liest nur gut halb so viele
-Bytes (rund 16,5 statt 28,6 GB) und ist trotzdem nicht schneller; die Grenze der Bandbreite
-läge bei etwa 9 bzw. 16 ms. CUDA liegt bei beiden Formaten rund 2 ms je Token hinter Vulkan.
+Anlass: B19. Erster Teil erledigt 2026-11-13 (`CHANGELOG.md`, `native-inference.md`): Die
+Normen einer Zeile laufen beim Decode mit Gruppen von 1024 (CUDA, Vulkan wo möglich);
+Qwen3.8-27B auf der RTX 5090 von 36 bis 39 auf 41 bis 45 Tokens/s.
 
-*Nächster Schritt:* messen, wohin die Zeit eines Tokens geht - `LAI_VULKAN_PROFILE` für Vulkan,
-für CUDA fehlt eine Zeitmessung je Kernel (Events um die Kernel des Graphen, oder ein Lauf ohne
-Graph). Verdächtig: `linear8` holt je Warp und Schritt nur einen Q4_K-Block (144 Bytes), also
-wenige Ladevorgänge gleichzeitig; die DeltaNet-Layer; die Zahl der Kernel je Token. Übernahme
-nur mit Messung.
+Offen, nach dem Vulkan-Profil von Qwen3.8-27B (nach Teil 1 rund 22,4 ms je Token, davon `linear` 18,8 ms):
+- **Q4_K bleibt hinter der Bandbreite:** Die Q4_K_M-Datei von ggml-org lädt 18,6 GB (viele
+  Matrizen in Q8_0), die Q8_0-Datei 27,4 GB; beide brauchen für die Matrixprodukte gleich
+  lange. Q8_0 erreicht so rund 1,46 TB/s (80 % der 1,8 TB/s), Q4_K_M nur rund 0,98 TB/s.
+  Verdächtig: `linear8` holt je Warp und Schritt nur einen Q4_K-Block (144 Bytes), also wenige
+  Ladevorgänge gleichzeitig; mehr Blöcke je Schritt oder je Invocation probieren.
+- **Weitere Reduktionen über eine Zeile mit 128:** die Norm je Kopf (`qkrope`), `gatednorm`
+  der DeltaNet-Layer, `gatherrows`/`scatteradd` - nur, wenn das Profil sie zeigt.
+- **CUDA:** keine Zeitmessung je Kernel (Events um die Kernel des Graphen, oder ein Lauf ohne
+  Graph); CUDA liegt bei beiden Formaten rund 2 ms je Token hinter Vulkan.
+
+Übernahme nur mit Messung.
 
 ---
 

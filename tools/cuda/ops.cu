@@ -3,7 +3,8 @@
 // qkrope.comp, swiglu.comp, attention.comp and attnmerge.comp (slice C5)
 // - float arithmetic as the Vulkan shaders: the logits match the CPU within a
 //   tolerance, not in bits
-// - every block reducing over a row has 128 threads (four warps)
+// - every block reducing over a row has 128 threads (four warps), but rmsnorm
+//   and addnorm: any multiple of 32, TQwen3Cuda starts 1024 (backlog B20)
 // - fill0, gatherrows and scatteradd: a mixture of experts (phase D, D3)
 // - qkrope16 and attention16: the same with the KV cache in half floats
 //   (TQwen3Cuda.KvF16), converted by cvt (no cuda_fp16.h needed)
@@ -80,6 +81,22 @@ __device__ float blockSum(float v, float* shared4)
   return shared4[0] + shared4[1] + shared4[2] + shared4[3];
 }
 
+// the sum of v over a block of any multiple of 32 threads up to 1024 (the row
+// norms, backlog B20); with 128 the very sums of blockSum
+__device__ float blockSumN(float v, float* shared32)
+{
+  for (unsigned int off = 16u; off > 0u; off >>= 1)
+    v += __shfl_down_sync(0xffffffffu, v, off);
+  __syncthreads(); // shared32 may still be read from a previous call
+  if ((threadIdx.x & 31u) == 0u)
+    shared32[threadIdx.x >> 5] = v;
+  __syncthreads();
+  float s = shared32[0];
+  for (unsigned int i = 1u; i < (blockDim.x >> 5); i++)
+    s += shared32[i];
+  return s;
+}
+
 // the maximum of v over the block
 __device__ float blockMax(float v, float* shared4)
 {
@@ -93,38 +110,42 @@ __device__ float blockMax(float v, float* shared4)
 }
 
 // y[r] = w * x[r] / sqrt(mean(x[r]^2) + eps), one block per row; y may be x
+// - any block of a multiple of 32 threads: TQwen3Cuda starts 1024 (backlog
+//   B20: a decode step norms one row, so one block waits out the latency of
+//   its loads - the more threads, the fewer loads each one makes in turn)
 extern "C" __global__ void rmsnorm(const float* x, const float* w, float* y,
   unsigned int cols, float eps)
 {
-  __shared__ float part[4];
+  __shared__ float part[32];
   unsigned long long base = (unsigned long long)blockIdx.x * cols;
   float s = 0.0f;
-  for (unsigned int c = threadIdx.x; c < cols; c += BLOCK)
+  for (unsigned int c = threadIdx.x; c < cols; c += blockDim.x)
   {
     float a = x[base + c];
     s += a * a;
   }
-  float inv = rsqrtf(blockSum(s, part) / float(cols) + eps);
-  for (unsigned int c = threadIdx.x; c < cols; c += BLOCK)
+  float inv = rsqrtf(blockSumN(s, part) / float(cols) + eps);
+  for (unsigned int c = threadIdx.x; c < cols; c += blockDim.x)
     y[base + c] = w[c] * (x[base + c] * inv);
 }
 
 // x[r] += t[r], then y[r] = w * x[r] / rms(x[r]): the residual and the next
-// norm in one launch, one block per row
-extern "C" __global__ void addnorm(float* x, const float* t, const float* w,
-  float* y, unsigned int cols, float eps)
+// norm in one launch, one block per row (any multiple of 32 threads, as
+// rmsnorm); the four buffers never overlap (__restrict__)
+extern "C" __global__ void addnorm(float* __restrict__ x, const float* __restrict__ t,
+  const float* __restrict__ w, float* __restrict__ y, unsigned int cols, float eps)
 {
-  __shared__ float part[4];
+  __shared__ float part[32];
   unsigned long long base = (unsigned long long)blockIdx.x * cols;
   float s = 0.0f;
-  for (unsigned int c = threadIdx.x; c < cols; c += BLOCK)
+  for (unsigned int c = threadIdx.x; c < cols; c += blockDim.x)
   {
     float a = x[base + c] + t[base + c];
     x[base + c] = a;
     s += a * a;
   }
-  float inv = rsqrtf(blockSum(s, part) / float(cols) + eps);
-  for (unsigned int c = threadIdx.x; c < cols; c += BLOCK)
+  float inv = rsqrtf(blockSumN(s, part) / float(cols) + eps);
+  for (unsigned int c = threadIdx.x; c < cols; c += blockDim.x)
     y[base + c] = w[c] * (x[base + c] * inv);
 }
 

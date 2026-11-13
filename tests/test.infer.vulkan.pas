@@ -194,6 +194,10 @@ type
     // (SPV_ATTENTION512) and with a scale of its own, both with a cache of
     // floats and of half floats; geglu.comp and scale.comp
     procedure Gemma4OpsMatchCpu;
+    /// B20: rmsnorm.comp and addnorm.comp in every build the device can run
+    // (work groups of 128, 512, 1024) against the CPU - rows of a decode step
+    // and of a prefill, widths that are no multiple of the group
+    procedure RowNormsMatchCpu;
     /// D6e2: tiny Gemma 4 on the device against the CPU - the model with
     // experts beside the dense block in F32 (a cache of floats and of half
     // floats), Q8_0 at load, the dense model, the tiny GGUF files (routed on
@@ -3484,6 +3488,129 @@ begin
   end;
 end;
 
+
+procedure TTestInferVulkan.RowNormsMatchCpu;
+type
+  TNormPush = record
+    Rows, Cols: cardinal;
+    Eps: single;
+  end;
+const
+  ROWS: array[0..2] of PtrInt = (1, 3, 1);
+  COLS: array[0..2] of PtrInt = (5120, 1000, 77);
+  GROUP_SIZES: array[0..2] of PtrInt = (128, 512, 1024);
+var
+  ref: TInferCpuBackend;
+  g, k, r, c, i, groups: PtrInt;
+  norm, add: TInferVkPipeline;
+  x, t, w, y, xc, yc, xs: TSingleDynArray;
+  bx, bt, bw, by: TInferVkBuffer;
+  push: TNormPush;
+  e: double;
+
+  function Up(const v: TSingleDynArray): TInferVkBuffer;
+  begin
+    result := TInferVkBuffer.Create(fVk, length(v) * 4, true);
+    fVk.Upload(result, 0, pointer(v), length(v) * 4);
+  end;
+
+begin
+  if not HasDevice then
+    exit;
+  ref := TInferCpuBackend.Create;
+  try
+    for g := 0 to high(GROUP_SIZES) do
+    begin
+      groups := GROUP_SIZES[g];
+      if (fVk.MaxInvocations < cardinal(groups)) or
+         (fVk.MaxGroupSizeX < cardinal(groups)) then
+        continue;
+      norm := nil;
+      add := nil;
+      try
+        case g of
+          0:
+            begin
+              norm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM, length(SPV_RMSNORM), 3,
+                SizeOf(TNormPush));
+              add := TInferVkPipeline.Create(fVk, @SPV_ADDNORM, length(SPV_ADDNORM), 4,
+                SizeOf(TNormPush));
+            end;
+          1:
+            begin
+              norm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM512,
+                length(SPV_RMSNORM512), 3, SizeOf(TNormPush));
+              add := TInferVkPipeline.Create(fVk, @SPV_ADDNORM512,
+                length(SPV_ADDNORM512), 4, SizeOf(TNormPush));
+            end;
+        else
+          begin
+            norm := TInferVkPipeline.Create(fVk, @SPV_RMSNORM1024,
+              length(SPV_RMSNORM1024), 3, SizeOf(TNormPush));
+            add := TInferVkPipeline.Create(fVk, @SPV_ADDNORM1024,
+              length(SPV_ADDNORM1024), 4, SizeOf(TNormPush));
+          end;
+        end;
+        for k := 0 to high(ROWS) do
+        begin
+          r := ROWS[k];
+          c := COLS[k];
+          Fill(x, r * c, 61 + k, 3);
+          Fill(t, r * c, 62 + k, 3);
+          Fill(w, c, 63 + k, 1);
+          push.Rows := r;
+          push.Cols := c;
+          push.Eps := 1e-6;
+          bx := Up(x);
+          bt := Up(t);
+          bw := Up(w);
+          by := TInferVkBuffer.Create(fVk, r * c * 4, true);
+          try
+            // rmsnorm: y = norm(x)
+            fVk.Run(norm, [bx, bw, by], @push, r);
+            SetLength(yc, r * c);
+            fVk.Download(by, 0, pointer(yc), r * c * 4);
+            SetLength(y, r * c);
+            ref.RmsNorm(pointer(x), r, c, pointer(w), push.Eps, pointer(y));
+            e := RelError(pointer(yc), pointer(y), r * c);
+            CheckUtf8(e <= 1e-5, 'rmsnorm % x % in groups of %: relative error %',
+              [r, c, groups, e]);
+            // addnorm: x += t, y = norm(x)
+            fVk.Run(add, [bx, bt, bw, by], @push, r);
+            SetLength(xc, r * c);
+            fVk.Download(bx, 0, pointer(xc), r * c * 4);
+            fVk.Download(by, 0, pointer(yc), r * c * 4);
+            xs := copy(x);
+            for i := 0 to r * c - 1 do
+              xs[i] := xs[i] + t[i];
+            ref.RmsNorm(pointer(xs), r, c, pointer(w), push.Eps, pointer(y));
+            CheckUtf8(CompareMem(pointer(xc), pointer(xs), r * c * 4),
+              'addnorm % x % in groups of %: the residual', [r, c, groups]);
+            e := RelError(pointer(yc), pointer(y), r * c);
+            CheckUtf8(e <= 1e-5, 'addnorm % x % in groups of %: relative error %',
+              [r, c, groups, e]);
+            // rmsnorm in place (y = x, as RecordNorm may run it)
+            fVk.Run(norm, [bx, bw, bx], @push, r);
+            fVk.Download(bx, 0, pointer(xc), r * c * 4);
+            e := RelError(pointer(xc), pointer(y), r * c);
+            CheckUtf8(e <= 1e-5, 'rmsnorm % x % in place in groups of %: relative error %',
+              [r, c, groups, e]);
+          finally
+            by.Free;
+            bw.Free;
+            bt.Free;
+            bx.Free;
+          end;
+        end;
+      finally
+        add.Free;
+        norm.Free;
+      end;
+    end;
+  finally
+    ref.Free;
+  end;
+end;
 
 procedure TTestInferVulkan.Gemma4OpsMatchCpu;
 type

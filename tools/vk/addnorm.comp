@@ -1,29 +1,38 @@
 // LandrixAI - the residual and the next RMSNorm in one dispatch (phase 4e of
 // docs/native-inference.md): x[r] += t[r], then y[r] = w * x[r] / rms(x[r]) -
 // add.comp followed by rmsnorm.comp, same arithmetic
-// - one work group of 128 per row
+// - one work group of LOCAL per row: 128 (every device), or 512 or 1024
+//   where the device allows it (SPV_ADDNORM512 / 1024, backlog B20): a
+//   decode step has one row, so one work group reads it - each invocation
+//   waits out the latency of its loads, LOCAL decides how many it does one
+//   after the other
+// - the four buffers never overlap (restrict): loads may pass the stores
 #version 450
 
-layout(local_size_x = 128) in;
+#ifndef LOCAL
+#define LOCAL 128
+#endif
 
-layout(std430, binding = 0) buffer BufX { float x[]; };
-layout(std430, binding = 1) readonly buffer BufT { float tt[]; };
-layout(std430, binding = 2) readonly buffer BufW { float w[]; };
-layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
+layout(local_size_x = LOCAL) in;
+
+layout(std430, binding = 0) restrict buffer BufX { float x[]; };
+layout(std430, binding = 1) restrict readonly buffer BufT { float tt[]; };
+layout(std430, binding = 2) restrict readonly buffer BufW { float w[]; };
+layout(std430, binding = 3) restrict writeonly buffer BufY { float y[]; };
 
 layout(push_constant) uniform Push {
   uint rows, cols;
   float eps;
 } p;
 
-shared float partial[128];
+shared float partial[LOCAL];
 
 void main()
 {
   uint t = gl_LocalInvocationID.x;
   uint base = gl_WorkGroupID.x * p.cols;
   float s = 0.0;
-  for (uint c = t; c < p.cols; c += 128u)
+  for (uint c = t; c < p.cols; c += uint(LOCAL))
   {
     float a = x[base + c] + tt[base + c];
     x[base + c] = a;
@@ -31,13 +40,13 @@ void main()
   }
   partial[t] = s;
   barrier();
-  for (uint h = 64u; h > 0u; h >>= 1)
+  for (uint h = uint(LOCAL) / 2u; h > 0u; h >>= 1)
   {
     if (t < h)
       partial[t] += partial[t + h];
     barrier();
   }
   float inv = inversesqrt(partial[0] / float(p.cols) + p.eps);
-  for (uint c = t; c < p.cols; c += 128u)
+  for (uint c = t; c < p.cols; c += uint(LOCAL))
     y[base + c] = w[c] * (x[base + c] * inv);
 }

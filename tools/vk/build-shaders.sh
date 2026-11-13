@@ -42,6 +42,14 @@ done
 "$GLSLANG" -V --target-env vulkan1.0 -Os -DMAXQ=4 -DNV=4 -o "$TMP/attention512.spv" attention.comp > "$TMP/attention512.log" || { cat "$TMP/attention512.log"; exit 1; }
 "$GLSLANG" -V --target-env vulkan1.0 -Os -DMAXQ=4 -DNV=4 -DKVF16 -o "$TMP/attention512_f16.spv" attention.comp > "$TMP/attention512_f16.log" || { cat "$TMP/attention512_f16.log"; exit 1; }
 ARGS+=("SPV_ATTENTION512=$TMP/attention512.spv" "SPV_ATTENTION512_F16=$TMP/attention512_f16.spv")
+# the row norms with work groups of 512 and 1024 (backlog B20), where the
+# device has them
+for n in addnorm rmsnorm; do
+  for g in 512 1024; do
+    "$GLSLANG" -V --target-env vulkan1.0 -Os -DLOCAL=$g -o "$TMP/${n}$g.spv" $n.comp > "$TMP/${n}$g.log" || { cat "$TMP/${n}$g.log"; exit 1; }
+    ARGS+=("SPV_$(echo "$n" | tr a-z A-Z)$g=$TMP/${n}$g.spv")
+  done
+done
 # matvec8.comp once per weight type (2 Q8_0, 3 Q4_K, 4 Q6_K), with and without
 # subgroup reductions
 for t in 2:Q8 3:Q4K 4:Q6K; do

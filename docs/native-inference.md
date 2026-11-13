@@ -1819,6 +1819,45 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B20, Teil 1 erledigt (2026-11-13): die Normen einer Zeile in breiten Gruppen.** Anlass war
+B19: Qwen3.8-27B dekodierte auf beiden Backends weit unter der Bandbreite der RTX 5090.
+
+- *Messung (`LAI_VULKAN_PROFILE`, Qwen3.8-27B, Decode 32 Tokens, je Token):* rund 25 ms, davon
+  `linear` 18,8 ms (75 %), `addnorm` 4,0 ms (16 %, 127 Aufrufe zu rund 31 µs), der Rest je unter
+  0,4 ms; `rmsnorm` rund 24 µs je Aufruf. Beide Dateien gleich: Die Q4_K_M-Datei von ggml-org
+  lädt 18,6 GB (viele Matrizen in Q8_0), nicht die angenommenen 16,5 GB.
+- *Ursache:* `addnorm.comp`/`rmsnorm.comp` und die CUDA-Kernel rechnen eine Zeile in einer
+  Gruppe von 128. Beim Decode ist es eine Zeile, also eine Gruppe; jede Invocation macht bei
+  5120 Werten 40 Runden nacheinander und wartet jedes Mal die Latenz ab (in `addnorm` zudem
+  Schreiben und Lesen derselben Puffer, die der Compiler nicht umordnen durfte).
+- *Änderung:*
+  - **Vulkan:** `LOCAL` als Define (Vorgabe 128), Builds mit 512 und 1024
+    (`SPV_ADDNORM512/1024`, `SPV_RMSNORM512/1024`); `TQwen3Vulkan` nimmt 1024, sonst 512, sonst
+    128 nach `MaxInvocations` und `MaxGroupSizeX`. Die Puffer von `addnorm` sind `restrict`
+    (sie überlappen nie).
+  - **CUDA:** `blockSumN` für jede Blockgröße aus Vielfachen von 32 bis 1024 (mit 128 dieselben
+    Summen wie `blockSum`), `rmsnorm` und `addnorm` laufen mit `NORM_BLOCK` = 1024 Threads,
+    `addnorm` mit `__restrict__`.
+- *Tempo (RTX 5090, `llm-bench` 200 Tokens Prompt, 64 Tokens Decode, Tokens/s):*
+  - **CUDA:** Q4_K_M 36,1 → 40,6, Q8_0 36,5 → 41,3.
+  - **Vulkan:** Q4_K_M 39,4 → 44,6, Q8_0 39,4 → 45,0.
+  - Ein `addnorm` braucht auf Vulkan noch rund 8 µs (1024) statt 31 µs.
+- *Tests:* `TTestInferVulkan.RowNormsMatchCpu` (neu): `rmsnorm` und `addnorm` in jeder Gruppe,
+  die das Gerät kann, gegen die CPU - eine Zeile von 5120, drei von 1000, eine von 77, `rmsnorm`
+  auch an Ort und Stelle; der CUDA-Op-Test rechnet die Normen mit 128, 512, 1024 und 160
+  Threads.
+- *Gegenprobe:* eine Reduktion ab `LOCAL / 4` (Vulkan) und eine Summe über nur 4 Warps (CUDA)
+  lassen 95 (Vulkan) und 101 (CUDA) Assertions scheitern, quer durch alle Modelle.
+- *Läufe:* RTX 5090 FPC 0 / 16.760, Delphi 13 0 / 16.760, Delphi 7 0 / 6.124; Mac M2 Pro
+  (FPC, MoltenVK): `infer.tests` 0 / 8.280, `llm.tests` 0 / 730,
+  `RowNormsMatchCpu` in allen drei Gruppen (128, 512, 1024).
+- *Review* (Claude-Finder und Codex): keine Fehler. Ergänzt: Op-Tests in allen Blockgrößen
+  (CUDA) und an Ort und Stelle (Vulkan), eine Pipeline im Test bei einem Fehler freigegeben, ein
+  veralteter Kommentar in `ops.cu`. Als weitere Kandidaten genannt: die Norm je Kopf, `gatednorm`,
+  `gatherrows`/`scatteradd` (Backlog B20).
+- *Offen (Backlog B20):* Q4_K erreicht in den Matrixprodukten nur rund 0,98 TB/s gegen 1,46 TB/s
+  bei Q8_0.
+
 **B18 erledigt (2026-11-13): mehrere Köpfe auf dem Gerät, Kopf-Index je Aufruf.** Anlass war
 Issue #1 (flydev): Der Code-Predictor von Qwen3-TTS nimmt je Schritt einen anderen seiner 15
 Köpfe. Bisher lud man den Stapel ohne Kopf, holte die normierte Zeile zurück und rechnete den

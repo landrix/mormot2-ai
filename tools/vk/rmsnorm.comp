@@ -1,9 +1,15 @@
 // LandrixAI - y[r] = w * x[r] / sqrt(mean(x[r]^2) + eps) on the device, row by
 // row (phase 4c of docs/native-inference.md; TInferCpuBackend.RmsNorm in float)
-// - one work group of 128 per row; y may be x (in place)
+// - one work group of LOCAL per row: 128 (every device), or 512 or 1024
+//   where the device allows it (SPV_RMSNORM512 / 1024, backlog B20, as
+//   addnorm.comp); y may be x (in place)
 #version 450
 
-layout(local_size_x = 128) in;
+#ifndef LOCAL
+#define LOCAL 128
+#endif
+
+layout(local_size_x = LOCAL) in;
 
 layout(std430, binding = 0) buffer BufX { float x[]; };
 layout(std430, binding = 1) readonly buffer BufW { float w[]; };
@@ -14,27 +20,27 @@ layout(push_constant) uniform Push {
   float eps;
 } p;
 
-shared float partial[128];
+shared float partial[LOCAL];
 
 void main()
 {
   uint t = gl_LocalInvocationID.x;
   uint base = gl_WorkGroupID.x * p.cols;
   float s = 0.0;
-  for (uint c = t; c < p.cols; c += 128u)
+  for (uint c = t; c < p.cols; c += uint(LOCAL))
   {
     float a = x[base + c];
     s += a * a;
   }
   partial[t] = s;
   barrier();
-  for (uint h = 64u; h > 0u; h >>= 1)
+  for (uint h = uint(LOCAL) / 2u; h > 0u; h >>= 1)
   {
     if (t < h)
       partial[t] += partial[t + h];
     barrier();
   }
   float inv = inversesqrt(partial[0] / float(p.cols) + p.eps);
-  for (uint c = t; c < p.cols; c += 128u)
+  for (uint c = t; c < p.cols; c += uint(LOCAL))
     y[base + c] = w[c] * (x[base + c] * inv);
 }
