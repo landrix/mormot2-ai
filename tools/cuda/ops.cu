@@ -7,6 +7,10 @@
 // - fill0, gatherrows and scatteradd: a mixture of experts (phase D, D3)
 // - qkrope16 and attention16: the same with the KV cache in half floats
 //   (TQwen3Cuda.KvF16), converted by cvt (no cuda_fp16.h needed)
+// - Gemma 4 (phase D, slice D6e1): heads of up to 512 values (qkrope, and
+//   attention512 / attention512_16), the value norm (qkrope with vnorm), a
+//   scale of the attention scores of its own, geglu, scale (the layer
+//   scalar) and the expert scales in route
 
 #define BLOCK 128u
 
@@ -152,6 +156,27 @@ extern "C" __global__ void swiglu(float* g, const float* u, unsigned int n,
   }
 }
 
+// g = gelu_tanh(g) * u over n values (GeGLU of Gemma, slice D6e1): the
+// steps of TInferCpuBackend.GeluTanhGlu in float
+extern "C" __global__ void geglu(float* g, const float* u, unsigned int n)
+{
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+  {
+    float a = g[i];
+    float t = tanhf(0.7978845608028654f * (a + 0.044715f * a * a * a));
+    g[i] = (0.5f * a * (1.0f + t)) * u[i];
+  }
+}
+
+// x[i] *= s over n values (the layer scalar of Gemma 4, slice D6e1)
+extern "C" __global__ void scale(float* x, unsigned int n, float s)
+{
+  unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    x[i] = x[i] * s;
+}
+
 // per token row (grid y) and head (grid x: the heads, then the KV heads):
 // RMSNorm of q (qn) or k (kn) when norm is set (Qwen3; Qwen2 has none: qn
 // and kn are not read), rotary positions unless rope is 0 (a NoPE layer,
@@ -159,16 +184,18 @@ extern "C" __global__ void swiglu(float* g, const float* u, unsigned int n,
 // sin), q in place, k and v stored into the cache at past + row
 // - rot: the first rot values of a head rotate (rotate_half within them, cs
 //   holds rot / 2 per row), the others pass (Qwen3.5, slice D7e1); 0: all
-// - headDim <= 256, even; T: the type of the cache (float or half float)
+// - vnorm (Gemma 4, slice D6e1): v stored as an RMSNorm without weight of
+//   each KV head; v may be k (K=V: the raw keys, which are only read)
+// - headDim <= 512, even; T: the type of the cache (float or half float)
 template <typename T>
 __device__ __forceinline__ void qkropeT(float* q, const float* k,
   const float* v, const float* qn, const float* kn, const float* cs, T* kc,
   T* vc, unsigned int rows, unsigned int heads, unsigned int kvHeads,
   unsigned int headDim, unsigned int past, float eps, unsigned int norm,
-  unsigned int rope, unsigned int rot)
+  unsigned int rope, unsigned int rot, unsigned int vnorm)
 {
   __shared__ float part[4];
-  __shared__ float normed[256];
+  __shared__ float normed[512];
   unsigned int t = threadIdx.x;
   unsigned int r = blockIdx.y;
   unsigned int hh = blockIdx.x;
@@ -226,28 +253,43 @@ __device__ __forceinline__ void qkropeT(float* q, const float* k,
     else
       store(kc, dst + c, normed[c]);
   if (!isQ)
+  {
+    // the value norm: the sum of squares of the head of v (a block of a KV
+    // head: every thread of it takes part in blockSum)
+    float vinv = 1.0f;
+    if (vnorm)
+    {
+      float sv = 0.0f;
+      for (unsigned int c = t; c < d; c += BLOCK)
+      {
+        float a = v[src + c];
+        sv += a * a;
+      }
+      vinv = rsqrtf(blockSum(sv, part) / float(d) + eps);
+    }
     for (unsigned int c = t; c < d; c += BLOCK)
-      store(vc, dst + c, v[src + c]);
+      store(vc, dst + c, vnorm ? v[src + c] * vinv : v[src + c]);
+  }
 }
 
 extern "C" __global__ void qkrope(float* q, const float* k, const float* v,
   const float* qn, const float* kn, const float* cs, float* kc, float* vc,
   unsigned int rows, unsigned int heads, unsigned int kvHeads,
   unsigned int headDim, unsigned int past, float eps, unsigned int norm,
-  unsigned int rope, unsigned int rot)
+  unsigned int rope, unsigned int rot, unsigned int vnorm)
 {
   qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
-    eps, norm, rope, rot);
+    eps, norm, rope, rot, vnorm);
 }
 
 extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
   const float* qn, const float* kn, const float* cs, unsigned short* kc,
   unsigned short* vc, unsigned int rows, unsigned int heads,
   unsigned int kvHeads, unsigned int headDim, unsigned int past, float eps,
-  unsigned int norm, unsigned int rope, unsigned int rot)
+  unsigned int norm, unsigned int rope, unsigned int rot, unsigned int vnorm)
 {
   qkropeT(q, k, v, qn, kn, cs, kc, vc, rows, heads, kvHeads, headDim, past,
-    eps, norm, rope, rot);
+    eps, norm, rope, rot, vnorm);
 }
 
 // causal attention with grouped-query heads - the CUDA form of
@@ -264,9 +306,12 @@ extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
 //   splits > 1: each range writes its unnormalized sums, its maximum and its
 //   sum of exponentials to part[] ([heads, rows, splits, headDim + 2]), and
 //   attnmerge combines them into y
-// - headDim a multiple of 4 and at most 256 (the queries kept as float4, each
-//   thread owns the output dimensions t and t + 128); keys 16-byte aligned
-//   (8 for half floats); T: the type of the cache
+// - headDim a multiple of 4 and at most 128 * NV (the queries kept as float4,
+//   each thread owns the output dimensions t, t + 128 .. t + 128 (NV - 1)):
+//   attention and attention16 up to 256, attention512 and attention512_16 up
+//   to 512 (Gemma 4, slice D6e1); keys 16-byte aligned (8 for half floats);
+//   T: the type of the cache
+// - scale: the factor of the scores, 0 for 1 / sqrt(headDim) (Gemma 4: 1)
 // - window > 0 (backlog D4b): row r sees only the keys past + r - window + 1 ..
 //   past + r; the cache holds every row, the ranges start at the window
 // - a block sums the values of all keys lo .. hi of its queries, those
@@ -283,14 +328,14 @@ extern "C" __global__ void qkrope16(float* q, const float* k, const float* v,
 #define MAXQ 8
 #define NEG -3.402823466e38f
 
-template <typename T>
+template <typename T, unsigned int NV>
 __device__ __forceinline__ void attentionT(const float* q, const T* keys,
   const T* vals, float* y, float* part, unsigned int rows,
   unsigned int heads, unsigned int headDim, unsigned int kvHeads,
   unsigned int past, unsigned int splits, unsigned int headBlock,
-  unsigned int rowBlock, unsigned int window, const float* sinks)
+  unsigned int rowBlock, unsigned int window, const float* sinks, float scale)
 {
-  __shared__ float4 qs[MAXQ * 64];   // the queries
+  __shared__ float4 qs[MAXQ * 32 * NV]; // the queries
   __shared__ float ps[MAXQ * 128];   // the scores, then the weights of a tile
   __shared__ float red[MAXQ * 128];  // the maximum of a tile
   unsigned int t = threadIdx.x;
@@ -305,13 +350,14 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
   unsigned int g = h0 / (heads / kvHeads);
   // query i: head h0 + i % hb, row r0 + i / hb
   unsigned int nq = hb * min(rowBlock, rows - r0);
-  float scale = rsqrtf(float(d));
+  if (scale == 0.0f)
+    scale = rsqrtf(float(d));
   for (unsigned int i = t; i < nq * d4; i += BLOCK)
   {
     unsigned int qi = i / d4;
     unsigned int k = i - qi * d4;
     unsigned long long qb = (r0 + qi / hb) * qw + (h0 + qi % hb) * d + 4u * k;
-    qs[qi * 64u + k] = make_float4(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]);
+    qs[qi * 32u * NV + k] = make_float4(q[qb], q[qb + 1u], q[qb + 2u], q[qb + 3u]);
   }
   // the keys j0 .. j1 - 1 of each query in this split (empty for a late
   // split of an early row); both grow with the row, the block reads lo .. hi
@@ -336,14 +382,15 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
     }
   }
   __syncthreads();
-  float m[MAXQ], l[MAXQ], acc0[MAXQ], acc1[MAXQ];
+  float m[MAXQ], l[MAXQ], acc[MAXQ][NV];
 #pragma unroll
   for (unsigned int i = 0u; i < MAXQ; i++)
   {
     m[i] = NEG;
     l[i] = 0.0f;
-    acc0[i] = 0.0f;
-    acc1[i] = 0.0f;
+#pragma unroll
+    for (unsigned int c = 0u; c < NV; c++)
+      acc[i][c] = 0.0f;
   }
   unsigned long long vk = (unsigned long long)g * d + t;
   for (unsigned int base = lo; base < hi; base += BLOCK)
@@ -365,7 +412,7 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
         for (unsigned int i = 0u; i < MAXQ; i++)
           if (i < nq)
           {
-            float4 qv = qs[i * 64u + k];
+            float4 qv = qs[i * 32u * NV + k];
             sv[i] += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
           }
       }
@@ -394,8 +441,9 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
     {
       float mn = fmaxf(m[i], red[i * 128u]);
       float f = expf(m[i] - mn);
-      acc0[i] *= f;
-      acc1[i] *= f;
+#pragma unroll
+      for (unsigned int c = 0u; c < NV; c++)
+        acc[i][c] *= f;
       l[i] *= f;
       m[i] = mn;
       float e = 0.0f;
@@ -410,19 +458,22 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
     for (unsigned int jj = 0u; jj < n; jj++)
     {
       unsigned long long vb = (base + jj) * kvw + vk;
-      float v0 = 0.0f;
-      float v1 = 0.0f;
-      if (t < d)
-        v0 = load(vals, vb);
-      if (t + 128u < d)
-        v1 = load(vals, vb + 128u);
+      float vv[NV];
+#pragma unroll
+      for (unsigned int c = 0u; c < NV; c++)
+      {
+        vv[c] = 0.0f;
+        if (t + 128u * c < d)
+          vv[c] = load(vals, vb + 128u * c);
+      }
 #pragma unroll
       for (unsigned int i = 0u; i < MAXQ; i++)
       {
         float w = ps[i * 128u + jj];
         l[i] += w;
-        acc0[i] += w * v0;
-        acc1[i] += w * v1;
+#pragma unroll
+        for (unsigned int c = 0u; c < NV; c++)
+          acc[i][c] += w * vv[c];
       }
     }
     __syncthreads(); // ps and red are refilled by the next tile
@@ -446,18 +497,18 @@ __device__ __forceinline__ void attentionT(const float* q, const T* keys,
           f = expf(m[i] - mm);
           den = l[i] * f + expf(sinks[h] - mm); // a share without a value
         }
-        if (t < d)
-          y[yb] = acc0[i] * f / den;
-        if (t + 128u < d)
-          y[yb + 128u] = acc1[i] * f / den;
+#pragma unroll
+        for (unsigned int c = 0u; c < NV; c++)
+          if (t + 128u * c < d)
+            y[yb + 128u * c] = acc[i][c] * f / den;
       }
       else
       {
         unsigned long long pb = (((unsigned long long)h * rows + r) * splits + s) * (d + 2u);
-        if (t < d)
-          part[pb + t] = acc0[i];
-        if (t + 128u < d)
-          part[pb + t + 128u] = acc1[i];
+#pragma unroll
+        for (unsigned int c = 0u; c < NV; c++)
+          if (t + 128u * c < d)
+            part[pb + t + 128u * c] = acc[i][c];
         if (t == 0u)
         {
           part[pb + d] = m[i];
@@ -471,10 +522,10 @@ extern "C" __global__ void attention(const float* q, const float* keys,
   const float* vals, float* y, float* part, unsigned int rows,
   unsigned int heads, unsigned int headDim, unsigned int kvHeads,
   unsigned int past, unsigned int splits, unsigned int headBlock,
-  unsigned int rowBlock, unsigned int window, const float* sinks)
+  unsigned int rowBlock, unsigned int window, const float* sinks, float scale)
 {
-  attentionT(q, keys, vals, y, part, rows, heads, headDim, kvHeads, past,
-    splits, headBlock, rowBlock, window, sinks);
+  attentionT<float, 2u>(q, keys, vals, y, part, rows, heads, headDim, kvHeads,
+    past, splits, headBlock, rowBlock, window, sinks, scale);
 }
 
 extern "C" __global__ void attention16(const float* q,
@@ -482,10 +533,31 @@ extern "C" __global__ void attention16(const float* q,
   float* part, unsigned int rows, unsigned int heads, unsigned int headDim,
   unsigned int kvHeads, unsigned int past, unsigned int splits,
   unsigned int headBlock, unsigned int rowBlock, unsigned int window,
-  const float* sinks)
+  const float* sinks, float scale)
 {
-  attentionT(q, keys, vals, y, part, rows, heads, headDim, kvHeads, past,
-    splits, headBlock, rowBlock, window, sinks);
+  attentionT<unsigned short, 2u>(q, keys, vals, y, part, rows, heads, headDim,
+    kvHeads, past, splits, headBlock, rowBlock, window, sinks, scale);
+}
+
+extern "C" __global__ void attention512(const float* q, const float* keys,
+  const float* vals, float* y, float* part, unsigned int rows,
+  unsigned int heads, unsigned int headDim, unsigned int kvHeads,
+  unsigned int past, unsigned int splits, unsigned int headBlock,
+  unsigned int rowBlock, unsigned int window, const float* sinks, float scale)
+{
+  attentionT<float, 4u>(q, keys, vals, y, part, rows, heads, headDim, kvHeads,
+    past, splits, headBlock, rowBlock, window, sinks, scale);
+}
+
+extern "C" __global__ void attention512_16(const float* q,
+  const unsigned short* keys, const unsigned short* vals, float* y,
+  float* part, unsigned int rows, unsigned int heads, unsigned int headDim,
+  unsigned int kvHeads, unsigned int past, unsigned int splits,
+  unsigned int headBlock, unsigned int rowBlock, unsigned int window,
+  const float* sinks, float scale)
+{
+  attentionT<unsigned short, 4u>(q, keys, vals, y, part, rows, heads, headDim,
+    kvHeads, past, splits, headBlock, rowBlock, window, sinks, scale);
 }
 
 // combines the key ranges of attention (flash-decoding), the CUDA form of
@@ -564,11 +636,12 @@ extern "C" __global__ void scatteradd(const float* src, const int* idx,
 
 // the router of TDecoderModel.Route on one row of logits: softmax in double,
 // the k highest logits (the lower id on a tie), each weight rounded to float,
-// renormed to their sum when norm - then sorted by expert id, so the experts
-// are summed in id order as the CPU does; one thread (experts <= 4096,
-// k <= 64, checked by the host)
+// renormed to their sum when norm, then times the scale of its expert when
+// scale is not 0 (Gemma 4, slice D6e1) - then sorted by expert id, so the
+// experts are summed in id order as the CPU does; one thread (experts <=
+// 4096, k <= 64, checked by the host)
 extern "C" __global__ void route(const float* logits, int* ids, float* w,
-  unsigned int experts, unsigned int k, unsigned int norm)
+  unsigned int experts, unsigned int k, unsigned int norm, const float* scale)
 {
   if (threadIdx.x != 0u || blockIdx.x != 0u)
     return;
@@ -600,6 +673,9 @@ extern "C" __global__ void route(const float* logits, int* ids, float* w,
   if (norm)
     for (unsigned int j = 0u; j < k; j++)
       wt[j] = (float)((double)wt[j] / picked);
+  if (scale != 0)
+    for (unsigned int j = 0u; j < k; j++)
+      wt[j] = wt[j] * scale[chosen[j]];
   // by id: an insertion sort of k entries
   for (unsigned int j = 1u; j < k; j++)
   {

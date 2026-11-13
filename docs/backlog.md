@@ -395,7 +395,20 @@ In Scheiben:
   QAT-Checkpoint hinter `ILlmClient`), der Tokenizer aus GGUF (die Tabellen von
   `tokenizer.json`; beim 12B das korrigierte mit 239 Merges weniger); Tiny-GGUFs nach dem
   Vorbild des Konverters.
-- *Offen:* D6e Vulkan und CUDA (Kopfdimension 512); E2B/E4B danach. `suppress_tokens` des
+- *D6e1 erledigt 2026-11-13* (`native-inference.md`, Phase D): Gemma 4 auf CUDA - Köpfe
+  bis 512 Werte, K=V, Value-Norm, zweiter RoPE-Satz, Sandwich-Norms, GeGLU, dichter Block
+  neben den Experten, Layer-Skalar und Softcap; Gate und Up der Experten aus GGUF als ein
+  Puffer, so wählt ein Decode-Schritt die Experten auf dem Gerät (26B-A4B Q8_0 gut 40
+  Tokens/s auf der RTX 5090).
+- *Offen aus dem Review von D6e1 (Codex Runde 2, 2026-11-13):* gezielte Tests für drei
+  Randfälle, die kein heutiges Modell erzeugt - eine Scheibe von Gate/Up, die keine ganzen
+  Wörter ist (Rückfall auf einen Puffer je Experte), ein Modell nur aus DeltaNet-Layern
+  (Attention-Puffer von einem Wort je Zeile), `dfDenseMoe` ohne Sandwich-Norms und ein
+  NoRope-Layer mit eigener Kopfbreite (`rot` 0). Nächster Schritt: Tiny-Konfigurationen dafür
+  in `make_reference_d6*.py`, wenn eine solche Familie kommt.
+- *Offen:* D6e2 Vulkan (Köpfe von 512 in 16 KB Shared Memory: eine Variante mit 4 Queries je
+  Block); E2B/E4B danach. Q4_0 auf den GPUs (CUDA und Vulkan haben keinen Q4_0-Kernel; die
+  QAT-Dateien von Gemma 4 sind Q4_0). `suppress_tokens` des
   12B (`generation_config.json`, im GGUF `tokenizer.ggml.suppress_tokens`: `<image|>`,
   `<audio|>`) wendet der Client nicht an - transformers verbietet sie bei `generate`.
 

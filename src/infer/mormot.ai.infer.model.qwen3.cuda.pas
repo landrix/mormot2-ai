@@ -41,6 +41,15 @@
 //   points of TDecoderContext (SaveStates, LoadStates) -, the output gate of
 //   the full attention (splitgate, gatemul) and the partial rotary share
 //   (qkrope with rot); the KV cache only for the attention layers
+// - Gemma 4 (phase D, slice D6e1): heads of their own shape per layer (the
+//   buffers sized for the widest, the cache per layer), heads of 512 values
+//   (attention512), K=V (v bound to the raw keys), the value norm (qkrope with
+//   vnorm), the second rotary set (its factors after the first in fDevCos),
+//   the attention scale, the norms around both blocks (SandwichNorm), GeGLU
+//   (geglu), the dense block beside the experts (dfDenseMoe: the router on
+//   its own norm in fDevH2, the experts' sum in fDevMoeOut), the expert scales
+//   (route, or TDecoderModel.Route on the host), the layer scalar (scale) and
+//   the logit softcap on the logits read back
 unit mormot.ai.infer.model.qwen3.cuda;
 
 {
@@ -118,6 +127,8 @@ type
       fDevCore: TInferCuBuffer;
     fDevConv, fDevState: TInferCuBufferDynArray;
     fDevSlotConv, fDevSlotState: array of TInferCuBufferDynArray;
+    // Gemma 4 (dfDenseMoe): the router input, the experts' sum
+    fDevH2, fDevMoeOut: TInferCuBuffer;
     procedure FreeScratch;
     procedure FreeCache;
     procedure FreeStates;
@@ -162,6 +173,11 @@ type
     fEpoch: integer; // the backend's WeightEpoch of the uploaded weights
     fSplitKeys: integer;
     fUseGraphs, fKvF16: boolean;
+    // Gemma 4: the kernels of heads of up to 512, GeGLU and the layer scalar;
+    // the widest query and KV rows and head of all layers, and the rotary
+    // factors per row of the second set (Rope2HeadDim / 2, 0 without)
+    fAttention512, fAttention512_16, fGeGlu, fScale: TCuHandle;
+    fMaxQw, fMaxKvw, fMaxHeadDim, fHalf2: PtrInt;
     procedure UploadWeights;
     function Vector(v: PSingleArray; aCount: PtrInt): TCuDevicePtr;
     function ChunkRows(aPast, aCount: PtrInt; aAllLogits: boolean): PtrInt;
@@ -179,12 +195,25 @@ type
       w: PSingleArray; y: TInferCuBuffer);
     procedure EnqueueAddNorm(x, t: TInferCuBuffer; aRows, aCols: PtrInt;
       w: PSingleArray; y: TInferCuBuffer);
-    /// the dfMoe block of layer aLayer: fDevH in, fDevTmp out
-    procedure EnqueueMoe(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
+    /// SwiGLU or GeGLU (Config.Activation) of aCount values: g := act(g) * u
+    procedure EnqueueGlu(g, u: TCuDevicePtr; aCount: PtrInt);
+    /// the dense feed-forward block of layer aLayer: fDevH in, fDevTmp out
+    procedure EnqueueDense(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
+    /// the experts of layer aLayer: the router on aRouterIn, the experts on
+    // fDevH, their weighted sum into aOut
+    procedure EnqueueMoe(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt;
+      aRouterIn, aOut: TInferCuBuffer);
     /// the same for one token row, the experts chosen on the device
-    procedure EnqueueMoeDevice(aCtx: TQwen3CuContext; aLayer: PtrInt);
+    procedure EnqueueMoeDevice(aCtx: TQwen3CuContext; aLayer: PtrInt;
+      aRouterIn, aOut: TInferCuBuffer);
+    /// how the attention of a layer whose KV heads serve aGroup heads each
+    // splits into blocks for aRows rows after aPast cached ones: aHb heads
+    // times aRb rows per block, the keys of a row in aSplits ranges (aWSplits
+    // for a layer with a sliding window, one row per block)
+    procedure Partition(aGroup, aRows, aPast: PtrInt;
+      out aHb, aRb, aSplits, aWSplits: PtrInt);
     /// CheckRoute: the device's choice against TDecoderModel.Route
-    procedure CheckDeviceRoute(aCtx: TQwen3CuContext);
+    procedure CheckDeviceRoute(aCtx: TQwen3CuContext; aLayer: PtrInt);
     /// the dmDeltaNet mixer of layer aLayer: fDevH in, fDevTmp out, its
     // states moved on
     procedure EnqueueDeltaNet(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
@@ -348,6 +377,8 @@ begin
   FreeAndNil(fDevBeta);
   FreeAndNil(fDevDecay);
   FreeAndNil(fDevCore);
+  FreeAndNil(fDevH2);
+  FreeAndNil(fDevMoeOut);
   fRows := 0;
 end;
 
@@ -449,7 +480,7 @@ end;
 
 constructor TQwen3Cuda.Create(aModel: TDecoderModel; aBackend: TInferCudaBackend);
 var
-  l: PtrInt;
+  l, hd: PtrInt;
 begin
   inherited Create;
   if (aModel = nil) or (aBackend = nil) then
@@ -472,9 +503,9 @@ begin
   for l := 0 to high(aModel.Config.Spec) do
     if aModel.Config.Spec[l].Ffn <> dfDense then
       fMoe := true;
-  // what Gemma 4 computes beyond gpt-oss and Qwen3.5 is not here yet (slice
-  // D6e)
-  if aModel.Extras - DECODER_EXTRAS_GPTOSS - [dxOutputGate, dxPartialRope] <> [] then
+  // gpt-oss, Qwen3.5 and Gemma 4 (slice D6e1)
+  if aModel.Extras - DECODER_EXTRAS_GPTOSS - DECODER_EXTRAS_GEMMA4 -
+     [dxOutputGate, dxPartialRope] <> [] then
     EInferError.RaiseUtf8('%: % computes what this device does not', [self, aModel]);
   // deltarule keeps a column of S in the registers of a warp, dnconv the
   // inputs of a channel in those of a thread
@@ -484,10 +515,22 @@ begin
     EInferError.RaiseUtf8('%: a Gated DeltaNet of key dim % and kernel % not ' +
       'supported', [self, aModel.Config.LinKeyDim, aModel.Config.LinConv]);
   // qkrope keeps one normalized head in shared memory, the attention reads
-  // the keys as float4
-  if (aModel.Config.HeadDim > 256) or (aModel.Config.HeadDim and 3 <> 0) then
-    EInferError.RaiseUtf8('%: head dimension % not supported', [self,
-      aModel.Config.HeadDim]);
+  // the keys as float4 (attention512 for a head of more than 256 values)
+  fMaxQw := 0;
+  fMaxKvw := 0;
+  fMaxHeadDim := 0;
+  for l := 0 to high(aModel.Config.Spec) do
+  begin
+    if aModel.Config.Spec[l].Mixer <> dmAttention then
+      continue;
+    hd := aModel.Config.Spec[l].HeadDim;
+    if (hd > 512) or (hd and 3 <> 0) then
+      EInferError.RaiseUtf8('%: head dimension % not supported', [self, hd]);
+    fMaxQw := MaxPtrInt(fMaxQw, aModel.Config.Heads * hd);
+    fMaxKvw := MaxPtrInt(fMaxKvw, aModel.Config.Spec[l].KvHeads * hd);
+    fMaxHeadDim := MaxPtrInt(fMaxHeadDim, hd);
+  end;
+  fHalf2 := aModel.Rope2HeadDim shr 1;
   fModel := aModel;
   fBackend := aBackend;
   fCu := aBackend.Cuda;
@@ -500,6 +543,10 @@ begin
   fAttention := fOps.Kernel('attention');
   fQkRope16 := fOps.Kernel('qkrope16');
   fAttention16 := fOps.Kernel('attention16');
+  fAttention512 := fOps.Kernel('attention512');
+  fAttention512_16 := fOps.Kernel('attention512_16');
+  fGeGlu := fOps.Kernel('geglu');
+  fScale := fOps.Kernel('scale');
   fMerge := fOps.Kernel('attnmerge');
   fFill0 := fOps.Kernel('fill0');
   fGather := fOps.Kernel('gatherrows');
@@ -550,8 +597,15 @@ end;
 procedure TQwen3Cuda.UploadWeights;
 var
   c: TQwen3Config;
-  l, qw, kvw, cd, vd: PtrInt;
+  l, qw, kvw, cd, vd, hd: PtrInt;
   ly: ^TQwen3Layer;
+
+  // a vector that may be absent
+  procedure Maybe(v: PSingleArray; aCount: PtrInt);
+  begin
+    if v <> nil then
+      Vector(v, aCount);
+  end;
 
   procedure Matrix(const w: TInferWeight; aRows, aCols: PtrInt);
   begin
@@ -602,12 +656,58 @@ var
           (aCols div INFER_DTYPE_BLOCK[w[e].DType]) * INFER_DTYPE_SIZE[w[e].DType]).Ptr;
   end;
 
+  // gate and up of the experts of a layer as one GGUF tensor stores them
+  // (Gemma 4, ffn_gate_up_exps): per expert its gate rows, then its up rows -
+  // one buffer for both, each an offset in it and every expert 2 slices on;
+  // false (nothing uploaded) when they do not lie so in host memory, or when
+  // a slice is no whole words (the up rows would start unaligned for the
+  // kernels, which read words)
+  function GateUp(aLayer: PtrInt): boolean;
+  var
+    e: PtrInt;
+    slice: Int64;
+    base: TCuDevicePtr;
+    g, u: ^TInferWeightDynArray;
+  begin
+    result := false;
+    g := @fModel.Layers[aLayer].ExpertGate;
+    u := @fModel.Layers[aLayer].ExpertUp;
+    if (length(g^) = 0) or (length(u^) <> length(g^)) or
+       not fBackend.GpuLinear(g^[0].DType, c.Hidden) then
+      exit;
+    slice := Int64(c.ExpertIntermediate) * (c.Hidden div INFER_DTYPE_BLOCK[g^[0].DType]) *
+      INFER_DTYPE_SIZE[g^[0].DType];
+    if slice and 3 <> 0 then
+      exit;
+    for e := 0 to high(g^) do
+      if (g^[e].DType <> g^[0].DType) or (u^[e].DType <> g^[0].DType) or
+         (PtrUInt(g^[e].Data) <> PtrUInt(g^[0].Data) + PtrUInt(e * 2 * slice)) or
+         (PtrUInt(u^[e].Data) <> PtrUInt(g^[e].Data) + PtrUInt(slice)) then
+        exit;
+    base := fBackend.DeviceWeight(g^[0].Data, g^[0].DType,
+      2 * slice * length(g^)).Ptr;
+    SetLength(fExpertGate[aLayer], length(g^));
+    SetLength(fExpertUp[aLayer], length(g^));
+    for e := 0 to high(g^) do
+    begin
+      fExpertGate[aLayer][e] := base + TCuDevicePtr(e * 2 * slice);
+      fExpertUp[aLayer][e] := base + TCuDevicePtr(e * 2 * slice + slice);
+    end;
+    // linear8ids finds an expert at id * stride (whole words: checked above)
+    fStrideGate[aLayer] := 0;
+    fStrideUp[aLayer] := 0;
+    if fBackend.GpuLinearIds(g^[0].DType, c.Hidden) then
+    begin
+      fStrideGate[aLayer] := 2 * slice;
+      fStrideUp[aLayer] := 2 * slice;
+    end;
+    result := true;
+  end;
+
 begin
   // everything up front: the first token would otherwise carry the transfer
   // - the caller holds GpuLock
   c := fModel.Config;
-  qw := c.Heads * c.HeadDim;
-  kvw := c.KvHeads * c.HeadDim;
   fExpertGate := nil;
   fExpertUp := nil;
   fExpertDown := nil;
@@ -625,6 +725,10 @@ begin
   for l := 0 to c.Layers - 1 do
   begin
     ly := @fModel.Layers[l];
+    // the shape of the heads of this layer (Gemma 4: per layer)
+    hd := c.Spec[l].HeadDim;
+    qw := c.Heads * hd;
+    kvw := c.Spec[l].KvHeads * hd;
     if c.Spec[l].Mixer = dmDeltaNet then
     begin
       // the four projections, the output, the convolution and the factors
@@ -648,22 +752,26 @@ begin
       else
         Matrix(ly^.Q, qw, c.Hidden);
       Matrix(ly^.K, kvw, c.Hidden);
-      Matrix(ly^.V, kvw, c.Hidden);
+      if not c.Spec[l].KIsV then // K=V: the raw keys are the values
+        Matrix(ly^.V, kvw, c.Hidden);
       Matrix(ly^.O, c.Hidden, qw);
     end;
-    if c.Spec[l].Ffn = dfMoe then
+    if c.Spec[l].Ffn in [dfMoe, dfDenseMoe] then
     begin
       Matrix(ly^.Router, c.Experts, c.Hidden);
-      Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l],
-        fStrideGate[l]);
-      Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l],
-        fStrideUp[l]);
+      if not GateUp(l) then
+      begin
+        Experts(ly^.ExpertGate, c.ExpertIntermediate, c.Hidden, fExpertGate[l],
+          fStrideGate[l]);
+        Experts(ly^.ExpertUp, c.ExpertIntermediate, c.Hidden, fExpertUp[l],
+          fStrideUp[l]);
+      end;
       Experts(ly^.ExpertDown, c.Hidden, c.ExpertIntermediate, fExpertDown[l],
         fStrideDown[l]);
       if (fStrideGate[l] = 0) or (fStrideUp[l] = 0) or (fStrideDown[l] = 0) then
         fDeviceRoutable := false;
-    end
-    else
+    end;
+    if c.Spec[l].Ffn in [dfDense, dfDenseMoe] then
     begin
       Matrix(ly^.Gate, c.Intermediate, c.Hidden);
       Matrix(ly^.Up, c.Intermediate, c.Hidden);
@@ -673,9 +781,18 @@ begin
     Vector(ly^.PostNorm, c.Hidden);
     if ly^.QNorm <> nil then
     begin
-      Vector(ly^.QNorm, c.HeadDim);
-      Vector(ly^.KNorm, c.HeadDim);
+      Vector(ly^.QNorm, hd);
+      Vector(ly^.KNorm, hd);
     end;
+    // Gemma 4: the norms around both blocks, those of the dense block beside
+    // the experts, the router scale and the expert scales
+    Maybe(ly^.AttnNorm, c.Hidden);
+    Maybe(ly^.FfnNorm, c.Hidden);
+    Maybe(ly^.DenseOutNorm, c.Hidden);
+    Maybe(ly^.MoeInNorm, c.Hidden);
+    Maybe(ly^.MoeOutNorm, c.Hidden);
+    Maybe(ly^.RouterScale, c.Hidden);
+    Maybe(ly^.ExpertScale, c.Experts);
     // the biases and sinks up front: a captured graph cannot upload
     if ly^.QBias <> nil then
     begin
@@ -737,8 +854,8 @@ var
   keys, values: TInferCuBufferDynArray;
 begin
   c := fModel.Config;
-  kvw := c.KvHeads * c.HeadDim;
-  half := c.RopeDims shr 1; // the rotary factors of a row
+  // the rotary factors of a row: of the first set, then of the second
+  half := c.RopeDims shr 1 + fHalf2;
   // the states of the DeltaNet layers: each one that is not there yet (an
   // allocation that failed is tried again)
   if fRecurrent then
@@ -787,6 +904,7 @@ begin
       begin
         if c.Spec[l].Mixer <> dmAttention then
           continue; // a DeltaNet layer keeps its state instead
+        kvw := c.Spec[l].KvHeads * c.Spec[l].HeadDim; // of this layer
         keys[l] := TInferCuBuffer.Create(fCu, Int64(cap) * kvw * es);
         values[l] := TInferCuBuffer.Create(fCu, Int64(cap) * kvw * es);
         if aCtx.fLength > 0 then
@@ -820,10 +938,11 @@ begin
     NeedDevice(fCu, aCtx.fDevX, Int64(aRows) * c.Hidden * 4);
     NeedDevice(fCu, aCtx.fDevH, Int64(aRows) * c.Hidden * 4);
     NeedDevice(fCu, aCtx.fDevTmp, Int64(aRows) * c.Hidden * 4);
-    NeedDevice(fCu, aCtx.fDevQ, Int64(aRows) * c.Heads * c.HeadDim * 4);
-    NeedDevice(fCu, aCtx.fDevAttn, Int64(aRows) * c.Heads * c.HeadDim * 4);
-    NeedDevice(fCu, aCtx.fDevK, Int64(aRows) * kvw * 4);
-    NeedDevice(fCu, aCtx.fDevV, Int64(aRows) * kvw * 4);
+    // (a model of DeltaNet layers alone has no attention: a word each)
+    NeedDevice(fCu, aCtx.fDevQ, Int64(aRows) * MaxPtrInt(fMaxQw, 1) * 4);
+    NeedDevice(fCu, aCtx.fDevAttn, Int64(aRows) * MaxPtrInt(fMaxQw, 1) * 4);
+    NeedDevice(fCu, aCtx.fDevK, Int64(aRows) * MaxPtrInt(fMaxKvw, 1) * 4);
+    NeedDevice(fCu, aCtx.fDevV, Int64(aRows) * MaxPtrInt(fMaxKvw, 1) * 4);
     NeedDevice(fCu, aCtx.fDevGate, Int64(aRows) *
       MaxPtrInt(c.Intermediate, c.ExpertIntermediate) * 4);
     NeedDevice(fCu, aCtx.fDevUp, Int64(aRows) *
@@ -832,8 +951,13 @@ begin
     SetLength(aCtx.fIn, aRows * (c.Hidden + 2 * half));
     if dxOutputGate in fModel.Extras then
     begin
-      NeedDevice(fCu, aCtx.fDevQg, Int64(aRows) * 2 * c.Heads * c.HeadDim * 4);
-      NeedDevice(fCu, aCtx.fDevGateQ, Int64(aRows) * c.Heads * c.HeadDim * 4);
+      NeedDevice(fCu, aCtx.fDevQg, Int64(aRows) * 2 * MaxPtrInt(fMaxQw, 1) * 4);
+      NeedDevice(fCu, aCtx.fDevGateQ, Int64(aRows) * MaxPtrInt(fMaxQw, 1) * 4);
+    end;
+    if dxDenseMoe in fModel.Extras then
+    begin
+      NeedDevice(fCu, aCtx.fDevH2, Int64(aRows) * c.Hidden * 4);
+      NeedDevice(fCu, aCtx.fDevMoeOut, Int64(aRows) * c.Hidden * 4);
     end;
     if fRecurrent then
     begin
@@ -911,13 +1035,45 @@ begin
     result := aBias + TCuDevicePtr(Int64(aRow) * aWidth * 4);
 end;
 
-procedure TQwen3Cuda.EnqueueMoe(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
+procedure TQwen3Cuda.EnqueueGlu(g, u: TCuDevicePtr; aCount: PtrInt);
+var
+  count: cardinal;
+  alpha, limit: single;
+begin
+  count := aCount;
+  if fModel.Config.Activation = daGeluTanh then
+    fCu.Enqueue(fGeGlu, [@g, @u, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK,
+      OPS_BLOCK)
+  else
+  begin
+    alpha := fModel.Config.SwiGluAlpha;
+    limit := fModel.Config.SwiGluLimit;
+    fCu.Enqueue(fSwiGlu, [@g, @u, @count, @alpha, @limit],
+      (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+  end;
+end;
+
+procedure TQwen3Cuda.EnqueueDense(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
+var
+  ly: ^TQwen3Layer;
+  h, f: PtrInt;
+begin
+  ly := @fModel.Layers[aLayer];
+  h := fModel.Config.Hidden;
+  f := fModel.Config.Intermediate;
+  fBackend.EnqueueLinear(aCtx.fDevH, aRows, h, ly^.Gate, f, aCtx.fDevGate);
+  fBackend.EnqueueLinear(aCtx.fDevH, aRows, h, ly^.Up, f, aCtx.fDevUp);
+  EnqueueGlu(aCtx.fDevGate.Ptr, aCtx.fDevUp.Ptr, aRows * f);
+  fBackend.EnqueueLinear(aCtx.fDevGate, aRows, f, ly^.Down, h, aCtx.fDevTmp);
+end;
+
+procedure TQwen3Cuda.EnqueueMoe(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt;
+  aRouterIn, aOut: TInferCuBuffer);
 var
   ly: ^TQwen3Layer;
   n, h, fi, k, ne, r, j, e, cnt, total: PtrInt;
-  ph, pg, pe, pt, pidx, pw, pu, gb, ub, db: TCuDevicePtr;
+  ph, pg, pe, pt, pidx, pw, gb, ub, db: TCuDevicePtr;
   cols, count: cardinal;
-  alpha, limit: single;
 begin
   ly := @fModel.Layers[aLayer];
   n := aRows;
@@ -925,8 +1081,6 @@ begin
   fi := fModel.Config.ExpertIntermediate;
   k := fModel.Config.ExpertsUsed;
   ne := fModel.Config.Experts;
-  alpha := fModel.Config.SwiGluAlpha;
-  limit := fModel.Config.SwiGluLimit;
   // the biases of the experts (gpt-oss), expert e at row e
   gb := 0;
   ub := 0;
@@ -937,12 +1091,14 @@ begin
     ub := Vector(ly^.ExpertUpBias, ne * fi);
   if ly^.ExpertDownBias <> nil then
     db := Vector(ly^.ExpertDownBias, ne * h);
-  // the router logits down (waits for the layer so far), the choice on the host
-  fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Router, ne, aCtx.fDevRoute,
+  // the router logits down (waits for the layer so far), the choice on the
+  // host - with the scale of every expert (Gemma 4)
+  fBackend.EnqueueLinear(aRouterIn, n, h, ly^.Router, ne, aCtx.fDevRoute,
     ly^.RouterBias);
   aCtx.fDevRoute.Download(0, pointer(aCtx.fRoute), Int64(n) * ne * 4);
   for r := 0 to n - 1 do
-    fModel.Route(@aCtx.fRoute[r * ne], @aCtx.fChosen[r * k], @aCtx.fChosenW[r * k]);
+    fModel.Route(@aCtx.fRoute[r * ne], @aCtx.fChosen[r * k], @aCtx.fChosenW[r * k],
+      ly^.ExpertScale);
   // the token rows and weights of every expert, expert by expert, up at once
   total := 0;
   for e := 0 to ne - 1 do
@@ -960,13 +1116,12 @@ begin
   aCtx.fStart[ne] := total;
   aCtx.fDevIdx.Upload(0, pointer(aCtx.fIdx), Int64(total) * 4);
   aCtx.fDevW.Upload(0, pointer(aCtx.fW), Int64(total) * 4);
-  pt := aCtx.fDevTmp.Ptr;
+  pt := aOut.Ptr;
   count := n * h;
   fCu.Enqueue(fFill0, [@pt, @count], (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
   ph := aCtx.fDevH.Ptr;
   pg := aCtx.fDevGather.Ptr;
   pe := aCtx.fDevExpOut.Ptr;
-  pu := aCtx.fDevUp.Ptr;
   cols := h;
   for e := 0 to ne - 1 do
   begin
@@ -980,31 +1135,25 @@ begin
       fExpertGate[aLayer][e], fi, aCtx.fDevGate, BiasRow(gb, e, fi));
     fBackend.EnqueueLinearAt(aCtx.fDevGather, cnt, h, ly^.ExpertUp[e].DType,
       fExpertUp[aLayer][e], fi, aCtx.fDevUp, BiasRow(ub, e, fi));
-    pg := aCtx.fDevGate.Ptr;
-    count := cnt * fi;
-    fCu.Enqueue(fSwiGlu, [@pg, @pu, @count, @alpha, @limit],
-      (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+    EnqueueGlu(aCtx.fDevGate.Ptr, aCtx.fDevUp.Ptr, cnt * fi);
     fBackend.EnqueueLinearAt(aCtx.fDevGate, cnt, fi, ly^.ExpertDown[e].DType,
       fExpertDown[aLayer][e], h, aCtx.fDevExpOut, BiasRow(db, e, h));
     fCu.Enqueue(fScatter, [@pe, @pidx, @pw, @pt, @cols], cnt, OPS_BLOCK);
-    pg := aCtx.fDevGather.Ptr;
   end;
 end;
 
-procedure TQwen3Cuda.EnqueueMoeDevice(aCtx: TQwen3CuContext; aLayer: PtrInt);
+procedure TQwen3Cuda.EnqueueMoeDevice(aCtx: TQwen3CuContext; aLayer: PtrInt;
+  aRouterIn, aOut: TInferCuBuffer);
 var
   ly: ^TQwen3Layer;
   h, fi, k: PtrInt;
-  pr, pids, pw, pg, pu, pd, pt, gb, ub, db: TCuDevicePtr;
+  pr, pids, pw, pd, pt, ps, gb, ub, db: TCuDevicePtr;
   experts, used, norm, count: cardinal;
-  alpha, limit: single;
 begin
   ly := @fModel.Layers[aLayer];
   h := fModel.Config.Hidden;
   fi := fModel.Config.ExpertIntermediate;
   k := fModel.Config.ExpertsUsed;
-  alpha := fModel.Config.SwiGluAlpha;
-  limit := fModel.Config.SwiGluLimit;
   gb := 0;
   ub := 0;
   db := 0;
@@ -1014,8 +1163,12 @@ begin
     ub := Vector(ly^.ExpertUpBias, fModel.Config.Experts * fi);
   if ly^.ExpertDownBias <> nil then
     db := Vector(ly^.ExpertDownBias, fModel.Config.Experts * h);
+  // the scale of every expert (Gemma 4), 0 for none
+  ps := 0;
+  if ly^.ExpertScale <> nil then
+    ps := Vector(ly^.ExpertScale, fModel.Config.Experts);
   // the router logits, the choice into fDevKIds / fDevKW - no host involved
-  fBackend.EnqueueLinear(aCtx.fDevH, 1, h, ly^.Router, fModel.Config.Experts,
+  fBackend.EnqueueLinear(aRouterIn, 1, h, ly^.Router, fModel.Config.Experts,
     aCtx.fDevRoute, ly^.RouterBias);
   pr := aCtx.fDevRoute.Ptr;
   pids := aCtx.fDevKIds.Ptr;
@@ -1023,32 +1176,28 @@ begin
   experts := fModel.Config.Experts;
   used := k;
   norm := ord(fModel.Config.NormTopK);
-  fCu.Enqueue(fRoute, [@pr, @pids, @pw, @experts, @used, @norm], 1, 32);
+  fCu.Enqueue(fRoute, [@pr, @pids, @pw, @experts, @used, @norm, @ps], 1, 32);
   if fCheckRoute then
-    CheckDeviceRoute(aCtx);
+    CheckDeviceRoute(aCtx, aLayer);
   // gate and up of the k experts from the same row, SwiGLU, down per slot
   fBackend.EnqueueLinearIds(aCtx.fDevH, h, ly^.ExpertGate[0].DType,
     fExpertGate[aLayer][0], fStrideGate[aLayer], fi, pids, k, false, aCtx.fDevKGate,
     gb);
   fBackend.EnqueueLinearIds(aCtx.fDevH, h, ly^.ExpertUp[0].DType,
     fExpertUp[aLayer][0], fStrideUp[aLayer], fi, pids, k, false, aCtx.fDevKUp, ub);
-  pg := aCtx.fDevKGate.Ptr;
-  pu := aCtx.fDevKUp.Ptr;
-  count := k * fi;
-  fCu.Enqueue(fSwiGlu, [@pg, @pu, @count, @alpha, @limit],
-    (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+  EnqueueGlu(aCtx.fDevKGate.Ptr, aCtx.fDevKUp.Ptr, k * fi);
   fBackend.EnqueueLinearIds(aCtx.fDevKGate, fi, ly^.ExpertDown[0].DType,
     fExpertDown[aLayer][0], fStrideDown[aLayer], h, pids, k, true, aCtx.fDevKDown,
     db);
-  // the weighted sum in id order into fDevTmp
+  // the weighted sum in id order into aOut
   pd := aCtx.fDevKDown.Ptr;
-  pt := aCtx.fDevTmp.Ptr;
+  pt := aOut.Ptr;
   count := h;
   fCu.Enqueue(fCombine, [@pd, @pw, @pt, @used, @count],
     (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
 end;
 
-procedure TQwen3Cuda.CheckDeviceRoute(aCtx: TQwen3CuContext);
+procedure TQwen3Cuda.CheckDeviceRoute(aCtx: TQwen3CuContext; aLayer: PtrInt);
 var
   k, j, t, id: PtrInt;
   v: single;
@@ -1060,7 +1209,8 @@ begin
   aCtx.fDevRoute.Download(0, pointer(aCtx.fRoute), Int64(fModel.Config.Experts) * 4);
   aCtx.fDevKIds.Download(0, pointer(aCtx.fKIds), Int64(k) * 4);
   aCtx.fDevKW.Download(0, pointer(aCtx.fKW), Int64(k) * 4);
-  fModel.Route(pointer(aCtx.fRoute), pointer(aCtx.fChosen), pointer(aCtx.fChosenW));
+  fModel.Route(pointer(aCtx.fRoute), pointer(aCtx.fChosen), pointer(aCtx.fChosenW),
+    fModel.Layers[aLayer].ExpertScale);
   // the host's choice by id, as the kernel writes it
   for j := 1 to k - 1 do
   begin
@@ -1150,29 +1300,65 @@ begin
   fBackend.EnqueueLinear(aCtx.fDevCore, aRows, vd, ly^.LinOut, h, aCtx.fDevTmp);
 end;
 
+procedure TQwen3Cuda.Partition(aGroup, aRows, aPast: PtrInt;
+  out aHb, aRb, aSplits, aWSplits: PtrInt);
+var
+  blocks, most: PtrInt;
+begin
+  // hb heads of one KV head (hb divides the group) times rb rows, the keys of
+  // a row cut into splits ranges unless there are enough blocks without
+  aHb := aGroup;
+  while (aHb > ATTENTION_QUERIES) or (aGroup mod aHb <> 0) do
+    dec(aHb);
+  aRb := ATTENTION_QUERIES div aHb;
+  blocks := (aRows + aRb - 1) div aRb;
+  aSplits := 1;
+  if fSplitKeys > 0 then
+    aSplits := (aPast + aRows + fSplitKeys - 1) div fSplitKeys;
+  most := SPLIT_GROUPS div ((fModel.Config.Heads div aHb) * blocks);
+  if aSplits > most then
+    aSplits := most;
+  if aSplits < 1 then
+    aSplits := 1;
+  // a layer with a sliding window: one token row per block, so all its
+  // queries share one key range - the others' rows would sum values outside
+  // their window with a weight of 0, and 0 times a NaN or infinite value is
+  // NaN
+  aWSplits := aSplits;
+  if aRows > 1 then
+  begin
+    aWSplits := 1;
+    if fSplitKeys > 0 then
+      aWSplits := (aPast + aRows + fSplitKeys - 1) div fSplitKeys;
+    most := SPLIT_GROUPS div ((fModel.Config.Heads div aHb) * aRows);
+    if aWSplits > most then
+      aWSplits := most;
+    if aWSplits < 1 then
+      aWSplits := 1;
+  end;
+end;
+
 procedure TQwen3Cuda.Chunk(aCtx: TQwen3CuContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
   aNormed: PSingleArray);
 var
   c: TQwen3Config;
-  n, h, f, qw, kvw, half, past, l, outRows, hb, rb, blocks, splits, most,
-    wsplits, last: PtrInt;
+  n, h, qw, kvw, hd, half, past, l, outRows, hb, rb, splits, wsplits, most,
+    last: PtrInt;
   ly: ^TQwen3Layer;
   p: PSingleArray;
-  pq, pk, pv, pqn, pkn, pcs, pkc, pvc, pa, ppart, px, pt, psk, pg: TCuDevicePtr;
+  pq, pk, pv, pqn, pkn, pcs, pcs2, prs, pkc, pvc, pa, ppart, px, pt, psk,
+    pg: TCuDevicePtr;
   rows, heads, kvHeads, headDim, ppast, nsplits, hblock, rblock, count,
-    norm, rope, window, rot: cardinal;
-  eps, alpha, limit: single;
+    norm, rope, window, rot, vnorm: cardinal;
+  eps, ascale, scalar: single;
   capture, device: boolean;
-  qkrope, attention: TCuHandle;
+  qkrope, attention, attention512, att: TCuHandle;
 begin
   c := fModel.Config;
   n := aCount;
   h := c.Hidden;
-  f := c.Intermediate;
-  qw := c.Heads * c.HeadDim;
-  kvw := c.KvHeads * c.HeadDim;
-  half := c.RopeDims shr 1; // the rotary factors of a row
+  half := c.RopeDims shr 1; // the rotary factors of a row (of the first set)
   past := aCtx.fLength;
   outRows := 0;
   if aLogits <> nil then
@@ -1184,59 +1370,41 @@ begin
   // the kernels of the cache format of aCtx (set by Prepare)
   qkrope := fQkRope;
   attention := fAttention;
+  attention512 := fAttention512;
   if aCtx.fKvF16 then
   begin
     qkrope := fQkRope16;
     attention := fAttention16;
+    attention512 := fAttention512_16;
   end;
-  // the attention blocks: hb heads of one KV head (hb divides the group)
-  // times rb rows, the keys of a row cut into splits ranges unless there are
-  // enough blocks without
-  hb := c.Heads div c.KvHeads;
-  while (hb > ATTENTION_QUERIES) or (c.Heads div c.KvHeads mod hb <> 0) do
-    dec(hb);
-  rb := ATTENTION_QUERIES div hb;
-  blocks := (n + rb - 1) div rb;
-  splits := 1;
-  if fSplitKeys > 0 then
-    splits := (past + n + fSplitKeys - 1) div fSplitKeys;
-  most := SPLIT_GROUPS div ((c.Heads div hb) * blocks);
-  if splits > most then
-    splits := most;
-  if splits < 1 then
-    splits := 1;
-  // a layer with a sliding window: one token row per block, so all its
-  // queries share one key range - the others' rows would sum values outside
-  // their window with a weight of 0, and 0 times a NaN or infinite value is
-  // NaN
-  wsplits := splits;
-  if n > 1 then
-  begin
-    wsplits := 1;
-    if fSplitKeys > 0 then
-      wsplits := (past + n + fSplitKeys - 1) div fSplitKeys;
-    most := SPLIT_GROUPS div ((c.Heads div hb) * n);
-    if wsplits > most then
-      wsplits := most;
-    if wsplits < 1 then
-      wsplits := 1;
-  end;
+  // the key ranges of the widest split of any layer, allocated before a graph
+  // is captured (Gemma 4: the layers group their heads differently)
+  most := 1;
+  for l := 0 to c.Layers - 1 do
+    if c.Spec[l].Mixer = dmAttention then
+    begin
+      Partition(c.Heads div c.Spec[l].KvHeads, n, past, hb, rb, splits, wsplits);
+      most := MaxPtrInt(most, MaxPtrInt(splits, wsplits));
+    end;
   ppart := 0;
-  if (splits > 1) or (wsplits > 1) then
+  if most > 1 then
   begin
-    NeedDevice(fCu, aCtx.fPart, Int64(c.Heads) * n * MaxPtrInt(splits, wsplits) *
-      (c.HeadDim + 2) * 4);
+    NeedDevice(fCu, aCtx.fPart, Int64(c.Heads) * n * most * (fMaxHeadDim + 2) * 4);
     ppart := aCtx.fPart.Ptr;
   end;
-  // the inputs: embeddings, then the rotary factors (cos, then sin)
+  // the inputs: embeddings, then the rotary factors (cos, then sin) of the
+  // first set and of the second (Gemma 4)
   p := pointer(aCtx.fIn);
   if aIds <> nil then
     fModel.Embed(aIds, n, p)
   else
     MoveFast(aEmbeds^[0], p^[0], n * h * SizeOf(single));
   fModel.Rotary(past, n, @p^[n * h], @p^[n * h + n * half]);
+  if fHalf2 > 0 then
+    fModel.Rotary2(past, n, @p^[n * h + 2 * n * half],
+      @p^[n * h + 2 * n * half + n * fHalf2]);
   aCtx.fDevX.Upload(0, p, Int64(n) * h * 4);
-  aCtx.fDevCos.Upload(0, @p^[n * h], Int64(n) * half * 2 * 4);
+  aCtx.fDevCos.Upload(0, @p^[n * h], Int64(n) * (half + fHalf2) * 2 * 4);
   // a new sequence: the states of the DeltaNet layers start at 0 (outside a
   // graph: it would replay the fill at every step)
   aCtx.fStateOk := false;
@@ -1255,18 +1423,14 @@ begin
       end;
   rows := n;
   heads := c.Heads;
-  kvHeads := c.KvHeads;
-  headDim := c.HeadDim;
-  rot := c.RopeDims; // the whole head unless Qwen3.5 rotates a share of it
   ppast := past;
-  nsplits := splits;
-  hblock := hb;
-  rblock := rb;
   eps := c.RmsEps;
+  ascale := c.AttentionScale; // 0: 1 / sqrt(headDim) in the kernel
+  vnorm := ord(c.ValueNorm);
   pq := aCtx.fDevQ.Ptr;
   pk := aCtx.fDevK.Ptr;
-  pv := aCtx.fDevV.Ptr;
   pcs := aCtx.fDevCos.Ptr;
+  pcs2 := pcs + TCuDevicePtr(Int64(n) * half * 2 * 4);
   pa := aCtx.fDevAttn.Ptr;
   // a single token: the whole step recorded as a graph, launched at once -
   // with experts only when they are chosen on the device; a RouteTape needs
@@ -1287,6 +1451,12 @@ begin
         EnqueueDeltaNet(aCtx, l, n)
       else
       begin
+        // the shape of the heads of this layer (Gemma 4: per layer)
+        hd := c.Spec[l].HeadDim;
+        qw := c.Heads * hd;
+        kvw := c.Spec[l].KvHeads * hd;
+        headDim := hd;
+        kvHeads := c.Spec[l].KvHeads;
         // attention block: the projections, per head the norms, rotary positions
         // and the store of k and v into the cache, the attention, the output
         if c.Spec[l].OutputGate then
@@ -1302,12 +1472,34 @@ begin
         else
           fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Q, qw, aCtx.fDevQ, ly^.QBias);
         fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.K, kvw, aCtx.fDevK, ly^.KBias);
-        fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, ly^.VBias);
+        // K=V (Gemma 4): the raw keys are the values, read before qkrope
+        // norms the keys (it only reads k)
+        if c.Spec[l].KIsV then
+          pv := pk
+        else
+        begin
+          fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.V, kvw, aCtx.fDevV, ly^.VBias);
+          pv := aCtx.fDevV.Ptr;
+        end;
         // without head norms (Qwen2) the kernel reads no qn or kn
         norm := ord(ly^.QNorm <> nil);
         rope := ord(not c.Spec[l].NoRope);
+        // the rotary set: the first (maybe a share of the head), or the second
+        // over the whole head (its factors 0 beyond the rotated share)
+        prs := pcs;
+        rot := c.RopeDims; // the whole head unless a share of it rotates
+        if c.Spec[l].Rope2 or c.Spec[l].NoRope then
+        begin
+          // a layer without rotary positions may have a head of its own
+          // width: rot never beyond it (Codex review)
+          if c.Spec[l].Rope2 then
+            prs := pcs2;
+          rot := 0;
+        end;
         window := c.Spec[l].Window;
+        Partition(c.Heads div c.Spec[l].KvHeads, n, past, hb, rb, splits, wsplits);
         nsplits := splits;
+        hblock := hb;
         rblock := rb;
         if window > 0 then
         begin
@@ -1318,8 +1510,8 @@ begin
         pkn := 0;
         if ly^.QNorm <> nil then
         begin
-          pqn := Vector(ly^.QNorm, c.HeadDim);
-          pkn := Vector(ly^.KNorm, c.HeadDim);
+          pqn := Vector(ly^.QNorm, hd);
+          pkn := Vector(ly^.KNorm, hd);
         end;
         pkc := aCtx.fDevKeys[l].Ptr;
         pvc := aCtx.fDevValues[l].Ptr;
@@ -1327,13 +1519,16 @@ begin
         psk := 0;
         if ly^.Sinks <> nil then
           psk := Vector(ly^.Sinks, c.Heads);
-        fCu.Enqueue(qkrope, [@pq, @pk, @pv, @pqn, @pkn, @pcs, @pkc, @pvc, @rows,
-          @heads, @kvHeads, @headDim, @ppast, @eps, @norm, @rope, @rot],
-          c.Heads + c.KvHeads, OPS_BLOCK, n);
-        fCu.Enqueue(attention, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
-          @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock, @window, @psk],
-          c.Heads div hb, OPS_BLOCK, (n + PtrInt(rblock) - 1) div PtrInt(rblock),
-          nsplits);
+        fCu.Enqueue(qkrope, [@pq, @pk, @pv, @pqn, @pkn, @prs, @pkc, @pvc, @rows,
+          @heads, @kvHeads, @headDim, @ppast, @eps, @norm, @rope, @rot, @vnorm],
+          c.Heads + c.Spec[l].KvHeads, OPS_BLOCK, n);
+        att := attention;
+        if hd > 256 then
+          att := attention512;
+        fCu.Enqueue(att, [@pq, @pkc, @pvc, @pa, @ppart, @rows, @heads,
+          @headDim, @kvHeads, @ppast, @nsplits, @hblock, @rblock, @window, @psk,
+          @ascale], c.Heads div hb, OPS_BLOCK,
+          (n + PtrInt(rblock) - 1) div PtrInt(rblock), nsplits);
         if nsplits > 1 then
           fCu.Enqueue(fMerge, [@ppart, @pa, @rows, @heads, @headDim, @nsplits, @psk],
             c.Heads, OPS_BLOCK, n);
@@ -1345,31 +1540,48 @@ begin
             OPS_BLOCK);
         end;
         fBackend.EnqueueLinear(aCtx.fDevAttn, n, qw, ly^.O, h, aCtx.fDevTmp, ly^.OBias);
+        // Gemma: the attention output normed before the residual
+        if c.SandwichNorm then
+          EnqueueNorm(aCtx.fDevTmp, n, h, ly^.AttnNorm, aCtx.fDevTmp);
       end;
-      // residual and the feed-forward pre-norm, gate and up, SwiGLU, down
+      // residual and the feed-forward pre-norm, then the block
       EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, ly^.PostNorm, aCtx.fDevH);
-      if c.Spec[l].Ffn = dfMoe then
-      begin
-        if device then
-          EnqueueMoeDevice(aCtx, l)
-        else
-          EnqueueMoe(aCtx, l, n);
-      end
+      case c.Spec[l].Ffn of
+        dfMoe:
+          if device then
+            EnqueueMoeDevice(aCtx, l, aCtx.fDevH, aCtx.fDevTmp)
+          else
+            EnqueueMoe(aCtx, l, n, aCtx.fDevH, aCtx.fDevTmp);
+        dfDenseMoe:
+          begin
+            // Gemma 4: the dense block on the pre-FFN norm, its output normed;
+            // the router on its own norm of the residual, the experts on
+            // theirs, their sum normed; both added
+            EnqueueDense(aCtx, l, n);
+            EnqueueNorm(aCtx.fDevTmp, n, h, ly^.DenseOutNorm, aCtx.fDevTmp);
+            EnqueueNorm(aCtx.fDevX, n, h, ly^.RouterScale, aCtx.fDevH2);
+            EnqueueNorm(aCtx.fDevX, n, h, ly^.MoeInNorm, aCtx.fDevH);
+            if device then
+              EnqueueMoeDevice(aCtx, l, aCtx.fDevH2, aCtx.fDevMoeOut)
+            else
+              EnqueueMoe(aCtx, l, n, aCtx.fDevH2, aCtx.fDevMoeOut);
+            EnqueueNorm(aCtx.fDevMoeOut, n, h, ly^.MoeOutNorm, aCtx.fDevMoeOut);
+            px := aCtx.fDevTmp.Ptr;
+            pt := aCtx.fDevMoeOut.Ptr;
+            count := n * h;
+            fCu.Enqueue(fAdd, [@px, @pt, @px, @count],
+              (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+          end;
       else
-      begin
-        fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Gate, f, aCtx.fDevGate);
-        fBackend.EnqueueLinear(aCtx.fDevH, n, h, ly^.Up, f, aCtx.fDevUp);
-        px := aCtx.fDevGate.Ptr;
-        pt := aCtx.fDevUp.Ptr;
-        count := n * f;
-        alpha := c.SwiGluAlpha;
-        limit := c.SwiGluLimit;
-        fCu.Enqueue(fSwiGlu, [@px, @pt, @count, @alpha, @limit],
-          (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
-        fBackend.EnqueueLinear(aCtx.fDevGate, n, f, ly^.Down, h, aCtx.fDevTmp);
+        EnqueueDense(aCtx, l, n);
       end;
-      // the residual, and the input norm of the next layer
-      if l < c.Layers - 1 then
+      // Gemma: the feed-forward output normed before the residual (the sum
+      // of a dfDenseMoe block always, as TDecoderModel.DenseMoeBlock)
+      if c.SandwichNorm or (c.Spec[l].Ffn = dfDenseMoe) then
+        EnqueueNorm(aCtx.fDevTmp, n, h, ly^.FfnNorm, aCtx.fDevTmp);
+      // the residual, and the input norm of the next layer - Gemma 4 scales
+      // the whole state by the layer scalar in between
+      if (l < c.Layers - 1) and (ly^.Scalar = nil) then
         EnqueueAddNorm(aCtx.fDevX, aCtx.fDevTmp, n, h, fModel.Layers[l + 1].InputNorm,
           aCtx.fDevH)
       else
@@ -1379,6 +1591,14 @@ begin
         count := n * h;
         fCu.Enqueue(fAdd, [@px, @pt, @px, @count],
           (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+        if ly^.Scalar <> nil then
+        begin
+          scalar := ly^.Scalar^[0];
+          fCu.Enqueue(fScale, [@px, @count, @scalar],
+            (count + OPS_BLOCK - 1) div OPS_BLOCK, OPS_BLOCK);
+          if l < c.Layers - 1 then
+            EnqueueNorm(aCtx.fDevX, n, h, fModel.Layers[l + 1].InputNorm, aCtx.fDevH);
+        end;
       end;
     end;
     last := 0;
@@ -1405,9 +1625,13 @@ begin
     fCu.CaptureAbort;
     raise;
   end;
-  // waits for every kernel before it (one stream)
+  // waits for every kernel before it (one stream); Gemma caps the logits
   if outRows > 0 then
+  begin
     aCtx.fLogits.Download(0, aLogits, Int64(outRows) * c.VocabSize * 4);
+    if c.LogitSoftcap > 0 then
+      InferSoftcap(aLogits, outRows * c.VocabSize, c.LogitSoftcap);
+  end;
   if aNormed <> nil then
     aCtx.fDevH.Download(Int64(last) * h * 4, aNormed, Int64(h) * 4);
   if (outRows = 0) and (aNormed = nil) then

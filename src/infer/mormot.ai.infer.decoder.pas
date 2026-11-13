@@ -307,6 +307,11 @@ const
   DECODER_EXTRAS_GPTOSS = [dxSinks, dxOutputBias, dxRouterBias, dxExpertBias,
     dxSwiGluLimit];
 
+  /// the extras of Gemma 4, which the CUDA device computes (slice D6e1)
+  DECODER_EXTRAS_GEMMA4 = [dxLayerShapes, dxAttentionScale, dxGeluTanh,
+    dxSandwichNorm, dxValueNorm, dxSharedKv, dxEmbedScale, dxLogitSoftcap,
+    dxLayerScalar, dxSecondRope, dxDenseMoe];
+
 type
 
   /// called with intermediate states of a Forward, for diagnosis and tests
@@ -923,6 +928,11 @@ function NewDecoderModel(const aFolder: TFileName; aBackend: TInferBackend;
 function NewDecoderModelFromGguf(const aFileName: TFileName;
   aBackend: TInferBackend): TDecoderModel;
 
+/// x := tanh(x / aCap) * aCap over aCount values, each step rounded to single
+// like the float32 reference (Gemma's final_logit_softcapping) - Forward does
+// it with Config.LogitSoftcap > 0, a device on the logits it read back
+procedure InferSoftcap(x: PSingleArray; aCount: PtrInt; aCap: double);
+
 
 implementation
 
@@ -1252,8 +1262,6 @@ begin
 end;
 
 
-/// x := tanh(x / aCap) * aCap, each step rounded to single like the float32
-// reference (Gemma's final_logit_softcapping)
 procedure InferSoftcap(x: PSingleArray; aCount: PtrInt; aCap: double);
 var
   i: PtrInt;

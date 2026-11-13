@@ -1818,6 +1818,95 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**D6e1 erledigt (2026-11-13): Gemma 4 auf CUDA.** `TQwen3Cuda` nimmt Gemma 4 an
+(`DECODER_EXTRAS_GEMMA4`): aus dem Ordner wie aus GGUF, dicht und mit Experten.
+
+- *Kernel* (`tools/cuda/ops.cu`):
+  - **Köpfe bis 512 Werte:** `attentionT` hat einen Template-Parameter für die
+    Ausgabeblöcke je Thread, `attention512` und `attention512_16` nehmen Köpfe bis 512
+    (24 KB Shared Memory). `qkrope` hält einen genormten Kopf von 512.
+  - **`qkrope` mit `vnorm`:** die Value-Norm (RMSNorm ohne Gewicht je KV-Kopf).
+  - **K=V:** Das Gerät bindet `v` an die rohen Keys, die `qkrope` nur liest.
+  - **Skala der Attention:** ein eigener Wert für die Scores (0 heißt wie bisher
+    1/sqrt(d), Gemma rechnet mit 1).
+  - **Neue Kernel:** `geglu` (GeGLU in float wie `GeluTanhGlu`) und `scale` (der
+    Layer-Skalar).
+  - **Router:** `route` nimmt die Skala je Experte, nach dem Renormieren wie
+    `TDecoderModel.Route`.
+- *Host:*
+  - **Kopfformen je Layer:** Die Scratch-Puffer haben die Größe der breitesten Form, der
+    KV-Cache die Form seines Layers. `Partition` teilt die Attention je Layer auf, weil die
+    Gruppen der KV-Köpfe verschieden groß sind. `fPart` wird vor dem Aufzeichnen eines
+    Graphen für die größte Teilung angelegt.
+  - **Zweiter RoPE-Satz:** Seine Faktoren liegen in `fDevCos` hinter dem ersten.
+  - **Norms:** die Sandwich-Norms.
+  - **Dichter Block neben den Experten:**
+    - Die Eingabe des Routers ist `RMSNorm(x) * RouterScale` in `fDevH2`.
+    - Die Experten rechnen auf ihrer eigenen Norm.
+    - Ihre Summe landet in `fDevMoeOut`, wird genormt und zum dichten Block addiert.
+    - Danach folgt immer die `FfnNorm`, wie in `DenseMoeBlock`.
+  - **Layer-Skalar:** Er kommt zwischen Residual und der Eingangsnorm des nächsten Layers.
+  - **Softcap:** Er wird auf die gelesenen Logits angewendet (`InferSoftcap`, jetzt im
+    Interface von `mormot.ai.infer.decoder`).
+- *Experten auf dem Gerät gewählt:*
+  - **Layout in der Datei:** GGUF legt Gate und Up in einem Tensor ab
+    (`ffn_gate_up_exps`), je Experte erst die Gate-, dann die Up-Zeilen. `GateUp` lädt den
+    Tensor als einen Puffer hoch. Gate und Up sind Offsets darin, von Experte zu Experte
+    zwei Scheiben weiter.
+  - **Wirkung:** Ein Decode-Schritt bleibt ein CUDA-Graph. Vorher wählte der Host je Layer.
+  - **Weitere Fälle:** Die verbreiterten F32-Experten aus dem Ordner liegen genauso. Bei
+    Q8_0 aus dem Ordner (ein Puffer je Experte) wählt weiter der Host.
+  - **Ausrichtung:** Eine Scheibe, die keine ganzen Wörter ist, nimmt den alten Weg
+    (Codex-Review: Die Up-Zeilen lägen sonst nicht auf Wortgrenzen).
+- *Genauigkeit (RTX 5090, Q8_0 aus GGUF gegen transformers in float32):*
+  - **12B:** Logits mit Kosinus 0,9887 im Rohtext-Fall 0 (größter Fehler 6,4),
+    0,9992–0,99995 in den Fällen 1..3.
+  - **26B-A4B:** Kosinus 0,9984–0,9997, größter Fehler 5,9.
+  - **Greedy:** gleich, wo die Referenz sicher war.
+  - **Gerät gegen CPU:** Auf dem Gerät liegen die Werte näher an der Referenz als auf der
+    CPU aus derselben Datei, weil die CPU mit Q8_0-Aktivierungen rechnet.
+- *Tempo (RTX 5090):*
+  - **26B-A4B Q8_0:** 24 Tokens in 0,56–0,58 s (gut 40 Tokens/s). Mit der Wahl auf dem
+    Host waren es bis zu 23 s.
+  - **12B Q8_0:** 24 Tokens in 0,63–0,67 s.
+  - **Laden:** 26B-A4B in 35 s, 12B in 16 s (die Datei, dann der Upload).
+  - **Speicher:** Das 26B-A4B in Q8_0 belegt gut 25 GB der 32 GB. Das 31B in Q8_0
+    (33 GB) passt nicht.
+- *Nicht auf dem Gerät:* Q4_0 (keine GPU hat bisher einen Q4_0-Kernel; Backlog). Der
+  Client auf dem Gerät läuft deshalb mit dem 12B in Q8_0.
+- *Tests* (`test.infer.cuda`):
+  - **`OpsMatchCpu`:**
+    - Köpfe von 512 (16 Köpfe auf 2 KV-Köpfen, K=V, ein Viertel drehend), 384 und 256
+      mit Fenster, Value-Norm und Skala 1.
+    - Dieselben mit Halbfloat-Cache (`Attention16Case`: die neuen Cache-Zeilen innerhalb
+      der Rundung eines Halbfloats, die Attention über die gespeicherten Halbfloats).
+    - `geglu` und `scale`.
+  - **`RouteMatchesHost`:** mit Expertenskalen.
+  - **`Gemma4MatchesCpu`** (die Tiny-Modelle gegen die CPU):
+    - F32 mit Cache in Floats und in Halbfloats, Q8_0 beim Laden, das dichte Modell,
+      die Tiny-GGUFs aus D6d.
+    - Ein Modell mit Köpfen von 44 und 15 drehenden Paaren.
+    - Prompt über zwei Chunks.
+    - Decode-Schritte als Graph bitgleich zu einzelnen Starts.
+    - Die Expertenwahl des Geräts gleich der des Hosts.
+    - Eine Verzweigung hinter dem Fenster.
+  - **`Gemma4OnDevice`:**
+    - 12B und 26B-A4B gegen die Referenzen aus D6b.
+    - Das 12B über `TNativeLlmClient` auf dem Gerät: Paris, `get_weather`, 17 °C.
+  - **`CheckGemma4Client`:** Die Chat-Prüfung aus `TTestInferGemma4` ist jetzt eine freie
+    Prozedur, damit der CUDA-Test sie mitbenutzen kann.
+- *Läufe:* RTX-Rechner FPC 16 402, Delphi 13 16 402 (beide mit `LAI_REQUIRE_CUDA`),
+  Delphi 7 5 867 (32 Bit: ohne CUDA und ohne die großen Modelle) - alle grün; `TTestInferCuda`
+  allein 1 546. Mac und WSL nicht: kein CUDA dort, der übrige Code ohne Plattformzweig.
+- *Review:* Claude-Finder und Codex in drei Runden. Runde 1: der Finder ohne P0/P1, beide
+  fanden die Gate/Up-Scheibe ohne ganze Wörter (Rückfall auf einen Puffer je Experte) und die
+  Attention-Puffer der Größe 0 eines Modells nur aus DeltaNet-Layern (mindestens ein Wort);
+  der Finder wollte den Halbfloat-Cache mit Köpfen von 512 auf Op-Ebene geprüft
+  (`Attention16Case`) und die `FfnNorm` eines `dfDenseMoe`-Blocks ohne Bedingung wie auf der
+  CPU. Runde 2: Codex fand, dass ein NoRope-Layer mit eigener Kopfbreite `rot` des ganzen
+  Modells bekam (jetzt 0); gezielte Tests für diese Randfälle, die kein heutiges Modell
+  erzeugt, stehen im Backlog. Runde 3: ohne Befund.
+
 **D6d erledigt (2026-11-12): Gemma 4 aus GGUF.** `TGemma4Model.CreateFromGguf` liest die
 Architektur `gemma4`, wie der Konverter von llama.cpp sie schreibt (nachgeschlagen in
 `conversion/gemma.py`, `src/models/gemma4.cpp` und `src/llama-vocab.cpp`, Commit `2a4daf0…`,
@@ -2719,8 +2808,8 @@ der CPU und aus safetensors.
   `Gemma4TextConfig`; der letzte Layer ist immer voll. Abgelehnt: Per-Layer-Embeddings und
   geteilter KV (E2B, E4B), ein ungebundener Kopf, Bias, bidirektionale Attention über alles,
   eine andere Aktivierung oder RoPE-Art, ein RoPE-Eintrag `null` (transformers baut dann keinen
-  Satz und scheitert im Durchlauf). Die GPU-Geräte lehnen jedes Extra jenseits von gpt-oss ab
-  (`DECODER_EXTRAS_GPTOSS`), bis D6e kommt.
+  Satz und scheitert im Durchlauf). Die GPU-Geräte lehnten jedes Extra jenseits von gpt-oss ab
+  (`DECODER_EXTRAS_GPTOSS`), bis D6e kam (CUDA: D6e1).
 - *Referenz* (`make_reference_d6.py`): `tiny-gemma4` - 4 Layer (Sliding mit Fenster 5, voll,
   Sliding, voll), Kopfdimension 16 (Sliding, 2 KV-Köpfe) bzw. 32 (voll, 1 KV-Kopf, K=V),
   die proportionale RoPE, dichter

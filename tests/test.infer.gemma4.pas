@@ -52,9 +52,6 @@ type
     // decoding gives the text back; at least aMinCases cases
     procedure CheckRefIds(aTokenizer: TInferTokenizer; const aDir: TFileName;
       aMinCases: PtrInt);
-    /// an answer (Paris), a tool call and its result (17), with aThinking a
-    // reasoning before the answer (391)
-    procedure CheckClientChat(aLlm: TNativeLlmClient; aThinking: boolean);
   published
     /// U+2581 for a space, the whole text one word, byte fallback, decoding;
     // foreign pipelines refused (no model needed)
@@ -117,6 +114,13 @@ function ChatCaseMessages(aCase: PDocVariantData): TLlmMessageDynArray;
 
 /// the tools of a chat case of a reference (name, description, parameters)
 function ChatCaseTools(aCase: PDocVariantData): TLlmToolDynArray;
+
+
+/// a Gemma 4 client: an answer (Paris), a tool call and its result (17), with
+// aThinking a reasoning before the answer (391) - also for a client on a
+// device (test.infer.cuda)
+procedure CheckGemma4Client(aTest: TSynTestCase; aLlm: TNativeLlmClient;
+  aThinking: boolean);
 
 
 implementation
@@ -1191,15 +1195,15 @@ begin
     (f.Parser = TGemma4OutputParser), 'gemma4_unified registered');
 end;
 
-procedure TTestInferGemma4.CheckClientChat(aLlm: TNativeLlmClient;
+procedure CheckGemma4Client(aTest: TSynTestCase; aLlm: TNativeLlmClient;
   aThinking: boolean);
 var
   r: TLlmChatRequest;
   a: TLlmChatResponse;
   timer: TPrecisionTimer;
 begin
-  Check(aLlm.Template is TGemma4ChatTemplate, 'the Gemma 4 template');
-  Check(not aLlm.EnableThinking, 'thinking only when asked');
+  aTest.Check(aLlm.Template is TGemma4ChatTemplate, 'the Gemma 4 template');
+  aTest.Check(not aLlm.EnableThinking, 'thinking only when asked');
   Finalize(r);
   FillCharFast(r, SizeOf(r), 0);
   SetLength(r.Messages, 1);
@@ -1209,11 +1213,11 @@ begin
     'What is the capital of France? Answer with one word.');
   timer.Start;
   a := aLlm.ChatComplete(r);
-  AddConsole(FormatString('capital in %: "%" (% tokens)', [timer.Stop, a.Content,
-    a.Usage.CompletionTokens]));
-  Check(a.FinishReason = lfrStop, 'stopped by itself');
-  Check(PosEx('Paris', a.Content) > 0, 'the answer Paris');
-  CheckEqual(a.Reasoning, '', 'no reasoning');
+  aTest.AddConsole(FormatString('capital in %: "%" (% tokens)', [timer.Stop,
+    a.Content, a.Usage.CompletionTokens]));
+  aTest.Check(a.FinishReason = lfrStop, 'stopped by itself');
+  aTest.Check(PosEx('Paris', a.Content) > 0, 'the answer Paris');
+  aTest.CheckEqual(a.Reasoning, '', 'no reasoning');
   // a tool call, then the answer with its result
   SetLength(r.Tools, 1);
   r.Tools[0].Name := 'get_weather';
@@ -1223,12 +1227,12 @@ begin
   r.Messages[0] := LlmMessage(lrUser, 'What is the weather in Berlin right now?');
   timer.Start;
   a := aLlm.ChatComplete(r);
-  AddConsole(FormatString('weather in %: % calls, content "%"', [timer.Stop,
+  aTest.AddConsole(FormatString('weather in %: % calls, content "%"', [timer.Stop,
     length(a.ToolCalls), a.Content]));
-  if not CheckFailed(length(a.ToolCalls) = 1, 'one tool call') then
+  if not aTest.CheckFailed(length(a.ToolCalls) = 1, 'one tool call') then
   begin
-    CheckEqual(a.ToolCalls[0].Name, 'get_weather', 'the tool');
-    CheckEqual(a.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
+    aTest.CheckEqual(a.ToolCalls[0].Name, 'get_weather', 'the tool');
+    aTest.CheckEqual(a.ToolCalls[0].ArgumentsJson, '{"city": "Berlin"}', 'the city');
     SetLength(r.Messages, 3);
     r.Messages[1] := LlmMessage(lrAssistant, a.Content);
     r.Messages[1].ToolCalls := a.ToolCalls;
@@ -1236,9 +1240,10 @@ begin
     r.Messages[2].ToolCallId := a.ToolCalls[0].Id;
     timer.Start;
     a := aLlm.ChatComplete(r);
-    AddConsole(FormatString('answer in %: "%"', [timer.Stop, copy(a.Content, 1, 200)]));
-    Check(a.FinishReason = lfrStop, 'answered');
-    Check(PosEx('17', a.Content) > 0, 'with the temperature of the tool');
+    aTest.AddConsole(FormatString('answer in %: "%"', [timer.Stop,
+      copy(a.Content, 1, 200)]));
+    aTest.Check(a.FinishReason = lfrStop, 'answered');
+    aTest.Check(PosEx('17', a.Content) > 0, 'with the temperature of the tool');
   end;
   if not aThinking then
     exit;
@@ -1250,11 +1255,12 @@ begin
   r.MaxTokens := 1500;
   timer.Start;
   a := aLlm.ChatComplete(r);
-  AddConsole(FormatString('17 x 23 with thinking in %: reasoning "%" answer "%" ' +
+  aTest.AddConsole(FormatString('17 x 23 with thinking in %: reasoning "%" ' +
+    'answer "%" ' +
     '(% tokens)', [timer.Stop, copy(a.Reasoning, 1, 100), copy(a.Content, 1, 100),
     a.Usage.CompletionTokens]));
-  Check(a.Reasoning <> '', 'with reasoning');
-  Check(PosEx('391', a.Content) > 0, 'the answer 391');
+  aTest.Check(a.Reasoning <> '', 'with reasoning');
+  aTest.Check(PosEx('391', a.Content) > 0, 'the answer 391');
 end;
 
 procedure TTestInferGemma4.Gemma4CheckpointChat;
@@ -1279,7 +1285,7 @@ begin
   llm := TNativeLlmClient.Create(dir); // Q8_0 at load
   try
     AddConsole(FormatString('gemma-4-26B-A4B-it client loaded in %', [timer.Stop]));
-    CheckClientChat(llm, true);
+    CheckGemma4Client(self, llm, true);
   finally
     llm.Free;
   end;
@@ -1399,7 +1405,7 @@ begin
       Check((llm.Family.Tokenizer = TSpBpeTokenizer) and (llm.Model.Gguf <> nil),
         'the tokenizer of the file');
       // the 12B Q4_0 file: the QAT checkpoint, its Q4_0 weights trained for it
-      CheckClientChat(llm, false);
+      CheckGemma4Client(self, llm, false);
     finally
       llm.Free;
     end;
