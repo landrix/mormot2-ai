@@ -1876,8 +1876,8 @@ für leere Argumente (`{}`), jetzt da.
   Client auf dem Gerät läuft deshalb mit dem 12B in Q8_0.
 - *Tests* (`test.infer.cuda`):
   - **`OpsMatchCpu`:**
-    - Köpfe von 512 (16 Köpfe auf 2 KV-Köpfen, K=V, ein Viertel drehend), 384 und 256
-      mit Fenster, Value-Norm und Skala 1.
+    - Köpfe von 512 (16 Köpfe auf 2 KV-Köpfen mit K=V und ein Viertel drehend, 4 auf
+      einem mit Value-Norm), 384 mit Skala 0,3, 256 mit Fenster, Value-Norm und Skala 1.
     - Dieselben mit Halbfloat-Cache (`Attention16Case`: die neuen Cache-Zeilen innerhalb
       der Rundung eines Halbfloats, die Attention über die gespeicherten Halbfloats).
     - `geglu` und `scale`.

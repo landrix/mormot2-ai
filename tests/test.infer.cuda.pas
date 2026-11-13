@@ -165,7 +165,7 @@ type
     // experts beside the dense block in F32 (a cache of floats and of half
     // floats), Q8_0 at load, the dense model, the tiny GGUF files (routed on
     // the device); a prompt over two chunks, decode steps as graphs and
-    // without, a branch behind the window; a head of 44 refused
+    // without, a branch behind the window; heads of 44 (15 pairs rotating)
     procedure Gemma4MatchesCpu;
     /// D6e1: Gemma 4 12B and 26B-A4B (Q8_0 GGUF) on the device against
     // transformers (the references of D6b), the 12B through TNativeLlmClient
