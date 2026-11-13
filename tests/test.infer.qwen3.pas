@@ -182,6 +182,11 @@ type
     // - D5e: no head either - the normed last row (aNormed) only, logits
     // refused before the cache changes
     procedure StackFromCheckpoint;
+    /// B18: a stack with several heads (CreateStack with a list) -
+    // ForwardEmbeds picks one per call on the same context: tiny-qwen3's
+    // head and its negation (stack/outer.head2.weight) give the logits and
+    // their negation, an unknown head refused before the cache changes
+    procedure StackWithHeads;
     /// B14: the talker and the code predictor of Qwen3-TTS-12Hz-0.6B-CustomVoice
     // fed with embedding rows, against PyTorch (flydev's qwen3-tts-lm
     // reference): every talker state and its logits, the 15 logit rows and
@@ -248,6 +253,19 @@ function NewTtsTalker(const aFolder: TFileName; aBackend: TInferBackend): TQwen3
 
 /// the code predictor of Qwen3-TTS (5 layers, no embedding, head of group 0)
 function NewTtsPredictor(const aFolder: TFileName; aBackend: TInferBackend): TQwen3Model;
+
+/// B18: Qwen3-TTS's code predictor with its 15 heads, one per code group
+// (ForwardEmbeds aHead = g)
+function NewTtsPredictorHeads(const aFolder: TFileName;
+  aBackend: TInferBackend): TQwen3Model;
+
+/// B18: tiny-qwen3/stack without an embedding, with the heads
+// outer.head.weight and outer.head2.weight (its negation)
+function NewStackTwoHeads(const aStackDir: TFileName;
+  aBackend: TInferBackend): TQwen3Model;
+
+/// B18: the count of aCount values where aNeg is not -aPos
+function NegatedMisses(aPos, aNeg: PSingleArray; aCount: PtrInt): PtrInt;
 
 /// true when config.json and model.safetensors in aFolder have the sha256 of
 // the manifest of aRef (model.files)
@@ -3306,6 +3324,148 @@ begin
   end;
 end;
 
+procedure TTestInferQwen3.StackWithHeads;
+var
+  dir, sdir: TFileName;
+  ref: TInferRefSet;
+  plain, two, one, none: TQwen3Model;
+  ctx, ctx2: TQwen3Context;
+  ids: PIntegerArray;
+  n, h, vocab: PtrInt;
+  want, rows, l0, l1, all1: TSingleDynArray;
+  noHeads: TRawUtf8DynArray;
+  why: RawUtf8;
+begin
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  sdir := dir + 'stack' + PathDelim;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  plain := nil;
+  two := nil;
+  one := nil;
+  none := nil;
+  ctx := nil;
+  ctx2 := nil;
+  try
+    plain := TQwen3Model.Create(dir, fCpu);
+    two := NewStackTwoHeads(sdir, fCpu);
+    CheckEqual(two.HeadCount, 2, 'two heads');
+    Check(two.HasHead and (two.HeadOf(0).Data = two.Head.Data) and
+      (two.HeadOf(1).Data <> two.Head.Data), 'Head is head 0');
+    ids := ref.I32('case2.ids', n);
+    h := plain.Config.Hidden;
+    vocab := plain.Config.VocabSize;
+    SetLength(want, n * vocab);
+    SetLength(rows, n * h);
+    SetLength(l0, vocab);
+    SetLength(l1, vocab);
+    SetLength(all1, n * vocab);
+    ctx := plain.NewContext;
+    plain.Forward(ctx, ids, n, pointer(want), true);
+    FreeAndNil(ctx);
+    plain.Embed(ids, n, pointer(rows));
+    // head 0: the bits of the plain model; head 1: their negation
+    ctx := two.NewContext;
+    two.ForwardEmbeds(ctx, pointer(rows), n - 1, pointer(l0), false, nil, nil, 0);
+    ctx2 := two.NewContext;
+    two.ForwardEmbeds(ctx2, pointer(rows), n - 1, pointer(l1), false, nil, nil, 1);
+    Check(CompareMem(pointer(l0), @want[(n - 2) * vocab], vocab * SizeOf(single)),
+      'head 0 gives the bits of the model');
+    CheckEqual(NegatedMisses(pointer(l0), pointer(l1), vocab), 0, 'head 1 negates');
+    // per call on one context: the next row through head 1, then all rows of
+    // a fresh pass through head 1
+    two.ForwardEmbeds(ctx, @rows[(n - 1) * h], 1, pointer(l1), false, nil, nil, 1);
+    CheckEqual(NegatedMisses(@want[(n - 1) * vocab], pointer(l1), vocab), 0,
+      'head 1 after head 0 on one context');
+    FreeAndNil(ctx2);
+    ctx2 := two.NewContext;
+    two.ForwardEmbeds(ctx2, pointer(rows), n, pointer(all1), true, nil, nil, 1);
+    CheckEqual(NegatedMisses(pointer(want), pointer(all1), n * vocab), 0,
+      'every row through head 1');
+    // an unknown head: refused before the cache changes
+    why := '';
+    try
+      two.ForwardEmbeds(ctx, pointer(rows), 1, pointer(l0), false, nil, nil, 2);
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('no head 2', why) > 0, 'head 2 refused: %', [why]);
+    CheckEqual(ctx.Length, n, 'the cache unchanged by the refused call');
+    why := '';
+    try
+      two.HeadOf(-1);
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('no head -1', why) > 0, 'HeadOf(-1) refused: %', [why]);
+    // a list of one: the one head; an empty list: none
+    one := TQwen3Model.CreateStack(sdir, fCpu, 'outer_config', 'outer.model.', '',
+      ['outer.head2.weight']);
+    noHeads := nil;
+    none := TQwen3Model.CreateStack(sdir, fCpu, 'outer_config', 'outer.model.', '',
+      noHeads);
+    CheckEqual(one.HeadCount, 1, 'a list of one');
+    CheckEqual(none.HeadCount, 0, 'an empty list');
+    Check(not none.HasHead, 'no head from an empty list');
+    FreeAndNil(ctx2);
+    ctx2 := one.NewContext;
+    one.ForwardEmbeds(ctx2, pointer(rows), n, pointer(l0));
+    CheckEqual(NegatedMisses(@want[(n - 1) * vocab], pointer(l0), vocab), 0,
+      'the one head of a list');
+    // refused: a head without a name, a head that is not in the file
+    why := '';
+    try
+      TQwen3Model.CreateStack(sdir, fCpu, 'outer_config', 'outer.model.', '',
+        ['outer.head.weight', '']).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('no name', why) > 0, 'a head without a name: %', [why]);
+    why := '';
+    try
+      TQwen3Model.CreateStack(sdir, fCpu, 'outer_config', 'outer.model.', '',
+        ['outer.head.weight', 'outer.nohead.weight']).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('outer.nohead.weight', why) > 0, 'a second head not in the file: %',
+      [why]);
+    // a tied head is the embedding: no list of heads there (Gemma 4 ties always)
+    why := '';
+    try
+      TQwen3Model.CreateStack(sdir, fCpu, 'tied', 'outer.model.',
+        'outer.model.embed_tokens.weight', ['outer.head.weight', 'outer.head2.weight']).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('tied', why) > 0, 'heads of a tied stack: %', [why]);
+    // also a list of one there (else the embedding would stand in for it)
+    why := '';
+    try
+      TQwen3Model.CreateStack(sdir, fCpu, 'tied', 'outer.model.',
+        'outer.model.embed_tokens.weight', ['outer.head.weight']).Free;
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('tied', why) > 0, 'a list of one on a tied stack: %', [why]);
+  finally
+    ctx2.Free;
+    ctx.Free;
+    none.Free;
+    one.Free;
+    two.Free;
+    plain.Free;
+    ref.Free;
+  end;
+end;
+
 function TtsFolder: TFileName;
 begin
   result := FindVendorModel(TTS_MODEL + PathDelim + 'model.safetensors');
@@ -3324,6 +3484,37 @@ begin
   result := TQwen3Model.CreateStack(aFolder, aBackend,
     'talker_config.code_predictor_config', 'talker.code_predictor.model.', '',
     'talker.code_predictor.lm_head.0.weight');
+end;
+
+function NewTtsPredictorHeads(const aFolder: TFileName;
+  aBackend: TInferBackend): TQwen3Model;
+var
+  heads: TRawUtf8DynArray;
+  g: PtrInt;
+begin
+  SetLength(heads, 15);
+  for g := 0 to high(heads) do
+    heads[g] := FormatUtf8('talker.code_predictor.lm_head.%.weight', [g]);
+  result := TQwen3Model.CreateStack(aFolder, aBackend,
+    'talker_config.code_predictor_config', 'talker.code_predictor.model.', '',
+    heads);
+end;
+
+function NewStackTwoHeads(const aStackDir: TFileName;
+  aBackend: TInferBackend): TQwen3Model;
+begin
+  result := TQwen3Model.CreateStack(aStackDir, aBackend, 'outer_config',
+    'outer.model.', '', ['outer.head.weight', 'outer.head2.weight']);
+end;
+
+function NegatedMisses(aPos, aNeg: PSingleArray; aCount: PtrInt): PtrInt;
+var
+  i: PtrInt;
+begin
+  result := 0;
+  for i := 0 to aCount - 1 do
+    if aNeg^[i] <> -aPos^[i] then
+      inc(result);
 end;
 
 function TtsFilesMatch(const aFolder: TFileName; aRef: TInferRefSet;

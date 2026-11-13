@@ -1,15 +1,18 @@
 """tiny-qwen3/stack: tiny-qwen3 as one stack of a larger checkpoint (backlog B14)
 
 The weights of tests/data/infer-ref/tiny-qwen3 under the prefix "outer.model." in place of
-"model.", the head as its own tensor "outer.head.weight" (a copy of the tied embedding), an
-unrelated tensor "other.weight", and the same layers again under "broken.model." with one
-tensor more (a Q bias the family does not have). config.json holds the settings as objects:
+"model.", the head as its own tensor "outer.head.weight" (a copy of the tied embedding), a
+second head "outer.head2.weight" (the embedding negated, exact in BF16: its logits are those of
+the first head negated, bit for bit - backlog B18), an unrelated tensor "other.weight", and the
+same layers again under "broken.model." with one tensor more (a Q bias the family does not
+have). config.json holds the settings as objects:
 
 - "outer_config": tiny-qwen3's settings, untied, with the multimodal RoPE of Qwen3-TTS's talker
   (sections 6 + 5 + 5 = head_dim / 2): plain RoPE while the positions are equal
 - "outer_config.inner": the same settings again, one level deeper (a dotted path)
 - "bad_mrope": sections summing to 15; "zero_mrope": the right sum from a negative and a zero
   section; "scaled": a linear rope_scaling - all refused
+- "tied": the settings with tie_word_embeddings - a list of heads is refused there (B18)
 
 Nothing is computed: a stack loaded with CreateStack must give tiny-qwen3's reference
 (tensors.bin of tiny-qwen3) bit for bit. Needs numpy only.
@@ -61,6 +64,12 @@ def main():
         out["broken." + name] = t
     emb = src["model.embed_tokens.weight"]
     out["outer.head.weight"] = emb
+    # the second head: every BF16 sign bit flipped
+    dtype, shape, raw = emb
+    assert dtype == "BF16", dtype
+    words = struct.unpack("<%dH" % (len(raw) // 2), raw)
+    out["outer.head2.weight"] = (dtype, shape,
+                                 struct.pack("<%dH" % len(words), *[w ^ 0x8000 for w in words]))
     hidden = cfg["hidden_size"]
     # a bias the family has not: under the layers of the broken stack
     out["broken.model.layers.0.self_attn.q_proj.bias"] = (
@@ -84,8 +93,10 @@ def main():
     zero["rope_scaling"] = {"mrope_section": [half + 1, -1, 0], "rope_type": "default"}
     scaled = dict(inner)
     scaled["rope_scaling"] = {"type": "linear", "factor": 2.0}
+    tied = dict(inner)
+    tied["tie_word_embeddings"] = True
     config = {"model_type": "some_speech_model", "outer_config": outer,
-              "bad_mrope": bad, "zero_mrope": zero, "scaled": scaled}
+              "bad_mrope": bad, "zero_mrope": zero, "scaled": scaled, "tied": tied}
     os.makedirs(OUT, exist_ok=True)
     write_safetensors(os.path.join(OUT, "model.safetensors"), out)
     with open(os.path.join(OUT, "config.json"), "w", encoding="utf-8", newline="\n") as f:

@@ -9,6 +9,12 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-13 - B18 (issue #1): several heads on the device, a head index per call.**
+  `CreateStack` takes a list of heads, `ForwardEmbeds(..., aHead)` picks one per call on the
+  CPU, Vulkan and CUDA - the product stays in the pass. Qwen3-TTS's code predictor runs its
+  15 heads on the device, against PyTorch with every code equal; on an RTX 5090 the 15
+  products add almost nothing to a frame (Vulkan 8.3 ms with them, 8.2 ms without logits;
+  with the heads on the CPU, measured in turn, 14.5 instead of 8.9 ms).
 - **2026-11-13 - B19: Q4_K on CUDA as fast as Q8_0.** The CUDA linear kernels read a Q4_K
   block as 32-bit words with one 64-bit address per block instead of single bytes; Qwen3.8-27B
   Q4_K_M decode on CUDA from 31.7 to 36.1 tokens/s (Q8_0 36.5, Vulkan 39.4).

@@ -43,7 +43,8 @@
 //   blocks used in place
 // - a decoder may also be one stack of a larger checkpoint (CreateStack: its
 //   settings from an object inside config.json, its tensors under a prefix,
-//   its own embedding and head or none of either), and take embedding rows
+//   its own embedding and head or none of either, or several heads picked
+//   per call - backlog B18), and take embedding rows
 //   instead of token ids (ForwardEmbeds, which also hands back the normed last
 //   row, on a device too) - the language model of a speech, vision or
 //   audio model; a model forgets its weights on a GPU backend when it is
@@ -562,6 +563,11 @@ type
     // replaces "model." in every tensor name, the tensors of the embedding
     // ('' = none) and of the head
     fStackConfig, fStackPrefix, fStackEmbed, fStackHead: RawUtf8;
+    // CreateStack with several heads: the tensors of heads 1.. (head 0 is
+    // fStackHead), and every head as used (nil: the one head fHead)
+    fStackHeads: TRawUtf8DynArray;
+    fStackList: boolean; // CreateStack with a list: its heads checked strictly
+    fHeads: TInferWeightDynArray;
     fRouteTape: TDecoderRouteTape;
     fEmbed, fHead: TInferWeight;
     fNorm: PSingleArray;
@@ -601,11 +607,15 @@ type
     // points
     procedure ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
       aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
-      aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
+      aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray;
+      aHead: PtrInt);
     /// ForwardRows of one part of the rows
     procedure ForwardPart(aCtx: TDecoderContext; aIds: PIntegerArray;
       aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
-      aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
+      aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray;
+      aHead: PtrInt);
+    /// the heads 1.. of CreateStack with several heads, after LoadWeights
+    procedure LoadStackHeads;
     /// true when a layer is dmDeltaNet: a context carries states
     function Recurrent: boolean;
     /// fConfig from a Hugging Face config.json - raises EInferError for a
@@ -735,7 +745,15 @@ type
     // - aWeights as Create
     constructor CreateStack(const aFolder: TFileName; aBackend: TInferBackend;
       const aConfigPath, aPrefix, aEmbedding, aHead: RawUtf8;
-      aWeights: TInferDType = idtF32);
+      aWeights: TInferDType = idtF32); overload;
+    /// CreateStack with several heads aHeads (full tensor names, [VocabSize,
+    // Hidden] each; none: no head) - a stack whose steps take turns over
+    // heads (a talker's code predictor: one per code group); ForwardEmbeds
+    // picks one per call (aHead), on a device too, so the product stays in
+    // the pass. Head is aHeads[0], every one is loaded as Head is
+    constructor CreateStack(const aFolder: TFileName; aBackend: TInferBackend;
+      const aConfigPath, aPrefix, aEmbedding: RawUtf8;
+      const aHeads: array of RawUtf8; aWeights: TInferDType = idtF32); overload;
     /// unmap the weights, and forget them on the backend first
     // (ForgetWeights) - the backend must still live
     destructor Destroy; override;
@@ -774,15 +792,23 @@ type
     // ([Hidden]): what the head multiplies, for a model that feeds it on
     // (a talker's code predictor) or applies a head of its own - on a device
     // too, and with aLogits nil also without a head
+    // - aHead: the head of the logits, 0 .. HeadCount - 1 (CreateStack with
+    // several heads; 0 is Head) - checked also when aLogits is nil
     procedure ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
       aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false;
-      const aOnState: TOnDecoderState = nil; aNormed: PSingleArray = nil);
+      const aOnState: TOnDecoderState = nil; aNormed: PSingleArray = nil;
+      aHead: PtrInt = 0);
     /// true when the model has a token embedding: Forward, Embed and Greedy
     // need one (a stack without one takes ForwardEmbeds only)
     function HasEmbedding: boolean;
     /// true when the model has a head: logits need one (a stack without one
     // gives the normed state of ForwardEmbeds only)
     function HasHead: boolean;
+    /// how many heads ForwardEmbeds can pick from (aHead): 0 without a head,
+    // 1 with one, more for CreateStack with several heads
+    function HeadCount: PtrInt;
+    /// head aIndex (0 .. HeadCount - 1) as used; 0 is Head
+    function HeadOf(aIndex: PtrInt): TInferWeight;
     /// the channels of the convolution of a dmDeltaNet layer: Q, K and V
     // (the rows a device keeps per token of such a layer)
     function LinChannels: PtrInt;
@@ -889,9 +915,10 @@ type
       aLogits: PSingleArray; aAllLogits: boolean = false); virtual; abstract;
     /// TDecoderModel.ForwardEmbeds for a context of this device (no states)
     // - raises EInferError here: a device that takes embedding rows overrides it
+    // - aHead: checked by the model (0 .. HeadCount - 1)
     procedure ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
       aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean = false;
-      aNormed: PSingleArray = nil); virtual;
+      aNormed: PSingleArray = nil; aHead: PtrInt = 0); virtual;
     /// TDecoderModel.Reuse for a context of this device
     function Reuse(aCtx: TDecoderContext; aIds: PIntegerArray;
       aCount: PtrInt): PtrInt; virtual; abstract;
@@ -1256,7 +1283,8 @@ end;
 { TDecoderDevice }
 
 procedure TDecoderDevice.ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
-  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean; aNormed: PSingleArray);
+  aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean; aNormed: PSingleArray;
+  aHead: PtrInt);
 begin
   EInferError.RaiseUtf8('%.ForwardEmbeds: embedding rows not supported', [self]);
 end;
@@ -1329,6 +1357,7 @@ begin
       [self, INFER_DTYPE_NAME[aWeights]]);
   fFile := TSafeTensorsFile.OpenFolder(aFolder);
   LoadWeights;
+  LoadStackHeads;
 end;
 
 constructor TDecoderModel.CreateFromGguf(const aFileName: TFileName;
@@ -1358,6 +1387,68 @@ begin
   fStackEmbed := aEmbedding;
   fStackHead := aHead;
   Create(aFolder, aBackend, aWeights);
+end;
+
+constructor TDecoderModel.CreateStack(const aFolder: TFileName;
+  aBackend: TInferBackend; const aConfigPath, aPrefix, aEmbedding: RawUtf8;
+  const aHeads: array of RawUtf8; aWeights: TInferDType);
+var
+  i: PtrInt;
+begin
+  if (aConfigPath = '') or (aPrefix = '') then
+    EInferError.RaiseUtf8('%.CreateStack: a config path and a prefix are needed',
+      [self]);
+  for i := 0 to high(aHeads) do
+    if aHeads[i] = '' then
+      EInferError.RaiseUtf8('%.CreateStack: head % has no name', [self, i]);
+  fStackConfig := aConfigPath;
+  fStackPrefix := aPrefix;
+  fStackEmbed := aEmbedding;
+  if length(aHeads) > 0 then
+    fStackHead := aHeads[0];
+  fStackList := true;
+  if length(aHeads) > 1 then
+    SetLength(fStackHeads, high(aHeads));
+  for i := 1 to high(aHeads) do
+    fStackHeads[i - 1] := aHeads[i];
+  Create(aFolder, aBackend, aWeights);
+end;
+
+procedure TDecoderModel.LoadStackHeads;
+var
+  i: PtrInt;
+begin
+  if not fStackList then
+    exit;
+  // a list means what it names, for every family: none is no head, and head
+  // 0 the first tensor - a tied head (Gemma 4 always, tie_word_embeddings) is
+  // the embedding, whatever the list says
+  if fStackHead = '' then
+  begin
+    if fHead.Data <> nil then
+      EInferError.RaiseUtf8('%: an empty list of heads, but the family gives one',
+        [self]);
+    exit;
+  end;
+  if fConfig.TiedEmbeddings then
+    EInferError.RaiseUtf8('%: a list of heads needs heads of their own, not the ' +
+      'tied embedding', [self]);
+  if (fHead.Data = nil) or (Find('lm_head.weight') = nil) then
+    EInferError.RaiseUtf8('%: the first head % is not loaded', [self, fStackHead]);
+  if fStackHeads = nil then
+    exit; // one head: fHead
+  // every head as the first one was loaded (its type: the family's choice);
+  // their tensors under 'lm_head.<i>.weight' (SourceName)
+  SetLength(fHeads, length(fStackHeads) + 1);
+  fHeads[0] := fHead;
+  for i := 1 to high(fHeads) do
+  begin
+    // the name the caller gave, not the layout's
+    if Find(FormatUtf8('lm_head.%.weight', [i])) = nil then
+      EInferError.RaiseUtf8('%: no head % in the file', [self, fStackHeads[i - 1]]);
+    fHeads[i] := Matrix(FormatUtf8('lm_head.%.weight', [i]), fConfig.VocabSize,
+      fConfig.Hidden, fHead.DType);
+  end;
 end;
 
 destructor TDecoderModel.Destroy;
@@ -1421,12 +1512,24 @@ begin
 end;
 
 function TDecoderModel.SourceName(const aName: RawUtf8): RawUtf8;
+var
+  i: PtrInt;
 begin
   result := aName;
   if fStackPrefix = '' then
     exit;
   if aName = 'lm_head.weight' then
     result := fStackHead
+  else if IdemPChar(pointer(aName), 'LM_HEAD.') then
+  begin
+    // head i of CreateStack with several heads: 'lm_head.<i>.weight'
+    i := GetInteger(PUtf8Char(pointer(aName)) + 8);
+    if (i >= 1) and (i <= length(fStackHeads)) and
+       (aName = FormatUtf8('lm_head.%.weight', [i])) then
+      result := fStackHeads[i - 1]
+    else
+      result := '';
+  end
   else if aName = 'model.embed_tokens.weight' then
     result := fStackEmbed
   else if IdemPChar(pointer(aName), 'MODEL.') then
@@ -1462,6 +1565,24 @@ end;
 function TDecoderModel.HasHead: boolean;
 begin
   result := fHead.Data <> nil;
+end;
+
+function TDecoderModel.HeadCount: PtrInt;
+begin
+  if fHeads <> nil then
+    result := length(fHeads)
+  else
+    result := ord(fHead.Data <> nil);
+end;
+
+function TDecoderModel.HeadOf(aIndex: PtrInt): TInferWeight;
+begin
+  if (aIndex < 0) or (aIndex >= HeadCount) then
+    EInferError.RaiseUtf8('%: no head % (% heads)', [self, aIndex, HeadCount]);
+  if fHeads <> nil then
+    result := fHeads[aIndex]
+  else
+    result := fHead;
 end;
 
 procedure TDecoderModel.CheckConfig(const aSource: TFileName);
@@ -3043,16 +3164,17 @@ procedure TDecoderModel.Forward(aCtx: TDecoderContext; aIds: PIntegerArray;
 begin
   if (aIds = nil) and (aCount > 0) then
     EInferError.RaiseUtf8('%.Forward: no ids', [self]);
-  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits, aOnState, nil);
+  ForwardRows(aCtx, aIds, nil, aCount, aLogits, aAllLogits, aOnState, nil, 0);
 end;
 
 procedure TDecoderModel.ForwardEmbeds(aCtx: TDecoderContext; aEmbeds: PSingleArray;
   aCount: PtrInt; aLogits: PSingleArray; aAllLogits: boolean;
-  const aOnState: TOnDecoderState; aNormed: PSingleArray);
+  const aOnState: TOnDecoderState; aNormed: PSingleArray; aHead: PtrInt);
 begin
   if (aEmbeds = nil) and (aCount > 0) then
     EInferError.RaiseUtf8('%.ForwardEmbeds: no rows', [self]);
-  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits, aOnState, aNormed);
+  ForwardRows(aCtx, nil, aEmbeds, aCount, aLogits, aAllLogits, aOnState, aNormed,
+    aHead);
 end;
 
 function TDecoderModel.Recurrent: boolean;
@@ -3068,7 +3190,8 @@ end;
 
 procedure TDecoderModel.ForwardRows(aCtx: TDecoderContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
-  aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
+  aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray;
+  aHead: PtrInt);
 var
   i, start, past, vocab: PtrInt;
   part: PSingleArray;
@@ -3079,7 +3202,7 @@ begin
      (aCtx.fMaxCheckpoints <= 0) or not Recurrent then
   begin
     ForwardPart(aCtx, aIds, aEmbeds, aCount, aLogits, aAllLogits, aOnState,
-      aNormed);
+      aNormed, aHead);
     exit;
   end;
   // what a later part would refuse, refused before the first one runs
@@ -3106,7 +3229,8 @@ begin
         part := nil;
         if aAllLogits and (aLogits <> nil) then
           part := @aLogits^[start * vocab];
-        ForwardPart(aCtx, @aIds^[start], nil, i - start, part, aAllLogits, nil, nil);
+        ForwardPart(aCtx, @aIds^[start], nil, i - start, part, aAllLogits, nil, nil,
+          aHead);
         start := i;
       end;
       aCtx.SaveCheckpoint;
@@ -3115,12 +3239,13 @@ begin
   if aAllLogits and (aLogits <> nil) then
     part := @aLogits^[start * vocab];
   ForwardPart(aCtx, @aIds^[start], nil, aCount - start, part, aAllLogits, nil,
-    aNormed);
+    aNormed, aHead);
 end;
 
 procedure TDecoderModel.ForwardPart(aCtx: TDecoderContext; aIds: PIntegerArray;
   aEmbeds: PSingleArray; aCount: PtrInt; aLogits: PSingleArray;
-  aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray);
+  aAllLogits: boolean; const aOnState: TOnDecoderState; aNormed: PSingleArray;
+  aHead: PtrInt);
 var
   i, l, n, h, f, qw, past, id: PtrInt;
   scalar: single;
@@ -3133,6 +3258,8 @@ begin
   if (aLogits <> nil) and (fHead.Data = nil) then
     EInferError.RaiseUtf8('%.Forward: no head for logits (the normed state only)',
       [self]);
+  if (aHead < 0) or ((aHead > 0) and (aHead >= HeadCount)) then
+    EInferError.RaiseUtf8('%.Forward: no head % (% heads)', [self, aHead, HeadCount]);
   if aCtx.fDevice <> nil then
   begin
     // the keys and values are on a device: computed there
@@ -3145,7 +3272,7 @@ begin
       aCtx.fDevice.Forward(aCtx, aIds, aCount, aLogits, aAllLogits)
     else
       aCtx.fDevice.ForwardEmbeds(aCtx, aEmbeds, aCount, aLogits, aAllLogits,
-        aNormed);
+        aNormed, aHead);
     exit;
   end;
   if aCount <= 0 then
@@ -3229,10 +3356,11 @@ begin
   if aLogits = nil then
     exit;
   if aAllLogits then
-    fBackend.Linear(pointer(aCtx.fH), n, h, fHead, fConfig.VocabSize, nil, aLogits)
+    fBackend.Linear(pointer(aCtx.fH), n, h, HeadOf(aHead), fConfig.VocabSize, nil,
+      aLogits)
   else
-    fBackend.Linear(@aCtx.fH[(n - 1) * h], 1, h, fHead, fConfig.VocabSize, nil,
-      aLogits);
+    fBackend.Linear(@aCtx.fH[(n - 1) * h], 1, h, HeadOf(aHead), fConfig.VocabSize,
+      nil, aLogits);
   if fConfig.LogitSoftcap > 0 then
     if aAllLogits then
       InferSoftcap(aLogits, n * fConfig.VocabSize, fConfig.LogitSoftcap)

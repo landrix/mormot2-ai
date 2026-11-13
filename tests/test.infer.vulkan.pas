@@ -142,6 +142,12 @@ type
     // the last logits, with every row's, without logits, single steps, over
     // two chunks, and from a stack without a head - against the CPU
     procedure NormedRowOnDevice;
+    /// B18: a stack with several heads on the device - tiny-qwen3/stack with
+    // its head and the negation of it: head 0 against the CPU, head 1 the
+    // negation of head 0, picked per call on one context, also through
+    // TDecoderModel.ForwardEmbeds; an unknown head refused before the cache
+    // changes
+    procedure StackHeadsOnDevice;
     /// B14: ForgetWeights - new weights at the address of forgotten ones are
     // served, other ranges kept; a freed model forgets its weights
     procedure ForgetWeightsServesNew;
@@ -2203,6 +2209,104 @@ begin
   end;
 end;
 
+procedure TTestInferVulkan.StackHeadsOnDevice;
+var
+  dir, sdir: TFileName;
+  ref: TInferRefSet;
+  gpu: TInferVulkanBackend;
+  cpu: TInferCpuBackend;
+  plain, two: TQwen3Model;
+  dev: TQwen3Vulkan;
+  c, cc: TQwen3Context;
+  ids: PIntegerArray;
+  n, h, vocab, i: PtrInt;
+  rows, want, neg, l0, l1, all0, all1: TSingleDynArray;
+  cmp: TInferCompare;
+  why: RawUtf8;
+begin
+  if not HasDevice then
+    exit;
+  dir := FindInferRefDir('tiny-qwen3');
+  if CheckFailed(dir <> '', 'tiny-qwen3 found') then
+    exit;
+  sdir := dir + 'stack' + PathDelim;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  gpu := TInferVulkanBackend.Create;
+  cpu := TInferCpuBackend.Create;
+  plain := nil;
+  two := nil;
+  dev := nil;
+  c := nil;
+  cc := nil;
+  try
+    plain := TQwen3Model.Create(dir, cpu);
+    two := NewStackTwoHeads(sdir, cpu);
+    dev := TQwen3Vulkan.Create(two, gpu);
+    dev.KvF16 := false; // against the CPU: the cache in floats
+    ids := ref.I32('case2.ids', n);
+    h := plain.Config.Hidden;
+    vocab := plain.Config.VocabSize;
+    SetLength(rows, n * h);
+    SetLength(want, n * vocab);
+    SetLength(neg, vocab);
+    SetLength(l0, vocab);
+    SetLength(l1, vocab);
+    SetLength(all0, n * vocab);
+    SetLength(all1, n * vocab);
+    plain.Embed(ids, n, pointer(rows));
+    cc := plain.NewContext;
+    plain.Forward(cc, ids, n, pointer(want), true);
+    FreeAndNil(cc);
+    for i := 0 to vocab - 1 do
+      neg[i] := -want[(n - 1) * vocab + i];
+    // per call on one context: the rows but the last through head 0, the
+    // last one through head 1
+    c := dev.NewContext;
+    dev.ForwardEmbeds(c, pointer(rows), n - 1, pointer(l0), false, nil, 0);
+    cmp := InferCompare(pointer(l0), @want[(n - 2) * vocab], vocab, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'head 0 on the device: %', [InferCompareText(cmp)]);
+    dev.ForwardEmbeds(c, @rows[(n - 1) * h], 1, pointer(l1), false, nil, 1);
+    cmp := InferCompare(pointer(l1), pointer(neg), vocab, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'head 1 after head 0 on the device: %',
+      [InferCompareText(cmp)]);
+    // every row of a pass through each head: one the negation of the other
+    c.Reset;
+    dev.ForwardEmbeds(c, pointer(rows), n, pointer(all0), true, nil, 0);
+    c.Reset;
+    dev.ForwardEmbeds(c, pointer(rows), n, pointer(all1), true, nil, 1);
+    CheckEqual(NegatedMisses(pointer(all0), pointer(all1), n * vocab), 0,
+      'head 1 negates head 0 on the device');
+    // through TDecoderModel.ForwardEmbeds (a context of the device)
+    c.Reset;
+    two.ForwardEmbeds(c, pointer(rows), n, pointer(l0), false, nil, nil, 0);
+    c.Reset;
+    two.ForwardEmbeds(c, pointer(rows), n, pointer(l1), false, nil, nil, 1);
+    CheckEqual(NegatedMisses(pointer(l0), pointer(l1), vocab), 0,
+      'aHead through the model');
+    cmp := InferCompare(pointer(l1), pointer(neg), vocab, 1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'head 1 through the model: %', [InferCompareText(cmp)]);
+    // an unknown head: refused before the cache changes
+    why := '';
+    try
+      dev.ForwardEmbeds(c, pointer(rows), 1, pointer(l0), false, nil, 2);
+    except
+      on E: EInferError do
+        why := StringToUtf8(E.Message);
+    end;
+    CheckUtf8(PosEx('no head 2', why) > 0, 'head 2 refused: %', [why]);
+    CheckEqual(c.Length, n, 'the cache unchanged by the refused call');
+  finally
+    cc.Free;
+    c.Free;
+    dev.Free;
+    two.Free;
+    plain.Free;
+    cpu.Free;
+    gpu.Free;
+    ref.Free;
+  end;
+end;
+
 procedure TTestInferVulkan.Qwen3TtsOnDevice;
 var
   dir, refdir: TFileName;
@@ -2219,6 +2323,13 @@ var
   st: TSafeTensorsFile;
   t: PInferTensor;
   codes: PIntegerArray;
+  model2: TQwen3Model;
+  dev2: TQwen3Vulkan;
+  ctx2: TQwen3Context;
+  cpuHeads: TSingleDynArray;
+  timer: TPrecisionTimer;
+  usDev, usCpu: Int64;
+  f: PtrInt;
 begin
   if not HasDevice then
     exit;
@@ -2249,6 +2360,9 @@ begin
   dev := nil;
   ctx := nil;
   st := nil;
+  model2 := nil;
+  dev2 := nil;
+  ctx2 := nil;
   try
     // the talker: the last logits of its 22 rows
     model := NewTtsTalker(dir, cpu);
@@ -2325,8 +2439,83 @@ begin
       if InferArgMax(@logits[g * vocab], vocab) = codes^[g + 1] then
         inc(m);
     CheckEqual(m, n - 1, 'the greedy codes of the reference, step by step');
+    // B18: the predictor with its 15 heads on the device - head g picked per
+    // step (aHead), its product in the pass
+    FreeAndNil(dev);
+    FreeAndNil(model);
+    model := NewTtsPredictorHeads(dir, cpu);
+    dev := TQwen3Vulkan.Create(model, gpu);
+    dev.KvF16 := false;
+    CheckEqual(model.HeadCount, n - 1, 'a head per code group');
+    FillCharFast(logits[0], (n - 1) * vocab * SizeOf(single), 0);
+    ctx := dev.NewContext;
+    for g := 0 to n - 2 do
+      if g = 0 then
+        dev.ForwardEmbeds(ctx, x, 2, @logits[0], false, nil, 0)
+      else
+        dev.ForwardEmbeds(ctx, @x^[(g + 1) * h], 1, @logits[g * vocab], false, nil, g);
+    cmp := InferCompare(pointer(logits), ref.F32('predictor.logits', m), (n - 1) * vocab,
+      1e-3, 1e-3);
+    CheckUtf8(InferCompareOk(cmp), 'predictor with its heads on %: %',
+      [fVk.DeviceName, InferCompareText(cmp)]);
+    AddConsole(FormatString('Qwen3-TTS predictor with its 15 heads on %: %',
+      [fVk.DeviceName, InferCompareText(cmp)]));
+    m := 0;
+    for g := 0 to n - 2 do
+      if InferArgMax(@logits[g * vocab], vocab) = codes^[g + 1] then
+        inc(m);
+    CheckEqual(m, n - 1, 'the greedy codes of the reference, heads on the device');
+    // the time of a frame (15 steps): the heads on the device against the
+    // heads of the caller on the CPU (the normed row read back, F32 heads)
+    model2 := TQwen3Model.CreateStack(dir, cpu, 'talker_config.code_predictor_config',
+      'talker.code_predictor.model.', '', '');
+    dev2 := TQwen3Vulkan.Create(model2, gpu);
+    dev2.KvF16 := false;
+    ctx2 := dev2.NewContext;
+    SetLength(cpuHeads, (n - 1) * vocab * h);
+    for g := 0 to n - 2 do
+    begin
+      t := st.Tensor(FormatUtf8('talker.code_predictor.lm_head.%.weight', [g]));
+      if CheckFailed(t^.DType = idtBF16, 'BF16 heads') then
+        exit; // the finally frees everything
+      for l := 0 to vocab * h - 1 do
+        PCardinal(@cpuHeads[g * vocab * h + l])^ := cardinal(PWordArray(t^.Data)^[l]) shl 16;
+    end;
+    // frame by frame in turn, the first one of each to warm up
+    usDev := 0;
+    usCpu := 0;
+    for f := 0 to 20 do
+    begin
+      timer.Start;
+      ctx.Reset;
+      for g := 0 to n - 2 do
+        if g = 0 then
+          dev.ForwardEmbeds(ctx, x, 2, @logits[0], false, nil, 0)
+        else
+          dev.ForwardEmbeds(ctx, @x^[(g + 1) * h], 1, @logits[g * vocab], false, nil, g);
+      if f > 0 then
+        inc(usDev, timer.StopInMicroSec);
+      timer.Start;
+      ctx2.Reset;
+      for g := 0 to n - 2 do
+      begin
+        if g = 0 then
+          dev2.ForwardEmbeds(ctx2, x, 2, nil, false, pointer(normed))
+        else
+          dev2.ForwardEmbeds(ctx2, @x^[(g + 1) * h], 1, nil, false, pointer(normed));
+        cpu.Linear(pointer(normed), 1, h, InferWeight(@cpuHeads[g * vocab * h], idtF32),
+          vocab, nil, @logits[g * vocab]);
+      end;
+      if f > 0 then
+        inc(usCpu, timer.StopInMicroSec);
+    end;
+    AddConsole(FormatString('Qwen3-TTS predictor frame (15 steps) on %: heads on the ' +
+      'device % us, heads on the CPU % us', [fVk.DeviceName, usDev div 20, usCpu div 20]));
   finally
     st.Free;
+    ctx2.Free;
+    dev2.Free;
+    model2.Free;
     ctx.Free;
     dev.Free;
     model.Free;

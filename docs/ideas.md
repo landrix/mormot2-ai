@@ -18,8 +18,7 @@ keine Vorlage für Code).
   Englisch ab).
 - **Abgrenzung:** flydev baut Qwen3-TTS auf mormot2-ai (`flydev-fr/mormot2-qwen-tts`, GPU,
   mehrsprachig); was er brauchte, steht in [`CHANGELOG.md`](../CHANGELOG.md) B14
-  (erledigt) und [backlog.md](backlog.md) B18. Kokoro wäre der
-  kleine Gegenpol: CPU, schnell, wenige Stimmen.
+  und B18 (erledigt). Kokoro wäre der kleine Gegenpol: CPU, schnell, wenige Stimmen.
 - **Was wiederverwendbar wäre:** safetensors-Loader, Linear-/Conv-Kernel der CPU, Threads.
   Neu: 1-D-Convolution in Breite, LSTM, AdaIN, inverse STFT, die G2P-Stufe.
 - **Offen:** Bedarf (wer braucht Sprachausgabe in einer Handwerks-App?), Lizenzweg für G2P

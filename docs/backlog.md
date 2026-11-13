@@ -39,18 +39,6 @@ Graph). Verdächtig: `linear8` holt je Warp und Schritt nur einen Q4_K-Block (14
 wenige Ladevorgänge gleichzeitig; die DeltaNet-Layer; die Zahl der Kernel je Token. Übernahme
 nur mit Messung.
 
-## B18 — Mehrere Köpfe auf dem Gerät, Kopf-Index je Aufruf (aufgenommen 2026-10-21)
-
-Anlass: <https://github.com/landrix/mormot2-ai/issues/1#issuecomment-6297975507>. Der
-Code-Predictor von Qwen3-TTS nimmt je Schritt einen anderen seiner 15 Köpfe (16 kleine Produkte
-je Frame). `TInferVulkanBackend.Linear` schickt jedes Produkt einzeln auf die GPU und wartet -
-rund 2 ms je Frame; flydev rechnet die Köpfe deshalb auf einem `TInferCpuFastBackend` mit
-8 Threads (11,3 ms je Talker-Frame gegen 10,9 ms im alten eigenen Durchlauf).
-
-*Vorschlag:* ein Stapel mit mehreren Köpfen auf dem Gerät (Vulkan und CUDA), `ForwardEmbeds`
-oder ein eigener Aufruf mit Kopf-Index, das Produkt im selben Durchlauf wie die Layer. Nach den
-Gemma-4-Scheiben (D6); nicht dringend (flydev). Rückmeldung im Issue, sobald es steht.
-
 ---
 
 ## B4 — Weitere Modelle: Phase D (Plan 2026-10-17)
@@ -242,6 +230,11 @@ Nur bei Bedarf:
 - **Adreno-Tempo (aus B11):** Qwen3-0.6B Q8_0 bei 200 Tokens auf dem Snapdragon X: Adreno
   Prefill 368 und Decode 30 Tokens/s, die CPU (8 Threads, NEON-Dotprod) 639 und 68. Die
   Shader sind nicht auf die Adreno abgestimmt (`matvec8` dort aus); kein Auftrag.
+- **gpt-oss als Stapel (aus dem Review von B18, Codex Runde 2):** Der Loader von gpt-oss
+  vergleicht die verstandenen Tensoren mit allen Tensoren der Datei, nicht mit denen unter dem
+  Präfix wie Qwen3 und Gemma 4. Als Stapel eines größeren Checkpoints (`CreateStack`) lädt
+  gpt-oss deshalb nicht, schon mit einem Kopf. Erst angehen, wenn ein Checkpoint gpt-oss als
+  Stapel enthält.
 - Weitere Ideen ohne Termin: [ideas.md](ideas.md).
 
 ---

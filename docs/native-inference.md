@@ -1819,6 +1819,64 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B18 erledigt (2026-11-13): mehrere Köpfe auf dem Gerät, Kopf-Index je Aufruf.** Anlass war
+Issue #1 (flydev): Der Code-Predictor von Qwen3-TTS nimmt je Schritt einen anderen seiner 15
+Köpfe. Bisher lud man den Stapel ohne Kopf, holte die normierte Zeile zurück und rechnete den
+Kopf auf der CPU.
+
+- *Schnittstelle (`mormot.ai.infer.decoder`):*
+  - **`CreateStack` mit einer Liste von Köpfen** (`const aHeads: array of RawUtf8`, je
+    [VocabSize, Hidden]): Kopf 0 ist `Head`, die übrigen lädt `LoadStackHeads` nach
+    `LoadWeights` über `Matrix` unter dem Namen `lm_head.<i>.weight` (`SourceName`), im Typ
+    des ersten Kopfes. Abgelehnt werden ein leerer Name, ein fehlender Tensor und ein Stapel
+    mit gebundenem Kopf (`tie_word_embeddings`; Gemma 4 bindet immer): Dort ist die Einbettung
+    der Kopf, gleich was die Liste sagt (Codex-Review).
+  - **`HeadCount`, `HeadOf(i)`.**
+  - **`ForwardEmbeds(..., aHead)`:** Vorgabe 0, geprüft bevor sich der Cache ändert, auch ohne
+    Logits. Auf der CPU, auf Vulkan und CUDA; `TDecoderDevice.ForwardEmbeds` reicht ihn durch.
+- *Geräte:* `TQwen3Vulkan` und `TQwen3Cuda` laden alle Köpfe in `UploadWeights` hoch (gleiche
+  Form, also eine Teilung des Kopfes für alle) und rechnen die Logits mit `HeadOf(aHead)` im
+  selben Durchlauf. CUDA zeichnet den Decode-Schritt ohnehin bei jedem Aufruf neu auf und
+  aktualisiert den Graphen, ein anderer Kopf ist dort nur ein anderer Zeiger.
+- *Tempo (RTX 5090, Predictor in F32, ein Frame = 15 Schritte, zwei Zeilen, dann je eine;
+  Probe mit 20 Frames):*
+  - **Vulkan:** 8,3 ms je Frame mit den Köpfen auf dem Gerät, 8,2 ms ganz ohne Logits.
+  - **CUDA:** 7,1 bis 7,6 ms mit den Köpfen, 6,8 bis 7,6 ms ohne Logits.
+  - Die 15 Produkte kosten auf dem Gerät also fast nichts; auf der CPU (`TInferCpuFastBackend`,
+    F32) kamen sie im Test zu den Schritten hinzu: Frame für Frame im Wechsel gemessen, Vulkan
+    8,9 ms mit den Köpfen auf dem Gerät gegen 14,5 ms mit den Köpfen auf der CPU, CUDA 7,7
+    gegen 11,2 ms. (Ein erster Lauf, beide Wege nacheinander, zeigte auf Vulkan 22,9 ms für
+    den Weg mit Köpfen - eine Störung der Messung, die die Probe und der Wechsel nicht zeigen.)
+  - Zwei Stapel auf einem Backend (Talker und Predictor wie bei flydev) bremsen sich nicht aus.
+- *Tests:*
+  - **`TTestInferQwen3.StackWithHeads`:** `tiny-qwen3/stack` hat einen zweiten Kopf
+    `outer.head2.weight`, die Einbettung mit umgedrehtem Vorzeichen (in BF16 exakt), und eine
+    gebundene Konfiguration `tied` (`make_reference_b14.py`). Kopf 0 gibt die Bits des Modells,
+    Kopf 1 genau deren Negation, je Aufruf auf einem Kontext gewechselt; Liste aus einem und
+    keinem Kopf; abgelehnt: Kopf 2, `HeadOf(-1)`, ein leerer Name, ein fehlender zweiter
+    Tensor, ein gebundener Stapel.
+  - **`StackHeadsOnDevice` (Vulkan, CUDA):** dasselbe auf dem Gerät, Kopf 0 gegen die CPU, auch
+    über `TDecoderModel.ForwardEmbeds`.
+  - **`Qwen3TtsOnDevice`:** der Predictor mit seinen 15 Köpfen auf dem Gerät gegen PyTorch
+    (Kosinus 0,9999999999, größte Abweichung 1,1e-4, alle Codes gleich), dazu die Zeit je Frame
+    gegen die Köpfe auf der CPU.
+- *Gegenprobe:* Ein Gerät, das `aHead` übergeht und immer Kopf 0 nimmt, lässt auf Vulkan und
+  CUDA je sechs Assertions scheitern (`StackHeadsOnDevice`, `Qwen3TtsOnDevice`).
+- *Läufe (RTX 5090):* volle Suite FPC 0 / 16.714, Delphi 13 0 / 16.714, Delphi 7 0 / 6.087 (vor
+  den Korrekturen aus Runde 2, die nur das Laden einer Liste prüfen); danach `TTestInferQwen3`
+  mit dem letzten Stand: FPC 0 / 10.689, Delphi 13 0 / 10.689, Delphi 7 0 / 2.532.
+- *Review* (Claude-Finder und Codex, drei Runden):
+  - **Runde 1:** Codex - Gemma 4 bindet den Kopf immer an die Einbettung, Kopf 0 einer Liste
+    wäre still die Einbettung gewesen (behoben: ein gebundener Stapel lehnt eine Liste ab).
+    Claude - die Prüfung von `aHead` auch ohne Logits dokumentiert, BF16 vor dem Verbreitern
+    geprüft, Doku.
+  - **Runde 2:** Codex - eine Liste mit einem oder keinem Kopf übersprang jede Prüfung
+    (behoben: eine Liste wird immer streng geprüft, eine leere darf keinen Kopf ergeben);
+    Claude - Meldungen nennen jetzt den Tensor des Aufrufers.
+  - **Nicht behoben (älter als B18):** gpt-oss vergleicht beim Laden mit allen Tensoren der
+    Datei; als Stapel eines größeren Checkpoints lädt es deshalb schon mit einem Kopf nicht.
+  - **Runde 3:** ohne Befund.
+
 **B19 erledigt (2026-11-13): Q4_K auf CUDA so schnell wie Q8_0.** Anlass war D7g: Qwen3.8-27B
 Q4_K_M dekodierte auf der RTX 5090 mit CUDA langsamer als mit Vulkan und als Q8_0 auf CUDA.
 
