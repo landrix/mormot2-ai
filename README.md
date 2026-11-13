@@ -676,7 +676,8 @@ Next, in this order:
    loads straight from llama.cpp GGUF files (Q8_0, Q4_0, F16), tokenizer included, so
    one .gguf file is a complete native `ILlmClient`, and Q4_K_M files load too (Q4_K
    and Q6_K, checked against ggml itself, with fused NEON / AVX2 kernels: 73 tokens/s
-   decoding in 475 MB). Open items: [docs/backlog.md](docs/backlog.md).
+   decoding in 475 MB). Open items: [docs/backlog.md](docs/backlog.md), finished ones:
+   [CHANGELOG.md](CHANGELOG.md).
 2. **GPU** — the whole Qwen3 forward pass runs on Vulkan: an RTX 5090 prefills Qwen3-0.6B
    at about 13600 and decodes at about 365 tokens/s (Q8_0; the i9 CPU: 757 and 72), with
    flash attention still about 330 tokens/s at 4000 tokens of context; `TNativeLlmClient`
@@ -723,7 +724,7 @@ Next, in this order:
    chat template and parser behind `ILlmClient`, picked by the template of the file (D7h).
    Plan and order:
    [docs/backlog.md](docs/backlog.md)
-   (German).
+   (German); finished items: [CHANGELOG.md](CHANGELOG.md).
 4. **After that, on demand** — a reranker, Qwen3-Embedding, BGE-M3 sparse/ColBERT output.
 
 Alongside, as a separate track: **distributed execution** - big inference jobs pulled

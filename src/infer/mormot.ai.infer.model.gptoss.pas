@@ -33,7 +33,7 @@
 //   SwiGLU limit 7 and alpha 1.702 as llama.cpp fixes them, YaRN with the betas
 //   of the file (32 and 1 without) and truncate false as the checkpoint says
 //   (llama.cpp itself rounds the correction range, as truncate true)
-// - not yet (backlog D5): a device (Vulkan, CUDA)
+// - on the devices since slices D5d1 (CUDA) and D5d2 (Vulkan)
 unit mormot.ai.infer.model.gptoss;
 
 {

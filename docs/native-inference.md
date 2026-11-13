@@ -882,9 +882,9 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
   Q4_K_M 455 / 78 Tokens/s (Prefill / Decode), 1000 Tokens: Q8_0 540 / 44, Q4_K_M 369 / 47.
   `llm-bench` schaltet unter Windows die EcoQoS-Drossel ab (wie `embed-bench`).
 
-- Offen in Phase 3, als agentenfertige Einträge in [backlog.md](backlog.md): K-Quant-Prefill
-  (B1, ein Versuch ohne eigenen Kernel war langsamer), Q4_0-Kernel (B2); beide
-  erledigt 2026-10-17.
+- In Phase 3 offen geblieben und als Backlog-Einträge erledigt 2026-10-17 (heute in
+  [`CHANGELOG.md`](../CHANGELOG.md)): K-Quant-Prefill (B1, ein Versuch ohne eigenen Kernel war
+  langsamer) und das Q4_0-Entpacken auf der CPU (B2).
 - *B1, erster Teil (2026-10-16):* `TInferKSums2` und `Q4KSums2NeonDot`.
   - Eine Q4_K-Gewichtszeile läuft gegen zwei Q8_K-Tokenzeilen. Nibbles, Skalen und Minima
     werden pro Block einmal ausgepackt, die SDOTs laufen gegen beide Zeilen.
@@ -1586,7 +1586,8 @@ Karte, C5 Tempo.
 ### Phase D — weitere Decoder-Familien
 
 Plan, Kandidaten und Reihenfolge: [backlog.md](backlog.md), Abschnitt B4 (MoE, Sliding
-Window, gpt-oss-20b, Gemma 4, Gated DeltaNet, Kolibri).
+Window, gpt-oss-20b, Gemma 4, Gated DeltaNet, Kolibri); die erledigten Slices in
+[`CHANGELOG.md`](../CHANGELOG.md).
 
 **D1 erledigt (2026-10-17): gemeinsame Decoder-Typen.** Reiner Umbau, die Rechnung ist
 unverändert (alle Qwen3-Tests ohne Änderung grün, Decode-Tempo gleich).
@@ -4029,4 +4030,4 @@ einige Tage.
 2. ~~Zeitpunkt der Delphi-7-Portierung~~ — **erledigt 2026-10-14**, vor dem ersten
    Engine-Code: die Engine entsteht von Anfang an unter `run-delphi7-tests.ps1`.
 3. ~~Maximale Kontextlänge für Embeddings~~ — **entschieden 2026-10-17**: 512 Tokens wie im
-   Vertrag v1 (Begründung: `docs/backlog.md` B7).
+   Vertrag v1 (Begründung: [`CHANGELOG.md`](../CHANGELOG.md) B7).

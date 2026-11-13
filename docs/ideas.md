@@ -17,7 +17,8 @@ keine Vorlage für Code).
   käme so nicht in Frage. Für Deutsch wäre eigene Arbeit nötig (misaki deckt vor allem
   Englisch ab).
 - **Abgrenzung:** flydev baut Qwen3-TTS auf mormot2-ai (`flydev-fr/mormot2-qwen-tts`, GPU,
-  mehrsprachig); was er braucht, steht in [backlog.md](backlog.md) B14. Kokoro wäre der
+  mehrsprachig); was er brauchte, steht in [`CHANGELOG.md`](../CHANGELOG.md) B14
+  (erledigt) und [backlog.md](backlog.md) B18. Kokoro wäre der
   kleine Gegenpol: CPU, schnell, wenige Stimmen.
 - **Was wiederverwendbar wäre:** safetensors-Loader, Linear-/Conv-Kernel der CPU, Threads.
   Neu: 1-D-Convolution in Breite, LSTM, AdaIN, inverse STFT, die G2P-Stufe.

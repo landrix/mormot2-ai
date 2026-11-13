@@ -62,8 +62,8 @@ published as a **standalone extension in its own repository**.
     comments in English.
 
   **Documentation language** (decision 2026-10-19): it follows its readers. Everything
-  users and contributors read is English: `README.md`, `SECURITY.md`, `CONCEPT.md`, the
-  READMEs under `tests/data` and `tools`. The working documents for the maintainers and
+  users and contributors read is English: `README.md`, `SECURITY.md`, `CONCEPT.md`,
+  `CHANGELOG.md`, the READMEs under `tests/data` and `tools`. The working documents for the maintainers and
   their agents stay German: `docs/native-inference.md`, `docs/backlog.md`,
   `docs/native-embeddings.md`, `docs/distributed-execution.md`, `docs/ideas.md` and
   `DESIGN.md` (mostly a log of review rounds). Code comments are English.
