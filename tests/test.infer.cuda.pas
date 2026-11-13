@@ -2216,10 +2216,11 @@ const
   SLOTS = 4;
   NOUT = 33;
   IDS: array[0..SLOTS - 1] of integer = (3, 0, 4, 3);
-  // type, inputs: the K-quant at 256, the others also at 896
-  KINDS: array[0..6] of TInferDType = (
-    idtF32, idtQ8_0, idtQ5_0, idtQ4_K, idtQ8_0, idtQ5_0, idtF32);
-  INPUTS: array[0..6] of integer = (256, 256, 256, 256, 896, 896, 896);
+  // type, inputs: the K-quant at 256 and 512 (two blocks per row: the block
+  // address of each step, backlog B19), the others also at 896
+  KINDS: array[0..7] of TInferDType = (
+    idtF32, idtQ8_0, idtQ5_0, idtQ4_K, idtQ8_0, idtQ5_0, idtF32, idtQ4_K);
+  INPUTS: array[0..7] of integer = (256, 256, 256, 256, 896, 896, 896, 512);
 var
   gpu: TInferCudaBackend;
   ref: TInferCpuBackend;

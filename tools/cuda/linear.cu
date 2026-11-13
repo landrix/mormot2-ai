@@ -240,26 +240,36 @@ __device__ __forceinline__ void weights8(const unsigned int* w, unsigned int dty
   {
     // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K); the 8
     // values lie in sub-block j
-    unsigned long long base = rowBase + (e >> 8) * 144ull;
+    // - a row is a whole number of 144-byte blocks and starts 4-aligned (as
+    //   an expert at ids * stride, stride a multiple of 4), so the block is
+    //   read as words: d and dmin in word 0, the 12 scale bytes in words 1..3,
+    //   the nibbles from word 4 - one 64-bit address per block (backlog B19)
+    const unsigned int* blk = w + ((rowBase + (e >> 8) * 144ull) >> 2);
     unsigned int k8 = e & 255u;
     unsigned int j = k8 >> 5;
+    unsigned int h0 = blk[0];
+    // byte j & 3 of the scale words: bytes 4 + (j & 3), 8 + (j & 3) and
+    // 12 + (j & 3) of the block
+    unsigned int s1 = u8(blk[1], j & 3u);
+    unsigned int s2 = u8(blk[2], j & 3u);
     unsigned int sc, m;
     if (j < 4u)
     {
-      sc = byteAt(w, base + 4u + j) & 63u;
-      m = byteAt(w, base + 8u + j) & 63u;
+      sc = s1 & 63u;
+      m = s2 & 63u;
     }
     else
     {
-      sc = (byteAt(w, base + 8u + j) & 15u) | ((byteAt(w, base + j) >> 6) << 4);
-      m = (byteAt(w, base + 8u + j) >> 4) | ((byteAt(w, base + 4u + j) >> 6) << 4);
+      unsigned int s3 = u8(blk[3], j & 3u);
+      sc = (s3 & 15u) | ((s1 >> 6) << 4);
+      m = (s3 >> 4) | ((s2 >> 6) << 4);
     }
-    float d1 = halfWord(w, base) * float(sc);
-    float m1 = halfWord(w, base + 2u) * float(m);
-    // 16 + 32 * (j / 2) + (k8 & 31): a multiple of 8, the block 4-aligned
-    unsigned long long qi = (base + 16u + 32u * (j >> 1) + (k8 & 31u)) >> 2;
-    unsigned int q0 = w[qi];
-    unsigned int q1 = w[qi + 1u];
+    float d1 = halfBits(h0 & 65535u) * float(sc);
+    float m1 = halfBits(h0 >> 16) * float(m);
+    // (16 + 32 * (j / 2) + (k8 & 31)) / 4: k8 & 31 a multiple of 8
+    const unsigned int* qw = blk + 4u + 8u * (j >> 1) + ((k8 & 31u) >> 2);
+    unsigned int q0 = qw[0];
+    unsigned int q1 = qw[1];
     unsigned int sh = (j & 1u) * 4u;
 #pragma unroll
     for (unsigned int k = 0u; k < 4u; k++)

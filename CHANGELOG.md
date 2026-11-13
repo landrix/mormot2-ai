@@ -9,6 +9,9 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-13 - B19: Q4_K on CUDA as fast as Q8_0.** The CUDA linear kernels read a Q4_K
+  block as 32-bit words with one 64-bit address per block instead of single bytes; Qwen3.8-27B
+  Q4_K_M decode on CUDA from 31.7 to 36.1 tokens/s (Q8_0 36.5, Vulkan 39.4).
 - **2026-11-13 - D6e2: Gemma 4 on Vulkan.** Heads of 512 in a variant of `attention.comp`
   (4 queries per work group, 12 KB shared memory), K=V with the value norm, the second RoPE
   set, sandwich norms, GeGLU, the dense block beside the experts, layer scalar and logit

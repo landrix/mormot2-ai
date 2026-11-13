@@ -26,13 +26,18 @@ CHANGELOG nennt den erledigten Teil, hier steht der offene Rest unter derselben 
 
 ---
 
-## B19 — Q4_K auf CUDA langsamer als auf Vulkan (aufgenommen 2026-11-11)
+## B20 — Decode großer Modelle weit unter der Bandbreite der GPU (aufgenommen 2026-11-13)
 
-Anlass: D7g. Qwen3.8-27B Q4_K_M decodiert auf der RTX 5090 mit CUDA 31,5 Tokens/s, mit Vulkan
-39,4; Q8_0 auf CUDA 35,9 - obwohl Q8_0 fast die Hälfte mehr Bytes liest. Der Verdacht liegt auf
-dem Q4_K-Matvec-Kernel von CUDA (beim 0.8B-Modell in Q8_0 ist CUDA vorn). *Nächster Schritt:*
-messen, welcher Kernel die Zeit nimmt (`llm-bench` mit CUDA-Zeiten je Kernel), dann mit dem
-Vulkan-Shader vergleichen. Übernahme nur mit Messung; nicht dringend.
+Anlass: B19. Qwen3.8-27B dekodiert auf der RTX 5090 (1,8 TB/s) in Q4_K_M mit 27,7 ms je Token
+(CUDA) bzw. 25,4 ms (Vulkan), in Q8_0 mit 27,4 bzw. 25,3 ms. Q4_K_M liest nur gut halb so viele
+Bytes (rund 16,5 statt 28,6 GB) und ist trotzdem nicht schneller; die Grenze der Bandbreite
+läge bei etwa 9 bzw. 16 ms. CUDA liegt bei beiden Formaten rund 2 ms je Token hinter Vulkan.
+
+*Nächster Schritt:* messen, wohin die Zeit eines Tokens geht - `LAI_VULKAN_PROFILE` für Vulkan,
+für CUDA fehlt eine Zeitmessung je Kernel (Events um die Kernel des Graphen, oder ein Lauf ohne
+Graph). Verdächtig: `linear8` holt je Warp und Schritt nur einen Q4_K-Block (144 Bytes), also
+wenige Ladevorgänge gleichzeitig; die DeltaNet-Layer; die Zahl der Kernel je Token. Übernahme
+nur mit Messung.
 
 ## B18 — Mehrere Köpfe auf dem Gerät, Kopf-Index je Aufruf (aufgenommen 2026-10-21)
 

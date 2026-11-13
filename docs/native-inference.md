@@ -1819,6 +1819,39 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B19 erledigt (2026-11-13): Q4_K auf CUDA so schnell wie Q8_0.** Anlass war D7g: Qwen3.8-27B
+Q4_K_M dekodierte auf der RTX 5090 mit CUDA langsamer als mit Vulkan und als Q8_0 auf CUDA.
+
+- *Ursache:* `weights8` in `tools/cuda/linear.cu` (genutzt von `linear8`, `linear8ids` und
+  `gemm8`) holte Skalen und Minima eines Q4_K-Blocks als einzelne Bytes und Halbwörter, jedes
+  mit eigener 64-Bit-Byteadresse - rund zehn Ladevorgänge samt Adressrechnung je acht Gewichte.
+  Q8_0 braucht dafür eine Skala und zwei Wörter. Der Shader von Vulkan rechnet dasselbe in
+  32 Bit.
+- *Änderung:* Ein Q4_K-Block liegt immer auf einer durch 4 teilbaren Adresse (eine Zeile ist
+  ein Vielfaches von 144 Bytes, ein Experte beginnt bei `ids * stride` mit `stride` durch 4
+  teilbar, ebenso Gate und Up aus GGUF). Der Kernel liest ihn deshalb als Wörter: `d` und
+  `dmin` aus Wort 0, die zwölf Skalenbytes aus den Wörtern 1 bis 3, die Nibbles ab Wort 4; die
+  64-Bit-Adresse wird einmal je Block gerechnet. Die Gleitkomma-Rechnung ist unverändert.
+- *Tempo (RTX 5090, `llm-bench` 200 Tokens Prompt, 64 Tokens Decode):*
+  - **Qwen3.8-27B Q4_K_M auf CUDA:** 31,7 → 36,1 Tokens/s (31,5 → 27,7 ms je Token).
+  - **Zum Vergleich:** Q8_0 auf CUDA 36,5, auf Vulkan Q4_K_M 39,4 und Q8_0 39,4.
+  - Der verbleibende Abstand zu Vulkan (rund 2 ms je Token) besteht auch bei Q8_0, ist also
+    nicht mehr Q4_K-eigen. Beide Backends liegen bei Q4_K_M weit über der Grenze der Bandbreite
+    (rund 9 ms je Token für 16,5 GB): Backlog B20.
+- *Tests:* `LinearIdsMatchesReference` prüft Q4_K jetzt auch mit 512 Eingängen (zwei Blöcke je
+  Zeile). `LinearMatchesReference` deckt `linear8` und `gemm8` mit mehreren Blöcken ab, die
+  Zufallsblöcke setzen auch die oberen Skalenbits.
+- *Gegenprobe:* Ohne die oberen Skalenbits bei `j >= 4` scheitern 31 Assertions in
+  `TTestInferCuda`: `LinearMatchesReference`, `LinearIdsMatchesReference` und die Q4_K_M-Modelle
+  (Qwen3-0.6B, Qwen2.5-0.5B, Qwen3-30B-A3B, Qwen3.8-27B).
+- *Läufe (RTX 5090, `TTestInferCuda` mit allen Modellen):* FPC 0 / 1550, Delphi 13 0 / 1550,
+  Delphi 7 0 / 58 (32 Bit, ohne CUDA: baut und überspringt).
+- *Review:* Claude-Finder und Codex: Byte-Zuordnung und Ausrichtung für alle Aufrufer bestätigt.
+  Ein Kommentar nannte die Byte-Offsets für `j >= 4` falsch (behoben). Der Finder vermisste
+  einen Q4_K-Fall mit mehreren Blöcken in `linear8ids` (ergänzt). Codex vermerkt als nicht
+  blockierend, dass kein Test Q4_K-Gate/Up aus GGUF mit versetztem Up-Zeiger prüft; die
+  Zeigerrechnung ist dieselbe wie bei Q8_0, die `Gemma4MatchesCpu` abdeckt.
+
 **D6e2 erledigt (2026-11-13): Gemma 4 auf Vulkan.** `TQwen3Vulkan` nimmt Gemma 4 an, mit
 denselben Schritten wie CUDA in D6e1.
 
