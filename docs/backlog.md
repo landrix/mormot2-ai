@@ -78,12 +78,22 @@ Qwen3.5 und Qwen3.8).
 | gpt-oss-20b (120b) | Apache 2.0 | 20b: MoE 32 Experten top-4, 24 Layer (120b: 128 Experten, 36 Layer), abwechselnd Fenster 128 und voll | MoE, Sliding Window, Attention-Sinks, YaRN, Bias, begrenzte SwiGLU, MXFP4, o200k-Tokenizer, Harmony-Chatformat | erledigt (D5) |
 | Gemma 4 26B-A4B, 31B, 12B (E2B, E4B) | Apache 2.0 | 26B: 30 Layer, 5 lokal (Fenster 1024) : 1 global, 128 Experten top-8 + dichter Parallelzweig; global 2 KV-Köpfe mit Dimension 512; 31B dicht | Kopfdimension 512 auf der GPU, GELU-tanh, Logit-Softcap, teilweise RoPE, K=V, eigener Tokenizer; nur E2B/E4B zusätzlich Per-Layer Embeddings und geteilter KV | erledigt bis auf E2B/E4B (D6) |
 | Qwen3.8-27B (`model_type` `qwen3_5`, wie Qwen3.5) | Apache 2.0 | 64 Layer = 16 × (3 Gated DeltaNet + 1 volle Attention mit Ausgangsgate) | Gated DeltaNet mit rekurrentem Zustand und Convolution-Puffer; Bildteil zunächst nicht | erledigt (D7) |
-| Kolibri-1 (Aleph Alpha) | Apache 2.0, nur Gewichte und Konfiguration | MoE 78B / 3,46B aktiv, 50 Layer, 4 Fenster (513) : 1 voll, NoPE in den vollen Layern, 384 Experten top-6 mit Sigmoid-Router + 1 geteilter | FP8 E4M3 in 128×128-Blöcken, safetensors in Teilen, Router mit Bias-Korrektur; GGUF nur von Dritten (Q4_K_M 47,5 GB) | offen (D8) |
+| Kolibri-1 (Aleph Alpha) | Apache 2.0, nur Gewichte und Konfiguration | MoE 78B / 3,46B aktiv, 50 Layer, 4 Fenster (513) : 1 voll, NoPE in den vollen Layern, 384 Experten top-6 mit Sigmoid-Router + 1 geteilter | FP8 E4M3 in 128×128-Blöcken, safetensors in Teilen, Router mit Bias-Korrektur; GGUF nur von Dritten (Q4_K_M 47,5 GB) | zurückgestellt (D8, Vergleich 2026-11-16) |
 | Nemotron 3.5 Bolt | OpenMDW-1.1 | 74B-A9B, Mamba-2/Transformer-Hybrid, LatentMoE | Mamba-2, LatentMoE, IQ2_XXS (Experten) und NVFP4 (Mamba-Projektionen) | gestrichen (D9) |
 
 **Reihenfolge (Nutzerentscheidung 2026-10-20):** D8 (Kolibri) erst nach einem Vergleich der
 deutschen Antworten mit Gemma 4 und Qwen3.5 - fällt weg, wenn es dort nichts voraus hat. D9
 (Nemotron 3.5 Bolt) gestrichen: vier neue Bausteine für ein Modell, eigene Lizenz.
+
+**Vergleich D8 (2026-11-16, Nutzerentscheidung: zurückgestellt):** llama.cpp b12441 auf der
+RTX 5090 (`--fit on`), acht deutsche Handwerks- und Büroaufgaben (Angebotstext,
+Mängelverjährung BGB/VOB/B, Fliesenmenge, JSON aus einer Kunden-Mail, Tool-Aufruf,
+Protokoll-Zusammenfassung, Beschwerde-Antwort, GAEB-Datenarten). Kolibri-1 Q4_K_M
+(bartowski @ ffd6001f) etwa gleichauf mit Gemma 4 31B Q8_0, etwas vor Qwen3.8-27B Q4_K_M
+(dort Verjährung falsch); GAEB kannte keins (Kolibri dachte bis zur Token-Grenze im Kreis,
+die anderen erfanden Antworten). Tempo 77 Tokens/s (Experten teils im RAM), Qwen3.8-27B 69,5.
+Kein Vorsprung, der FP8, 384 Experten und ein Modell über dem VRAM rechtfertigt; wieder
+aufnehmen nur nach einem größeren Test mit echten Aufgaben.
 
 **Testrechner:** RTX-Rechner (RTX 5090 mit 32 GB, 96 GB RAM; echte große Modelle), Mac M2 Pro
 (16 GB RAM; Tiny-Modelle und kleine echte Modelle), Snapdragon X mit Adreno (nur Tiny- und
