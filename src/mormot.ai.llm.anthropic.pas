@@ -626,8 +626,7 @@ begin
   body := AnthropicChatRequestJson(aRequest, {stream=}false);
   sock := Connect(path);
   try
-    status := sock.Request(path, 'POST', 0, Headers({stream=}false),
-      body, 'application/json', false, nil, nil);
+    status := LlmPostOnce(sock, path, Headers({stream=}false), body, nil);
     if (status < 200) or (status >= 300) then
       ELlmClient.RaiseUtf8('ChatComplete: HTTP % - %', [status, sock.Content]);
     result := ParseAnthropicChatResponse(sock.Content);
@@ -655,8 +654,7 @@ begin
       // wrapper owns sse and frees it - so we only ever free outStream
       if fConfig.MaxResponseBytes > 0 then
         outStream := TLimitedStreamWriter.Create(sse, fConfig.MaxResponseBytes);
-      status := sock.Request(path, 'POST', 0, Headers({stream=}true),
-        body, 'application/json', false, nil, outStream);
+      status := LlmPostOnce(sock, path, Headers({stream=}true), body, outStream);
       sse.Flush; // emit a final event delivered without a closing newline
       if (status < 200) or (status >= 300) then
         // a non-2xx body is a JSON error (not SSE): RawBody keeps it readable

@@ -9,6 +9,14 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-16 - LLM clients: a provider call is sent at most once.** mORMot's
+  `THttpClientSocket.Request` resent a POST once by itself, on a new connection, when no answer
+  came (no headers within the timeout, connection closed while waiting) - the provider may have
+  processed and billed the first call. All provider POSTs (OpenAI-wire chat, stream and
+  embeddings; Anthropic chat and stream) now go through `LlmPostOnce`, which tells mORMot the
+  call is the retry already, so it reports the error instead. Test
+  `TTestLlmClient.ProviderPostIsNeverRepeated` (a local server answering too late; without the
+  fix every call arrives twice).
 - **2026-11-16 - B20, part 5: Q4_K in `matvec8` with 16-byte loads.** The decode profile
   after part 4 showed the matrix products equally fast on Vulkan and CUDA, and the Q4_K
   matrices of the FFN at 1.19 to 1.38 TB/s against 1.5 for Q8_0. A lane now reads the

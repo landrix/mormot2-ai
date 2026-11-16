@@ -11,10 +11,14 @@ uses
   mormot.core.text,
   mormot.core.variants,
   mormot.core.json,
+  mormot.core.os,
   mormot.core.test,
+  mormot.net.http,
+  mormot.net.server,
   mormot.ai.llm.types,
   mormot.ai.llm,
-  mormot.ai.llm.openai;
+  mormot.ai.llm.openai,
+  mormot.ai.llm.anthropic;
 
 type
   TTestLlmClient = class(TSynTestCase)
@@ -37,10 +41,31 @@ type
     procedure ExtraCannotOverrideTheTransportMode;
     procedure FalsyErrorKeyIsNotAProviderError;
     procedure ReasoningRoundTrip;
+    /// a provider call that times out is not sent again: mORMot's client
+    // retries once by itself unless told the call is the retry already
+    // (LlmPostOnce) - a second POST could run and bill the call twice
+    procedure ProviderPostIsNeverRepeated;
   end;
 
 
 implementation
+
+type
+  /// a provider that counts the requests and answers too late
+  TSlowProvider = class
+  public
+    Count: integer;
+    function OnRequest(Ctxt: THttpServerRequestAbstract): cardinal;
+  end;
+
+function TSlowProvider.OnRequest(Ctxt: THttpServerRequestAbstract): cardinal;
+begin
+  LockedInc32(@Count);
+  SleepHiRes(1000); // past the client's timeout
+  Ctxt.OutContent := '{}';
+  Ctxt.OutContentType := 'application/json';
+  result := HTTP_SUCCESS;
+end;
 
 /// set the RTL's global thousand separator, return the previous one
 // - FPC: DefaultFormatSettings; Delphi XE and up: FormatSettings; older Delphi
@@ -587,6 +612,107 @@ begin
   CheckEqual(_Safe(_Json(json))^.A['messages']^._[1]^.U['reasoning'], 'add',
     'Ollama: reasoning');
   Check(PosEx('reasoning_content', json) = 0, 'Ollama: not reasoning_content');
+end;
+
+
+procedure TTestLlmClient.ProviderPostIsNeverRepeated;
+var
+  provider: TSlowProvider;
+  server: THttpServer;
+  port, base, i: integer;
+  openai: TLlmClient;
+  openaiRef, anthropic: ILlmClient;
+  config: TLlmProviderConfig;
+  msgs: TLlmMessageDynArray;
+  req: TLlmChatRequest;
+  inputs: TRawUtf8DynArray;
+
+  procedure Expect(const aName: RawUtf8; aKind: integer);
+  var
+    before, waited: integer;
+    raised: boolean;
+  begin
+    before := provider.Count;
+    raised := false;
+    try
+      case aKind of
+        0:
+          openaiRef.ChatComplete(req);
+        1:
+          openaiRef.ChatStream(req, nil);
+        2:
+          openai.Embeddings('m', inputs);
+        3:
+          anthropic.ChatComplete(req);
+      else
+        anthropic.ChatStream(req, nil);
+      end;
+    except
+      on ELlmClient do
+        raised := true;
+    end;
+    // the first request may reach the handler late on a loaded machine; a
+    // retried one would follow right after the client's timeout of 300 ms
+    waited := 0;
+    while (provider.Count = before) and (waited < 3000) do
+    begin
+      SleepHiRes(50);
+      inc(waited, 50);
+    end;
+    SleepHiRes(500);
+    CheckUtf8(raised, '%: no answer is an error', [aName]);
+    CheckEqual(provider.Count - before, 1, aName + ': sent once');
+  end;
+
+begin
+  provider := TSlowProvider.Create;
+  server := nil;
+  try
+    port := 0;
+    base := 19000 + integer(GetTickCount64 mod 1000);
+    for i := 0 to 19 do
+    begin
+      try
+        // loopback only: no firewall prompt on Windows
+        server := THttpServer.Create(FormatUtf8('127.0.0.1:%', [base + i]),
+          nil, nil, 'llmtest', 4);
+        server.OnRequest := provider.OnRequest;
+        server.WaitStarted(5);
+        port := base + i;
+        break;
+      except
+        on Exception do
+          FreeAndNil(server);
+      end;
+    end;
+    if port = 0 then
+    begin
+      Check(false, 'no free port for the slow provider');
+      exit;
+    end;
+    SetLength(msgs, 1);
+    msgs[0] := LlmMessage(lrUser, 'Hi');
+    req := LlmChatRequest('m', msgs);
+    SetLength(inputs, 1);
+    inputs[0] := 'text';
+    config := OpenAIConfig('key', 'm');
+    config.BaseUrl := FormatUtf8('http://127.0.0.1:%/v1', [port]);
+    config.TimeoutMs := 300;
+    openai := TLlmClient.Create(config);
+    openaiRef := openai; // the interface owns the instance
+    config := AnthropicConfig('key', 'm');
+    config.BaseUrl := FormatUtf8('http://127.0.0.1:%/v1', [port]);
+    config.TimeoutMs := 300;
+    anthropic := TAnthropicClient.Create(config);
+    Expect('chat', 0);
+    Expect('chat stream', 1);
+    Expect('embeddings', 2);
+    Expect('anthropic', 3);
+    Expect('anthropic stream', 4);
+  finally
+    server.Free; // waits for the handlers still sleeping
+    provider.Free;
+  end;
 end;
 
 end.

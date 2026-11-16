@@ -97,6 +97,19 @@ function OpenAIEmbeddingsRequestJson(const aModel: RawUtf8;
 //   batch response is mapped back to input order rather than array position
 function ParseOpenAIEmbeddings(const aJson: RawUtf8): TLlmEmbeddingDynArray;
 
+/// POST aBody (JSON) on aSock to a provider, sent at most once
+// - THttpClientSocket.Request retries once by itself, on a new connection,
+//   when no answer comes (no headers within the timeout, connection closed
+//   while waiting): the provider may have received and billed the first call,
+//   so the retry could run - and cost - it twice; AsRetry=true tells mORMot
+//   this is the retry already, and it returns an error status instead
+//   (mostly HTTP_CLIENTERROR) - on purpose against the advice of
+//   THttpClientSocket.Request to keep AsRetry false
+// - the answer goes to aSock.Content, or to aOut when not nil (streaming)
+// - redirects are not followed (THttpClientSocket.RedirectMax stays 0)
+function LlmPostOnce(aSock: THttpClientSocket; const aPath, aHeaders,
+  aBody: RawUtf8; aOut: TStream): integer;
+
 
 type
   /// OpenAI-wire LLM client driving OpenAI, LiteLLM and Ollama via config
@@ -375,6 +388,13 @@ begin
   fConfig := aConfig;
 end;
 
+function LlmPostOnce(aSock: THttpClientSocket; const aPath, aHeaders,
+  aBody: RawUtf8; aOut: TStream): integer;
+begin
+  result := aSock.Request(aPath, 'POST', 0, aHeaders, aBody, 'application/json',
+    {AsRetry=}true, nil, aOut);
+end;
+
 function TLlmClient.Config: TLlmProviderConfig;
 begin
   result := fConfig;
@@ -416,9 +436,8 @@ begin
   body := OpenAIChatRequestJson(aRequest, {stream=}false, fConfig.ReasoningField);
   sock := Connect('/chat/completions', path);
   try
-    status := sock.Request(path, 'POST', 0,
-      'Accept: application/json'#13#10'Accept-Encoding: identity',
-      body, 'application/json', false, nil, nil);
+    status := LlmPostOnce(sock, path,
+      'Accept: application/json'#13#10'Accept-Encoding: identity', body, nil);
     if (status < 200) or (status >= 300) then
       ELlmClient.RaiseUtf8('ChatComplete: HTTP % - %', [status, sock.Content]);
     result := ParseOpenAIChatResponse(sock.Content);
@@ -437,9 +456,8 @@ begin
   body := OpenAIEmbeddingsRequestJson(aModel, aInput);
   sock := Connect('/embeddings', path);
   try
-    status := sock.Request(path, 'POST', 0,
-      'Accept: application/json'#13#10'Accept-Encoding: identity',
-      body, 'application/json', false, nil, nil);
+    status := LlmPostOnce(sock, path,
+      'Accept: application/json'#13#10'Accept-Encoding: identity', body, nil);
     if (status < 200) or (status >= 300) then
       ELlmClient.RaiseUtf8('Embeddings: HTTP % - %', [status, sock.Content]);
     result := ParseOpenAIEmbeddings(sock.Content);
@@ -469,9 +487,9 @@ begin
         outStream := TLimitedStreamWriter.Create(sse, fConfig.MaxResponseBytes);
       // no compression: GetBody streams each chunk into sse.Write live, but it
       // refuses a Content-Encoding'd body
-      status := sock.Request(path, 'POST', 0,
-        'Accept: text/event-stream'#13#10'Accept-Encoding: identity',
-        body, 'application/json', false, nil, outStream);
+      status := LlmPostOnce(sock, path,
+        'Accept: text/event-stream'#13#10'Accept-Encoding: identity', body,
+        outStream);
       sse.Flush; // emit a final event delivered without a closing newline
       if (status < 200) or (status >= 300) then
         // a non-2xx body is a JSON error (not SSE): RawBody keeps it readable
