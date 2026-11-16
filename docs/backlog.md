@@ -26,22 +26,23 @@ CHANGELOG nennt den erledigten Teil, hier steht der offene Rest unter derselben 
 
 ---
 
-## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teile 1 bis 4 erledigt)
+## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teile 1 bis 5 erledigt)
 
 Anlass: B19. Erledigt (`CHANGELOG.md`, `native-inference.md`): Teil 1 (2026-11-13) - die
 Normen einer Zeile beim Decode mit Gruppen von 1024; Teil 2 (2026-11-16) - eine Decode-Zeile
 von Q8_0 und K-Quants auf NVIDIA durch `matvec8` (CUDA neu), zwei Features je Warp ab 4096
 Ausgängen; Teil 3 (2026-11-16) - jedes Q4_K-Quant-Byte einmal gelesen, beide Nibbles in einer
-Lane; Teil 4 (2026-11-16) - `linear-bench` und eine engere Barriere im Vulkan-Batch.
-Qwen3.8-27B Q4_K_M auf der RTX 5090 jetzt 60,6 (CUDA) und 59,3 (Vulkan) Tokens/s, Q8_0
-47,8 und 48,4.
+Lane; Teil 4 (2026-11-16) - `linear-bench` und eine engere Barriere im Vulkan-Batch; Teil 5
+(2026-11-16) - Q4_K in `matvec8` mit 16-Byte-Ladevorgängen. Qwen3.8-27B Q4_K_M auf der RTX
+5090 jetzt 63,5 (CUDA) und 61,9 (Vulkan) Tokens/s, Q8_0 47,8 und 48,4.
 
 Offen:
-- **Vulkan noch hinter CUDA** (Q4_K_M 59,3 gegen 60,6): `linear-bench` zeigt je Dispatch
-  noch rund 1,5 bis 2 µs mehr (Matrizen 14,7 gegen 13,8 ms je Durchgang); die Lücke ist fest
-  je Dispatch, nicht Bandbreite. Weniger Dispatches: `ffn_gate` und `ffn_up` in einem
-  Dispatch, `ssm_alpha`/`ssm_beta` (48 Ausgänge, 6,1 gegen 4,6 µs) mit `attn_qkv`
-  zusammen.
+- **Vulkan knapp hinter CUDA** (Q4_K_M 61,9 gegen 63,5): Im Decode brauchen die Matrizen auf
+  beiden gleich lang (Profil nach Teil 4: 13,85 ms); der Rest liegt in den kleinen Operationen
+  (`addnorm` 127 Aufrufe zu rund 7 µs). Weniger Dispatches (`ffn_gate` und `ffn_up` in einem)
+  bringen wenig: Diese Paare laufen im Batch schon ohne Barriere dazwischen.
+- **Q4_K bei rund 1,42 bis 1,49 TB/s** (CUDA, Teil 5): eine Feature je Warp für Q4_K wäre noch
+  rund 0,17 ms je Token schneller (nahe am Rauschen, `LAI_PAIRS` in `linear-bench`).
 - **Q8_0 bei rund 85 % der Bandbreite:** Die Matrixprodukte lesen 27,4 GB in rund 18 ms je Token
   (Vulkan-Profil: 1,52 von 1,79 TB/s); wenig Luft; ein Block von 34
   Bytes liegt bei jeder zweiten Einheit auf 2 mod 4 (zwei Wörter je Quant-Wort).

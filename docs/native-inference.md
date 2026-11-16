@@ -1819,6 +1819,52 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B20, Teil 5 erledigt (2026-11-16): Q4_K in `matvec8` mit 16-Byte-Ladevorgängen.** Anlass war
+das Decode-Profil nach Teil 4.
+
+- *Messung (`LAI_VULKAN_PROFILE`, Qwen3.8-27B Q4_K_M, Decode, je Token):* 16,4 ms GPU, davon
+  `linear` 13,85 ms - so viel wie die Matrizen eines Durchgangs auf CUDA (`linear-bench`
+  13,87 ms). Der Abstand Vulkan zu CUDA bei den Matrizen ist damit zu; Vulkan 59,9 gegen
+  CUDA 60,6 Tokens/s. Größter Posten danach: die Q4_K-Matrizen der FFN (192 je Token) mit
+  1,19 bis 1,38 TB/s gegen 1,5 bis 1,56 TB/s bei Q8_0 gleicher Größe.
+- *Probe (`linear-bench`, CUDA, je Matrix):* Kopf und Quants einer Einheit je als ein
+  16-Byte-Ladevorgang statt je vier Wörter: `ffn_down` (5120 x 17408) 41,6 → 35,1 µs,
+  `ffn_gate`/`ffn_up` (17408 x 5120) 36,3 → 33,6 µs, alle Matrizen eines Durchgangs 13,87 →
+  13,10 ms. Verworfen: die Schleife über die Einheiten zweifach entrollt (`gate`/`up` wieder
+  36,3 µs; für alle Typen zudem Q8_0 10240 x 5120 37 → 44,5 µs); eine Feature je Warp für
+  Q4_K (33,8 und 33,0 µs, rund 0,17 ms je Token, nahe am Rauschen; Q8_0 verliert dabei).
+- *Änderung:*
+  - **CUDA (`linear.cu`, `unitDot<3>`):** `__ldg` eines `uint4` für den Blockkopf und für die
+    16 Quant-Bytes der Einheit. Ein Q4_K-Block (144 Bytes) und jede Zeile beginnen auf einem
+    Vielfachen von 16; `LinearShape` nimmt `matvec8` für Q4_K nur bei einer Gewichtsadresse,
+    die ein Vielfaches von 16 ist (`EnqueueLinearAt` nimmt jede Adresse), sonst `linear8`.
+  - **Vulkan (`matvec8.comp`, Define `W4`, nur die Q4_K-Builds):** Bindung 0 als `uvec4 w4[]`
+    statt `uint w[]` - eine einzige Deklaration, keine zweite Sicht auf dieselbe Bindung
+    (MoltenVK); der Code für Q8_0 und Q6_K entfällt in diesen Builds.
+- *Tempo (`llm-bench` 200/64, Decode, Tokens/s, je zwei Läufe):*
+  - **CUDA:** Qwen3.8-27B Q4_K_M 60,7 → 63,5; Qwen3-0.6B Q4_K_M 536 → 552; Qwen3-30B-A3B
+    122,7 → 125,1.
+  - **Vulkan:** Qwen3.8-27B Q4_K_M 59,6 → 61,9; Qwen3-0.6B Q4_K_M 452 → 463; Qwen3-30B-A3B
+    109,6 → 109,2 (Rauschen: die Experten rechnet `linear8ids`).
+  - `linear-bench` Vulkan: `ffn_down` 42,4 → 36,9 µs, `gate`/`up` 39,1 → 36,8 µs.
+  - **M2 Pro (MoltenVK, eine Feature je Warp):** Qwen3-0.6B Q4_K_M 77,6 → 95,0 (+22 %), Q8_0
+    unverändert (106,9 / 105,2).
+- *Tests:* `LinearMatchesReference` (CUDA) rechnet zusätzlich eine Q4_K-Zeile über
+  `EnqueueLinearAt` an einer Gewichtsadresse 4 und 16 Bytes in einem Puffer.
+- *Gegenprobe:* die Quants der Nachbareinheit (`uu xor 1`) in beiden Kerneln und ohne die Prüfung
+  der Adresse in `LinearShape`: Vulkan 26 von 2.161 Assertions scheitern (Q4_K-Formen,
+  Qwen3-0.6B, Qwen2.5, Qwen3-30B-A3B, Qwen3.8-27B Q4_K_M), CUDA scheitert an den Q4_K-Formen
+  und bricht beim Gewicht 4 Bytes im Puffer mit `CUDA_ERROR_MISALIGNED_ADDRESS` ab (der Kontext
+  ist danach tot); echter Build Vulkan 0 / 2.166, CUDA 0 / 1.989.
+- *Läufe:* RTX 5090 FPC 0 / 17.584, Delphi 13 0 / 17.584, Delphi 7 0 / 6.544; Mac M2 Pro (FPC,
+  MoltenVK): `infer.tests` 0 / 8.700, `llm.tests` 0 / 730.
+- *Review* (Claude-Finder und Codex): keine Fehler an Adressen, Bereichsgrenzen, Präprozessor
+  und Arithmetik. Behoben: zwei Kommentare nannten Q4_K noch „4-aligned“; im neuen Test blieb
+  ein Puffer ohne Freigabe, wenn das Anlegen des zweiten scheiterte. Verworfen: eine Prüfung
+  für Vulkan wie in CUDA - `w4[]` zählt ab dem Beginn der Bindung, ein Versatz, den das
+  Gerät erlaubt (`minStorageBufferOffsetAlignment`), verschiebt nichts.
+- `linear-bench` liest `LAI_PAIRS` (Schwelle für zwei Features je Warp) für solche Proben.
+
 **B20, Teil 4 erledigt (2026-11-16): `linear-bench` und eine engere Barriere im Vulkan-Batch.**
 Ziel war der Abstand Vulkan zu CUDA (Qwen3.8-27B Q4_K_M 56,4 gegen 60,6 Tokens/s).
 

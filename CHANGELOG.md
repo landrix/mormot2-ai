@@ -9,6 +9,14 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-16 - B20, part 5: Q4_K in `matvec8` with 16-byte loads.** The decode profile
+  after part 4 showed the matrix products equally fast on Vulkan and CUDA, and the Q4_K
+  matrices of the FFN at 1.19 to 1.38 TB/s against 1.5 for Q8_0. A lane now reads the
+  header of its Q4_K block and its 16 quant bytes as one 16-byte load each (a block of 144
+  bytes and its rows start at a multiple of 16; CUDA takes `matvec8` for Q4_K only at such
+  a weight address, `linear8` otherwise). Qwen3.8-27B Q4_K_M from 60.7 to 63.5 tokens/s
+  (CUDA) and from 59.6 to 61.9 (Vulkan); Qwen3-0.6B Q4_K_M from 536 to 552 (CUDA) and 452 to
+  463 (Vulkan); on an M2 Pro (MoltenVK) from 77.6 to 95.0.
 - **2026-11-16 - B20, part 4: a narrower barrier in a Vulkan batch; `linear-bench`.** The new
   demo `demos/infer/linear-bench` times the one-row matrix products of a GGUF model per
   type and shape (CUDA as a graph, Vulkan by its profile). It showed Vulkan 2 to 4 us per

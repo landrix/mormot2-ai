@@ -55,11 +55,14 @@ done
 # reductions
 for t in 2:Q8 3:Q4K 4:Q6K; do
   d=${t%%:*}
+  # Q4_K: the weights as 16-byte words (matvec8.comp, W4)
+  w4=
+  [ $d = 3 ] && w4=-DW4
   for f in 1 2; do
     n=${t#*:}
     [ $f = 2 ] && n=${n}_F2
-    "$GLSLANG" -V --target-env vulkan1.0 -Os -DDTYPE=${d}u -DFEAT=${f}u -o "$TMP/mv_$n.spv" matvec8.comp > "$TMP/mv_$n.log" || { cat "$TMP/mv_$n.log"; exit 1; }
-    "$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP -DDTYPE=${d}u -DFEAT=${f}u -o "$TMP/mv_${n}_sg.spv" matvec8.comp > "$TMP/mv_${n}_sg.log" || { cat "$TMP/mv_${n}_sg.log"; exit 1; }
+    "$GLSLANG" -V --target-env vulkan1.0 -Os $w4 -DDTYPE=${d}u -DFEAT=${f}u -o "$TMP/mv_$n.spv" matvec8.comp > "$TMP/mv_$n.log" || { cat "$TMP/mv_$n.log"; exit 1; }
+    "$GLSLANG" -V --target-env vulkan1.1 -Os -DSUBGROUP $w4 -DDTYPE=${d}u -DFEAT=${f}u -o "$TMP/mv_${n}_sg.spv" matvec8.comp > "$TMP/mv_${n}_sg.log" || { cat "$TMP/mv_${n}_sg.log"; exit 1; }
     ARGS+=("SPV_MATVEC8_$n=$TMP/mv_$n.spv" "SPV_MATVEC8_${n}_SG=$TMP/mv_${n}_sg.spv")
   done
 done

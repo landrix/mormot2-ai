@@ -732,7 +732,9 @@ Next, in this order:
    nibbles by one lane (B20, part 3: 60.6 and 56.4); the barrier between the operations of a
    Vulkan batch names compute and copy stages only (B20, part 4: Vulkan Qwen3.8-27B Q4_K_M
    59.3 tokens/s, Qwen3-0.6B 7 to 9 % faster) and `demos/infer/linear-bench` times the matrix
-   products of a GGUF model per shape on CUDA and Vulkan.
+   products of a GGUF model per shape on CUDA and Vulkan; Q4_K read in 16-byte loads (B20,
+   part 5: Qwen3.8-27B Q4_K_M 63.5 tokens/s on CUDA, 61.9 on Vulkan, Qwen3-0.6B Q4_K_M 22 %
+   faster on an M2 Pro).
    Plan and order:
    [docs/backlog.md](docs/backlog.md)
    (German); finished items: [CHANGELOG.md](CHANGELOG.md).

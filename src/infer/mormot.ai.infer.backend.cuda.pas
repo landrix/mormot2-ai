@@ -72,10 +72,11 @@ type
       aBytes: Int64): TInferCuBuffer;
     function Scratch(var aBuffer: TInferCuBuffer; aBytes: Int64): TInferCuBuffer;
     // the kernel and grid of a Linear: gemm8 for GEMM_ROWS rows or more,
-    // matvec8 for one row of Q8_0, Q4_K or Q6_K when UseMatvec, linear8 when
-    // the inputs allow, linear otherwise
+    // matvec8 for one row of Q8_0, Q4_K or Q6_K when UseMatvec (Q4_K only at
+    // a weight address aWeight that is a multiple of 16: it reads 16-byte
+    // words), linear8 when the inputs allow, linear otherwise
     procedure LinearShape(aType: TInferDType; aIn, aRows, aOut: PtrInt;
-      out aKernel: TCuHandle; out aX, aY, aBlock: cardinal);
+      aWeight: TCuDevicePtr; out aKernel: TCuHandle; out aX, aY, aBlock: cardinal);
   public
     /// the CPU part as TInferCpuFastBackend.Create, plus the CUDA device
     // (TInferCuda.Create: raises EInferCuda without one)
@@ -192,7 +193,8 @@ begin
 end;
 
 procedure TInferCudaBackend.LinearShape(aType: TInferDType; aIn, aRows,
-  aOut: PtrInt; out aKernel: TCuHandle; out aX, aY, aBlock: cardinal);
+  aOut: PtrInt; aWeight: TCuDevicePtr; out aKernel: TCuHandle;
+  out aX, aY, aBlock: cardinal);
 var
   f: PtrInt;
 begin
@@ -205,7 +207,8 @@ begin
     aBlock := GEMM_BLOCK;
   end
   else if fFastLinear and fUseMatvec and (aRows = 1) and
-          (aType in [idtQ8_0, idtQ4_K, idtQ6_K]) then
+          (aType in [idtQ8_0, idtQ4_K, idtQ6_K]) and
+          ((aType <> idtQ4_K) or (aWeight and 15 = 0)) then
   begin
     // f features per warp, 4 warps per block
     f := 1;
@@ -356,7 +359,7 @@ begin
   nout := aOut;
   dtype := LINEAR_DTYPE[aType];
   hasBias := ord(aBias <> 0);
-  LinearShape(aType, aIn, aRows, aOut, kernel, gx, gy, block);
+  LinearShape(aType, aIn, aRows, aOut, pw, kernel, gx, gy, block);
   fCu.Enqueue(kernel, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
     @hasBias], gx, block, gy);
 end;
@@ -487,7 +490,7 @@ begin
     nout := aOut;
     dtype := LINEAR_DTYPE[w.DType];
     hasBias := ord(bias <> nil);
-    LinearShape(w.DType, aIn, aRows, aOut, kernel, gx, gy, block);
+    LinearShape(w.DType, aIn, aRows, aOut, pw, kernel, gx, gy, block);
     fCu.Launch(kernel, [@pw, @px, @pb, @py, @rows, @nin, @nout, @dtype,
       @hasBias], gx, block, gy);
     yb.Download(0, y, Int64(aRows) * aOut * 4);

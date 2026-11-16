@@ -17,6 +17,8 @@
 //   decode step) - its wall clock would count the device idling while the
 //   host records the batch, which a decode step overlaps (BatchFlush); a
 //   pass over every group first brings the clocks of the GPU up
+// - LAI_PAIRS=<n> in the environment: from how many outputs matvec8 takes two
+//   features per warp (MatvecPairsFrom of either backend; 999999: never)
 //
 //   usage: linear-bench file.gguf [vulkan | cuda] [rounds=5]
 //   e.g.   linear-bench qwen3.8-27b-q4_k_m.gguf cuda
@@ -136,6 +138,8 @@ var
   t0, t1: Int64;
 begin
   be := TInferCudaBackend.Create;
+  if GetEnvironmentVariable('LAI_PAIRS') <> '' then
+    be.MatvecPairsFrom := StrToInt(GetEnvironmentVariable('LAI_PAIRS'));
   x := nil;
   y := nil;
   try
@@ -213,6 +217,8 @@ var
   ns: Int64;
 begin
   be := TInferVulkanBackend.Create;
+  if GetEnvironmentVariable('LAI_PAIRS') <> '' then
+    be.MatvecPairsFrom := StrToInt(GetEnvironmentVariable('LAI_PAIRS'));
   x := nil;
   y := nil;
   temp := nil;

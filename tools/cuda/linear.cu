@@ -549,8 +549,9 @@ extern "C" __global__ void gemm8(const unsigned int* w, const float* x,
 //   byte read once) - reading their scales once and their quants as whole
 //   words, the activations of a unit loaded once for the FEAT
 //   features
-// - a row starts 2-aligned (Q8_0, Q6_K) or 4-aligned (Q4_K): rows of whole
-//   blocks, an expert at a multiple of its matrix
+// - a row starts 2-aligned (Q8_0, Q6_K) or 16-aligned (Q4_K, read as 16-byte
+//   words: blocks of 144 bytes, and LinearShape checks the weight address):
+//   rows of whole blocks, an expert at a multiple of its matrix
 
 // the 4 bytes from bit sh (0 or 16) of word i on (wordAt of matvec8.comp)
 __device__ __forceinline__ unsigned int wordAtMv(const unsigned int* w,
@@ -653,21 +654,27 @@ __device__ __forceinline__ float unitDot(const unsigned int* w,
     unsigned long long i = (rowBase + (u >> 3) * 144ull) >> 2;
     unsigned int uu = u & 7u;
     unsigned int j = uu & 6u;
-    unsigned int h = w[i];
-    unsigned int s0 = w[i + 1u];
-    unsigned int s1 = w[i + 2u];
-    unsigned int s2 = w[i + 3u];
+    // the block header and the unit's quants as one 16-byte load each (a
+    // block of 144 bytes and its rows start at a multiple of 16; LinearShape
+    // takes matvec8 for Q4_K only at such a weight address) - backlog B20,
+    // 5 to 15 % faster than four word loads each on an RTX 5090
+    uint4 hd = __ldg(reinterpret_cast<const uint4*>(w + i));
+    uint4 qv = __ldg(reinterpret_cast<const uint4*>(w + i + 4u + 4u * uu));
+    unsigned int h = hd.x;
+    unsigned int s0 = hd.y;
+    unsigned int s1 = hd.z;
+    unsigned int s2 = hd.w;
     unsigned int sc0, m0, sc1, m1;
     scaleMinK4(s0, s1, s2, j, sc0, m0);
     scaleMinK4(s0, s1, s2, j + 1u, sc1, m1);
-    const unsigned int* q = w + i + 4u + 4u * uu;
+    unsigned int qa[4] = {qv.x, qv.y, qv.z, qv.w};
     float s1v = 0.0f;
     float sx0 = 0.0f;
     float sx1 = 0.0f;
 #pragma unroll
     for (unsigned int k = 0u; k < 4u; k++)
     {
-      unsigned int v = q[k];
+      unsigned int v = qa[k];
       s += dot4n(v, 0u, xv[k]);
       s1v += dot4n(v, 4u, xv[k + 4u]);
       sx0 += xv[k].x + xv[k].y + xv[k].z + xv[k].w;

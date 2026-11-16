@@ -69,7 +69,10 @@ type
     // against the reference's F32 product of the dequantized weights (a
     // tolerance: another summation order), with and without bias, more than
     // 65535 outputs, the weight cache, and the CPU for other types; one row
-    // through linear8 and matvec8 (one and two features per warp, backlog B20)
+    // through linear8 and matvec8 (one and two features per warp, backlog B20);
+    // one row of Q4_K through EnqueueLinearAt at a weight address that is a
+    // multiple of 16 (matvec8, which reads 16-byte words) and at one that is
+    // not (linear8)
     procedure LinearMatchesReference;
     /// slice C3 (attention: C5): rmsnorm, addnorm, swiglu, qkrope and attention of
     // tools/cuda/ops.cu against the CPU reference's RmsNorm, Add, SwiGlu, Rope
@@ -730,11 +733,13 @@ var
   t, i, o, m, rows, nin, nout: PtrInt;
   kind: TInferDType;
   x, bias, wf, wd, y1, y2, y3: TSingleDynArray;
-  wq: RawByteString;
+  wq, padded: RawByteString;
   data: pointer;
   b: PSingleArray;
   e: double;
   calls: Int64;
+  pad: PtrInt;
+  xb, yb: TInferCuBuffer;
 begin
   if not HasDevice then
     exit;
@@ -859,6 +864,54 @@ begin
       pointer(y2));
     Check(gpu.GpuLinears = calls, 'Q4_0 stays on the CPU');
     Check(SameBits(pointer(y1), pointer(y2), 2 * 8), 'Q4_0 as the fast backend');
+    // backlog B20: matvec8 reads Q4_K as 16-byte words - one row at a weight
+    // address 4 bytes into the buffer (no multiple of 16: linear8 instead,
+    // where a 16-byte load would stop the context), then 16 bytes into it
+    gpu.FastLinear := true;
+    gpu.UseMatvec := true;
+    gpu.MatvecPairsFrom := MaxInt;
+    nin := 2560;
+    nout := 37;
+    wq := RandomK(idtQ4_K, nout, nin, 97);
+    SetLength(wd, nout * nin);
+    for o := 0 to nout - 1 do
+      InferRowToF32(pointer(wq), idtQ4_K, o, nin, @wd[o * nin]);
+    Fill(x, nin, 7, 3);
+    SetLength(y1, nout);
+    SetLength(y2, nout);
+    ref.Linear(pointer(x), 1, nin, InferWeight(pointer(wd), idtF32), nout, nil,
+      pointer(y1));
+    for i := 0 to 1 do
+    begin
+      pad := 4 + 12 * i;
+      SetLength(padded, pad + length(wq));
+      FillChar(pointer(padded)^, pad, 0);
+      Move(pointer(wq)^, PByteArray(padded)^[pad], length(wq));
+      FillChar(pointer(y2)^, nout * 4, 0);
+      gpu.GpuLock;
+      try
+        xb := TInferCuBuffer.Create(gpu.Cuda, nin * 4);
+        try
+          yb := TInferCuBuffer.Create(gpu.Cuda, nout * 4);
+          try
+            xb.Upload(0, pointer(x), nin * 4);
+            gpu.EnqueueLinearAt(xb, 1, nin, idtQ4_K, gpu.DeviceWeight(
+              pointer(padded), idtQ4_K, length(padded)).Ptr + pad, nout, yb);
+            yb.Download(0, pointer(y2), nout * 4);
+          finally
+            yb.Free;
+          end;
+        finally
+          xb.Free;
+        end;
+      finally
+        gpu.GpuUnLock;
+      end;
+      e := RelError(pointer(y2), pointer(y1), nout);
+      CheckUtf8(e <= 1e-5, 'Q4_K at weight offset %: relative error %', [pad, e]);
+      // the cache is keyed by the host address, which the next string may reuse
+      gpu.ClearWeights;
+    end;
   finally
     fast.Free;
     ref.Free;

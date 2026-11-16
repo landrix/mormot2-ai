@@ -9,7 +9,8 @@
 //   values of two sub-blocks, every byte read once) - reading their scales
 //   once and their quants as whole words (shifted by 16 bits where
 //   they start at 2 mod 4: a Q8_0 block at 0 mod 4, its quants follow a
-//   2-byte scale; a Q6_K block at 2 mod 4; Q4_K blocks are 4-aligned);
+//   2-byte scale; a Q6_K block at 2 mod 4; Q4_K blocks are 16-aligned and
+//   read as 16-byte words, see W4);
 //   linear8.comp reads the scales byte by byte for every 8 weights
 // - FEAT 1 (SPV_MATVEC8_<type>), or 2 (SPV_MATVEC8_<type>_F2, backlog B20):
 //   the activations of a unit loaded once for both features - each invocation
@@ -29,7 +30,15 @@
 
 layout(local_size_x = 128) in;
 
+// -DW4 (the Q4_K builds, backlog B20): the weights as 16-byte words - a
+// Q4_K block (144 bytes) and its rows start at a multiple of 16, a unit reads
+// its header and its quants in one load each (CUDA: 5 to 15 % faster on an
+// RTX 5090); one declaration only, no second view of the binding
+#ifdef W4
+layout(std430, binding = 0) readonly buffer BufW { uvec4 w4[]; };
+#else
 layout(std430, binding = 0) readonly buffer BufW { uint w[]; };
+#endif
 layout(std430, binding = 1) readonly buffer BufX { vec4 x[]; };
 layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
@@ -72,6 +81,7 @@ float dot4n(uint v, uint sh, vec4 a)
          float((v >> (sh + 24u)) & 15u) * a.w;
 }
 
+#ifndef W4
 // the 4 bytes from bit sh (0 or 16) of word i on: at 16 the halves of two
 // words - without a branch (neighbour invocations alternate between both
 // cases for Q8_0 and Q6_K), and without a read past the word of the last byte
@@ -91,6 +101,7 @@ uint half16(uint a)
 {
   return (w[a >> 2] >> ((a & 2u) * 8u)) & 0xffffu;
 }
+#endif
 
 // byte k of the little-endian words s0 s1 s2
 uint byte12(uint s0, uint s1, uint s2, uint k)
@@ -131,6 +142,7 @@ uint xAt(uint u, uint k)
 float unitDot(uint rowBase, uint u, vec4 xv[8])
 {
   float s = 0.0;
+#ifndef W4
   if (DT == 2u)
   {
     // Q8_0: 34 bytes per 32 values, value = d * qs[j]
@@ -145,30 +157,38 @@ float unitDot(uint rowBase, uint u, vec4 xv[8])
       s += dot4s(wordAt(qi + k, qs), xv[k]);
     return d * s;
   }
-  else if (DT == 3u)
+  else
+#endif
+  if (DT == 3u)
   {
     // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K); value =
     // d * sc * q - dmin * m. Unit uu = u % 8 of block u / 8: the 16 bytes at
     // 16 + 32 * (uu / 2) + 16 * (uu % 2), both nibbles - values 16 (uu % 2) ..
     // + 15 of sub-blocks j = 2 (uu / 2) (low, xv[0..3]) and j + 1 (high,
     // xv[4..7]); every quant byte read once (xAt maps the activations)
-    uint i = (rowBase + (u >> 3) * 144u) >> 2;
     uint uu = u & 7u;
     uint j = uu & 6u;
-    vec2 dm = unpackHalf2x16(w[i]);
-    uint s0 = w[i + 1u];
-    uint s1 = w[i + 2u];
-    uint s2 = w[i + 3u];
-    uint sc0, m0, sc1, m1;
-    scaleMinK4(s0, s1, s2, j, sc0, m0);
-    scaleMinK4(s0, s1, s2, j + 1u, sc1, m1);
+#ifdef W4
+    // the 16-byte word of the block header, then that of the unit's quants
+    uint i4 = (rowBase + (u >> 3) * 144u) >> 4;
+    uvec4 hd = w4[i4];
+    uvec4 qv = w4[i4 + 1u + uu];
+#else
+    uint i = (rowBase + (u >> 3) * 144u) >> 2;
+    uvec4 hd = uvec4(w[i], w[i + 1u], w[i + 2u], w[i + 3u]);
     uint qi = i + 4u + 4u * uu;
+    uvec4 qv = uvec4(w[qi], w[qi + 1u], w[qi + 2u], w[qi + 3u]);
+#endif
+    vec2 dm = unpackHalf2x16(hd.x);
+    uint sc0, m0, sc1, m1;
+    scaleMinK4(hd.y, hd.z, hd.w, j, sc0, m0);
+    scaleMinK4(hd.y, hd.z, hd.w, j + 1u, sc1, m1);
     float s1v = 0.0;
     float sx0 = 0.0;
     float sx1 = 0.0;
     for (uint k = 0u; k < 4u; k++)
     {
-      uint q = w[qi + k];
+      uint q = qv[k];
       s += dot4n(q, 0u, xv[k]);
       s1v += dot4n(q, 4u, xv[k + 4u]);
       sx0 += xv[k].x + xv[k].y + xv[k].z + xv[k].w;
@@ -177,6 +197,7 @@ float unitDot(uint rowBase, uint u, vec4 xv[8])
     return dm.x * (float(sc0) * s + float(sc1) * s1v) -
            dm.y * (float(m0) * sx0 + float(m1) * sx1);
   }
+#ifndef W4
   else
   {
     // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d
@@ -211,6 +232,8 @@ float unitDot(uint rowBase, uint u, vec4 xv[8])
     return d * (float(bitfieldExtract(int(scw), 0, 8)) * s +
                 float(bitfieldExtract(int(scw), 8, 8)) * s1);
   }
+#endif
+  return s; // not reached: DT is one of the three types
 }
 
 void main()
