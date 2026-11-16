@@ -1819,6 +1819,48 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B20, Teil 4 erledigt (2026-11-16): `linear-bench` und eine engere Barriere im Vulkan-Batch.**
+Ziel war der Abstand Vulkan zu CUDA (Qwen3.8-27B Q4_K_M 56,4 gegen 60,6 Tokens/s).
+
+- *CUDA-Profil, verworfen:* Events nach jedem Kernel ohne Graph zählen die Startlücken unter
+  Windows mit (Summe 20,8 ms je Token = Wandzeit ohne Graph, mit Graph 16,5 ms); als Knoten
+  im Graphen (`cuEventRecordWithFlags`, `CU_EVENT_RECORD_EXTERNAL`) kostet jedes Event rund
+  5 µs (Decode 22,4 ms). Nicht übernommen.
+- *Neu: `demos/infer/linear-bench`* (`linear-bench datei.gguf [vulkan|cuda] [runden=5]`): alle
+  2-D-Gewichte, die das Gerät multipliziert, nach Typ und Form gruppiert; eine Zeile durch
+  jede Matrix der Gruppe, mehrere Runden - CUDA als ein Graph (Wandzeit um Start und
+  Warten), Vulkan als ein Batch (Summe des Profils; die Wandzeit zählte das Warten der GPU
+  während der Aufzeichnung mit: 23,8 ms statt 15,3); vorher ein Durchgang über alle Gruppen,
+  damit die GPU hochtaktet (ohne ihn liefen die ersten Gruppen halb so schnell: der Kopf
+  1589 statt 805 µs). Neu dafür `TInferCuda.GraphLaunch` und `TInferVulkan.ProfileNs`.
+- *Befund:* Vulkan lag bei jeder Form 2 bis 4 µs je Dispatch hinter CUDA (Matrizen eines
+  Durchgangs 15,3 gegen 13,9 ms) - feste Kosten, keine Bandbreite. Eine Probe ohne Barriere
+  (falsche Ergebnisse, nur zur Zeit) brachte 82 Tokens/s, eine enge 59,6.
+- *Änderung (`TInferVulkan.Barrier`):* statt `ALL_COMMANDS` mit `MEMORY_WRITE` →
+  `MEMORY_READ | MEMORY_WRITE` nennt die Barriere zwischen den Operationen eines Batches nur
+  die Stufen Compute und Transfer mit `SHADER_WRITE | TRANSFER_WRITE` →
+  `SHADER_READ | SHADER_WRITE | TRANSFER_READ | TRANSFER_WRITE` - ein Batch hält nur
+  Dispatches auf Storage-Buffern und Pufferkopien; Host und frühere Übergaben ordnen die
+  unveränderten Barrieren in `CmdBegin` und `CmdSubmit`.
+- *Tempo (`llm-bench` 200/64, Decode, Tokens/s, Vulkan):*
+  - **RTX 5090:** Qwen3.8-27B Q4_K_M 56,5 → 59,3, Q8_0 46,4 → 48,4 (CUDA 47,8);
+    Qwen3-0.6B Q8_0 395 → 433, Q4_K_M 414 → 445; Qwen3-30B-A3B 101 → 109.
+  - **M2 Pro (MoltenVK):** im Rauschen (Qwen3-0.6B Q4_K_M 81,9 / 81,6 → 81,9 / 81,4, Q8_0
+    111 / 108 → 108 / 107,6).
+  - `linear-bench` danach: Matrizen eines Durchgangs Vulkan 14,7 gegen CUDA 13,8 ms; der Rest
+    liegt weiter je Dispatch (48 × 5120: 6,1 gegen 4,6 µs).
+- *Gegenprobe:* ohne Barriere im Batch scheitern 417 von 1.955 Assertions von
+  `TTestInferVulkan` (dazu Ausnahmen in `Route` und `InferSoftCap`); echter Build 0 / 2.166.
+- *Läufe:* RTX 5090 FPC 0 / 17.582, Delphi 13 0 / 17.582, Delphi 7 0 / 6.544; Mac M2 Pro
+  (FPC, MoltenVK): `infer.tests` 0 / 8.700, `llm.tests` 0 / 730.
+- *Review* (Claude-Finder und Codex): die Barriere deckt jedes Paar aus Dispatch und Kopie
+  (RAW, WAR, WAW), nichts liest über `Barrier` auf dem Host. In `linear-bench` verdeckte die
+  Variable `tries` die Konstante `TRIES` (Pascal unterscheidet keine Groß- und
+  Kleinschreibung; gemessen wurde je einmal statt bestes von drei) - jetzt `TIMED_RUNS`; ein
+  Gerät, das sich erst beim Aufwärmen als „ein Zeitstempel je Batch“ zeigt, lieferte 0 und
+  eine Division durch null - jetzt eine Fehlermeldung. Im Kopf ergänzt: Experten (3-D) fehlen,
+  eine Gruppe kleiner als der L2 liest ab der zweiten Runde von dort.
+
 **B20, Teil 3 erledigt (2026-11-16): jedes Q4_K-Quant-Byte einmal gelesen.** Anlass war das
 Profil nach Teil 2.
 

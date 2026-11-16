@@ -231,6 +231,9 @@ type
     // (cuGraphExecUpdate) or is made again when the graph changed its shape
     // - free aExec with GraphFree
     procedure CaptureEnd(var aExec: TCuHandle);
+    /// launch an executable graph of CaptureEnd again, with the parameters of
+    // its last capture (no wait)
+    procedure GraphLaunch(aExec: TCuHandle);
     /// end a capture without launching it (after an error); never raises
     procedure CaptureAbort;
     /// release an executable graph of CaptureEnd and set aExec to nil
@@ -730,6 +733,22 @@ begin
     fApi.CtxSetCurrent(fContext); // no Use: this method never raises
     if fApi.StreamEndCapture(fStream, graph) = CUDA_SUCCESS then
       fApi.GraphDestroy(graph);
+  finally
+    CudaFpuLeave(fpu);
+  end;
+end;
+
+procedure TInferCuda.GraphLaunch(aExec: TCuHandle);
+var
+  fpu: TCudaFpu;
+begin
+  if (aExec = nil) or fCapturing then
+    raise EInferCuda.CreateUtf8('%.GraphLaunch: no graph or during a capture',
+      [self]);
+  fpu := CudaFpuEnter;
+  try
+    Use;
+    Check(fApi.GraphLaunch(aExec, fStream), 'cuGraphLaunch');
   finally
     CudaFpuLeave(fpu);
   end;

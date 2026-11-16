@@ -9,6 +9,15 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-16 - B20, part 4: a narrower barrier in a Vulkan batch; `linear-bench`.** The new
+  demo `demos/infer/linear-bench` times the one-row matrix products of a GGUF model per
+  type and shape (CUDA as a graph, Vulkan by its profile). It showed Vulkan 2 to 4 us per
+  dispatch behind CUDA at every shape - the cost of the barrier between the operations of a
+  batch, which named every stage and every memory access. It now names the compute and copy
+  stages and their shader and transfer accesses only (a batch holds nothing else). Vulkan
+  on an RTX 5090: Qwen3.8-27B Q4_K_M from 56.5 to 59.3 tokens/s, Q8_0 from 46.4 to 48.4
+  (CUDA 47.8); Qwen3-0.6B from 395 to 433 (Q8_0) and 414 to 445 (Q4_K_M); Qwen3-30B-A3B
+  from 101 to 109. An M2 Pro (MoltenVK) stays as it was.
 - **2026-11-16 - B20, part 3: every Q4_K quant byte read once in `matvec8`.** A lane took one
   Q4_K sub-block and used one nibble of the 32 bytes it read; its neighbour read them again
   for the other nibble. Now a lane takes 16 bytes and both nibbles (16 values of two

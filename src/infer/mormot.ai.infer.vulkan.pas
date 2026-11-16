@@ -446,13 +446,20 @@ const
   VK_COMMAND_BUFFER_LEVEL_PRIMARY = 0;
   VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT = 1;
   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT = $800;
+  VK_PIPELINE_STAGE_TRANSFER_BIT = $1000;
   VK_PIPELINE_STAGE_HOST_BIT = $4000;
   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT = $2000;
   VK_QUERY_TYPE_TIMESTAMP = 2;
   VK_QUERY_RESULT_64_BIT = 1;
   VK_QUERY_RESULT_WAIT_BIT = 2;
   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT = $10000;
+  VK_ACCESS_SHADER_READ_BIT = $20;
   VK_ACCESS_SHADER_WRITE_BIT = $40;
+  VK_ACCESS_TRANSFER_READ_BIT = $800;
+  VK_ACCESS_TRANSFER_WRITE_BIT = $1000;
+  /// the stages of the operations of a batch: dispatches and buffer copies
+  VK_BATCH_STAGES = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT or
+    VK_PIPELINE_STAGE_TRANSFER_BIT;
   VK_ACCESS_HOST_READ_BIT = $2000;
   VK_ACCESS_MEMORY_READ_BIT = $8000;
   VK_ACCESS_MEMORY_WRITE_BIT = $10000;
@@ -869,6 +876,8 @@ type
     property Profile: boolean read fProfile write fProfile;
     /// the summed GPU time per name since ProfileReset, longest first
     function ProfileText: RawUtf8;
+    /// the GPU time of every name together since ProfileReset, in nanoseconds
+    function ProfileNs: Int64;
     /// forget the summed times
     procedure ProfileReset;
     /// true when the compute queue writes timestamps (Profile can measure) -
@@ -1673,13 +1682,18 @@ var
   barrier: TVkMemoryBarrier;
 begin
   // every write so far before every later access: the operations of a batch
-  // form one chain
+  // form one chain - a batch holds compute dispatches on storage buffers and
+  // buffer copies only, so the barrier names their stages and accesses: the
+  // ALL_COMMANDS / MEMORY_* form costs NVIDIA about 1 us per dispatch (backlog
+  // B20); the host and the submissions before are ordered by CmdBegin and
+  // CmdSubmit
   FillCharFast(barrier, SizeOf(barrier), 0);
   barrier.sType := VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-  barrier.srcAccessMask := VK_ACCESS_MEMORY_WRITE_BIT;
-  barrier.dstAccessMask := VK_ACCESS_MEMORY_READ_BIT or VK_ACCESS_MEMORY_WRITE_BIT;
-  fApi.CmdPipelineBarrier(fCmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, @barrier, 0, nil, 0, nil);
+  barrier.srcAccessMask := VK_ACCESS_SHADER_WRITE_BIT or VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask := VK_ACCESS_SHADER_READ_BIT or VK_ACCESS_SHADER_WRITE_BIT or
+    VK_ACCESS_TRANSFER_READ_BIT or VK_ACCESS_TRANSFER_WRITE_BIT;
+  fApi.CmdPipelineBarrier(fCmd, VK_BATCH_STAGES, VK_BATCH_STAGES, 0, 1, @barrier,
+    0, nil, 0, nil);
 end;
 
 procedure TInferVulkan.BatchBegin;
@@ -1816,6 +1830,15 @@ begin
   fProfName := nil;
   fProfNs := nil;
   fProfCount := nil;
+end;
+
+function TInferVulkan.ProfileNs: Int64;
+var
+  i: PtrInt;
+begin
+  result := 0;
+  for i := 0 to high(fProfNs) do
+    inc(result, fProfNs[i]);
 end;
 
 function TInferVulkan.ProfileText: RawUtf8;

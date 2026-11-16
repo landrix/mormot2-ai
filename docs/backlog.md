@@ -26,27 +26,31 @@ CHANGELOG nennt den erledigten Teil, hier steht der offene Rest unter derselben 
 
 ---
 
-## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teile 1 bis 3 erledigt)
+## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teile 1 bis 4 erledigt)
 
 Anlass: B19. Erledigt (`CHANGELOG.md`, `native-inference.md`): Teil 1 (2026-11-13) - die
 Normen einer Zeile beim Decode mit Gruppen von 1024; Teil 2 (2026-11-16) - eine Decode-Zeile
 von Q8_0 und K-Quants auf NVIDIA durch `matvec8` (CUDA neu), zwei Features je Warp ab 4096
 Ausgängen; Teil 3 (2026-11-16) - jedes Q4_K-Quant-Byte einmal gelesen, beide Nibbles in einer
-Lane. Qwen3.8-27B Q4_K_M auf der RTX 5090 jetzt 60,6 (CUDA) und 56,4 (Vulkan) Tokens/s, Q8_0
-47,8 und 46,4.
+Lane; Teil 4 (2026-11-16) - `linear-bench` und eine engere Barriere im Vulkan-Batch.
+Qwen3.8-27B Q4_K_M auf der RTX 5090 jetzt 60,6 (CUDA) und 59,3 (Vulkan) Tokens/s, Q8_0
+47,8 und 48,4.
 
 Offen:
-- **Vulkan hinter CUDA** (Q4_K_M 56,4 gegen 60,6, rund 1,2 ms je Token): Das Vulkan-Profil
-  ordnet Dispatches ohne Barriere dazwischen dem letzten ihrer Gruppe zu (der Zeitstempel am
-  Ende der Pipeline wartet auf alle); die Aufteilung je Matrix ist so unscharf. Für einen
-  Vergleich Kernel für Kernel fehlt das CUDA-Profil (unten).
+- **Vulkan noch hinter CUDA** (Q4_K_M 59,3 gegen 60,6): `linear-bench` zeigt je Dispatch
+  noch rund 1,5 bis 2 µs mehr (Matrizen 14,7 gegen 13,8 ms je Durchgang); die Lücke ist fest
+  je Dispatch, nicht Bandbreite. Weniger Dispatches: `ffn_gate` und `ffn_up` in einem
+  Dispatch, `ssm_alpha`/`ssm_beta` (48 Ausgänge, 6,1 gegen 4,6 µs) mit `attn_qkv`
+  zusammen.
 - **Q8_0 bei rund 85 % der Bandbreite:** Die Matrixprodukte lesen 27,4 GB in rund 18 ms je Token
   (Vulkan-Profil: 1,52 von 1,79 TB/s); wenig Luft; ein Block von 34
   Bytes liegt bei jeder zweiten Einheit auf 2 mod 4 (zwei Wörter je Quant-Wort).
 - **Weitere Reduktionen über eine Zeile mit 128:** die Norm je Kopf (`qkrope`), `gatednorm`
   der DeltaNet-Layer, `gatherrows`/`scatteradd` - nur, wenn das Profil sie zeigt.
-- **CUDA:** keine Zeitmessung je Kernel (Events um die Kernel des Graphen, oder ein Lauf ohne
-  Graph).
+- **CUDA:** keine Zeitmessung je Kernel. Erprobt und verworfen (Teil 4): Events im Graphen
+  (`CU_EVENT_RECORD_EXTERNAL`) kosten je Knoten rund 5 µs (Decode 16,5 → 22,4 ms), ohne
+  Graph zählen die Startlücken unter Windows mit (Summe = Wandzeit 21 ms). Für Matrizen
+  reicht `linear-bench`; für den Rest Nsight Systems (auf der RTX nicht installiert).
 - **Andere Vulkan-Geräte:** `matvec8` läuft nur auf Apple (eine Feature je Warp) und NVIDIA;
   AMD, Intel und Adreno behalten `linear8`, bis dort jemand misst.
 
