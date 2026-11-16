@@ -3,20 +3,23 @@
 // - same bindings and push constants as linear.comp; only rows = 1 and
 //   dtype 2 (Q8_0), 3 (Q4_K) or 4 (Q6_K) reach it
 //   (TInferVulkanBackend.LinearShape)
-// - a work group of 128 = 4 groups of 32 invocations, one output feature per
-//   group (four per group decoded 5 % slower on the M2 Pro: fewer work
-//   groups); an invocation takes units of 32 consecutive weights - a Q8_0
-//   block, a Q4_K sub-block, a quarter of a Q6_K half - reading their scales
-//   once and their quants as whole words (shifted by 16 bits where they start
-//   at 2 mod 4: a Q8_0 block at 0 mod 4, its quants follow a 2-byte scale; a
-//   Q6_K block at 2 mod 4; Q4_K blocks are 4-aligned); linear8.comp reads the scales byte by byte for every 8
-//   weights
+// - a work group of 128 = 4 groups of 32 invocations, FEAT consecutive output
+//   features per group: an invocation takes units of 32 consecutive weights -
+//   a Q8_0 block, a Q4_K sub-block, a quarter of a Q6_K half - reading their
+//   scales once and their quants as whole words (shifted by 16 bits where
+//   they start at 2 mod 4: a Q8_0 block at 0 mod 4, its quants follow a
+//   2-byte scale; a Q6_K block at 2 mod 4; Q4_K blocks are 4-aligned);
+//   linear8.comp reads the scales byte by byte for every 8 weights
+// - FEAT 1 (SPV_MATVEC8_<type>), or 2 (SPV_MATVEC8_<type>_F2, backlog B20):
+//   the activations of a unit loaded once for both features - each invocation
+//   has twice the loads in flight, half as many work groups run; four
+//   features per group decoded 5 % slower on the M2 Pro (fewer work groups)
 // - the dequantization is that of InferRowToF32 (linear8.comp: weights8)
-// - TInferVulkanBackend takes it on Apple GPUs only (UseMatvec): an RTX 5090
-//   decodes faster with linear8.comp
+// - TInferVulkanBackend takes it on Apple GPUs (FEAT 1) and on NVIDIA (FEAT 2
+//   for wide matrices) only (UseMatvec, MatvecPairsFrom)
 // - the 32 partial sums of a feature are added in shared memory, or with
-//   -DSUBGROUP (SPV_MATVEC8_<type>_SG) by subgroupClusteredAdd, under the same
-//   conditions and lane mapping as linear8.comp
+//   -DSUBGROUP (SPV_MATVEC8_<type>[_F2]_SG) by subgroupClusteredAdd, under the
+//   same conditions and lane mapping as linear8.comp
 #version 450
 #ifdef SUBGROUP
 #extension GL_KHR_shader_subgroup_basic : require
@@ -44,7 +47,11 @@ layout(push_constant) uniform Push {
 #define DT p.dtype
 #endif
 
-shared float partial[128];
+#ifndef FEAT
+#define FEAT 1u
+#endif
+
+shared float partial[FEAT * 128u];
 
 // the 4 signed bytes of v times a
 float dot4s(uint v, vec4 a)
@@ -200,48 +207,61 @@ void main()
     rowBytes = (p.nin >> 8) * 144u;
   else
     rowBytes = (p.nin >> 8) * 210u;
-  for (uint ob = gl_WorkGroupID.x * 4u; ob < p.nout; ob += gl_NumWorkGroups.x * 4u)
+  for (uint ob = gl_WorkGroupID.x * (4u * FEAT); ob < p.nout;
+       ob += gl_NumWorkGroups.x * (4u * FEAT))
   {
-    uint o = ob + group;
-    float acc = 0.0;
-    if (o < p.nout)
+    uint o0 = ob + group * FEAT;
+    float acc[FEAT];
+    for (uint f = 0u; f < FEAT; f++)
+      acc[f] = 0.0;
+    if (o0 < p.nout)
       for (uint u = lane; u < units; u += 32u)
       {
         vec4 xv[8];
         for (uint k = 0u; k < 8u; k++)
           xv[k] = x[u * 8u + k];
-        acc += unitDot(o * rowBytes, u, xv);
+        for (uint f = 0u; f < FEAT; f++)
+          if (o0 + f < p.nout)
+            acc[f] += unitDot((o0 + f) * rowBytes, u, xv);
       }
 #ifdef SUBGROUP
     if (sg)
     {
-      float v = subgroupClusteredAdd(acc, 32u);
-      if ((lane == 0u) && (o < p.nout))
+      for (uint f = 0u; f < FEAT; f++)
       {
-        float b = 0.0;
-        if (p.hasBias != 0u)
-          b = bias[p.biasOff + o];
-        y[o] = v + b;
+        float v = subgroupClusteredAdd(acc[f], 32u);
+        uint o = o0 + f;
+        if ((lane == 0u) && (o < p.nout))
+        {
+          float b = 0.0;
+          if (p.hasBias != 0u)
+            b = bias[p.biasOff + o];
+          y[o] = v + b;
+        }
       }
     }
     else
 #endif
     {
-      partial[t] = acc;
+      for (uint f = 0u; f < FEAT; f++)
+        partial[f * 128u + t] = acc[f];
       barrier();
       for (uint h = 16u; h > 0u; h >>= 1)
       {
         if (lane < h)
-          partial[t] += partial[t + h];
+          for (uint f = 0u; f < FEAT; f++)
+            partial[f * 128u + t] += partial[f * 128u + t + h];
         barrier();
       }
-      if ((lane == 0u) && (o < p.nout))
-      {
-        float b = 0.0;
-        if (p.hasBias != 0u)
-          b = bias[p.biasOff + o];
-        y[o] = partial[t] + b;
-      }
+      if (lane == 0u)
+        for (uint f = 0u; f < FEAT; f++)
+          if (o0 + f < p.nout)
+          {
+            float b = 0.0;
+            if (p.hasBias != 0u)
+              b = bias[p.biasOff + o0 + f];
+            y[o0 + f] = partial[f * 128u + t] + b;
+          }
       barrier(); // partial[] is reused for the next features
     }
   }

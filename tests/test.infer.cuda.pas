@@ -68,7 +68,8 @@ type
     /// slice C2: TInferCudaBackend.Linear for F32, Q8_0, Q4_K and Q6_K weights
     // against the reference's F32 product of the dequantized weights (a
     // tolerance: another summation order), with and without bias, more than
-    // 65535 outputs, the weight cache, and the CPU for other types
+    // 65535 outputs, the weight cache, and the CPU for other types; one row
+    // through linear8 and matvec8 (one and two features per warp, backlog B20)
     procedure LinearMatchesReference;
     /// slice C3 (attention: C5): rmsnorm, addnorm, swiglu, qkrope and attention of
     // tools/cuda/ops.cu against the CPU reference's RmsNorm, Add, SwiGlu, Rope
@@ -713,11 +714,12 @@ const
   // from 16 rows on, linear8 below; then three F32 only: inputs no multiple
   // of 32 (linear8 at 20 rows) or of 8 (linear); the last four not for the
   // K-quants: whole blocks of 32 but no multiple of 256 (Qwen2.5's 896), an
-  // odd number of blocks (rows not 4-aligned for Q8_0 and Q5_0)
-  SHAPES: array[0..12, 0..2] of integer = (
+  // odd number of blocks (rows not 4-aligned for Q8_0 and Q5_0); one row of
+  // ten K-quant blocks (matvec8: more units than lanes, an odd output count)
+  SHAPES: array[0..13, 0..2] of integer = (
     (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001),
     (70, 512, 130), (20, 520, 9), (3, 100, 9), (16, 36, 66), (1, 32, 3),
-    (3, 96, 17), (1, 896, 65), (20, 896, 33));
+    (3, 96, 17), (1, 896, 65), (20, 896, 33), (1, 2560, 37));
   TYPES: array[0..5] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
     idtQ5_0, idtMXFP4);
   MXFP4_EDGES: array[0..5] of byte = (0, 1, 2, 127, 128, 200);
@@ -740,17 +742,23 @@ begin
   ref := TInferCpuBackend.Create;
   fast := TInferCpuFastBackend.Create;
   try
-    // the plain linear kernel, then the fast ones
-    for m := 0 to 1 do
+    // the plain linear kernel, then the fast ones: one row through linear8,
+    // through matvec8 with one feature per warp, with two
+    for m := 0 to 3 do
     for t := 0 to high(TYPES) do
     begin
-      gpu.FastLinear := m = 1;
+      gpu.FastLinear := m >= 1;
+      gpu.UseMatvec := m >= 2;
+      if m = 3 then
+        gpu.MatvecPairsFrom := 0
+      else
+        gpu.MatvecPairsFrom := MaxInt;
       kind := TYPES[t];
       for i := 0 to high(SHAPES) do
       begin
         if (i in [6..8]) and (kind <> idtF32) then
           continue;
-        if (i > 8) and (kind in [idtQ4_K, idtQ6_K]) then
+        if (i in [9..12]) and (kind in [idtQ4_K, idtQ6_K]) then
           continue;
         rows := SHAPES[i, 0];
         nin := SHAPES[i, 1];
@@ -804,8 +812,8 @@ begin
           pointer(y2));
         CheckUtf8(gpu.GpuLinears = calls + 1, '% on the device', [INFER_DTYPE_NAME[kind]]);
         e := RelError(pointer(y2), pointer(y1), rows * nout);
-        CheckUtf8(e <= 1e-5, '% % x % x % (fast %): relative error %',
-          [INFER_DTYPE_NAME[kind], rows, nin, nout, gpu.FastLinear, e]);
+        CheckUtf8(e <= 1e-5, '% % x % x % (kernels %): relative error %',
+          [INFER_DTYPE_NAME[kind], rows, nin, nout, m, e]);
         // again, from the weight cache: the same bits
         SetLength(y3, rows * nout);
         gpu.Linear(pointer(x), rows, nin, InferWeight(data, kind), nout, b,

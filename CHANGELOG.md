@@ -9,6 +9,16 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-16 - B20, part 2: one decode row through `matvec8` on NVIDIA.** `linear8` read one
+  144-byte Q4_K block per warp and step, so Q4_K_M matrices moved only about 0.98 TB/s
+  against 1.46 TB/s for Q8_0. `matvec8` (until now for Apple GPUs) takes units of 32 weights
+  per lane and now comes in a build with two output features per warp that loads the
+  activations once for both; CUDA got the same kernel. Both backends take it for one row of
+  Q8_0, Q4_K and Q6_K on NVIDIA, with pairs from 4096 output features on (narrower matrices
+  decoded slower with them). On an RTX 5090: Qwen3.8-27B Q4_K_M from 40.5 to 56.6 tokens/s
+  (CUDA) and from 44.4 to 53.1 (Vulkan), Q8_0 from 41.1 to 47.7 and from 44.6 to 46.2;
+  Qwen3-0.6B on CUDA from 420 to 525 (Q8_0), Qwen3-30B-A3B from 109 to 119. Apple GPUs and
+  every other Vulkan device keep their kernels.
 - **2026-11-13 - B20, part 1: row norms with wide groups.** A decode step norms one row, so one
   work group of 128 waited out the latency of its loads (`addnorm` 4 of 25 ms per token of
   Qwen3.8-27B). `rmsnorm` and `addnorm` now run with 1024 threads on CUDA and with 1024 or 512

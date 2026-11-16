@@ -5,7 +5,8 @@
 //   arithmetic of InferRowToF32 followed by an F32 dot product, in another
 //   summation order (a tolerance, not bits)
 // - one block of 128 threads per output feature (grid x) and token row
-//   (grid y): correct first, the speed comes with slice C5
+//   (grid y): correct first, the speed comes with slice C5 (linear8, gemm8
+//   below) and backlog B20 (matvec8, one token row)
 // - the half scales sit at even byte offsets in every block layout: a 16-bit
 //   load is aligned; converted by cvt.f32.f16 (no cuda_fp16.h: it needs headers
 //   the nvcc wheel does not carry)
@@ -537,3 +538,203 @@ extern "C" __global__ void gemm8(const unsigned int* w, const float* x,
     }
   }
 }
+
+// ---- backlog B20: matvec8, the CUDA port of tools/vk/matvec8.comp - one
+// token row (decoding) of Q8_0, Q4_K or Q6_K weights, same parameters as
+// linear8 (rows is 1), the dequantization of InferRowToF32, another summation
+// order
+// - a block of 128 = 4 warps, FEAT consecutive output features per warp; a
+//   lane takes units of 32 consecutive weights - a Q8_0 block, a Q4_K
+//   sub-block, a quarter of a Q6_K half - reading their scales once and their
+//   quants as whole words, the activations of a unit loaded once for the FEAT
+//   features
+// - a row starts 2-aligned (Q8_0, Q6_K) or 4-aligned (Q4_K): rows of whole
+//   blocks, an expert at a multiple of its matrix
+
+// the 4 bytes from bit sh (0 or 16) of word i on (wordAt of matvec8.comp)
+__device__ __forceinline__ unsigned int wordAtMv(const unsigned int* w,
+  unsigned long long i, unsigned int sh)
+{
+  return (w[i] >> sh) | ((w[i + (sh >> 4)] << 16) << (16u - sh));
+}
+
+// the 4 bytes at the even byte address a as a word
+__device__ __forceinline__ unsigned int word2(const unsigned int* w,
+  unsigned long long a)
+{
+  return wordAtMv(w, a >> 2, (unsigned int)(a & 2u) * 8u);
+}
+
+// the 2 bytes at the even byte address a (never past their own word)
+__device__ __forceinline__ unsigned int half16(const unsigned int* w,
+  unsigned long long a)
+{
+  return (w[a >> 2] >> ((unsigned int)(a & 2u) * 8u)) & 0xffffu;
+}
+
+// byte k of the little-endian words s0 s1 s2
+__device__ __forceinline__ unsigned int byte12(unsigned int s0, unsigned int s1,
+  unsigned int s2, unsigned int k)
+{
+  unsigned int v = k < 4u ? s0 : (k < 8u ? s1 : s2);
+  return (v >> ((k & 3u) * 8u)) & 255u;
+}
+
+// the 4 signed bytes of v times a
+__device__ __forceinline__ float dot4s(unsigned int v, float4 a)
+{
+  return s8(v, 0u) * a.x + s8(v, 1u) * a.y + s8(v, 2u) * a.z + s8(v, 3u) * a.w;
+}
+
+// the 4 nibbles at bit sh of the bytes of v times a
+__device__ __forceinline__ float dot4n(unsigned int v, unsigned int sh, float4 a)
+{
+  return float((v >> sh) & 15u) * a.x + float((v >> (sh + 8u)) & 15u) * a.y +
+         float((v >> (sh + 16u)) & 15u) * a.z + float((v >> (sh + 24u)) & 15u) * a.w;
+}
+
+// unit u (32 weights) of the row at byte rowBase times its activations xv
+template <unsigned int DT>
+__device__ __forceinline__ float unitDot(const unsigned int* w,
+  unsigned long long rowBase, unsigned int u, const float4* xv)
+{
+  float s = 0.0f;
+  if (DT == 2u)
+  {
+    // Q8_0: 34 bytes per 32 values, value = d * qs[j]; the quants from byte
+    // a + 2 on: word qi, bit qs
+    unsigned long long a = rowBase + u * 34ull;
+    float d = halfBits(half16(w, a));
+    unsigned long long qi = (a >> 2) + ((a >> 1) & 1u);
+    unsigned int qs = 16u - (unsigned int)(a & 2u) * 8u;
+#pragma unroll
+    for (unsigned int k = 0u; k < 8u; k++)
+      s += dot4s(wordAtMv(w, qi + k, qs), xv[k]);
+    return d * s;
+  }
+  else if (DT == 3u)
+  {
+    // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K); sub-block
+    // j of block u / 8: value = d * sc * q - dmin * m
+    unsigned long long i = (rowBase + (u >> 3) * 144ull) >> 2;
+    unsigned int j = u & 7u;
+    unsigned int h = w[i];
+    unsigned int s0 = w[i + 1u];
+    unsigned int s1 = w[i + 2u];
+    unsigned int s2 = w[i + 3u];
+    unsigned int sc, m;
+    if (j < 4u)
+    {
+      sc = byte12(s0, s1, s2, j) & 63u;
+      m = byte12(s0, s1, s2, j + 4u) & 63u;
+    }
+    else
+    {
+      sc = (byte12(s0, s1, s2, j + 4u) & 15u) |
+           ((byte12(s0, s1, s2, j - 4u) >> 6) << 4);
+      m = (byte12(s0, s1, s2, j + 4u) >> 4) | ((byte12(s0, s1, s2, j) >> 6) << 4);
+    }
+    // the quants: 32 bytes at 16 + 32 * (j / 2), nibble j % 2
+    const unsigned int* q = w + i + 4u + 8u * (j >> 1);
+    unsigned int sh = (j & 1u) * 4u;
+    float sx = 0.0f;
+#pragma unroll
+    for (unsigned int k = 0u; k < 8u; k++)
+    {
+      s += dot4n(q[k], sh, xv[k]);
+      sx += xv[k].x + xv[k].y + xv[k].z + xv[k].w;
+    }
+    return halfBits(h & 65535u) * float(sc) * s - halfBits(h >> 16) * float(m) * sx;
+  }
+  else
+  {
+    // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d
+    // (Q6KValue); unit uu = u % 8 of block u / 8: the values 32 uu .. 32 uu +
+    // 31 of half uu / 4, quarter uu % 4, under two scales of 16 values
+    unsigned long long base = rowBase + (u >> 3) * 210ull;
+    unsigned int uu = u & 7u;
+    unsigned int n = uu >> 2;
+    unsigned int quarter = uu & 3u;
+    unsigned long long la = base + 64u * n + ((quarter & 1u) != 0u ? 32u : 0u);
+    unsigned long long ha = base + 128u + 32u * n;
+    unsigned int lsh = quarter >= 2u ? 4u : 0u;
+    unsigned int hsh = 2u * quarter;
+    unsigned int scw = half16(w, base + 192u + 2u * uu); // the two int8 scales
+    float d = halfBits(half16(w, base + 208u));
+    float s1 = 0.0f;
+#pragma unroll
+    for (unsigned int k = 0u; k < 8u; k++)
+    {
+      // per byte: q = (ql nibble) | (2 bits of qh) << 4, value q - 32
+      unsigned int q = ((word2(w, la + 4u * k) >> lsh) & 0x0f0f0f0fu) |
+                       (((word2(w, ha + 4u * k) >> hsh) & 0x03030303u) << 4);
+      float4 a = xv[k];
+      float v = (float(q & 255u) - 32.0f) * a.x +
+                (float((q >> 8) & 255u) - 32.0f) * a.y +
+                (float((q >> 16) & 255u) - 32.0f) * a.z +
+                (float(q >> 24) - 32.0f) * a.w;
+      if (k < 4u)
+        s += v;
+      else
+        s1 += v;
+    }
+    return d * (s8(scw, 0u) * s + s8(scw, 1u) * s1);
+  }
+}
+
+template <unsigned int DT, unsigned int FEAT>
+__device__ __forceinline__ void matvec8Body(const unsigned int* w,
+  const float* x, const float* bias, float* y, unsigned int nin,
+  unsigned int nout, unsigned int hasBias)
+{
+  unsigned int lane = threadIdx.x & 31u;
+  unsigned int o0 = (blockIdx.x * 4u + (threadIdx.x >> 5)) * FEAT;
+  if (o0 >= nout)
+    return; // a whole warp: the shuffles below stay within live warps
+  unsigned long long rowBytes = rowBytesOf(DT, nin);
+  unsigned int units = nin >> 5;
+  const float4* x4 = reinterpret_cast<const float4*>(x);
+  float acc[FEAT];
+#pragma unroll
+  for (unsigned int f = 0u; f < FEAT; f++)
+    acc[f] = 0.0f;
+  for (unsigned int u = lane; u < units; u += 32u)
+  {
+    float4 xv[8];
+#pragma unroll
+    for (unsigned int k = 0u; k < 8u; k++)
+      xv[k] = x4[u * 8u + k];
+#pragma unroll
+    for (unsigned int f = 0u; f < FEAT; f++)
+      if (o0 + f < nout)
+        acc[f] += unitDot<DT>(w, (o0 + f) * rowBytes, u, xv);
+  }
+#pragma unroll
+  for (unsigned int f = 0u; f < FEAT; f++)
+    if (o0 + f < nout) // the same for the whole warp
+    {
+      float v = acc[f];
+      for (unsigned int off = 16u; off > 0u; off >>= 1)
+        v += __shfl_down_sync(0xffffffffu, v, off);
+      if (lane == 0u)
+        y[o0 + f] = v + (hasBias ? bias[o0 + f] : 0.0f);
+    }
+}
+
+// one kernel per weight type and FEAT (as matvec8.comp: the code of the
+// other types costs registers); rows and dtype only for the parameters of
+// linear8
+#define MATVEC8(name, dt, feat) \
+extern "C" __global__ void name(const unsigned int* w, const float* x, \
+  const float* bias, float* y, unsigned int rows, unsigned int nin, \
+  unsigned int nout, unsigned int dtype, unsigned int hasBias) \
+{ \
+  matvec8Body<dt, feat>(w, x, bias, y, nin, nout, hasBias); \
+}
+
+MATVEC8(matvec8q8, 2u, 1u)
+MATVEC8(matvec8q4k, 3u, 1u)
+MATVEC8(matvec8q6k, 4u, 1u)
+MATVEC8(matvec8q8f2, 2u, 2u)
+MATVEC8(matvec8q4kf2, 3u, 2u)
+MATVEC8(matvec8q6kf2, 4u, 2u)

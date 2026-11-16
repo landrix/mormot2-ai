@@ -1819,6 +1819,44 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B20, Teil 2 erledigt (2026-11-16): eine Decode-Zeile durch `matvec8` auf NVIDIA.** Anlass war
+Teil 1: Q4_K_M bewegte in den Matrixprodukten nur rund 0,98 TB/s, Q8_0 rund 1,46 TB/s.
+
+- *Ursache:* `linear8` (Vulkan und CUDA) nimmt je Lane und Schritt 8 Gewichte; ein Warp liest
+  so je Schritt einen Q4_K-Block von 144 Bytes (bei Q8_0 acht Blöcke, 272 Bytes), mit den
+  Skalen Byte für Byte - wenige Ladevorgänge gleichzeitig. `matvec8.comp` (bisher nur Apple)
+  nimmt je Lane Einheiten von 32 Gewichten mit den Skalen einmal und den Quants als Wörtern.
+  Jede Einheit liest aber 128 Bytes Aktivierungen zu 16 Bytes Q4_K-Quants.
+- *Probe (RTX 5090, Qwen3.8-27B, Decode, Tokens/s):* `matvec8` auf Vulkan Q4_K_M 44,4 → 47,7;
+  mit zwei Features je Warp (die Aktivierungen einer Einheit einmal geladen) 53,1, mit drei
+  51,1, mit vier 49,5. Qwen3-0.6B wird mit zwei Features je Warp für alle Matrizen langsamer
+  (Q4_K_M 401 → 360: zu wenige Gruppen); ab 2048 oder 4096 Ausgängen gleich schnell wie ohne,
+  ab 8192 verliert die 27B wieder (51,9).
+- *Änderung:*
+  - **Vulkan:** `matvec8.comp` mit `FEAT` (Vorgabe 1), Builds `SPV_MATVEC8_<Typ>_F2[_SG]`;
+    `TInferVulkanBackend` nimmt `matvec8` auf Apple (wie bisher, eine Feature je Warp) und auf
+    NVIDIA, dort mit zwei ab `MatvecPairsFrom` = 4096 Ausgängen. Andere Geräte unverändert.
+  - **CUDA:** `matvec8` neu in `linear.cu` (`unitDot<DT>`, `matvec8Body<DT, FEAT>`, sechs
+    Kernel: drei Typen, `FEAT` 1 und 2; Parameter wie `linear8`); `TInferCudaBackend` nimmt ihn für eine
+    Zeile Q8_0, Q4_K und Q6_K (`UseMatvec`, `MatvecPairsFrom` = 4096).
+- *Tempo (RTX 5090, `llm-bench` 200 Tokens Prompt, 64 Tokens Decode, Tokens/s):*
+  - **CUDA:** Qwen3.8-27B Q4_K_M 40,5 → 56,6, Q8_0 41,1 → 47,7; Qwen3-0.6B Q8_0 420 → 525,
+    Q4_K_M 404 → 488; Qwen3-30B-A3B Q4_K_M 108,6 → 118,9.
+  - **Vulkan:** Qwen3.8-27B Q4_K_M 44,4 → 53,1, Q8_0 44,6 → 46,2; Qwen3-0.6B rund 400 und
+    Qwen3-30B-A3B rund 98 bis 100 unverändert (im Rauschen).
+- *Tests:* `LinearMatchesReference` beider Backends rechnet eine Zeile durch `linear8`,
+  `matvec8` mit einer und mit zwei Features je Warp; neue Form 1 x 2560 x 37 (zehn K-Quant-
+  Blöcke, mehr Einheiten als Lanes, ungerade Ausgänge).
+- *Gegenprobe:* beide Features einer Gruppe aus derselben Zeile lassen 84 (Vulkan) und 76
+  (CUDA) Assertions scheitern, quer durch alle Modelle; echter Build Vulkan 0 / 2.166, CUDA
+  0 / 1.987.
+- *Läufe:* RTX 5090 FPC 0 / 17.582, Delphi 13 0 / 17.582, Delphi 7 0 / 6.544; Mac M2 Pro (FPC, MoltenVK, eine Feature je Warp wie bisher): `infer.tests`
+  0 / 8.700, `llm.tests` 0 / 730.
+- *Review* (Claude-Finder und Codex): keine Fehler. Ergänzt: veraltete Kommentare
+  (`UseMatvec`, `LinearShape`, `linear.cu`, `FastLinear`). Der Hinweis, die letzte Q8_0-Zeile
+  lese 2 Bytes über die Daten hinaus, trifft nicht: Der CUDA-Puffer ist auf Wörter
+  aufgerundet (wie in Vulkan).
+
 **B20, Teil 1 erledigt (2026-11-13): die Normen einer Zeile in breiten Gruppen.** Anlass war
 B19: Qwen3.8-27B dekodierte auf beiden Backends weit unter der Bandbreite der RTX 5090.
 
@@ -1856,7 +1894,7 @@ B19: Qwen3.8-27B dekodierte auf beiden Backends weit unter der Bandbreite der RT
   veralteter Kommentar in `ops.cu`. Als weitere Kandidaten genannt: die Norm je Kopf, `gatednorm`,
   `gatherrows`/`scatteradd` (Backlog B20).
 - *Offen (Backlog B20):* Q4_K erreicht in den Matrixprodukten nur rund 0,98 TB/s gegen 1,46 TB/s
-  bei Q8_0.
+  bei Q8_0 (in Teil 2 angegangen).
 
 **B18 erledigt (2026-11-13): mehrere Köpfe auf dem Gerät, Kopf-Index je Aufruf.** Anlass war
 Issue #1 (flydev): Der Code-Predictor von Qwen3-TTS nimmt je Schritt einen anderen seiner 15

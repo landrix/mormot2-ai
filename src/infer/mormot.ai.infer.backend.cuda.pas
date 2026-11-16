@@ -52,7 +52,11 @@ type
     fCu: TInferCuda;
     fLinearModule: TInferCuModule;
     fLinear, fLinear8, fGemm8, fLinear8Ids: TCuHandle;
-    fFastLinear: boolean;
+    // matvec8 with 1 or 2 features per warp, per LINEAR_DTYPE (2 Q8_0, 3 Q4_K,
+    // 4 Q6_K)
+    fMatvec8: array[1..2, 2..4] of TCuHandle;
+    fFastLinear, fUseMatvec: boolean;
+    fMatvecPairsFrom: PtrInt;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
     // hundred matrices)
@@ -68,7 +72,8 @@ type
       aBytes: Int64): TInferCuBuffer;
     function Scratch(var aBuffer: TInferCuBuffer; aBytes: Int64): TInferCuBuffer;
     // the kernel and grid of a Linear: gemm8 for GEMM_ROWS rows or more,
-    // linear8 when the inputs allow, linear otherwise
+    // matvec8 for one row of Q8_0, Q4_K or Q6_K when UseMatvec, linear8 when
+    // the inputs allow, linear otherwise
     procedure LinearShape(aType: TInferDType; aIn, aRows, aOut: PtrInt;
       out aKernel: TCuHandle; out aX, aY, aBlock: cardinal);
   public
@@ -128,9 +133,15 @@ type
     property GpuLinears: Int64 read fGpuLinears;
     /// incremented by ClearWeights: a holder of uploaded weights uploads again
     property WeightEpoch: integer read fWeightEpoch;
-    /// the fast kernels of tools/cuda/linear.cu (linear8, gemm8) - default
+    /// the fast kernels of tools/cuda/linear.cu (linear8, matvec8, gemm8) - default
     // true; false: the plain linear kernel only (the tests compare both)
     property FastLinear: boolean read fFastLinear write fFastLinear;
+    /// one row of Q8_0, Q4_K or Q6_K weights (decoding) through matvec8
+    // instead of linear8 - default true (with FastLinear; backlog B20)
+    property UseMatvec: boolean read fUseMatvec write fUseMatvec;
+    /// from how many output features on matvec8 computes two features per
+    // warp - default MATVEC_PAIRS; MaxInt: never
+    property MatvecPairsFrom: PtrInt read fMatvecPairsFrom write fMatvecPairsFrom;
   end;
 
 
@@ -144,17 +155,26 @@ const
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
     0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 6);
 
-  /// the threads of a block of linear and linear8 in tools/cuda/linear.cu
+  /// the threads of a block of linear, linear8 and matvec8 in tools/cuda/linear.cu
   LINEAR_BLOCK = 128;
   /// the threads of a gemm8 block (a tile of 64 rows x 64 features)
   GEMM_BLOCK = 256;
   /// from this many rows on a Linear runs gemm8 (as GEMM_ROWS on Vulkan)
   GEMM_ROWS = 16;
+  /// from how many output features matvec8 takes two per warp (as
+  // MATVEC_PAIRS_NVIDIA on Vulkan)
+  MATVEC_PAIRS = 4096;
+  /// the kernels of matvec8 per features and LINEAR_DTYPE
+  MATVEC8_NAME: array[1..2, 2..4] of RawUtf8 = (
+    ('matvec8q8', 'matvec8q4k', 'matvec8q6k'),
+    ('matvec8q8f2', 'matvec8q4kf2', 'matvec8q6kf2'));
 
 
 { TInferCudaBackend }
 
 constructor TInferCudaBackend.Create(aThreads: integer);
+var
+  f, i: PtrInt;
 begin
   inherited Create(aThreads);
   fCu := TInferCuda.Create;
@@ -163,11 +183,18 @@ begin
   fLinear8 := fLinearModule.Kernel('linear8');
   fGemm8 := fLinearModule.Kernel('gemm8');
   fLinear8Ids := fLinearModule.Kernel('linear8ids');
+  for f := low(fMatvec8) to high(fMatvec8) do
+    for i := low(fMatvec8[f]) to high(fMatvec8[f]) do
+      fMatvec8[f, i] := fLinearModule.Kernel(MATVEC8_NAME[f, i]);
   fFastLinear := true;
+  fUseMatvec := true;
+  fMatvecPairsFrom := MATVEC_PAIRS;
 end;
 
 procedure TInferCudaBackend.LinearShape(aType: TInferDType; aIn, aRows,
   aOut: PtrInt; out aKernel: TCuHandle; out aX, aY, aBlock: cardinal);
+var
+  f: PtrInt;
 begin
   if fFastLinear and (aRows >= GEMM_ROWS) and (aIn and 31 = 0) then
   begin
@@ -176,6 +203,18 @@ begin
     aX := (aOut + 63) shr 6;
     aY := (aRows + 63) shr 6;
     aBlock := GEMM_BLOCK;
+  end
+  else if fFastLinear and fUseMatvec and (aRows = 1) and
+          (aType in [idtQ8_0, idtQ4_K, idtQ6_K]) then
+  begin
+    // f features per warp, 4 warps per block
+    f := 1;
+    if aOut >= fMatvecPairsFrom then
+      f := 2;
+    aKernel := fMatvec8[f, LINEAR_DTYPE[aType]];
+    aX := (aOut + 4 * f - 1) div (4 * f);
+    aY := 1;
+    aBlock := LINEAR_BLOCK;
   end
   else if fFastLinear and ((aType <> idtF32) or (aIn and 7 = 0)) then
   begin

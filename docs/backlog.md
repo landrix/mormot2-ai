@@ -26,22 +26,23 @@ CHANGELOG nennt den erledigten Teil, hier steht der offene Rest unter derselben 
 
 ---
 
-## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teil 1 erledigt)
+## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teile 1 und 2 erledigt)
 
-Anlass: B19. Erster Teil erledigt 2026-11-13 (`CHANGELOG.md`, `native-inference.md`): Die
-Normen einer Zeile laufen beim Decode mit Gruppen von 1024 (CUDA, Vulkan wo möglich);
-Qwen3.8-27B auf der RTX 5090 von 36 bis 39 auf 41 bis 45 Tokens/s.
+Anlass: B19. Erledigt (`CHANGELOG.md`, `native-inference.md`): Teil 1 (2026-11-13) - die
+Normen einer Zeile beim Decode mit Gruppen von 1024; Teil 2 (2026-11-16) - eine Decode-Zeile
+von Q8_0 und K-Quants auf NVIDIA durch `matvec8` (CUDA neu), zwei Features je Warp ab 4096
+Ausgängen. Qwen3.8-27B Q4_K_M auf der RTX 5090 jetzt 56,6 (CUDA) und 53,1 (Vulkan) Tokens/s,
+Q8_0 47,7 und 46,2.
 
-Offen, nach dem Vulkan-Profil von Qwen3.8-27B (nach Teil 1 rund 22,4 ms je Token, davon `linear` 18,8 ms):
-- **Q4_K bleibt hinter der Bandbreite:** Die Q4_K_M-Datei von ggml-org lädt 18,6 GB (viele
-  Matrizen in Q8_0), die Q8_0-Datei 27,4 GB; beide brauchen für die Matrixprodukte gleich
-  lange. Q8_0 erreicht so rund 1,46 TB/s (80 % der 1,8 TB/s), Q4_K_M nur rund 0,98 TB/s.
-  Verdächtig: `linear8` holt je Warp und Schritt nur einen Q4_K-Block (144 Bytes), also wenige
-  Ladevorgänge gleichzeitig; mehr Blöcke je Schritt oder je Invocation probieren.
+Offen:
+- **Vulkan hinter CUDA bei Q4_K_M** (53,1 gegen 56,6): ein neues Profil (`LAI_VULKAN_PROFILE`)
+  zeigen lassen, wo die 1,2 ms je Token liegen.
 - **Weitere Reduktionen über eine Zeile mit 128:** die Norm je Kopf (`qkrope`), `gatednorm`
   der DeltaNet-Layer, `gatherrows`/`scatteradd` - nur, wenn das Profil sie zeigt.
 - **CUDA:** keine Zeitmessung je Kernel (Events um die Kernel des Graphen, oder ein Lauf ohne
-  Graph); CUDA liegt bei beiden Formaten rund 2 ms je Token hinter Vulkan.
+  Graph).
+- **Andere Vulkan-Geräte:** `matvec8` läuft nur auf Apple (eine Feature je Warp) und NVIDIA;
+  AMD, Intel und Adreno behalten `linear8`, bis dort jemand misst.
 
 Übernahme nur mit Messung.
 

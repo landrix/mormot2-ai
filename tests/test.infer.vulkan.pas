@@ -76,7 +76,9 @@ type
     /// phase 4b: TInferVulkanBackend.Linear for F32, Q8_0, Q4_K and Q6_K
     // weights against the reference's F32 product of the dequantized weights
     // (a tolerance: another summation order), with and without bias, more
-    // than 65535 outputs, the weight cache, and the CPU for other types
+    // than 65535 outputs, the weight cache, and the CPU for other types; one
+    // row through linear8.comp and matvec8.comp (one and two features per 32
+    // invocations, backlog B20)
     procedure LinearMatchesReference;
     /// backlog B11: RecordLinear of a matrix larger than one binding
     // (MaxLinearBytes) in parts of 10 features - 10, 10, 10 and 7 - for F32,
@@ -508,10 +510,12 @@ const
   // outputs than one dispatch dimension holds, and several gemm8.comp tiles
   // of rows and features; the last four not for the K-quants: whole blocks
   // of 32 but no multiple of 256 (Qwen2.5's 896), an odd number of blocks
-  // (rows not 4-aligned for Q8_0 and Q5_0)
-  SHAPES: array[0..9, 0..2] of integer = (
+  // (rows not 4-aligned for Q8_0 and Q5_0); one row of ten K-quant blocks
+  // (matvec8.comp: more units than invocations, an odd output count)
+  SHAPES: array[0..10, 0..2] of integer = (
     (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001),
-    (70, 512, 130), (1, 32, 3), (3, 96, 17), (1, 896, 65), (20, 896, 33));
+    (70, 512, 130), (1, 32, 3), (3, 96, 17), (1, 896, 65), (20, 896, 33),
+    (1, 2560, 37));
   TYPES: array[0..5] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
     idtQ5_0, idtMXFP4);
 var
@@ -527,6 +531,7 @@ var
   e: double;
   calls: Int64;
   matvec, gemm: boolean;
+  pairs: PtrInt;
 begin
   if not HasDevice then
     exit;
@@ -541,19 +546,25 @@ begin
       AddConsole('Vulkan subgroups: none usable (shared-memory linear8 only)');
     // and matvec8.comp for one row of Q8_0 / K-quants, gemm8.comp or
     // linear8.comp for many rows
+    // (one and two features per 32 invocations)
     matvec := gpu.UseMatvec;
     gemm := gpu.UseGemm;
-    for s := ord(not gpu.SubgroupLinear) * 2 to 3 do
+    pairs := gpu.MatvecPairsFrom;
+    for s := ord(not gpu.SubgroupLinear) * 3 to 5 do
     begin
-      gpu.UseSubgroups := s < 2;
-      gpu.UseMatvec := odd(s);
-      gpu.UseGemm := not odd(s);
+      gpu.UseSubgroups := s < 3;
+      gpu.UseMatvec := s mod 3 <> 0;
+      gpu.UseGemm := s mod 3 = 0;
+      if s mod 3 = 2 then
+        gpu.MatvecPairsFrom := 0
+      else
+        gpu.MatvecPairsFrom := MaxInt;
       for t := 0 to high(TYPES) do
       begin
         kind := TYPES[t];
         for i := 0 to high(SHAPES) do
         begin
-          if (i > 5) and (kind in [idtQ4_K, idtQ6_K]) then
+          if (i in [6..9]) and (kind in [idtQ4_K, idtQ6_K]) then
             continue;
           rows := SHAPES[i, 0];
           nin := SHAPES[i, 1];
@@ -604,8 +615,8 @@ begin
             pointer(y2));
           CheckUtf8(gpu.GpuLinears = calls + 1, '% on the device', [INFER_DTYPE_NAME[kind]]);
           e := RelError(pointer(y2), pointer(y1), rows * nout);
-          CheckUtf8(e <= 1e-5, '% % x % x %: relative error %',
-            [INFER_DTYPE_NAME[kind], rows, nin, nout, e]);
+          CheckUtf8(e <= 1e-5, '% % x % x % (kernels %): relative error %',
+            [INFER_DTYPE_NAME[kind], rows, nin, nout, s, e]);
           // again, from the weight cache: the same bits
           SetLength(y3, rows * nout);
           gpu.Linear(pointer(x), rows, nin, InferWeight(data, kind), nout, b,
@@ -618,6 +629,7 @@ begin
     gpu.UseSubgroups := gpu.SubgroupLinear;
     gpu.UseMatvec := matvec;
     gpu.UseGemm := gemm;
+    gpu.MatvecPairsFrom := pairs;
     // MXFP4 with the exponents 0 and 1: the scale is subnormal (Vulkan may
     // flush it), the weights 4 * 2^-128 and 2 * 2^-127 are not - times
     // inputs of 2^126, every row sums exactly to 32 (one row: linear8, 16
