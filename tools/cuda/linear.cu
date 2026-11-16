@@ -544,9 +544,10 @@ extern "C" __global__ void gemm8(const unsigned int* w, const float* x,
 // linear8 (rows is 1), the dequantization of InferRowToF32, another summation
 // order
 // - a block of 128 = 4 warps, FEAT consecutive output features per warp; a
-//   lane takes units of 32 consecutive weights - a Q8_0 block, a Q4_K
-//   sub-block, a quarter of a Q6_K half - reading their scales once and their
-//   quants as whole words, the activations of a unit loaded once for the FEAT
+//   lane takes units of 32 weights - a Q8_0 block, a quarter of a Q6_K half,
+//   both nibbles of 16 Q4_K quant bytes (16 values of two sub-blocks, every
+//   byte read once) - reading their scales once and their quants as whole
+//   words, the activations of a unit loaded once for the FEAT
 //   features
 // - a row starts 2-aligned (Q8_0, Q6_K) or 4-aligned (Q4_K): rows of whole
 //   blocks, an expert at a multiple of its matrix
@@ -593,6 +594,36 @@ __device__ __forceinline__ float dot4n(unsigned int v, unsigned int sh, float4 a
          float((v >> (sh + 16u)) & 15u) * a.z + float((v >> (sh + 24u)) & 15u) * a.w;
 }
 
+// the 6-bit scale and min of sub-block j of a Q4_K block whose 12 scale
+// bytes are the words s0 s1 s2 (InferScaleMinK4)
+__device__ __forceinline__ void scaleMinK4(unsigned int s0, unsigned int s1,
+  unsigned int s2, unsigned int j, unsigned int& sc, unsigned int& m)
+{
+  if (j < 4u)
+  {
+    sc = byte12(s0, s1, s2, j) & 63u;
+    m = byte12(s0, s1, s2, j + 4u) & 63u;
+  }
+  else
+  {
+    sc = (byte12(s0, s1, s2, j + 4u) & 15u) |
+         ((byte12(s0, s1, s2, j - 4u) >> 6) << 4);
+    m = (byte12(s0, s1, s2, j + 4u) >> 4) | ((byte12(s0, s1, s2, j) >> 6) << 4);
+  }
+}
+
+// the float4 of x for activations k (0..7) of unit u: 8 in a row, but for
+// Q4_K the values 16 (uu % 2) .. + 15 of sub-blocks 2 (uu / 2) and 2 (uu / 2)
+// + 1 (uu = u % 8)
+template <unsigned int DT>
+__device__ __forceinline__ unsigned int xAt(unsigned int u, unsigned int k)
+{
+  if (DT == 3u)
+    return (u >> 3) * 64u + ((u >> 1) & 3u) * 16u + (u & 1u) * 4u + (k & 3u) +
+           (k >> 2) * 8u;
+  return u * 8u + k;
+}
+
 // unit u (32 weights) of the row at byte rowBase times its activations xv
 template <unsigned int DT>
 __device__ __forceinline__ float unitDot(const unsigned int* w,
@@ -614,37 +645,36 @@ __device__ __forceinline__ float unitDot(const unsigned int* w,
   }
   else if (DT == 3u)
   {
-    // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K); sub-block
-    // j of block u / 8: value = d * sc * q - dmin * m
+    // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K); value =
+    // d * sc * q - dmin * m. Unit uu = u % 8 of block u / 8: the 16 bytes at
+    // 16 + 32 * (uu / 2) + 16 * (uu % 2), both nibbles - values 16 (uu % 2) ..
+    // + 15 of sub-blocks j = 2 (uu / 2) (low, xv[0..3]) and j + 1 (high,
+    // xv[4..7]); every quant byte read once (xAt maps the activations)
     unsigned long long i = (rowBase + (u >> 3) * 144ull) >> 2;
-    unsigned int j = u & 7u;
+    unsigned int uu = u & 7u;
+    unsigned int j = uu & 6u;
     unsigned int h = w[i];
     unsigned int s0 = w[i + 1u];
     unsigned int s1 = w[i + 2u];
     unsigned int s2 = w[i + 3u];
-    unsigned int sc, m;
-    if (j < 4u)
-    {
-      sc = byte12(s0, s1, s2, j) & 63u;
-      m = byte12(s0, s1, s2, j + 4u) & 63u;
-    }
-    else
-    {
-      sc = (byte12(s0, s1, s2, j + 4u) & 15u) |
-           ((byte12(s0, s1, s2, j - 4u) >> 6) << 4);
-      m = (byte12(s0, s1, s2, j + 4u) >> 4) | ((byte12(s0, s1, s2, j) >> 6) << 4);
-    }
-    // the quants: 32 bytes at 16 + 32 * (j / 2), nibble j % 2
-    const unsigned int* q = w + i + 4u + 8u * (j >> 1);
-    unsigned int sh = (j & 1u) * 4u;
-    float sx = 0.0f;
+    unsigned int sc0, m0, sc1, m1;
+    scaleMinK4(s0, s1, s2, j, sc0, m0);
+    scaleMinK4(s0, s1, s2, j + 1u, sc1, m1);
+    const unsigned int* q = w + i + 4u + 4u * uu;
+    float s1v = 0.0f;
+    float sx0 = 0.0f;
+    float sx1 = 0.0f;
 #pragma unroll
-    for (unsigned int k = 0u; k < 8u; k++)
+    for (unsigned int k = 0u; k < 4u; k++)
     {
-      s += dot4n(q[k], sh, xv[k]);
-      sx += xv[k].x + xv[k].y + xv[k].z + xv[k].w;
+      unsigned int v = q[k];
+      s += dot4n(v, 0u, xv[k]);
+      s1v += dot4n(v, 4u, xv[k + 4u]);
+      sx0 += xv[k].x + xv[k].y + xv[k].z + xv[k].w;
+      sx1 += xv[k + 4u].x + xv[k + 4u].y + xv[k + 4u].z + xv[k + 4u].w;
     }
-    return halfBits(h & 65535u) * float(sc) * s - halfBits(h >> 16) * float(m) * sx;
+    return halfBits(h & 65535u) * (float(sc0) * s + float(sc1) * s1v) -
+           halfBits(h >> 16) * (float(m0) * sx0 + float(m1) * sx1);
   }
   else
   {
@@ -703,7 +733,7 @@ __device__ __forceinline__ void matvec8Body(const unsigned int* w,
     float4 xv[8];
 #pragma unroll
     for (unsigned int k = 0u; k < 8u; k++)
-      xv[k] = x4[u * 8u + k];
+      xv[k] = x4[xAt<DT>(u, k)];
 #pragma unroll
     for (unsigned int f = 0u; f < FEAT; f++)
       if (o0 + f < nout)

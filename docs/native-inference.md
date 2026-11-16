@@ -1819,6 +1819,38 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B20, Teil 3 erledigt (2026-11-16): jedes Q4_K-Quant-Byte einmal gelesen.** Anlass war das
+Profil nach Teil 2.
+
+- *Messung (`LAI_VULKAN_PROFILE`, Qwen3.8-27B Q4_K_M, je Token):* GPU 18,4 ms, davon `linear`
+  15,2 ms. Die `matvec8`-Pipelines vorübergehend nach Typ benannt: Q4_K (128 Aufrufe, `ffn_gate`
+  und `ffn_up` zusammen, `ffn_down`) 8,8 ms, Q8_0 6,4 ms - nach Bytes rund 1,09 TB/s gegen
+  1,36 TB/s. Die schmalen Q8_0-Matrizen (`ssm_alpha`/`ssm_beta`, 48 Ausgänge) zeigten 63 µs je
+  Aufruf: ein Messartefakt - sie laufen ohne Barriere neben `attn_qkv`, und der Zeitstempel am
+  Ende der Pipeline wartet auf alle Dispatches davor.
+- *Ursache:* Eine Lane nahm einen Q4_K-Unterblock (32 Werte) und las dafür die 32 Bytes des
+  Paars von Unterblöcken, von denen sie je ein Nibble brauchte; die Nachbar-Lane las dieselben
+  Bytes für das andere.
+- *Änderung (`matvec8.comp`, `linear.cu`):* Einheit uu = u mod 8 eines Blocks nimmt die 16 Bytes
+  ab 16 + 32 (uu div 2) + 16 (uu mod 2) und beide Nibbles - je 16 Werte der Unterblöcke
+  2 (uu div 2) und 2 (uu div 2) + 1 mit ihren Skalen (`scaleMinK4`); `xAt` ordnet die
+  Aktivierungen zu. Gleich viele Einheiten, jedes Byte einmal gelesen.
+- *Tempo (`llm-bench` 200/64, Decode, Tokens/s):*
+  - **RTX 5090, CUDA:** Qwen3.8-27B Q4_K_M 56,6 → 60,6; Qwen3-0.6B Q4_K_M 488 → 535;
+    Qwen3-30B-A3B 119 → 122; Q8_0 47,7 → 47,8 (im Rauschen).
+  - **RTX 5090, Vulkan:** Qwen3.8-27B Q4_K_M 53,1 → 56,4; Qwen3-0.6B Q4_K_M 400 → 422;
+    Qwen3-30B-A3B 98,5 → 102.
+  - **M2 Pro (MoltenVK, eine Feature je Warp):** Qwen3-0.6B Q4_K_M 80 → 82, Q8_0 109 → 110.
+- *Tests:* die Formen von `LinearMatchesReference` aus Teil 2 (eine Zeile Q4_K mit einem und
+  zehn Blöcken, ungerade Ausgänge, eine und zwei Features je Warp).
+- *Gegenprobe:* `xAt` ohne die Hälfte uu mod 2 lässt 24 (Vulkan) und 18 (CUDA) Assertions
+  scheitern, quer durch die Modelle mit Q4_K; echter Build Vulkan 0 / 2.166, CUDA 0 / 1.987.
+- *Läufe:* RTX 5090 FPC 0 / 17.582, Delphi 13 0 / 17.582, Delphi 7 0 / 6.544; Mac M2 Pro (FPC,
+  MoltenVK): `infer.tests` 0 / 8.700, `llm.tests` 0 / 730.
+- *Review* (Claude-Finder und Codex): keine Fehler; die Indexrechnung gegen `DequantQ4K` für
+  alle uu und k nachgerechnet. Ergänzt: die Überblickskommentare beider Kernel (sie sprachen
+  noch von 32 aufeinanderfolgenden Gewichten).
+
 **B20, Teil 2 erledigt (2026-11-16): eine Decode-Zeile durch `matvec8` auf NVIDIA.** Anlass war
 Teil 1: Q4_K_M bewegte in den Matrixprodukten nur rund 0,98 TB/s, Q8_0 rund 1,46 TB/s.
 

@@ -4,9 +4,10 @@
 //   dtype 2 (Q8_0), 3 (Q4_K) or 4 (Q6_K) reach it
 //   (TInferVulkanBackend.LinearShape)
 // - a work group of 128 = 4 groups of 32 invocations, FEAT consecutive output
-//   features per group: an invocation takes units of 32 consecutive weights -
-//   a Q8_0 block, a Q4_K sub-block, a quarter of a Q6_K half - reading their
-//   scales once and their quants as whole words (shifted by 16 bits where
+//   features per group: an invocation takes units of 32 weights - a Q8_0
+//   block, a quarter of a Q6_K half, both nibbles of 16 Q4_K quant bytes (16
+//   values of two sub-blocks, every byte read once) - reading their scales
+//   once and their quants as whole words (shifted by 16 bits where
 //   they start at 2 mod 4: a Q8_0 block at 0 mod 4, its quants follow a
 //   2-byte scale; a Q6_K block at 2 mod 4; Q4_K blocks are 4-aligned);
 //   linear8.comp reads the scales byte by byte for every 8 weights
@@ -98,6 +99,34 @@ uint byte12(uint s0, uint s1, uint s2, uint k)
   return (v >> ((k & 3u) * 8u)) & 255u;
 }
 
+// the 6-bit scale and min of sub-block j of a Q4_K block whose 12 scale
+// bytes are the words s0 s1 s2 (InferScaleMinK4)
+void scaleMinK4(uint s0, uint s1, uint s2, uint j, out uint sc, out uint m)
+{
+  if (j < 4u)
+  {
+    sc = byte12(s0, s1, s2, j) & 63u;
+    m = byte12(s0, s1, s2, j + 4u) & 63u;
+  }
+  else
+  {
+    sc = (byte12(s0, s1, s2, j + 4u) & 15u) |
+         ((byte12(s0, s1, s2, j - 4u) >> 6) << 4);
+    m = (byte12(s0, s1, s2, j + 4u) >> 4) | ((byte12(s0, s1, s2, j) >> 6) << 4);
+  }
+}
+
+// the vec4 of x for activations k (0..7) of unit u: 8 in a row, but for
+// Q4_K the values 16 (uu % 2) .. + 15 of sub-blocks 2 (uu / 2) and 2 (uu / 2)
+// + 1 (uu = u % 8)
+uint xAt(uint u, uint k)
+{
+  if (DT == 3u)
+    return (u >> 3) * 64u + ((u >> 1) & 3u) * 16u + (u & 1u) * 4u + (k & 3u) +
+           (k >> 2) * 8u;
+  return u * 8u + k;
+}
+
 // unit u (32 weights) of the row at byte rowBase times its activations xv
 float unitDot(uint rowBase, uint u, vec4 xv[8])
 {
@@ -118,36 +147,35 @@ float unitDot(uint rowBase, uint u, vec4 xv[8])
   }
   else if (DT == 3u)
   {
-    // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K); sub-block
-    // j of block u / 8: value = d * sc * q - dmin * m
+    // Q4_K: 144 bytes per 256 values (InferScaleMinK4, DequantQ4K); value =
+    // d * sc * q - dmin * m. Unit uu = u % 8 of block u / 8: the 16 bytes at
+    // 16 + 32 * (uu / 2) + 16 * (uu % 2), both nibbles - values 16 (uu % 2) ..
+    // + 15 of sub-blocks j = 2 (uu / 2) (low, xv[0..3]) and j + 1 (high,
+    // xv[4..7]); every quant byte read once (xAt maps the activations)
     uint i = (rowBase + (u >> 3) * 144u) >> 2;
-    uint j = u & 7u;
+    uint uu = u & 7u;
+    uint j = uu & 6u;
     vec2 dm = unpackHalf2x16(w[i]);
     uint s0 = w[i + 1u];
     uint s1 = w[i + 2u];
     uint s2 = w[i + 3u];
-    uint sc, m;
-    if (j < 4u)
+    uint sc0, m0, sc1, m1;
+    scaleMinK4(s0, s1, s2, j, sc0, m0);
+    scaleMinK4(s0, s1, s2, j + 1u, sc1, m1);
+    uint qi = i + 4u + 4u * uu;
+    float s1v = 0.0;
+    float sx0 = 0.0;
+    float sx1 = 0.0;
+    for (uint k = 0u; k < 4u; k++)
     {
-      sc = byte12(s0, s1, s2, j) & 63u;
-      m = byte12(s0, s1, s2, j + 4u) & 63u;
+      uint q = w[qi + k];
+      s += dot4n(q, 0u, xv[k]);
+      s1v += dot4n(q, 4u, xv[k + 4u]);
+      sx0 += xv[k].x + xv[k].y + xv[k].z + xv[k].w;
+      sx1 += xv[k + 4u].x + xv[k + 4u].y + xv[k + 4u].z + xv[k + 4u].w;
     }
-    else
-    {
-      sc = (byte12(s0, s1, s2, j + 4u) & 15u) |
-           ((byte12(s0, s1, s2, j - 4u) >> 6) << 4);
-      m = (byte12(s0, s1, s2, j + 4u) >> 4) | ((byte12(s0, s1, s2, j) >> 6) << 4);
-    }
-    // the quants: 32 bytes at 16 + 32 * (j / 2), nibble j % 2
-    uint qi = i + 4u + 8u * (j >> 1);
-    uint sh = (j & 1u) * 4u;
-    float sx = 0.0;
-    for (uint k = 0u; k < 8u; k++)
-    {
-      s += dot4n(w[qi + k], sh, xv[k]);
-      sx += xv[k].x + xv[k].y + xv[k].z + xv[k].w;
-    }
-    return dm.x * float(sc) * s - dm.y * float(m) * sx;
+    return dm.x * (float(sc0) * s + float(sc1) * s1v) -
+           dm.y * (float(m0) * sx0 + float(m1) * sx1);
   }
   else
   {
@@ -219,7 +247,7 @@ void main()
       {
         vec4 xv[8];
         for (uint k = 0u; k < 8u; k++)
-          xv[k] = x[u * 8u + k];
+          xv[k] = x[xAt(u, k)];
         for (uint f = 0u; f < FEAT; f++)
           if (o0 + f < p.nout)
             acc[f] += unitDot((o0 + f) * rowBytes, u, xv);

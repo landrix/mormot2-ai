@@ -9,6 +9,12 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-16 - B20, part 3: every Q4_K quant byte read once in `matvec8`.** A lane took one
+  Q4_K sub-block and used one nibble of the 32 bytes it read; its neighbour read them again
+  for the other nibble. Now a lane takes 16 bytes and both nibbles (16 values of two
+  sub-blocks), the activations mapped to match - on Vulkan and CUDA. Qwen3.8-27B Q4_K_M from
+  56.6 to 60.6 tokens/s (CUDA) and from 53.1 to 56.4 (Vulkan); Qwen3-0.6B Q4_K_M from 488 to
+  535 (CUDA) and from 400 to 422 (Vulkan); on an M2 Pro from 80 to 82.
 - **2026-11-16 - B20, part 2: one decode row through `matvec8` on NVIDIA.** `linear8` read one
   144-byte Q4_K block per warp and step, so Q4_K_M matrices moved only about 0.98 TB/s
   against 1.46 TB/s for Q8_0. `matvec8` (until now for Apple GPUs) takes units of 32 weights
