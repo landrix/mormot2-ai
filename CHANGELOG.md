@@ -9,6 +9,14 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-17 - B20 closed: the last decode measurements.** On the RTX 5090 with
+  Qwen3.8-27B Q4_K_M (warm GPU, 200/256, alternating runs): `addnorm` on Vulkan with a subgroup
+  sum takes 6.3 instead of 7.2 µs per call, end to end within the noise (61.0 to 61.4
+  tokens/s, the rest is the start of each dispatch); one feature per warp for Q4_K gains 0.7 %
+  on CUDA (63.65 -> 64.11) and loses on Vulkan - both below the 1 % threshold, not taken.
+  Measuring note: with only 64 decode tokens the GPU leaving its power-saving state costs up
+  to 15 %; measure warm and with 256 tokens. Remaining ideas are listed as on-demand in the
+  backlog.
 - **2026-11-17 - The AVX2 kernels run on Linux x86_64 (SysV).** The SysV entry of the AVX2
   kernels had only been checked by reading since the last Linux run (2026-10-14); six kernels
   came after it (`Mxfp4UnpackAvx2Asm`, `DeltaRowsF32Avx2Asm`, `Q4KSumsAvx2Asm`,

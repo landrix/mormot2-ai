@@ -1820,6 +1820,25 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B20 abgeschlossen (2026-11-17): Messungen zum Rest.** RTX 5090, Qwen3.8-27B Q4_K_M,
+`llm-bench` 200/256, je Variante abwechselnd, nach einem Aufwärmlauf.
+
+- *Messfalle:* Mit nur 64 Decode-Tokens kommt die GPU erst während des Laufs aus dem
+  Stromsparzustand (P5, 180 MHz): kalt Vulkan 53 und CUDA 57 Tokens/s, warm 61 und 63,6. Messen
+  deshalb warm und mit 256 Tokens.
+- *Ausgang (Profil, 64 Tokens):* `addnorm` 127 Aufrufe je Token zu 7,2 µs (0,92 ms, 5 %);
+  andere kleine Shader rund 2 µs; für 5120 Werte bräuchte die Bandbreite unter 0,1 µs.
+- *`addnorm` auf Vulkan, Versuch:* (A) Summe per `subgroupAdd` (zwei Barrieren statt elf),
+  (B) die Zeile zwischen den Durchgängen in Registern (bis 8 je Invocation), (A+B). Profil je
+  Aufruf: 7,2 / 6,3 / 7,4 / 6,8 µs. Ende zu Ende (vier Runden): 61,0 / 61,4 / 61,2 / 61,3
+  Tokens/s bei einer Streuung von ±1,5 - Rauschen. Der Rest ist Startaufwand je Dispatch.
+  Verworfen.
+- *Q4_K eine Feature je Warp (`matvec8`, statt zwei ab 4096 Ausgängen):* CUDA in allen sechs
+  Paaren vorn, 63,65 → 64,11 (+0,7 %); Qwen3-0.6B Q4_K_M unverändert (557,6 / 559,4). Vulkan
+  60,6 → 59,7 (schlechter, stark streuend). Unter der Schwelle von 1 %, nicht übernommen.
+- *Übrige Punkte* (Q8_0-Bandbreite, Reduktionen über 128, andere Vulkan-Geräte, CUDA-Zeit je
+  Kernel) stehen im Backlog unter „Weitere Punkte nur bei Bedarf“.
+
 **Linux x86_64: SysV-Lauf der AVX2-Kernel (2026-11-17).** Anlass: Seit dem letzten Lauf unter
 Linux x86_64 (2026-10-14, `ab03023`) war der SysV-Einsprung nur statisch geprüft.
 
@@ -2037,7 +2056,7 @@ B19: Qwen3.8-27B dekodierte auf beiden Backends weit unter der Bandbreite der RT
   (CUDA) und an Ort und Stelle (Vulkan), eine Pipeline im Test bei einem Fehler freigegeben, ein
   veralteter Kommentar in `ops.cu`. Als weitere Kandidaten genannt: die Norm je Kopf, `gatednorm`,
   `gatherrows`/`scatteradd` (Backlog B20).
-- *Offen (Backlog B20):* Q4_K erreicht in den Matrixprodukten nur rund 0,98 TB/s gegen 1,46 TB/s
+- *Damals offen (Backlog B20, inzwischen erledigt: Teile 2 bis 5 und Abschluss 2026-11-17):* Q4_K erreicht in den Matrixprodukten nur rund 0,98 TB/s gegen 1,46 TB/s
   bei Q8_0 (in Teil 2 angegangen).
 
 **B18 erledigt (2026-11-13): mehrere Köpfe auf dem Gerät, Kopf-Index je Aufruf.** Anlass war

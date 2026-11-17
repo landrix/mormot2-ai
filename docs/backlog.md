@@ -1,7 +1,7 @@
 # Backlog — native Inferenz und Umfeld
 
 Offene Themen, jedes so beschrieben, dass ein Agent ohne Vorwissen aus dieser Session
-loslegen kann. Reihenfolge = grobe Priorität. Stand 2026-11-13.
+loslegen kann. Reihenfolge = grobe Priorität. Stand 2026-11-17.
 
 Erledigte Einträge stehen mit ihrer Nummer (B…, D…) in [`CHANGELOG.md`](../CHANGELOG.md); die
 ausführlichen Berichte in [`native-inference.md`](native-inference.md). Ein erledigter Eintrag
@@ -40,39 +40,6 @@ Prefill von Qwen3-0.6B Q4_K_M sind das unter Linux 10 % der Zeit, im Decode 12 %
 (Attention) und GELU prüfen.
 *Gate:* Toleranztests (relativer Fehler, Randwerte: ±Inf, NaN, große |x|, Denormale),
 Gegenprobe, Tempo unter Linux und Windows mit einem und 16 Threads, Modelle end-to-end.
-
----
-
-## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teile 1 bis 5 erledigt)
-
-Anlass: B19. Erledigt (`CHANGELOG.md`, `native-inference.md`): Teil 1 (2026-11-13) - die
-Normen einer Zeile beim Decode mit Gruppen von 1024; Teil 2 (2026-11-16) - eine Decode-Zeile
-von Q8_0 und K-Quants auf NVIDIA durch `matvec8` (CUDA neu), zwei Features je Warp ab 4096
-Ausgängen; Teil 3 (2026-11-16) - jedes Q4_K-Quant-Byte einmal gelesen, beide Nibbles in einer
-Lane; Teil 4 (2026-11-16) - `linear-bench` und eine engere Barriere im Vulkan-Batch; Teil 5
-(2026-11-16) - Q4_K in `matvec8` mit 16-Byte-Ladevorgängen. Qwen3.8-27B Q4_K_M auf der RTX
-5090 jetzt 63,5 (CUDA) und 61,9 (Vulkan) Tokens/s, Q8_0 47,8 und 48,4.
-
-Offen:
-- **Vulkan knapp hinter CUDA** (Q4_K_M 61,9 gegen 63,5): Im Decode brauchen die Matrizen auf
-  beiden gleich lang (Profil nach Teil 4: 13,85 ms); der Rest liegt in den kleinen Operationen
-  (`addnorm` 127 Aufrufe zu rund 7 µs). Weniger Dispatches (`ffn_gate` und `ffn_up` in einem)
-  bringen wenig: Diese Paare laufen im Batch schon ohne Barriere dazwischen.
-- **Q4_K bei rund 1,42 bis 1,49 TB/s** (CUDA, Teil 5): eine Feature je Warp für Q4_K wäre noch
-  rund 0,17 ms je Token schneller (nahe am Rauschen, `LAI_PAIRS` in `linear-bench`).
-- **Q8_0 bei rund 85 % der Bandbreite:** Die Matrixprodukte lesen 27,4 GB in rund 18 ms je Token
-  (Vulkan-Profil: 1,52 von 1,79 TB/s); wenig Luft; ein Block von 34
-  Bytes liegt bei jeder zweiten Einheit auf 2 mod 4 (zwei Wörter je Quant-Wort).
-- **Weitere Reduktionen über eine Zeile mit 128:** die Norm je Kopf (`qkrope`), `gatednorm`
-  der DeltaNet-Layer, `gatherrows`/`scatteradd` - nur, wenn das Profil sie zeigt.
-- **CUDA:** keine Zeitmessung je Kernel. Erprobt und verworfen (Teil 4): Events im Graphen
-  (`CU_EVENT_RECORD_EXTERNAL`) kosten je Knoten rund 5 µs (Decode 16,5 → 22,4 ms), ohne
-  Graph zählen die Startlücken unter Windows mit (Summe = Wandzeit 21 ms). Für Matrizen
-  reicht `linear-bench`; für den Rest Nsight Systems (auf der RTX nicht installiert).
-- **Andere Vulkan-Geräte:** `matvec8` läuft nur auf Apple (eine Feature je Warp) und NVIDIA;
-  AMD, Intel und Adreno behalten `linear8`, bis dort jemand misst.
-
-Übernahme nur mit Messung.
 
 ---
 
@@ -280,6 +247,18 @@ Nur bei Bedarf:
   Präfix wie Qwen3 und Gemma 4. Als Stapel eines größeren Checkpoints (`CreateStack`) lädt
   gpt-oss deshalb nicht, schon mit einem Kopf. Erst angehen, wenn ein Checkpoint gpt-oss als
   Stapel enthält.
+- **Decode-Feinschliff aus B20 (abgeschlossen 2026-11-17, Messungen in `native-inference.md`):**
+  - *Kleine Ops auf Vulkan:* `addnorm` mit Subgroup-Summe 6,3 statt 7,2 µs je Aufruf, Ende zu
+    Ende im Rauschen; der Rest ist Startaufwand je Dispatch. Weniger Dispatches (Fusion von
+    `addnorm` in die folgende Matrix) nur, wenn ein Gerät mit teurerem Start es verlangt.
+  - *Q4_K eine Feature je Warp:* CUDA +0,7 % (Qwen3.8-27B), Vulkan schlechter - unter der
+    Schwelle von 1 %, nicht übernommen.
+  - *Q8_0 bei rund 85 % der Bandbreite*, *Reduktionen über 128* (`qkrope`, `gatednorm`,
+    `gatherrows`/`scatteradd`): nur, wenn ein Profil sie zeigt.
+  - *Andere Vulkan-Geräte* (AMD, Intel, Adreno behalten `linear8`): erst mit einem Gerät zum
+    Messen.
+  - *CUDA-Zeit je Kernel:* verworfen (Events im Graphen kosten rund 5 µs je Knoten, siehe B20
+    Teil 4); für Einzelzeiten Nsight Systems.
 - Weitere Ideen ohne Termin: [ideas.md](ideas.md).
 
 ---
