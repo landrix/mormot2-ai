@@ -56,7 +56,7 @@ type
     // matvec8.comp with 1 or 2 features per 32 invocations, per LINEAR_DTYPE
     // (2 Q8_0, 3 Q4_K, 4 Q6_K), plain and with subgroup reductions
     fMatvec, fMatvecSg: array[1..2, 2..4] of TInferVkPipeline;
-    fUseSubgroups, fUseMatvec, fUseGemm: boolean;
+    fUseSubgroups, fUseMatvec, fUseGemm, fPlainLinear: boolean;
     fMatvecPairsFrom: PtrInt;
     fGpu: TLightLock;
     // the weight cache: parallel arrays, searched linearly (a model has a few
@@ -174,6 +174,10 @@ type
     /// many rows (prefill) through the tiled gemm8.comp instead of linear8.comp
     // - by default where the device runs work groups of 256 invocations
     property UseGemm: boolean read fUseGemm write fUseGemm;
+    /// every Linear through the plain linear.comp (one feature per work group,
+    // the weights dequantized one by one) - for tests only: by default
+    // linear.comp runs only for F32 inputs that are no multiple of 8
+    property PlainLinear: boolean read fPlainLinear write fPlainLinear;
     /// how many Linear calls ran on the device
     property GpuLinears: Int64 read fGpuLinears;
     /// the bytes of a weight binding at most, below maxStorageBufferRange -
@@ -198,7 +202,7 @@ const
   // MXFP4;
   // 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
-    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 6);
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 7, 3, 4, 5, 6);
 
   /// from this many rows on a Linear runs the tiled gemm8.comp (UseGemm)
   GEMM_ROWS = 16;
@@ -405,7 +409,8 @@ function TInferVulkanBackend.LinearShape(aType: TInferDType; aIn, aRows,
 var
   n, f: PtrInt;
 begin
-  if fUseMatvec and (aType in [idtQ8_0, idtQ4_K, idtQ6_K]) and (aRows = 1) then
+  if not fPlainLinear and fUseMatvec and (aType in [idtQ8_0, idtQ4_K, idtQ6_K]) and
+     (aRows = 1) then
   begin
     f := 1;
     if aOut >= fMatvecPairsFrom then
@@ -417,7 +422,7 @@ begin
     n := (aOut + 4 * f - 1) div (4 * f); // f features per 32 invocations
     aY := 1;
   end
-  else if fUseGemm and (fGemm8 <> nil) and (aRows >= GEMM_ROWS) and
+  else if not fPlainLinear and fUseGemm and (fGemm8 <> nil) and (aRows >= GEMM_ROWS) and
           (aIn and 31 = 0) and
           ((aOut + 63) shr 6 <= 65535) then
   begin
@@ -427,7 +432,7 @@ begin
     aY := (aRows + 63) shr 6;
     exit;
   end
-  else if (aType <> idtF32) or (aIn and 7 = 0) then
+  else if not fPlainLinear and ((aType <> idtF32) or (aIn and 7 = 0)) then
   begin
     // 8 weights per step: every block type qualifies, F32 when aIn allows
     if fUseSubgroups and (fLinear8Sg <> nil) then

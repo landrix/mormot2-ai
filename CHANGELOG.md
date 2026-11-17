@@ -9,6 +9,21 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-17 - B2: Q4_0 weights on the GPUs.** CUDA and Vulkan had no kernel for Q4_0, so
+  the QAT files of Gemma 4 ran on the CPU only. Q4_0 is now dtype 7 in every Linear kernel
+  (CUDA `linear`, `linear8`, `linear8ids`, `gemm8`; Vulkan `linear`, `linear8` with and without
+  expert ids, `gemm8`), the bytes read one by one (a block of 18 bytes starts 2-aligned).
+  Gemma 4 12B Q4_0 on the RTX 5090 against the CPU on the same file: logits cosine 0.9927 to
+  0.9996 on CUDA and Vulkan alike (the CPU quantizes the activations); loaded in 9 to 10 s
+  instead of 16 to 17 s for Q8_0 (7.2 instead of 12.7 GB), 24 tokens in about the same time
+  (decode still through `linear8`; `matvec8` for Q4_0 follows with B16). CUDA takes its fast
+  kernels only at a 4-aligned weight address (`EnqueueLinearAt` may name a 2-aligned Q4_0
+  matrix); Vulkan has a test switch `PlainLinear`, so `linear.comp` is tested for every block
+  type. Counterproof: an offset of 7 instead of 8 and swapped nibbles each fail every Q4_0
+  shape in every kernel on both GPUs, and without the alignment check CUDA stops with a
+  misaligned address; green
+  on FPC (RTX 0 / 18,193; macOS M2 0 / 9,119), Delphi 13 (0 / 18,193), Delphi 7 (0 / 6,963) and the
+  Adreno X1-85 (Vulkan Linear tests).
 - **2026-11-17 - B20 closed: the last decode measurements.** On the RTX 5090 with
   Qwen3.8-27B Q4_K_M (warm GPU, 200/256, alternating runs): `addnorm` on Vulkan with a subgroup
   sum takes 6.3 instead of 7.2 µs per call, end to end within the noise (61.0 to 61.4

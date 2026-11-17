@@ -510,18 +510,17 @@ const
   // outputs than one dispatch dimension holds, and several gemm8.comp tiles
   // of rows and features; the last four not for the K-quants: whole blocks
   // of 32 but no multiple of 256 (Qwen2.5's 896), an odd number of blocks
-  // (rows not 4-aligned for Q8_0 and Q5_0); one row of ten K-quant blocks
+  // (rows not 4-aligned for Q8_0, Q5_0 and Q4_0); one row of ten K-quant blocks
   // (matvec8.comp: more units than invocations, an odd output count)
   SHAPES: array[0..10, 0..2] of integer = (
     (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001),
     (70, 512, 130), (1, 32, 3), (3, 96, 17), (1, 896, 65), (20, 896, 33),
     (1, 2560, 37));
-  TYPES: array[0..5] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
-    idtQ5_0, idtMXFP4);
+  TYPES: array[0..6] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
+    idtQ5_0, idtMXFP4, idtQ4_0);
 var
   gpu: TInferVulkanBackend;
   ref: TInferCpuBackend;
-  fast: TInferCpuFastBackend;
   s, t, i, o, rows, nin, nout: PtrInt;
   kind: TInferDType;
   x, bias, wf, wd, y1, y2, y3: TSingleDynArray;
@@ -537,7 +536,6 @@ begin
     exit;
   gpu := TInferVulkanBackend.Create;
   ref := TInferCpuBackend.Create;
-  fast := TInferCpuFastBackend.Create;
   try
     // both builds of linear8.comp where the device has subgroups
     if gpu.SubgroupLinear then
@@ -546,12 +544,14 @@ begin
       AddConsole('Vulkan subgroups: none usable (shared-memory linear8 only)');
     // and matvec8.comp for one row of Q8_0 / K-quants, gemm8.comp or
     // linear8.comp for many rows
-    // (one and two features per 32 invocations)
+    // (one and two features per 32 invocations); last the plain linear.comp
+    // for every type (PlainLinear)
     matvec := gpu.UseMatvec;
     gemm := gpu.UseGemm;
     pairs := gpu.MatvecPairsFrom;
-    for s := ord(not gpu.SubgroupLinear) * 3 to 5 do
+    for s := ord(not gpu.SubgroupLinear) * 3 to 6 do
     begin
+      gpu.PlainLinear := s = 6;
       gpu.UseSubgroups := s < 3;
       gpu.UseMatvec := s mod 3 <> 0;
       gpu.UseGemm := s mod 3 = 0;
@@ -588,6 +588,13 @@ begin
             idtQ5_0:
               begin
                 wq := RandomQ5(nout, nin, 141 + i);
+                data := pointer(wq);
+              end;
+            idtQ4_0:
+              begin
+                // 18 bytes per block: every row of an odd number of blocks
+                // starts 2-aligned only
+                wq := RandomQ4(nout, nin, 341 + i);
                 data := pointer(wq);
               end;
             idtMXFP4:
@@ -627,6 +634,7 @@ begin
       end;
     end;
     gpu.UseSubgroups := gpu.SubgroupLinear;
+    gpu.PlainLinear := false;
     gpu.UseMatvec := matvec;
     gpu.UseGemm := gemm;
     gpu.MatvecPairsFrom := pairs;
@@ -665,20 +673,7 @@ begin
     Check(gpu.GpuLinears = calls + 1, 'F32 x 36 on the device');
     e := RelError(pointer(y2), pointer(y1), 3 * 5);
     CheckUtf8(e <= 1e-5, 'F32 3 x 36 x 5: relative error %', [e]);
-    // a weight type without a shader: the CPU, bit for bit as the fast backend
-    wq := RandomQ4(8, 64, 5);
-    Fill(x, 2 * 64, 3, 2);
-    SetLength(y1, 2 * 8);
-    SetLength(y2, 2 * 8);
-    calls := gpu.GpuLinears;
-    gpu.Linear(pointer(x), 2, 64, InferWeight(pointer(wq), idtQ4_0), 8, nil,
-      pointer(y1));
-    fast.Linear(pointer(x), 2, 64, InferWeight(pointer(wq), idtQ4_0), 8, nil,
-      pointer(y2));
-    Check(gpu.GpuLinears = calls, 'Q4_0 stays on the CPU');
-    Check(SameBits(pointer(y1), pointer(y2), 2 * 8), 'Q4_0 as the fast backend');
   finally
-    fast.Free;
     ref.Free;
     gpu.Free;
   end;
@@ -1669,9 +1664,11 @@ const
   NOUT = 33;
   IDS: array[0..SLOTS - 1] of integer = (3, 0, 4, 3);
   // type, inputs: the K-quant at 256, the others also at 896
-  KINDS: array[0..6] of TInferDType = (
-    idtF32, idtQ8_0, idtQ5_0, idtQ4_K, idtQ8_0, idtQ5_0, idtF32);
-  INPUTS: array[0..6] of integer = (256, 256, 256, 256, 896, 896, 896);
+  KINDS: array[0..8] of TInferDType = (
+    idtF32, idtQ8_0, idtQ5_0, idtQ4_K, idtQ8_0, idtQ5_0, idtF32, idtQ4_0,
+    idtQ4_0);
+  INPUTS: array[0..8] of integer = (256, 256, 256, 256, 896, 896, 896, 256,
+    896);
 var
   gpu: TInferVulkanBackend;
   ref: TInferCpuBackend;
@@ -1714,6 +1711,11 @@ begin
           idtQ5_0:
             begin
               wq := RandomQ5(EXPERTS * NOUT, nin, 83 + c);
+              data := pointer(wq);
+            end;
+          idtQ4_0:
+            begin
+              wq := RandomQ4(EXPERTS * NOUT, nin, 85 + c);
               data := pointer(wq);
             end;
         else
@@ -4158,15 +4160,19 @@ end;
 
 procedure TTestInferVulkan.Gemma4OnDevice;
 const
-  FILES: array[0..1] of RawUtf8 = ('gemma-4-12b-it-q8_0.gguf',
-    'gemma-4-26b-a4b-it-q8_0.gguf');
-  DATASETS: array[0..1] of RawUtf8 = ('gemma4-12b', 'gemma4-26b-a4b');
+  FILES: array[0..2] of RawUtf8 = ('gemma-4-12b-it-q8_0.gguf',
+    'gemma-4-26b-a4b-it-q8_0.gguf', 'gemma-4-12b-it-q4_0.gguf');
+  DATASETS: array[0..2] of RawUtf8 = ('gemma4-12b', 'gemma4-26b-a4b',
+    'gemma4-12b');
   // the bounds of the raw text case 0 of the CPU from the same file (D6d):
   // 12B logits cosine 0.9854 and max 6.9, 26B-A4B 0.9953 - the other cases
   // closer; the reference was float32 transformers, the device computes in
-  // float from the Q8_0 weights
-  COS: array[0..1] of double = (0.98, 0.99);
-  MAXABS: array[0..1] of double = (8, 12);
+  // float from the Q8_0 weights; the 12B Q4_0 (QAT, backlog B2: other
+  // weights than the reference) against the CPU on the same file, which
+  // quantizes the activations to Q8_0: cosine 0.9927 and max 3.57 at worst
+  // (case 2, RTX 5090, CUDA and Vulkan alike)
+  COS: array[0..2] of double = (0.98, 0.99, 0.99);
+  MAXABS: array[0..2] of double = (8, 12, 5);
 var
   fn, refdir: TFileName;
   gpu: TInferVulkanBackend;
@@ -4213,18 +4219,24 @@ begin
           [FILES[f], fVk.DeviceName, timer.Stop, dev.DeviceRoutable]));
         CheckUtf8(dev.DeviceRoutable = (model.Config.Experts > 0),
           '% routed on the device', [FILES[f]]);
-        model.Device := dev;
-        CheckDeviceCases(self, model, ref, FormatUtf8('% on the device', [FILES[f]]),
-          COS[f], MAXABS[f]);
-        model.Device := nil;
+        if f = 2 then
+          // QAT: other weights than the float32 reference - against the CPU
+          CheckDeviceAgainstCpu(self, model, dev, ref, FormatUtf8('% on the device',
+            [FILES[f]]), COS[f], MAXABS[f])
+        else
+        begin
+          model.Device := dev;
+          CheckDeviceCases(self, model, ref, FormatUtf8('% on the device', [FILES[f]]),
+            COS[f], MAXABS[f]);
+          model.Device := nil;
+        end;
         FreeAndNil(dev);
         FreeAndNil(model);
       finally
         ref.Free;
       end;
-      // the 12B through TNativeLlmClient on the device (Q4_0 has no shader on
-      // the GPUs yet)
-      if f = 0 then
+      // the 12B through TNativeLlmClient on the device, from Q8_0 and Q4_0
+      if f <> 1 then
       begin
         timer.Start;
         client := TNativeLlmClient.CreateFromGguf(fn, '', gpu);

@@ -5,8 +5,9 @@ loslegen kann. Reihenfolge = grobe Priorität. Stand 2026-11-17.
 
 Erledigte Einträge stehen mit ihrer Nummer (B…, D…) in [`CHANGELOG.md`](../CHANGELOG.md); die
 ausführlichen Berichte in [`native-inference.md`](native-inference.md). Ein erledigter Eintrag
-wird nicht abgehakt, sondern dorthin verschoben. B2 und B16 stehen in beiden Dateien: Der
-CHANGELOG nennt den erledigten Teil, hier steht der offene Rest unter derselben Nummer.
+wird nicht abgehakt, sondern dorthin verschoben. B16 steht in beiden Dateien: Der CHANGELOG
+nennt den erledigten Teil, hier steht der offene Rest unter derselben Nummer. Reste
+erledigter Einträge ohne Termin stehen unter „Weitere Punkte nur bei Bedarf“ (etwa aus B2).
 
 **Für jeden Eintrag gilt** (Regeln aus `CONCEPT.md` §1 und `docs/native-inference.md`):
 
@@ -99,7 +100,7 @@ Gate wie D6: Tiny-Modelle aus transformers, dann die echten Modelle auf CPU und 
 
 **Gemma 4, kleinere Reste:** `suppress_tokens` des 12B (`generation_config.json`, im GGUF
 `tokenizer.ggml.suppress_tokens`: `<image|>`, `<audio|>`) wendet der Client nicht an -
-transformers verbietet sie bei `generate`. Q4_0 auf den GPUs: siehe B2.
+transformers verbietet sie bei `generate`. Q4_0 auf den GPUs: erledigt mit B2 (2026-11-17).
 
 **Offen aus den Reviews von D6e1 und D6e2 (Codex Runde 2, 2026-11-13):** gezielte Tests für
 Randfälle, die kein heutiges Modell erzeugt - eine Scheibe von Gate/Up, die keine ganzen
@@ -130,25 +131,6 @@ Laufzeitzustand und Drafter, ohne Bildteil.
 Llama 3, Mistral: je ein eigener Eintrag, sobald gebraucht. Llama/Mistral brauchen vor allem
 den llama-bpe- bzw. SentencePiece-Tokenizer. Bild- und Videoeingang (Qwen3.8, Gemma 4, Bolt)
 ist nicht Teil von D.
-
----
-
-## B2 — Q4_0: GPU-Kernel und fusionierter CPU-Kernel
-
-Q4_0 läuft auf der CPU (seit 2026-10-17 entpackt nach Q8_0, Decode auf ARM und x64 mindestens
-so schnell wie Q8_0), aber **nicht auf den GPUs**: CUDA und Vulkan haben keinen Q4_0-Kernel
-(„no kernel for a Q4_0 matrix"). Die QAT-Dateien von Gemma 4 sind Q4_0; das 12B Q4_0 läuft
-deshalb nur auf der CPU.
-
-*Vorhaben GPU:* Q4_0 als `dtype` in den Linear-Kerneln von CUDA (`linear8`, `gemm8`,
-`linear8ids`) und Vulkan (`linear8.comp`, `gemm8.comp`, `matvec8.comp`), wie Q5_0 in B16.
-*Gate:* Linear gegen die Referenz (eine Zeile, mehrere Zeilen, Experten), Gemma 4 12B Q4_0 auf
-CUDA und Vulkan gegen die CPU, Gegenproben (Nibble-Reihenfolge, −8 vergessen).
-
-*Nur bei Bedarf (CPU):* ein fusionierter Q4_0×Q8_0-Kernel wie ggml (`ggml_vec_dot_q4_0_q8_0`,
-MIT; NEON: Nibbles maskieren, −8, SDOT; AVX2: `maddubs` mit Vorzeichentrick), ARM-Repacking
-(block_q4_0 verschränkt) oder ein AVX2-`InferQ4Unpack` (höchstens etwa 1 ms je Token) - nur,
-wenn größere Modelle es verlangen.
 
 ---
 
@@ -226,8 +208,8 @@ Nur bei Bedarf:
 - **Q5_1** (Block 24: zusätzlich FP16-Minimum): llama.cpp nimmt es als Ersatz für Q5_K -
   eine Q5_K_M-Datei braucht also zuerst Q5_K. Auf der CPU nicht verlustfrei nach Q8_0
   auszupacken (Wert d · q + m): der Summand m · Summe(x) je Block käme dazu.
-- **`matvec8.comp` für Q5_0**: Vulkan dekodiert Q5_0 mit `linear8`, 8 % langsamer als Q8_0
-  mit `matvec8`.
+- **`matvec8` für Q5_0 und Q4_0** (Vulkan und CUDA): Vulkan dekodiert Q5_0 mit `linear8`, 8 %
+  langsamer als Q8_0 mit `matvec8`; Q4_0 läuft seit B2 (2026-11-17) ebenfalls über `linear8`.
 - **Auspacken mit NEON/AVX2** wie `InferQ4Unpack`: Prefill auf der CPU 4 % langsamer als
   Q8_0 (891 / 931 Tokens/s).
 
@@ -259,6 +241,10 @@ Nur bei Bedarf:
     Messen.
   - *CUDA-Zeit je Kernel:* verworfen (Events im Graphen kosten rund 5 µs je Knoten, siehe B20
     Teil 4); für Einzelzeiten Nsight Systems.
+- **Q4_0 auf der CPU, fusioniert (aus B2):** ein Q4_0×Q8_0-Kernel wie ggml
+  (`ggml_vec_dot_q4_0_q8_0`, MIT; NEON: Nibbles maskieren, −8, SDOT; AVX2: `maddubs` mit
+  Vorzeichentrick), ARM-Repacking (block_q4_0 verschränkt) oder ein AVX2-`InferQ4Unpack`
+  (höchstens etwa 1 ms je Token) - nur, wenn größere Modelle es verlangen.
 - Weitere Ideen ohne Termin: [ideas.md](ideas.md).
 
 ---

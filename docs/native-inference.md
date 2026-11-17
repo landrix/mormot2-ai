@@ -1820,6 +1820,51 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B2 erledigt (2026-11-17): Q4_0 auf den GPUs.** Anlass: Die QAT-Dateien von Gemma 4 sind Q4_0,
+und CUDA wie Vulkan hatten dafür keinen Kernel - das 12B Q4_0 lief nur auf der CPU.
+
+- *Änderung:* Q4_0 als `dtype 7` (18 Bytes: FP16 d, 16 Bytes qs; Wert d · (q − 8), das niedrige
+  Nibble von qs[j & 15] unter 16, das hohe ab 16) wie Q5_0 in B16:
+  - **CUDA (`linear.cu`):** `weight()` und die Zeilenlänge des einfachen Kernels `linear`,
+    `rowBytesOf()` und `weights8()` für `linear8`, `linear8ids` und `gemm8`.
+  - **Vulkan:** `linear.comp` (`weight`, Zeilenlänge), `linear8.comp` (auch `-DIDS`) und
+    `gemm8.comp` (`weights8`, Zeilenlänge).
+  - Bytes einzeln bzw. über `bytes8` (jede Ausrichtung): ein Block beginnt nur auf einem geraden
+    Byte. `LINEAR_DTYPE` in beiden Backends; Zulassung, Modelle und Decoder fragen generisch.
+  - `matvec8` (eine Zeile) bleibt bei Q8_0/Q4_K/Q6_K; Q4_0 dekodiert über `linear8` (B16).
+  - **CUDA, Ausrichtung (Codex-Review):** `EnqueueLinearAt` nimmt jede Gewichtsadresse; eine
+    Q4_0-Matrix hinter einer ungeraden Zahl von Blöcken beginnt nur 2-ausgerichtet, und die
+    schnellen Kernel lesen 32-Bit-Wörter. `LinearShape` nimmt deshalb nur bei einer Adresse,
+    die ein Vielfaches von 4 ist, `gemm8`, `matvec8` und `linear8`, sonst den einfachen Kernel
+    (er liest Bytes). Vulkan lehnt einen solchen Versatz schon ab (`MinStorageAlignment`).
+    Das deckt auch Experten in einem Puffer, deren Länge kein Vielfaches von 4 Bytes ist
+    (eine ungerade Blockzahl bei Q8_0, Q5_0 oder Q4_0): `TQwen3Cuda` rechnet sie dann einzeln
+    über `EnqueueLinearAt`; F32 braucht weiter eine 4-ausgerichtete Adresse.
+  - **Vulkan, Test-Schalter `PlainLinear` (Review):** `linear.comp` lief bisher nur für F32
+    mit einer Eingangszahl, die kein Vielfaches von 8 ist - der Q4_0-, Q5_0- und MXFP4-Zweig
+    dort war nie getestet. `PlainLinear` schickt jeden Linear dorthin; `LinearMatchesReference`
+    hat dafür einen siebten Durchgang.
+- *Tests:* `LinearMatchesReference` (CUDA und Vulkan) mit Q4_0 in allen Formen und allen
+  Kernel-Arten, auf Vulkan mit `PlainLinear` auch `linear.comp` (Zeilen ungerader Blockzahl
+  nur 2-ausgerichtet); CUDA zusätzlich Q4_0 über `EnqueueLinearAt` bei Versatz 2 und 18, eine
+  und 20 Zeilen; `LinearIdsMatchesReference` mit
+  Q4_0-Experten bei 256 und 896 Eingängen; die alte Erwartung „Q4_0 bleibt auf der CPU“
+  entfällt. `Gemma4OnDevice` nimmt `gemma-4-12b-it-q4_0.gguf` dazu: Die QAT-Gewichte sind andere
+  als die der float32-Referenz (gegen sie Kosinus 0,36 bis 0,78 auf CPU wie GPU), deshalb neu
+  `CheckDeviceAgainstCpu` - dieselbe Datei auf der CPU und dem Gerät, Logits der letzten
+  Position. Gemessen Kosinus 0,9927 bis 0,9996, Abstand höchstens 3,57 (die CPU quantisiert die
+  Aktivierungen nach Q8_0); Grenzen 0,99 und 5. Der Client läuft auf dem Gerät mit Q8_0 und
+  Q4_0.
+- *Gegenprobe:* (1) Versatz 7 statt 8, (2) Nibbles vertauscht, je in allen fünf
+  Q4_0-Abschnitten: CUDA 48 / 872 (`LinearMatchesReference`) und 4 / 40 (Experten), Vulkan
+  77 / 1.487 und 8 / 72 - jede Q4_0-Form in jeder Kernel-Art, `linear.comp` eingeschlossen;
+  echt 0. (3) Ohne die Ausrichtungsprüfung in `LinearShape`: `CUDA_ERROR_MISALIGNED_ADDRESS`
+  beim Versatz 2.
+- *Tempo (RTX 5090, aus den Geräte-Tests):* 24 Tokens mit Q4_0 auf CUDA 0,56 s, Vulkan
+  0,52–0,54 s; Q8_0 0,55–0,62 s. Laden 9–10 s statt 16–17 s (7,2 statt 12,7 GB).
+- *Läufe:* RTX 5090 FPC 0 / 18.193, Delphi 13 0 / 18.193, Delphi 7 0 / 6.963; Mac M2 (MoltenVK)
+  0 / 9.119; Adreno X1-85 (FPC 3.3.1 aarch64) Vulkan-Linear 0 / 1.487, 0 / 72 und 0 / 21 (`LinearInParts`).
+
 **B20 abgeschlossen (2026-11-17): Messungen zum Rest.** RTX 5090, Qwen3.8-27B Q4_K_M,
 `llm-bench` 200/256, je Variante abwechselnd, nach einem Aufwärmlauf.
 
@@ -2284,8 +2329,8 @@ denselben Schritten wie CUDA in D6e1.
   - **Laden:** 26B-A4B in 35 s, 12B in 16 s (die Datei, dann der Upload).
   - **Speicher:** Das 26B-A4B in Q8_0 belegt gut 25 GB der 32 GB. Das 31B in Q8_0
     (33 GB) passt nicht.
-- *Nicht auf dem Gerät:* Q4_0 (keine GPU hat bisher einen Q4_0-Kernel; Backlog). Der
-  Client auf dem Gerät läuft deshalb mit dem 12B in Q8_0.
+- *Nicht auf dem Gerät:* Q4_0 (keine GPU hatte damals einen Q4_0-Kernel; seit B2,
+  2026-11-17, auf CUDA und Vulkan). Der Client auf dem Gerät lief deshalb mit dem 12B in Q8_0.
 - *Tests* (`test.infer.cuda`):
   - **`OpsMatchCpu`:**
     - Köpfe von 512 (16 Köpfe auf 2 KV-Köpfen mit K=V und ein Viertel drehend, 4 auf

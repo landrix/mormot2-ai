@@ -154,7 +154,7 @@ const
   // MXFP4;
   // 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
-    0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 3, 4, 5, 6);
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 7, 3, 4, 5, 6);
 
   /// the threads of a block of linear, linear8 and matvec8 in tools/cuda/linear.cu
   LINEAR_BLOCK = 128;
@@ -197,8 +197,14 @@ procedure TInferCudaBackend.LinearShape(aType: TInferDType; aIn, aRows,
   out aX, aY, aBlock: cardinal);
 var
   f: PtrInt;
+  whole: boolean;
 begin
-  if fFastLinear and (aRows >= GEMM_ROWS) and (aIn and 31 = 0) then
+  // the fast kernels read the weights as 32-bit words from a 4-aligned
+  // address; EnqueueLinearAt may name any one (a Q4_0 matrix behind an odd
+  // number of 18-byte blocks starts 2-aligned only, review B2): the plain
+  // kernel then, which reads bytes
+  whole := aWeight and 3 = 0;
+  if fFastLinear and whole and (aRows >= GEMM_ROWS) and (aIn and 31 = 0) then
   begin
     // 64 rows x 64 features per block
     aKernel := fGemm8;
@@ -206,7 +212,7 @@ begin
     aY := (aRows + 63) shr 6;
     aBlock := GEMM_BLOCK;
   end
-  else if fFastLinear and fUseMatvec and (aRows = 1) and
+  else if fFastLinear and whole and fUseMatvec and (aRows = 1) and
           (aType in [idtQ8_0, idtQ4_K, idtQ6_K]) and
           ((aType <> idtQ4_K) or (aWeight and 15 = 0)) then
   begin
@@ -219,7 +225,7 @@ begin
     aY := 1;
     aBlock := LINEAR_BLOCK;
   end
-  else if fFastLinear and ((aType <> idtF32) or (aIn and 7 = 0)) then
+  else if fFastLinear and whole and ((aType <> idtF32) or (aIn and 7 = 0)) then
   begin
     // 8 weights per step: every block type qualifies, F32 when aIn allows;
     // 4 features (one per warp) x 8 rows per block

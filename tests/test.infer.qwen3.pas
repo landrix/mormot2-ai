@@ -290,6 +290,15 @@ function RotaryMatches(aModel: TDecoderModel; aRef: TInferRefSet;
 procedure CheckDeviceCases(aTest: TSynTestCase; aModel: TDecoderModel;
   aRef: TInferRefSet; const aLabel: RawUtf8; aCos, aMaxAbs: double);
 
+/// the prompts of a reference (case0 .. case3) on aModel twice - with
+// aDevice and on its CPU backend (Device nil) - and the logits of the last
+// position compared (cosine at least aCos, no value off by more than aMaxAbs):
+// for a file whose own reference does not exist (Gemma 4 QAT Q4_0, backlog
+// B2); aModel.Device is nil afterwards
+procedure CheckDeviceAgainstCpu(aTest: TSynTestCase; aModel: TDecoderModel;
+  aDevice: TDecoderDevice; aRef: TInferRefSet; const aLabel: RawUtf8;
+  aCos, aMaxAbs: double);
+
 /// aDoc.D[aName] := aValue - which FPC 3.2.4 on aarch64-darwin compiles to
 // store 0 (TDocVariantData.SetDoubleByName): through a variant instead
 procedure SetFloat(var aDoc: TDocVariantData; const aName: RawUtf8; aValue: double);
@@ -5260,6 +5269,52 @@ begin
       [aLabel, k, cmp.MaxAbs]);
     aTest.CheckUtf8((diff >= m) or (margin < 1), '% case % greedy leaves the ' +
       'reference at step % where it was % sure', [aLabel, k, diff, margin]);
+  end;
+end;
+
+procedure CheckDeviceAgainstCpu(aTest: TSynTestCase; aModel: TDecoderModel;
+  aDevice: TDecoderDevice; aRef: TInferRefSet; const aLabel: RawUtf8;
+  aCos, aMaxAbs: double);
+var
+  ctx: TDecoderContext;
+  ids: PIntegerArray;
+  prompt: TIntegerDynArray;
+  cpu, dev: TSingleDynArray;
+  cmp: TInferCompare;
+  k, n, pass: PtrInt;
+begin
+  SetLength(cpu, aModel.Config.VocabSize);
+  SetLength(dev, aModel.Config.VocabSize);
+  for k := 0 to 3 do
+  begin
+    ids := aRef.I32(FormatUtf8('case%.ids', [k]), n);
+    SetLength(prompt, n);
+    MoveFast(ids^, prompt[0], n * SizeOf(integer));
+    for pass := 0 to 1 do
+    begin
+      if pass = 0 then
+        aModel.Device := nil
+      else
+        aModel.Device := aDevice;
+      ctx := aModel.NewContext;
+      try
+        if pass = 0 then
+          aModel.Forward(ctx, pointer(prompt), n, pointer(cpu))
+        else
+          aModel.Forward(ctx, pointer(prompt), n, pointer(dev));
+      finally
+        ctx.Free;
+      end;
+    end;
+    aModel.Device := nil;
+    cmp := InferCompare(pointer(dev), pointer(cpu), aModel.Config.VocabSize, 1, 0);
+    aTest.AddConsole(FormatString('% case %: % tokens, logits against the CPU ' +
+      'cos % maxabs %', [aLabel, k, n, cmp.Cosine, cmp.MaxAbs]));
+    aTest.CheckUtf8(cmp.NonFinite = 0, '% case % logits finite', [aLabel, k]);
+    aTest.CheckUtf8(cmp.Cosine >= aCos, '% case % logits cosine against the CPU %',
+      [aLabel, k, cmp.Cosine]);
+    aTest.CheckUtf8(cmp.MaxAbs <= aMaxAbs, '% case % logits max error against ' +
+      'the CPU %', [aLabel, k, cmp.MaxAbs]);
   end;
 end;
 
