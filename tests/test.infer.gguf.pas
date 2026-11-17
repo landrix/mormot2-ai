@@ -69,6 +69,9 @@ type
     /// Q5_0 weights of ggml's reference quantizer dequantize exactly and give
     // the Q5_0 Linear of ggml-cpu
     procedure Q5LikeGgml;
+    /// Q5_1 weights of ggml's reference quantizer dequantize exactly and give
+    // the Q5_1 Linear of ggml-cpu (Q8_1 activations there: a tolerance)
+    procedure Q51LikeGgml;
     /// MXFP4 weights of ggml's reference quantizer dequantize exactly (also
     // with exponents outside the range the CPU computes exactly) and give the
     // MXFP4 Linear of ggml-cpu
@@ -596,6 +599,62 @@ begin
     // ggml sums in single, we in double: the integer block sums are the same
     cmp := InferCompare(pointer(out), y, rows * nout, 1e-5, 1e-5);
     CheckUtf8(InferCompareOk(cmp), 'Q5_0 linear like ggml: %', [InferCompareText(cmp)]);
+  finally
+    ref.Free;
+  end;
+end;
+
+procedure TTestInferGguf.Q51LikeGgml;
+var
+  ref: TInferRefSet;
+  dir: TFileName;
+  x, b, y, deq: PSingleArray;
+  blocks, w: PByteArray;
+  t: PInferRefTensor;
+  n, m, rows, cols, nin, nout, r: PtrInt;
+  out, row: TSingleDynArray;
+  cmp: TInferCompare;
+begin
+  CheckUtf8(GgufTensorType(7) = idtQ5_1, 'ggml type 7 is Q5_1');
+  dir := FindInferRefDir('q51');
+  if CheckFailed(dir <> '', 'q51 found') then
+    exit;
+  ref := TInferRefSet.CreateFromFolder(dir);
+  try
+    // blocks of quantize_row_q5_1_ref - every q from 0 to 31, a zero block,
+    // tiny and large rows, a repeated value (d = 0), a positive minimum -
+    // dequantize to the values of dequantize_row_q5_1: d * q + m
+    t := ref.Tensor('quant/x');
+    rows := t^.Shape[0];
+    cols := t^.Shape[1];
+    blocks := ref.U8('quant/blocks', m);
+    CheckEqual(m, rows * (cols div 32) * SizeOf(TInferBlockQ5_1), 'block bytes');
+    deq := ref.F32('dequant/y', n);
+    SetLength(row, cols);
+    for r := 0 to rows - 1 do
+    begin
+      InferRowToF32(blocks, idtQ5_1, r, cols, pointer(row));
+      cmp := InferCompare(pointer(row), @deq^[r * cols], cols, 0, 0);
+      CheckUtf8(InferCompareOk(cmp), 'dequantized row %: %', [r, InferCompareText(cmp)]);
+    end;
+    // the Linear against ggml_vec_dot_q5_1_q8_1: the same integer block sums,
+    // but ggml takes d * sum(qx) of the activations rounded to FP16 (Q8_1),
+    // the engine computes it exactly from the Q8_0 blocks
+    t := ref.Tensor('linear/x');
+    rows := t^.Shape[0];
+    nin := t^.Shape[1];
+    nout := ref.Tensor('linear/bias')^.Shape[0];
+    x := ref.F32('linear/x', n);
+    b := ref.F32('linear/bias', n);
+    y := ref.F32('linear/y', n);
+    w := ref.U8('linear/weight', n);
+    CheckUtf8(fCpu.Supports(ioLinear, idtQ5_1), 'the CPU backend takes Q5_1');
+    SetLength(out, rows * nout);
+    fCpu.Linear(x, rows, nin, InferWeight(w, idtQ5_1), nout, b, pointer(out));
+    // measured 2026-11-17: at most 1.4e-3 apart on values up to 30 (rel 8e-5)
+    cmp := InferCompare(pointer(out), y, rows * nout, 2e-3, 2e-4);
+    AddConsole('Q5_1 linear against ggml: %', [InferCompareText(cmp)]);
+    CheckUtf8(InferCompareOk(cmp), 'Q5_1 linear like ggml: %', [InferCompareText(cmp)]);
   finally
     ref.Free;
   end;

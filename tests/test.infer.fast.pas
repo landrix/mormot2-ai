@@ -72,6 +72,10 @@ type
     /// Q5_0 Linear: the unpacking against its definition, exact = the
     // reference bit for bit, the float path within tolerance
     procedure LinearQ5MatchesReference;
+    /// Q5_1 Linear: the unpacking and dequantization against their definition,
+    // the reference against the dequantized weights, exact = the reference bit
+    // for bit, the float path within tolerance
+    procedure LinearQ51MatchesReference;
     /// MXFP4 Linear: the unpacking against its definition (every byte, every
     // exponent), exact = the reference bit for bit, the float path within
     // tolerance
@@ -116,6 +120,9 @@ function RandomQ8(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 function RandomQ4(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// Q5_0 weights [aOut, aIn] with random scales, nibbles and fifth bits
 function RandomQ5(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+/// Q5_1 weights [aOut, aIn] with random scales, minimums of both signs,
+// nibbles and fifth bits
+function RandomQ51(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// MXFP4 weights [aOut, aIn] with random nibbles and exponents in 110..140
 function RandomMxfp4(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
 /// random K-quant rows (Q4_K, Q6_K): every bit pattern, finite scales
@@ -227,6 +234,33 @@ begin
   begin
     aSeed := aSeed * 1103515245 + 12345;
     blk^.d := InferSingleToHalf((integer((aSeed shr 8) and 1023) - 512) / 16384 + 1e-4);
+    for j := 0 to 3 do
+    begin
+      aSeed := aSeed * 1103515245 + 12345;
+      blk^.qh[j] := aSeed shr 24;
+    end;
+    for j := 0 to 15 do
+    begin
+      aSeed := aSeed * 1103515245 + 12345;
+      blk^.qs[j] := aSeed shr 24;
+    end;
+    inc(blk);
+  end;
+end;
+
+function RandomQ51(aOut, aIn: PtrInt; aSeed: cardinal): RawByteString;
+var
+  b, j: PtrInt;
+  blk: PInferBlockQ5_1;
+begin
+  SetLength(result, aOut * (aIn div 32) * SizeOf(TInferBlockQ5_1));
+  blk := pointer(result);
+  for b := 0 to aOut * (aIn div 32) - 1 do
+  begin
+    aSeed := aSeed * 1103515245 + 12345;
+    blk^.d := InferSingleToHalf(integer((aSeed shr 8) and 1023) / 32768 + 1e-4);
+    aSeed := aSeed * 1103515245 + 12345;
+    blk^.m := InferSingleToHalf((integer((aSeed shr 8) and 1023) - 512) / 1024);
     for j := 0 to 3 do
     begin
       aSeed := aSeed * 1103515245 + 12345;
@@ -876,6 +910,122 @@ begin
       nil, pointer(y1));
     e := RelError(pointer(y3), pointer(y1), rows * nout);
     CheckUtf8(e <= 2e-6, 'Q5_0 float % x % x %: relative error %', [rows, nin, nout, e]);
+  end;
+end;
+
+procedure TTestInferFast.LinearQ51MatchesReference;
+const
+  // rows, in, out: as LinearQ5MatchesReference (partial tiles, 896 inputs,
+  // 136 blocks per row beyond the tile buffer on the stack)
+  SHAPES: array[0..5, 0..2] of integer = (
+    (1, 32, 1), (3, 96, 17), (37, 896, 33), (64, 1024, 100), (1, 896, 70),
+    (2, 4352, 20));
+var
+  i, j, k, b, r, o, rows, nin, nout: PtrInt;
+  x, bias, y1, y2, y3, row, wf: TSingleDynArray;
+  xq: array of TInferBlockQ8_0;
+  wq: RawByteString;
+  e, acc, worst: double;
+  q51: array[0..15] of TInferBlockQ5_1;
+  q8: array[0..15] of TInferBlockQ8_0;
+  qh: cardinal;
+  want: single;
+  ok: boolean;
+begin
+  // the unpacking against the definition of a Q5_1 value: every byte value
+  // in the nibbles, every fifth bit set and clear
+  for i := 0 to 15 do
+  begin
+    q51[i].d := i * 7 + 1;
+    q51[i].m := $3c00 + i * 37; // 1 and above
+    if i and 1 <> 0 then
+      q51[i].m := q51[i].m or $8000; // and below -1
+    for j := 0 to 15 do
+      q51[i].qs[j] := i * 16 + j;
+    qh := cardinal(i) * 2654435761 xor $A5A5A5A5;
+    if i = 0 then
+      qh := 0
+    else if i = 1 then
+      qh := $FFFFFFFF;
+    for j := 0 to 3 do
+      q51[i].qh[j] := (qh shr (j * 8)) and 255;
+  end;
+  InferQ51ToQ8(@q51, 16, @q8);
+  ok := true;
+  SetLength(row, 32);
+  for i := 0 to 15 do
+  begin
+    if q8[i].d <> q51[i].d then
+      ok := false;
+    qh := q51[i].qh[0] or (cardinal(q51[i].qh[1]) shl 8) or
+      (cardinal(q51[i].qh[2]) shl 16) or (cardinal(q51[i].qh[3]) shl 24);
+    for k := 0 to 31 do
+    begin
+      if k < 16 then
+        j := q51[i].qs[k] and 15
+      else
+        j := q51[i].qs[k - 16] shr 4;
+      j := j + PtrInt((qh shr k) and 1) * 16;
+      if q8[i].qs[k] <> j then
+        ok := false;
+    end;
+    // and the dequantization: d * q + m per value, rounded once to single
+    InferRowToF32(@q51, idtQ5_1, i, 32, pointer(row));
+    for k := 0 to 31 do
+    begin
+      want := InferHalfToSingle(q51[i].d) * q8[i].qs[k] + InferHalfToSingle(q51[i].m);
+      if row[k] <> want then
+        ok := false;
+    end;
+  end;
+  Check(ok, 'InferQ51ToQ8 and InferRowToF32 = d * q + m for all values');
+  for i := 0 to high(SHAPES) do
+  begin
+    rows := SHAPES[i, 0];
+    nin := SHAPES[i, 1];
+    nout := SHAPES[i, 2];
+    Fill(x, rows * nin, 511 + i, 3);
+    Fill(bias, nout, 531 + i, 1);
+    wq := RandomQ51(nout, nin, 541 + i);
+    SetLength(y1, rows * nout);
+    SetLength(y2, rows * nout);
+    SetLength(y3, rows * nout);
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ5_1), nout,
+      pointer(bias), pointer(y1));
+    fExact.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ5_1), nout,
+      pointer(bias), pointer(y2));
+    CheckUtf8(SameBits(pointer(y1), pointer(y2), rows * nout), 'Q5_1 exact % x % x %',
+      [rows, nin, nout]);
+    // the reference against the dequantized weights times the Q8_0
+    // activations: the same sum in another order (a wrong m term would not be)
+    SetLength(wf, nout * nin);
+    for o := 0 to nout - 1 do
+      InferRowToF32(pointer(wq), idtQ5_1, o, nin, @wf[o * nin]);
+    SetLength(xq, nin shr 5);
+    worst := 0;
+    for r := 0 to rows - 1 do
+    begin
+      InferQuantizeRowQ8_0(@x[r * nin], nin, pointer(xq));
+      for o := 0 to nout - 1 do
+      begin
+        acc := bias[o];
+        for b := 0 to (nin shr 5) - 1 do
+          for k := 0 to 31 do
+            acc := acc + wf[o * nin + b * 32 + k] *
+              (InferHalfToSingle(xq[b].d) * xq[b].qs[k]);
+        e := abs(acc - y1[r * nout + o]) / (abs(acc) + 1);
+        if e > worst then
+          worst := e;
+      end;
+    end;
+    CheckUtf8(worst <= 1e-5, 'Q5_1 reference % x % x % against the dequantized ' +
+      'weights: %', [rows, nin, nout, worst]);
+    fFast.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ5_1), nout,
+      nil, pointer(y3));
+    fRef.Linear(pointer(x), rows, nin, InferWeight(pointer(wq), idtQ5_1), nout,
+      nil, pointer(y1));
+    e := RelError(pointer(y3), pointer(y1), rows * nout);
+    CheckUtf8(e <= 2e-6, 'Q5_1 float % x % x %: relative error %', [rows, nin, nout, e]);
   end;
 end;
 

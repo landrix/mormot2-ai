@@ -15,7 +15,7 @@
 // - head_dim comes from the configuration: Qwen3-0.6B has 16 heads of 128 for
 //   a hidden size of 1024, not 1024 / 16
 // - or a llama.cpp GGUF file of the qwen3 architecture (CreateFromGguf): its
-//   metadata for the settings, its Q8_0 / Q4_0 / Q5_0 / Q4_K / Q6_K matrices
+//   metadata for the settings, its Q8_0 / Q4_0 / Q5_0 / Q5_1 / Q4_K / Q6_K matrices
 //   used in place
 // - TQwen2Model: Qwen2 and Qwen2.5 (model_type and GGUF architecture qwen2,
 //   looked up in modeling_qwen2.py): the same decoder with a bias on the Q, K

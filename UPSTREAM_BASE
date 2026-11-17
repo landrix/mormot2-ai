@@ -140,6 +140,15 @@ never a build input.
            of llm_graph_context::build_moe_ffn (src/llama-graph.cpp)
            -> mormot.ai.infer.tensor / backend.cpu / model.gptoss. Checked
            bit-exactly against the lembed oracle build (dataset mxfp4).
+  Followed (backlog B16, written anew - no code taken): the blocks Q5_0 (d, qh[4],
+           qs[16]; d * (q - 16)) and Q5_1 (d, m, qh[4], qs[16]; d * q + m) of
+           ggml/src/ggml-common.h, and the split of ggml_vec_dot_q5_1_q8_1 into a d
+           part and m * (the activation block sum) -> mormot.ai.infer.tensor /
+           backend.cpu and the GPU kernels. Checked against the lembed oracle build
+           (datasets q5 and q51: dequantization bit-exact, the Linear within the FP16
+           rounding of Q8_1's sum). tools/infer-ref/quantize_q5_1.py calls gguf-py's
+           Q5_1 quantizer from a llama.cpp checkout at run time (commit
+           2a4daf0e08d6a9b6993ee0d4a9a3cfc35a6f405c); nothing of it is copied.
 
 ## GPU: Vulkan (phase 4)
 

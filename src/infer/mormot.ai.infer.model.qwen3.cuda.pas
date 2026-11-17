@@ -220,8 +220,8 @@ type
     procedure EnqueueDeltaNet(aCtx: TQwen3CuContext; aLayer, aRows: PtrInt);
   public
     /// upload every weight of aModel to the device of aBackend; raises
-    // EInferError when a matrix type has no kernel (F32, Q8_0, Q5_0, Q4_K and
-    // Q6_K have one)
+    // EInferError when a matrix type has no kernel (F32 and the GGUF block
+    // types have one)
     // - aModel and aBackend are not owned and must outlive this instance
     constructor Create(aModel: TDecoderModel; aBackend: TInferCudaBackend);
     destructor Destroy; override;

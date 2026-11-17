@@ -9,7 +9,7 @@
 //   features), then each invocation adds 4 rows x 4 features from them -
 //   every loaded value serves 64 products instead of 8 (linear8.comp reads
 //   the activations from global memory for each feature)
-// - needs nin to be a multiple of 32 (F32, Q8_0, Q5_0, Q4_0) / 256 (K-quants): the
+// - needs nin to be a multiple of 32 (F32, Q8_0, Q5_0, Q4_0, Q5_1) / 256 (K-quants): the
 //   backend takes linear8.comp otherwise
 #version 450
 
@@ -24,7 +24,8 @@ layout(std430, binding = 1) readonly buffer BufX { vec4 x[]; };
 layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 
-// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0, 6 = MXFP4, 7 = Q4_0
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0, 6 = MXFP4, 7 = Q4_0,
+// 8 = Q5_1
 // (TInferVulkanBackend)
 layout(push_constant) uniform Push {
   uint rows, nin, nout, dtype, hasBias;
@@ -191,6 +192,24 @@ void weights8(uint rowBase, uint e, out float wv[8])
       wv[k + 4u] = d * float(int((u8(q.y, k) >> sh) & 15u) - 8);
     }
   }
+  else if (p.dtype == 8u)
+  {
+    // Q5_1: 24 bytes per 32 values - d, m, qh[4], qs[16]; value = d * q + m,
+    // q packed as in Q5_0 (the 8 fifth bits one byte of qh)
+    uint base = rowBase + (e >> 5) * 24u;
+    uint j = e & 31u;
+    float d = halfAt(base);
+    float m = halfAt(base + 2u);
+    uint hb = byteAt(base + 4u + (j >> 3));
+    uvec2 q = bytes8(base + 8u + (j & 15u));
+    uint sh = j >= 16u ? 4u : 0u;
+    for (uint k = 0u; k < 4u; k++)
+    {
+      wv[k] = d * float(((u8(q.x, k) >> sh) & 15u) | (((hb >> k) & 1u) << 4)) + m;
+      wv[k + 4u] = d * float(((u8(q.y, k) >> sh) & 15u) |
+        (((hb >> (k + 4u)) & 1u) << 4)) + m;
+    }
+  }
   else
   {
     // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d
@@ -235,6 +254,8 @@ void main()
     rowBytes = (p.nin >> 5) * 17u;
   else if (p.dtype == 7u)
     rowBytes = (p.nin >> 5) * 18u;
+  else if (p.dtype == 8u)
+    rowBytes = (p.nin >> 5) * 24u;
   else
     rowBytes = (p.nin >> 8) * 210u;
   // staging: invocation t loads 8 consecutive inputs of row / feature t / 4

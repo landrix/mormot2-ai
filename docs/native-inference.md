@@ -1820,6 +1820,52 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B16 Q5_1 erledigt (2026-11-17).** Anlass: Abschluss Inferenz, Punkt 7a. llama.cpp schreibt Q5_1
+etwa als Ersatz in Q5_K_M-Dateien; offizielle Q5_1-Dateien gibt es kaum.
+
+- *Block:* 24 Bytes - d, m (je FP16), qh[4], qs[16]; Wert d · q + m, q (0..31) gepackt wie
+  Q5_0. `idtQ5_1` (GGUF-Typ 7, GPU-`dtype 8`), `INFER_DTYPE_SIZE/BLOCK/NAME`,
+  `INFER_BLOCK_DTYPES`; `InferRowToF32` rechnet d · q + m (d · q exakt, die Summe einmal
+  gerundet - in double exakt, beide Halbwerte zwischen 2⁻²⁴ und 2¹⁶ -, also auf jedem
+  Compiler dieselben Bits, auch Delphi 7 mit x87). `CheckScales` prüft auch m auf NaN und
+  Unendlich.
+- *CPU:* nicht verlustfrei nach Q8_0 auszupacken. `InferQ51ToQ8` packt d und q (0..31) als
+  Q8_0 aus; die vorhandenen Q8_0-Kernel rechnen den d-Teil, danach kommt je Block
+  m · dx · Σqx dazu (dx · Σqx exakt in double, je Aktivierungsblock einmal). Die Referenz
+  rechnet erst den d-Teil über alle Blöcke, dann den m-Teil in Blockreihenfolge; Exact tut
+  dasselbe nach seinem Kernel und ist damit bitgleich. ggml rechnet mit Q8_1-Aktivierungen,
+  deren Summe s als FP16 gerundet ist: gegen ggml eine Toleranz (gemessen höchstens 1,4e-3
+  bei Werten bis 30, relativ 8e-5).
+- *GPU:* `dtype 8` in CUDA `linear`, `linear8`, `linear8ids`, `gemm8` und Vulkan `linear`,
+  `linear8` (auch `-DIDS`), `gemm8` - das qh-Byte wie bei Q5_0 einzeln (Adreno). `matvec8`
+  bleibt bei Q8_0/Q4_K/Q6_K (7b).
+- *Modell:* Keine offizielle Datei, deshalb `tools/infer-ref/quantize_q5_1.py`: jede Q8_0-Matrix
+  von Qwens `qwen3-0.6b-q8_0.gguf` aus den BF16-Gewichten von `model.safetensors` neu nach
+  Q5_1 (gguf-py, die numpy-Form von `quantize_row_q5_1_ref`, wie `llama-quantize --pure`),
+  Normen, Metadaten und Tokenizer unverändert, `general.file_type` 9. Jede Quellmatrix vorher
+  gegen ihre Q8_0-Form geprüft (Grenze Kosinus 0,99, gemessen 0,9998 im schlechtesten Fall) - eine
+  falsch zugeordnete Matrix läge nahe 0. SHA-256: `model.safetensors`
+  `f47f7117…`, `qwen3-0.6b-q8_0.gguf` `9465e63a…`, Ergebnis `qwen3-0.6b-q5_1.gguf`
+  `5741d60a75b39ee880b0d1d260f5a094a62f5044e02036e55151e3c15a9f0d0a` (453 MB, Q8_0 640 MB);
+  197 Matrizen Q5_1, 113 F32.
+- *Gate in zwei Stufen:* (1) gegen ggml selbst - Datensatz `q51` aus der lembed-Orakel-Build
+  (`quantize_row_q5_1_ref`, `dequantize_row_q5_1`, `ggml_vec_dot_q5_1_q8_1`): Entquantisieren
+  bitgleich, Linear in der Toleranz oben. (2) gegen FP32 (`Qwen3GgufQ51`): jede Matrix nahe
+  ihren BF16-Gewichten (Kosinus mindestens 0,9992, Grenze 0,998), Logits Kosinus 0,979
+  (chat_en) bis 0,991, Abstand höchstens 4,3 (Grenzen 0,97 und 5,5); greedy weicht nur ab,
+  wo die Referenz höchstens 0,65 sicher war (Grenze 1 wie Q8_0). Auf dem Gerät gegen die CPU
+  (`Qwen3GgufMatchesCpu`): Kosinus 0,9995 auf CUDA und Vulkan, argmax 16 von 16.
+- *Tests:* `LinearQ51MatchesReference` (Auspacken und `InferRowToF32` gegen die Definition, die
+  Referenz gegen die entquantisierten Gewichte, Exact bitgleich, Float-Pfad), `Q51LikeGgml`,
+  m als Skala im Tiny-GGUF-Test; GPU `LinearMatchesReference` und `LinearIdsMatchesReference`
+  mit Q5_1 (bei 256 und 896 Eingängen).
+- *Gegenprobe:* (A) Referenz ohne m-Teil und `CheckScales` ohne m, (B) Exact ohne den letzten
+  m-Block und `InferRowToF32` ohne m, (C) falsche fünfte Bits beim Auspacken, (D) GPU ohne m,
+  (E) GPU liest das fünfte Bit aus dem falschen Byte: jede fällt durch - CPU 7 bis 19 / 19,
+  ggml 1 bis 6 / 11, Skalen 2 / 28; GPU CUDA 44 / 1.004 (jede Q5_1-Form in allen vier
+  Kernel-Arten) und 4 / 48, Vulkan 77 / 1.718 (sieben Arten) und 8 / 88; echt 0.
+- *Läufe:* RTX 5090 FPC 0 / 18.643, Delphi 13 0 / 18.643, Delphi 7 0 / 7.244; Mac M2 0 / 9.427; Adreno (ARM64, FPC 3.3.1) CPU-Q5_1-Tests 0 / 19, 0 / 11, 0 / 28 und Vulkan 0 / 1.718, 0 / 88, 0 / 21. Ein Test verglich zunächst den Ausdruck d · q + m ungerundet mit dem single-Wert; auf ARM64 und mit Delphi Win64 (Zwischenlauf 1 / 18.643) fiel das auf - der Erwartungswert steht jetzt in einer single-Variable.
+
 **B2 erledigt (2026-11-17): Q4_0 auf den GPUs.** Anlass: Die QAT-Dateien von Gemma 4 sind Q4_0,
 und CUDA wie Vulkan hatten dafür keinen Kernel - das 12B Q4_0 lief nur auf der CPU.
 

@@ -723,8 +723,8 @@ type
     constructor Create(const aFolder: TFileName; aBackend: TInferBackend;
       aWeights: TInferDType = idtF32); virtual;
     /// load a llama.cpp GGUF file of the architecture: the settings from its
-    // metadata, every matrix as stored (Q8_0, Q4_0, Q5_0, Q4_K and Q6_K used
-    // in place, F16 and BF16 widened to F32), a head tied to token_embd when the
+    // metadata, every matrix as stored (Q8_0, Q4_0, Q5_0, Q5_1, Q4_K, Q6_K and
+    // MXFP4 used in place, F16 and BF16 widened to F32), a head tied to token_embd when the
     // file has no output.weight
     // - raises EInferError for another architecture, a tensor of another type
     // or shape, a scale that is not finite, or a tensor not understood
@@ -2146,11 +2146,11 @@ begin
   end;
   size := INFER_DTYPE_SIZE[t^.DType];
   // where the half-float scales sit: d first (Q8_0, Q4_0, Q5_0), d and dmin first
-  // (Q4_K), d last (Q6_K)
+  // (Q4_K), d and m first (Q5_1), d last (Q6_K)
   first := 0;
   second := -1;
   case t^.DType of
-    idtQ4_K:
+    idtQ4_K, idtQ5_1:
       second := 2;
     idtQ6_K:
       first := SizeOf(TInferBlockQ6_K) - 2;
@@ -2211,7 +2211,7 @@ begin
     // a GGUF file decides: blocks in place, F32 in place, F16 / BF16 widened
     t := Checked(aName, [aRows, aCols], true);
     case t^.DType of
-      idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K, idtMXFP4:
+      idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K, idtMXFP4, idtQ5_1:
         begin
           CheckScales(t, aName, self);
           result := InferWeight(t^.Data, t^.DType);

@@ -42,6 +42,8 @@ type
   // - idtMXFP4 is the OCP microscaling FP4 type: 32 E2M1 values share one
   // power-of-two scale (see TInferBlockMxfp4) - a GGUF type, and the layout
   // the engine repacks the *_blocks / *_scales of a safetensors checkpoint into
+  // - idtQ5_1 is the GGUF block type of 32 values with an FP16 scale and an
+  // FP16 minimum (see TInferBlockQ5_1)
   TInferDType = (
     idtUnknown,
     idtF32,
@@ -56,7 +58,8 @@ type
     idtQ4_K,
     idtQ6_K,
     idtQ5_0,
-    idtMXFP4);
+    idtMXFP4,
+    idtQ5_1);
 
   /// one Q8_0 block as ggml stores it: value[i] = d * qs[i]
   // - d is an IEEE half float (raw bits), 34 bytes per 32 elements
@@ -95,6 +98,20 @@ type
   TInferBlockQ5_0Array = array[0..(MaxInt div SizeOf(TInferBlockQ5_0)) - 1] of
     TInferBlockQ5_0;
   PInferBlockQ5_0Array = ^TInferBlockQ5_0Array;
+
+  /// one Q5_1 block as ggml stores it: value[i] = d * q[i] + m, q in 0..31
+  // - d and m are IEEE half floats (raw bits); q packed as in Q5_0 (low 4 bits
+  // in the nibbles of qs, the fifth bit of q[i] bit i of qh) - 24 bytes per
+  // 32 elements
+  TInferBlockQ5_1 = packed record
+    d, m: word;
+    qh: array[0..3] of byte;
+    qs: array[0..15] of byte;
+  end;
+  PInferBlockQ5_1 = ^TInferBlockQ5_1;
+  TInferBlockQ5_1Array = array[0..(MaxInt div SizeOf(TInferBlockQ5_1)) - 1] of
+    TInferBlockQ5_1;
+  PInferBlockQ5_1Array = ^TInferBlockQ5_1Array;
 
   /// one MXFP4 block as ggml stores it: value[i] = 2^(e - 128) * k[q[i]],
   // with k the E2M1 values doubled (INFER_MXFP4_VALUES) - so 2^(e - 127) times
@@ -168,19 +185,20 @@ type
 const
   /// size in bytes of one block of each type (0 = unknown)
   INFER_DTYPE_SIZE: array[TInferDType] of byte = (
-    0, 4, 2, 2, 4, 8, 1, 1, 34, 18, 144, 210, 22, 17);
+    0, 4, 2, 2, 4, 8, 1, 1, 34, 18, 144, 210, 22, 17, 24);
 
   /// elements per block of each type: 1 for plain element types
   INFER_DTYPE_BLOCK: array[TInferDType] of word = (
-    0, 1, 1, 1, 1, 1, 1, 1, 32, 32, 256, 256, 32, 32);
+    0, 1, 1, 1, 1, 1, 1, 1, 32, 32, 256, 256, 32, 32, 32);
 
   /// the block types of GGUF matrices the engine reads in place
-  INFER_BLOCK_DTYPES = [idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K, idtMXFP4];
+  INFER_BLOCK_DTYPES = [idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K, idtMXFP4,
+    idtQ5_1];
 
   /// the name of each type (safetensors names, ggml's for block types)
   INFER_DTYPE_NAME: array[TInferDType] of RawUtf8 = (
     '', 'F32', 'F16', 'BF16', 'I32', 'I64', 'U8', 'I8', 'Q8_0', 'Q4_0', 'Q4_K',
-    'Q6_K', 'Q5_0', 'MXFP4');
+    'Q6_K', 'Q5_0', 'MXFP4', 'Q5_1');
 
   /// the E2M1 values of an MXFP4 nibble, doubled to integers: 0, 0.5, 1, 1.5,
   // 2, 3, 4, 6 and their negatives (bit 3 the sign) - as ggml's kvalues_mxfp4
@@ -224,8 +242,10 @@ function InferE8M0HalfBits(e: byte): cardinal;
 // - F32 is copied, BF16 and F16 widened (exact, bit by bit: NaN and infinity
 // kept, never loaded into the FPU), Q8_0, Q4_0 and Q5_0 dequantized (d * q,
 // d * (q - 8), d * (q - 16): exact in single), MXFP4 as 2^(e - 128) * k (exact
-// but for an infinity beyond the single range), Q4_K and Q6_K with the single
-// steps of ggml's dequantize_row_*; aCols must be a multiple of the block size
+// but for an infinity beyond the single range), Q5_1 as d * q + m (d * q exact,
+// the sum rounded once: exact in double, both halves within 2^-24 .. 2^16),
+// Q4_K and Q6_K with the single steps of ggml's dequantize_row_*; aCols must
+// be a multiple of the block size
 procedure InferRowToF32(aData: pointer; aType: TInferDType; aRow, aCols: PtrInt;
   aDst: PSingleArray);
 
@@ -451,8 +471,9 @@ var
   blk: PInferBlockQ8_0;
   b4: PInferBlockQ4_0;
   b5: PInferBlockQ5_0;
+  b51: PInferBlockQ5_1;
   bm: PInferBlockMxfp4;
-  d: single;
+  d, m: single;
   qh: cardinal;
   w: PWordArray;
 begin
@@ -530,6 +551,26 @@ begin
               (((qh shr (j + 16)) and 1) shl 4)) - 16);
           end;
           inc(b5);
+        end;
+      end;
+    idtQ5_1:
+      begin
+        nb := aCols div 32;
+        b51 := @PInferBlockQ5_1Array(aData)^[aRow * nb];
+        for b := 0 to nb - 1 do
+        begin
+          d := InferHalfToSingle(b51^.d);
+          m := InferHalfToSingle(b51^.m);
+          qh := b51^.qh[0] or (cardinal(b51^.qh[1]) shl 8) or
+            (cardinal(b51^.qh[2]) shl 16) or (cardinal(b51^.qh[3]) shl 24);
+          for j := 0 to 15 do
+          begin
+            aDst^[b * 32 + j] := d * integer((b51^.qs[j] and 15) or
+              (((qh shr j) and 1) shl 4)) + m;
+            aDst^[b * 32 + j + 16] := d * integer((b51^.qs[j] shr 4) or
+              (((qh shr (j + 16)) and 1) shl 4)) + m;
+          end;
+          inc(b51);
         end;
       end;
     idtMXFP4:

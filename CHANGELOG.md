@@ -9,6 +9,16 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-17 - B16: Q5_1 weights.** `idtQ5_1` (GGUF type 7) on the CPU, CUDA and Vulkan.
+  The CPU unpacks d and q as Q8_0 for the existing kernels and adds m * dx * sum(qx) per
+  block afterwards (exact, so Exact stays bit-identical to the reference); the GPUs read it
+  as dtype 8 in every Linear kernel. The minimum is checked as a scale. No official Q5_1
+  file exists: `tools/infer-ref/quantize_q5_1.py` quantizes Qwen3-0.6B from its BF16 weights
+  like `llama-quantize --pure`. Gate: against ggml itself (dataset `q51`: dequantization
+  bit-exact, the Linear within the FP16 rounding of ggml's Q8_1 sum), then against FP32
+  (logits cosine 0.979 or better) and on both GPUs against the CPU (0.9995). Five mutants
+  caught; RTX 5090 FPC 0/18,643, Delphi 13 0/18,643, Delphi 7 0/7,244;
+  Mac M2 0/9,427; Adreno Vulkan 0/1,718, 0/88, 0/21.
 - **2026-11-17 - B2: Q4_0 weights on the GPUs.** CUDA and Vulkan had no kernel for Q4_0, so
   the QAT files of Gemma 4 ran on the CPU only. Q4_0 is now dtype 7 in every Linear kernel
   (CUDA `linear`, `linear8`, `linear8ids`, `gemm8`; Vulkan `linear`, `linear8` with and without

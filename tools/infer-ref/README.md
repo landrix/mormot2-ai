@@ -25,7 +25,8 @@ Targets: `ops`, `tiny`, `bge-m3` (model, cases, corpus vectors), `tokens` (token
 plus for phase 1b `q8`, `tiny-gguf` and `lembed-tokens`, for phase 3e `q4` (Q4_0 from
 ggml itself: `quantize_row_q4_0_ref`, `dequantize_row_q4_0`, `ggml_vec_dot_q4_0_q8_0`),
 for backlog B16 `q5` (Q5_0: `quantize_row_q5_0_ref`, `dequantize_row_q5_0`,
-`ggml_vec_dot_q5_0_q8_0`) and for backlog D5b `mxfp4` (MXFP4: `quantize_row_mxfp4_ref`,
+`ggml_vec_dot_q5_0_q8_0`) and `q51` (Q5_1: `quantize_row_q5_1_ref`, `dequantize_row_q5_1`,
+`quantize_row_q8_1`, `ggml_vec_dot_q5_1_q8_1`) and for backlog D5b `mxfp4` (MXFP4: `quantize_row_mxfp4_ref`,
 `dequantize_row_mxfp4`, `ggml_vec_dot_mxfp4_q8_0`).
 With `bge-m3` or `tokens` the script loads BAAI/bge-m3 in the fixed revision
 `5617a9f61b028005a4858fdac845db406aefb181` (about 2.3 GB into the Hugging Face cache).
@@ -40,7 +41,18 @@ GGUF `vendor/models/bge-m3-q8_0.gguf` (redirectable with `LAI_GGUF`); the script
 if its SHA-256 is not the one of reference contract v1. Invocation:
 
 ```bash
-LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 q4 q5 mxfp4 tiny-gguf lembed-tokens
+LD_LIBRARY_PATH=$PWD/vendor/sqlite-ext/aarch64-linux ~/.venvs/lai-infer-ref/bin/python tools/infer-ref/make_reference.py q8 q4 q5 q51 mxfp4 tiny-gguf lembed-tokens
+```
+
+`quantize_q5_1.py` writes `vendor/models/qwen3-0.6b-q5_1.gguf` (no official Q5_1 file
+exists): every Q8_0 matrix of Qwen's `qwen3-0.6b-q8_0.gguf` quantized again to Q5_1 from the
+BF16 weights of `model.safetensors`, like `llama-quantize --pure`, with gguf-py's quantizer
+from a llama.cpp checkout (`LAI_LLAMA_CPP`); numpy only, it prints the SHA-256 of its inputs
+and of the file:
+
+```bash
+LAI_LLAMA_CPP=<llama.cpp checkout> python tools/infer-ref/quantize_q5_1.py \
+  vendor/models/qwen3-0.6b vendor/models/qwen3-0.6b-q8_0.gguf vendor/models/qwen3-0.6b-q5_1.gguf
 ```
 
 ## Sliding window and NoPE (phase D, D4)

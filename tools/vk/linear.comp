@@ -1,6 +1,6 @@
 // LandrixAI - y[r, o] = bias[o] + sum_i w[o, i] * x[r, i] on the device
 // (phase 4b of docs/native-inference.md)
-// - w in its storage type: F32, Q8_0, Q4_K, Q6_K, Q5_0, MXFP4 or Q4_0 (ggml block layouts, see
+// - w in its storage type: F32, Q8_0, Q4_K, Q6_K, Q5_0, MXFP4, Q4_0 or Q5_1 (ggml block layouts, see
 //   mormot.ai.infer.tensor), dequantized per element in float, x in F32 - the
 //   arithmetic of InferRowToF32 followed by an F32 dot product, in another
 //   summation order (a tolerance, not bits)
@@ -17,7 +17,8 @@ layout(std430, binding = 1) readonly buffer BufX { float x[]; };
 layout(std430, binding = 2) readonly buffer BufB { float bias[]; };
 layout(std430, binding = 3) writeonly buffer BufY { float y[]; };
 
-// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0, 6 = MXFP4, 7 = Q4_0
+// dtype: 1 = F32, 2 = Q8_0, 3 = Q4_K, 4 = Q6_K, 5 = Q5_0, 6 = MXFP4, 7 = Q4_0,
+// 8 = Q5_1
 // (TInferVulkanBackend)
 layout(push_constant) uniform Push {
   uint rows, nin, nout, dtype, hasBias;
@@ -132,6 +133,20 @@ float weight(uint rowBase, uint i)
       q = q & 15u;
     return halfAt(base) * float(int(q) - 8);
   }
+  if (p.dtype == 8u)
+  {
+    // Q5_1: 24 bytes per 32 values - d, m, qh[4], qs[16]; value = d * q + m
+    // with q (0..31) packed as in Q5_0
+    uint base = rowBase + (i >> 5) * 24u;
+    uint j = i & 31u;
+    uint q = byteAt(base + 8u + (j & 15u));
+    if (j >= 16u)
+      q = q >> 4;
+    else
+      q = q & 15u;
+    q = q | (((byteAt(base + 4u + (j >> 3)) >> (j & 7u)) & 1u) << 4);
+    return halfAt(base) * float(q) + halfAt(base + 2u);
+  }
   // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d (Q6KValue)
   uint base = rowBase + (i >> 8) * 210u;
   uint k = i & 255u;
@@ -168,6 +183,8 @@ void main()
     rowBytes = (p.nin >> 5) * 17u;
   else if (p.dtype == 7u)
     rowBytes = (p.nin >> 5) * 18u;
+  else if (p.dtype == 8u)
+    rowBytes = (p.nin >> 5) * 24u;
   else
     rowBytes = (p.nin >> 8) * 210u;
   for (uint o = gl_WorkGroupID.x; o < p.nout; o += gl_NumWorkGroups.x)

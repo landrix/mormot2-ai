@@ -516,8 +516,8 @@ const
     (1, 256, 1), (3, 512, 17), (37, 1024, 33), (5, 3072, 20), (1, 256, 70001),
     (70, 512, 130), (1, 32, 3), (3, 96, 17), (1, 896, 65), (20, 896, 33),
     (1, 2560, 37));
-  TYPES: array[0..6] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
-    idtQ5_0, idtMXFP4, idtQ4_0);
+  TYPES: array[0..7] of TInferDType = (idtF32, idtQ8_0, idtQ4_K, idtQ6_K,
+    idtQ5_0, idtMXFP4, idtQ4_0, idtQ5_1);
 var
   gpu: TInferVulkanBackend;
   ref: TInferCpuBackend;
@@ -595,6 +595,11 @@ begin
                 // 18 bytes per block: every row of an odd number of blocks
                 // starts 2-aligned only
                 wq := RandomQ4(nout, nin, 341 + i);
+                data := pointer(wq);
+              end;
+            idtQ5_1:
+              begin
+                wq := RandomQ51(nout, nin, 441 + i);
                 data := pointer(wq);
               end;
             idtMXFP4:
@@ -1042,7 +1047,8 @@ end;
 
 procedure TTestInferVulkan.Qwen3GgufMatchesCpu;
 const
-  FILES: array[0..1] of TFileName = ('qwen3-0.6b-q4_k_m.gguf', 'qwen3-0.6b-q8_0.gguf');
+  FILES: array[0..2] of TFileName = ('qwen3-0.6b-q4_k_m.gguf', 'qwen3-0.6b-q8_0.gguf',
+    'qwen3-0.6b-q5_1.gguf');
   // "Wie verlege ich ein Kupferrohr?" - any ids do; these are ordinary words
   PROMPT: array[0..11] of integer = (
     151644, 872, 198, 54, 645, 2739, 273, 10109, 12153, 3105, 63084, 30);
@@ -1664,11 +1670,11 @@ const
   NOUT = 33;
   IDS: array[0..SLOTS - 1] of integer = (3, 0, 4, 3);
   // type, inputs: the K-quant at 256, the others also at 896
-  KINDS: array[0..8] of TInferDType = (
+  KINDS: array[0..10] of TInferDType = (
     idtF32, idtQ8_0, idtQ5_0, idtQ4_K, idtQ8_0, idtQ5_0, idtF32, idtQ4_0,
-    idtQ4_0);
-  INPUTS: array[0..8] of integer = (256, 256, 256, 256, 896, 896, 896, 256,
-    896);
+    idtQ4_0, idtQ5_1, idtQ5_1);
+  INPUTS: array[0..10] of integer = (256, 256, 256, 256, 896, 896, 896, 256,
+    896, 256, 896);
 var
   gpu: TInferVulkanBackend;
   ref: TInferCpuBackend;
@@ -1716,6 +1722,11 @@ begin
           idtQ4_0:
             begin
               wq := RandomQ4(EXPERTS * NOUT, nin, 85 + c);
+              data := pointer(wq);
+            end;
+          idtQ5_1:
+            begin
+              wq := RandomQ51(EXPERTS * NOUT, nin, 86 + c);
               data := pointer(wq);
             end;
         else

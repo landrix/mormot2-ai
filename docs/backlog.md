@@ -201,13 +201,12 @@ treibt die 5090 an ihre Leistungsgrenze (rund 0,8 Decode-Tokens je Joule bei Vul
 
 ---
 
-## B16 — Q5_1 und Feinschliff an Q5_0 (Q5_0 erledigt 2026-10-19)
+## B16 — Feinschliff an Q5_0, Q4_0 und Q5_1 (Q5_0 erledigt 2026-10-19, Q5_1 2026-11-17)
 
 Nur bei Bedarf:
 
-- **Q5_1** (Block 24: zusätzlich FP16-Minimum): llama.cpp nimmt es als Ersatz für Q5_K -
-  eine Q5_K_M-Datei braucht also zuerst Q5_K. Auf der CPU nicht verlustfrei nach Q8_0
-  auszupacken (Wert d · q + m): der Summand m · Summe(x) je Block käme dazu.
+- **Q5_K** (für Q5_K_M-Dateien, in denen llama.cpp Q5_1 als Ersatz schreibt): Q5_1 kann die
+  Engine seit 2026-11-17, Q5_K nicht.
 - **`matvec8` für Q5_0 und Q4_0** (Vulkan und CUDA): Vulkan dekodiert Q5_0 mit `linear8`, 8 %
   langsamer als Q8_0 mit `matvec8`; Q4_0 läuft seit B2 (2026-11-17) ebenfalls über `linear8`.
 - **Auspacken mit NEON/AVX2** wie `InferQ4Unpack`: Prefill auf der CPU 4 % langsamer als

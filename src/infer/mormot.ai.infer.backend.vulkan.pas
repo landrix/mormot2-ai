@@ -2,8 +2,8 @@
 // - part of the mormot.ai.* extension (LandrixAI)
 // - licensed under a MPL/GPL/LGPL three license - see LICENSE
 // - phase 4b of docs/native-inference.md: TInferVulkanBackend is the fast CPU
-//   backend whose Linear runs on a Vulkan device for F32, Q8_0, Q5_0, Q4_K,
-//   Q6_K and MXFP4 weights; every other operation, every other weight type and every
+//   backend whose Linear runs on a Vulkan device for F32 and every GGUF block
+//   type the CPU reads (Q8_0, Q4_0, Q5_0, Q5_1, Q4_K, Q6_K, MXFP4); every other operation, every other weight type and every
 //   call while the device is busy stay on the CPU
 // - weights and biases are uploaded once, on first use, and kept on the
 //   device, keyed by their address, type and size: they must neither change
@@ -85,8 +85,8 @@ type
     // (TInferVulkan.Create: raises EInferVulkan without one)
     constructor Create(aThreads: integer = 0); reintroduce;
     destructor Destroy; override;
-    /// y = x * w^T + bias on the device for F32, Q8_0, Q5_0, Q4_K, Q6_K and
-    // MXFP4 weights, on the CPU otherwise (and while another thread uses the device)
+    /// y = x * w^T + bias on the device for F32 and the GGUF block types (see
+    // LINEAR_DTYPE), on the CPU otherwise (and while another thread uses the device)
     procedure Linear(x: PSingleArray; aRows, aIn: PtrInt; const w: TInferWeight;
       aOut: PtrInt; bias: PSingleArray; y: PSingleArray); override;
     /// release every weight kept on the device
@@ -199,10 +199,10 @@ const
 
   /// the dtype push constant of tools/vk/linear.comp
   // - Unknown, F32, F16, BF16, I32, I64, U8, I8, Q8_0, Q4_0, Q4_K, Q6_K, Q5_0,
-  // MXFP4;
+  // MXFP4, Q5_1;
   // 0 = CPU
   LINEAR_DTYPE: array[TInferDType] of cardinal = (
-    0, 1, 0, 0, 0, 0, 0, 0, 2, 7, 3, 4, 5, 6);
+    0, 1, 0, 0, 0, 0, 0, 0, 2, 7, 3, 4, 5, 6, 8);
 
   /// from this many rows on a Linear runs the tiled gemm8.comp (UseGemm)
   GEMM_ROWS = 16;

@@ -732,6 +732,8 @@ GGUF_Q8_SHA256 = "aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a1
 Q8_BLOCK = 34  # bytes of one Q8_0 block: FP16 scale + 32 int8
 Q4_BLOCK = 18  # bytes of one Q4_0 block: FP16 scale + 32 nibbles
 Q5_BLOCK = 22  # bytes of one Q5_0 block: FP16 scale, 32 fifth bits, 32 nibbles
+Q51_BLOCK = 24  # bytes of one Q5_1 block: FP16 scale and minimum, 32 fifth bits, 32 nibbles
+Q81_BLOCK = 36  # bytes of one Q8_1 block: FP16 scale and d * sum, 32 int8
 MX_BLOCK = 17  # bytes of one MXFP4 block: E8M0 exponent + 32 nibbles
 Q4K_BLOCK = 144  # one Q4_K super-block of 256: d, dmin, 12 bytes scales, 128 nibbles
 Q6K_BLOCK = 210  # one Q6_K super-block of 256: 128 + 64 bytes quants, 16 scales, d
@@ -775,6 +777,14 @@ class Ggml:
         self.base.dequantize_row_q5_0.restype = None
         self.cpu.ggml_vec_dot_q5_0_q8_0.argtypes = self.cpu.ggml_vec_dot_q8_0_q8_0.argtypes
         self.cpu.ggml_vec_dot_q5_0_q8_0.restype = None
+        self.base.quantize_row_q5_1_ref.argtypes = [fp, vp, i64]
+        self.base.quantize_row_q5_1_ref.restype = None
+        self.base.dequantize_row_q5_1.argtypes = [vp, fp, i64]
+        self.base.dequantize_row_q5_1.restype = None
+        self.cpu.quantize_row_q8_1.argtypes = [fp, vp, i64]
+        self.cpu.quantize_row_q8_1.restype = None
+        self.cpu.ggml_vec_dot_q5_1_q8_1.argtypes = self.cpu.ggml_vec_dot_q8_0_q8_0.argtypes
+        self.cpu.ggml_vec_dot_q5_1_q8_1.restype = None
         self.base.quantize_row_mxfp4_ref.argtypes = [fp, vp, i64]
         self.base.quantize_row_mxfp4_ref.restype = None
         self.base.dequantize_row_mxfp4.argtypes = [vp, fp, i64]
@@ -839,6 +849,24 @@ class Ggml:
     def dot_q5(self, n, w, x):
         s = self.ct.c_float()
         self.cpu.ggml_vec_dot_q5_0_q8_0(n, self.ct.byref(s), 0, w, 0, x, 0, 1)
+        return s.value
+
+    def quant_q51(self, x):
+        """weights, as a GGUF writer quantizes them to Q5_1"""
+        return self._quant(self.base.quantize_row_q5_1_ref, x, Q51_BLOCK)
+
+    def dequant_q51(self, raw, n):
+        y = np.zeros(n, dtype=np.float32)
+        self.base.dequantize_row_q5_1(raw, y.ctypes.data_as(self.ct.POINTER(self.ct.c_float)), n)
+        return y
+
+    def quant_q81(self, x):
+        """activations, as ggml-cpu quantizes them before a Q5_1 matmul"""
+        return self._quant(self.cpu.quantize_row_q8_1, x, Q81_BLOCK)
+
+    def dot_q51(self, n, w, x):
+        s = self.ct.c_float()
+        self.cpu.ggml_vec_dot_q5_1_q8_1(n, self.ct.byref(s), 0, w, 0, x, 0, 1)
         return s.value
 
     def quant_mx(self, x):
@@ -1061,6 +1089,54 @@ def q5():
              "ggml_vec_dot_q5_0_q8_0 (float sums) + bias in float64")
     blob.write(os.path.join(OUT, "q5"), {
         "dataset": "q5", "environment": environment(),
+        "ggml": {"dir": os.path.relpath(GGML_DIR, ROOT), "sha256": g.libs,
+                 "note": "the ggml build of the lembed oracle"}})
+
+
+def q51():
+    """Q5_1 fixtures from ggml itself (backlog B16): weights from the reference
+    quantizer of a GGUF writer, their dequantization, and the Q5_1 x Q8_1 dot product
+    of ggml-cpu (the engine takes Q8_0 activations and adds m * dx * sum(qx) exactly:
+    ggml rounds that sum to FP16, a tolerance)"""
+    print("q51")
+    g = Ggml()
+    rng = np.random.default_rng(TINY_SEED + 51)
+    f32 = lambda a: np.asarray(a, dtype=np.float32)
+    blob = Blob()
+    x = f32(rng.standard_normal((6, 96)))
+    x[0, :32] = np.arange(32)     # d = 1, m = 0: every q from 0 to 31 once
+    x[1, :32] = 0                  # a zero block: d = 0, m = 0
+    x[2] *= 1e-6
+    x[3] *= 1e4
+    x[4, 32:64] = 7.0              # one value repeated: d = 0, m = 7, all at q = 0
+    x[5, 64:96] = np.abs(x[5, 64:96]) + 3  # every value above zero: m > 0
+    wq = b"".join(g.quant_q51(r) for r in x)
+    blob.add("quant/x", x)
+    blob.add("quant/blocks", np.frombuffer(wq, dtype=np.uint8).reshape(6, 3 * Q51_BLOCK),
+             "quantize_row_q5_1_ref per row")
+    blob.add("dequant/y", np.stack([g.dequant_q51(g.quant_q51(r), 96) for r in x]),
+             "dequantize_row_q5_1 of those blocks")
+    # Q5_1 linear: weights from the reference quantizer (shifted, so m matters),
+    # activations quantized by ggml-cpu
+    n_in, n_out = 128, 6
+    xs = f32(rng.standard_normal((3, n_in)) + 0.5)
+    w = f32(rng.standard_normal((n_out, n_in)) * 0.2 + 0.3)
+    b = f32(rng.standard_normal(n_out))
+    wq = b"".join(g.quant_q51(r) for r in w)
+    rb = n_in // 32 * Q51_BLOCK
+    y = np.zeros((3, n_out), dtype=np.float64)
+    for r in range(3):
+        xq = g.quant_q81(xs[r])
+        for o in range(n_out):
+            y[r, o] = g.dot_q51(n_in, wq[o * rb:(o + 1) * rb], xq)
+    blob.add("linear/x", xs)
+    blob.add("linear/weight", np.frombuffer(wq, dtype=np.uint8).reshape(n_out, -1),
+             "[out, in/32 blocks] Q5_1")
+    blob.add("linear/bias", b)
+    blob.add("linear/y", y + b.astype(np.float64),
+             "ggml_vec_dot_q5_1_q8_1 (float sums) + bias in float64")
+    blob.write(os.path.join(OUT, "q51"), {
+        "dataset": "q51", "environment": environment(),
         "ggml": {"dir": os.path.relpath(GGML_DIR, ROOT), "sha256": g.libs,
                  "note": "the ggml build of the lembed oracle"}})
 
@@ -1464,7 +1540,7 @@ def lembed_tokens():
 def main():
     setup_determinism()
     what = set(sys.argv[1:]) or {"ops", "tiny", "bge-m3", "tokens", "q8", "q4", "q5",
-                                 "mxfp4", "qk", "tiny-gguf", "lembed-tokens"}
+                                 "q51", "mxfp4", "qk", "tiny-gguf", "lembed-tokens"}
     if "ops" in what:
         ops()
     if "tiny" in what:
@@ -1481,6 +1557,8 @@ def main():
         q4()
     if "q5" in what:
         q5()
+    if "q51" in what:
+        q51()
     if "mxfp4" in what:
         mxfp4()
     if "qk" in what:

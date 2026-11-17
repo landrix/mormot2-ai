@@ -136,6 +136,9 @@ type
     procedure Qwen3Gguf;
     /// a Q4_K_M GGUF of Qwen3-0.6B (Q4_K and Q6_K matrices) against FP32
     procedure Qwen3GgufQ4KM;
+    /// a pure Q5_1 GGUF of Qwen3-0.6B (tools/infer-ref/quantize_q5_1.py from
+    // the BF16 weights) against FP32
+    procedure Qwen3GgufQ51;
     /// the decoder families: registration, NewDecoderModel by model_type and
     // architecture, the kind of every layer, foreign families refused
     procedure DecoderFamilies;
@@ -305,6 +308,37 @@ procedure SetFloat(var aDoc: TDocVariantData; const aName: RawUtf8; aValue: doub
 
 
 implementation
+
+type
+  /// access to the protected CheckBlockScales
+  TDecoderModelAccess = class(TDecoderModel);
+
+/// two Q5_1 blocks, the second with the half bits aD and aM, through the
+// scale check of aModel: true when it refuses them as no finite number
+function Q51ScaleRefused(aModel: TDecoderModel; aD, aM: word): boolean;
+var
+  blk: array[0..1] of TInferBlockQ5_1;
+  t: TInferTensor;
+begin
+  FillChar(blk, SizeOf(blk), 0);
+  blk[0].d := $3c00;
+  blk[0].m := $bc00;
+  blk[1].d := aD;
+  blk[1].m := aM;
+  t.Name := 'q51';
+  t.DType := idtQ5_1;
+  t.Shape := nil;
+  t.Count := 64;
+  t.Bytes := SizeOf(blk);
+  t.Data := @blk;
+  result := false;
+  try
+    TDecoderModelAccess(aModel).CheckBlockScales(@t, 'q51');
+  except
+    on E: EInferError do
+      result := PosEx('no finite number', StringToUtf8(E.Message)) > 0;
+  end;
+end;
 
 { TTestInferDecoder }
 
@@ -1524,6 +1558,13 @@ begin
     Refused('bad-shape.gguf', 'shaped');
     Refused('bad-ropedim.gguf', 'RoPE over');
     Refused('bad-embscale.gguf', 'no finite number');
+    // Q5_1: its minimum m is a half scale as well (CheckScales)
+    g := TQwen3Model.CreateFromGguf(gdir + 'q8_0.gguf', fCpu);
+    Check(not Q51ScaleRefused(g, $3c00, $3c00), 'Q5_1 finite scales pass');
+    Check(Q51ScaleRefused(g, $7c00, $3c00), 'Q5_1 d infinite refused');
+    Check(Q51ScaleRefused(g, $3c00, $7c00), 'Q5_1 m infinite refused');
+    Check(Q51ScaleRefused(g, $3c00, $fe00), 'Q5_1 m NaN refused');
+    FreeAndNil(g);
   finally
     e.Free;
     s.Free;
@@ -1888,6 +1929,51 @@ begin
   // where it was 1.37 sure (chat_en answers "Paris." with a full stop) - far
   // better than Q4_0, still no greedy condition for a 0.6B model
   Qwen3Quantized(idtQ4_K, 0.8, 12, 1e9, gguf);
+end;
+
+procedure TTestInferQwen3.Qwen3GgufQ51;
+var
+  dir, gguf: TFileName;
+  g: TQwen3Model;
+  st: TSafeTensorsFile;
+  detail: RawUtf8;
+  cs: double;
+begin
+  dir := RealModel;
+  if dir = '' then
+    exit;
+  gguf := ExpandFileName(IncludeTrailingPathDelimiter(dir) + '..' + PathDelim +
+    'qwen3-0.6b-q5_1.gguf');
+  if not FileExists(gguf) then
+  begin
+    CheckUtf8(GetEnvironmentVariable('LAI_REQUIRE_MODEL') <> '1',
+      'LAI_REQUIRE_MODEL=1 but no vendor/models/qwen3-0.6b-q5_1.gguf');
+    AddConsole('SKIP Qwen3 Q5_1: no vendor/models/qwen3-0.6b-q5_1.gguf ' +
+      '(tools/infer-ref/quantize_q5_1.py, see docs/native-inference.md)');
+    exit;
+  end;
+  // every matrix Q5_1, quantized from model.safetensors itself: close to its
+  // BF16 weights - a wrong minimum or fifth bit would not be
+  g := TQwen3Model.CreateFromGguf(gguf, fFast);
+  st := nil;
+  try
+    Check(g.Weights = idtQ5_1, 'Q5_1 layers');
+    Check(g.Head.DType = idtQ5_1, 'a Q5_1 head (tied to token_embd)');
+    st := TSafeTensorsFile.Create(IncludeTrailingPathDelimiter(dir) +
+      'model.safetensors');
+    cs := SourceCosine(g, st, detail);
+    AddConsole(FormatString('Q5_1 matrices against the BF16 weights: lowest ' +
+      'cosine % (%)', [cs, detail]));
+    // measured 2026-11-17: 0.9992 at worst (layer 16 down_proj)
+    CheckUtf8(cs >= 0.998, 'Q5_1 matrices like the BF16 weights: % %', [cs, detail]);
+  finally
+    st.Free;
+    g.Free;
+  end;
+  // measured 2026-11-17 (RTX 5090, AVX2): logits cosine 0.979 (chat_en) to
+  // 0.991, max error 4.3; greedy leaves the reference where it was 0.65 sure
+  // at most - the margin gate of Q8_0
+  Qwen3Quantized(idtQ5_1, 0.97, 5.5, 1, gguf);
 end;
 
 procedure TTestInferQwen3.Qwen3GreedyMatchesReference;

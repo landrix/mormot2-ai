@@ -115,6 +115,12 @@ procedure InferQ4ToQ8(aSrc: PInferBlockQ4_0; aBlocks: PtrInt; aDst: PInferBlockQ
 // value - exact, so every Q8_0 kernel computes the Q5_0 x Q8_0 dot product
 procedure InferQ5ToQ8(aSrc: PInferBlockQ5_0; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
 
+/// aBlocks Q5_1 blocks as Q8_0 blocks: the same scale d, q (0..31) as the
+// value, the minimum m left out - exact, so a Q8_0 kernel computes the d part
+// of the Q5_1 x Q8_0 dot product and the caller adds m * dx * (sum of the qx)
+// per block (see TInferCpuBackend.Linear)
+procedure InferQ51ToQ8(aSrc: PInferBlockQ5_1; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
+
 /// aBlocks MXFP4 blocks as Q8_0 blocks: the doubled E2M1 values as the signed
 // value, 2^(e - 128) as the FP16 scale - exact for an exponent in
 // INFER_MXFP4_EXACT_MIN..INFER_MXFP4_EXACT_MAX, a scale of 0 for any other
@@ -123,7 +129,7 @@ procedure InferMxfp4ToQ8(aSrc: PInferBlockMxfp4; aBlocks: PtrInt; aDst: PInferBl
 
 type
   /// scalar reference backend: every operation; Linear takes F32, Q8_0, Q4_0,
-  // Q5_0, Q4_K, Q6_K or MXFP4
+  // Q5_0, Q5_1, Q4_K, Q6_K or MXFP4
   TInferCpuBackend = class(TInferBackend)
   protected
     /// query rows aFirst..aLast of one head: scores, masked softmax, weighted
@@ -193,6 +199,8 @@ type
     Xq: PInferBlockQ8_0Array;
     Dx: PDoubleArray;
     Dxs: PSingleArray;
+    /// per activation block dx * (the sum of its qs), for Q5_1 weights
+    Sx: PDoubleArray;
     /// the activation rows as Q8_K blocks, for Q4_K / Q6_K weights
     Xk: PInferBlockQ8_KArray;
     /// true: the FP32 arithmetic of the SIMD kernel (Q8_0 or F32 weights),
@@ -224,6 +232,7 @@ type
     fXk: array of TInferBlockQ8_K;
     fDx: TDoubleDynArray;
     fDxs: TSingleDynArray;
+    fSx: TDoubleDynArray;
     fScratch: array of TSingleDynArray;
     fRowBlocks: PtrInt;
     fGamma, fBeta: PSingleArray;
@@ -1072,6 +1081,43 @@ begin
   end;
 end;
 
+procedure InferQ51ToQ8(aSrc: PInferBlockQ5_1; aBlocks: PtrInt; aDst: PInferBlockQ8_0);
+var
+  b: PtrInt;
+  qh: cardinal;
+  {$ifdef INFERQ4WORDS}
+  s, d: PInt64Array;
+  {$else}
+  j, v: PtrInt;
+  {$endif INFERQ4WORDS}
+begin
+  for b := 0 to aBlocks - 1 do
+  begin
+    aDst^.d := aSrc^.d;
+    qh := aSrc^.qh[0] or (cardinal(aSrc^.qh[1]) shl 8) or
+      (cardinal(aSrc^.qh[2]) shl 16) or (cardinal(aSrc^.qh[3]) shl 24);
+    // as InferQ5ToQ8, without the offset: q stays 0..31
+    {$ifdef INFERQ4WORDS}
+    s := @aSrc^.qs;
+    d := @aDst^.qs;
+    d^[0] := (s^[0] and Int64($0F0F0F0F0F0F0F0F)) or Q5_HIGH[qh and 255];
+    d^[1] := (s^[1] and Int64($0F0F0F0F0F0F0F0F)) or Q5_HIGH[(qh shr 8) and 255];
+    d^[2] := ((s^[0] shr 4) and Int64($0F0F0F0F0F0F0F0F)) or
+      Q5_HIGH[(qh shr 16) and 255];
+    d^[3] := ((s^[1] shr 4) and Int64($0F0F0F0F0F0F0F0F)) or Q5_HIGH[qh shr 24];
+    {$else}
+    for j := 0 to 15 do
+    begin
+      v := aSrc^.qs[j];
+      aDst^.qs[j] := (v and 15) or PtrInt(((qh shr j) and 1) shl 4);
+      aDst^.qs[j + 16] := (v shr 4) or PtrInt(((qh shr (j + 16)) and 1) shl 4);
+    end;
+    {$endif INFERQ4WORDS}
+    inc(aSrc);
+    inc(aDst);
+  end;
+end;
+
 var
   /// the FP16 scale of each E8M0 exponent (InferMxfp4ToQ8)
   MXFP4_HALF: array[byte] of word;
@@ -1288,29 +1334,43 @@ function TInferCpuBackend.Supports(aOp: TInferOp; aWeights: TInferDType): boolea
 begin
   if aOp = ioLinear then
     result := aWeights in [idtF32, idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K,
-      idtMXFP4]
+      idtMXFP4, idtQ5_1]
   else
     result := aWeights = idtF32;
 end;
 
+// aMins: the Q5_1 matrix whose blocks w holds as Q8_0 (InferQ51ToQ8), nil for
+// any other type - after the d part, block by block, m * dx * (sum of the qx)
 procedure LinearQ8_0(x: PSingleArray; aRows, aIn: PtrInt; w: PInferBlockQ8_0Array;
-  aOut: PtrInt; bias: PSingleArray; y: PSingleArray);
+  aOut: PtrInt; bias: PSingleArray; y: PSingleArray;
+  aMins: PInferBlockQ5_1Array = nil);
 var
   r, o, b, j, nb: PtrInt;
   sum: integer;
-  acc, dx, dw: double;
+  acc, dx, dw, dm: double;
   xq: array of TInferBlockQ8_0;
   wb, xb: PInferBlockQ8_0;
-  dxs: array of double;
+  mb: PInferBlockQ5_1;
+  dxs, sxs: array of double;
 begin
   nb := aIn shr 5;
   SetLength(xq, nb);
   SetLength(dxs, nb);
+  SetLength(sxs, nb);
   for r := 0 to aRows - 1 do
   begin
     InferQuantizeRowQ8_0(@x^[r * aIn], aIn, pointer(xq));
     for b := 0 to nb - 1 do
+    begin
       dxs[b] := InferHalfToSingle(xq[b].d);
+      if aMins <> nil then
+      begin
+        sum := 0;
+        for j := 0 to 31 do
+          inc(sum, xq[b].qs[j]);
+        sxs[b] := dxs[b] * sum; // exact: 11 by 12 significant bits
+      end;
+    end;
     for o := 0 to aOut - 1 do
     begin
       wb := @w^[o * nb];
@@ -1328,6 +1388,16 @@ begin
         dx := dxs[b];
         acc := acc + sum * (dw * dx);
         inc(wb);
+      end;
+      if aMins <> nil then
+      begin
+        mb := @aMins^[o * nb];
+        for b := 0 to nb - 1 do
+        begin
+          dm := InferHalfToSingle(mb^.m);
+          acc := acc + dm * sxs[b];
+          inc(mb);
+        end;
       end;
       y^[r * aOut + o] := acc;
     end;
@@ -1381,6 +1451,18 @@ begin
         SetLength(w8, aOut * (aIn shr 5));
         InferQ5ToQ8(w.Data, length(w8), pointer(w8));
         LinearQ8_0(x, aRows, aIn, pointer(w8), aOut, bias, y);
+        exit;
+      end;
+    idtQ5_1:
+      begin
+        if aIn and 31 <> 0 then
+          EInferError.RaiseUtf8('%.Linear: % inputs are no whole Q5_1 blocks',
+            [self, aIn]);
+        // d * q as Q8_0 blocks through the Q8_0 path, then m * dx * sum(qx)
+        // per block: ggml's Q5_1 x Q8_1 split, with Q8_0 activations
+        SetLength(w8, aOut * (aIn shr 5));
+        InferQ51ToQ8(w.Data, length(w8), pointer(w8));
+        LinearQ8_0(x, aRows, aIn, pointer(w8), aOut, bias, y, w.Data);
         exit;
       end;
     idtMXFP4:
@@ -1881,7 +1963,8 @@ end;
 
 procedure LinearQuantizeRow(const aJob: TInferLinearJob; aRow: PtrInt);
 var
-  b, first: PtrInt;
+  b, first, j: PtrInt;
+  sum: integer;
 begin
   first := aRow * aJob.Blocks;
   if aJob.W.DType in [idtQ4_K, idtQ6_K] then
@@ -1902,6 +1985,13 @@ begin
         [b - first]);
     aJob.Dx^[b] := INFER_HALF[aJob.Xq^[b].d];
     aJob.Dxs^[b] := INFER_HALF[aJob.Xq^[b].d];
+    if aJob.W.DType = idtQ5_1 then
+    begin
+      sum := 0;
+      for j := 0 to 31 do
+        inc(sum, aJob.Xq^[b].qs[j]);
+      aJob.Sx^[b] := aJob.Dx^[b] * sum; // as the reference: exact
+    end;
   end;
 end;
 
@@ -1928,6 +2018,7 @@ var
   wfirst: PtrInt;
   unpacked: array[0..TILE * 128 - 1] of TInferBlockQ8_0;
   unpackedHeap: array of TInferBlockQ8_0;
+  mins: boolean; // Q5_1: m * dx * sum(qx) after the Q8_0 part
 
   function Bias(aOut: PtrInt): double;
   begin
@@ -1954,6 +2045,26 @@ var
       end;
   end;
 
+  // Q5_1: aAcc plus the m part of output aOut and token row aRow, in the
+  // order of the reference (LinearQ8_0)
+  function AddMins(aAcc: double; aOut, aRow: PtrInt): double;
+  var
+    c: PtrInt;
+    mb: PInferBlockQ5_1;
+    sx: PDoubleArray;
+    dm: double;
+  begin
+    result := aAcc;
+    mb := @PInferBlockQ5_1Array(aJob.W.Data)^[aOut * nb];
+    sx := @aJob.Sx^[aRow * nb];
+    for c := 0 to nb - 1 do
+    begin
+      dm := INFER_HALF[mb^.m];
+      result := result + dm * sx^[c];
+      inc(mb);
+    end;
+  end;
+
   // one weight row against token row aRow: the reference loop
   procedure Row1(aRow: PtrInt);
   var
@@ -1970,6 +2081,8 @@ var
       acc := acc + sums^[c] * (dw * d^[c]);
       inc(wb);
     end;
+    if mins then
+      acc := AddMins(acc, o, aRow);
     aJob.Y^[aRow * aJob.OutCount + o] := acc;
   end;
 
@@ -1989,6 +2102,8 @@ var
       accs := accs + sums^[c] * (INFER_HALF[wb^.d] * d^[c]);
       inc(wb);
     end;
+    if mins then
+      accs := accs + AddMins(0, o, aRow);
     aJob.Y^[aRow * aJob.OutCount + o] := Bias(o) + accs;
   end;
 
@@ -2040,7 +2155,8 @@ begin
     nb := aJob.Blocks;
     wbase := aJob.W.Data;
     wfirst := 0;
-    if aJob.W.DType in [idtQ4_0, idtQ5_0, idtMXFP4] then
+    mins := aJob.W.DType = idtQ5_1;
+    if aJob.W.DType in [idtQ4_0, idtQ5_0, idtMXFP4, idtQ5_1] then
     begin
       wfirst := aTile * TILE;
       if nb <= 128 then
@@ -2052,6 +2168,9 @@ begin
       end;
       if aJob.W.DType = idtQ5_0 then
         InferQ5ToQ8(@PInferBlockQ5_0Array(aJob.W.Data)^[wfirst * nb],
+          (oEnd - wfirst + 1) * nb, @wbase^[0])
+      else if mins then
+        InferQ51ToQ8(@PInferBlockQ5_1Array(aJob.W.Data)^[wfirst * nb],
           (oEnd - wfirst + 1) * nb, @wbase^[0])
       else if aJob.W.DType = idtMXFP4 then
       begin
@@ -2096,6 +2215,13 @@ begin
           else
             InferQ8DotF32x4x2(wq, @aJob.Xq^[r * nb], @aJob.Xq^[r * nb], nb,
               @aJob.Dxs^[r * nb], @aJob.Dxs^[r * nb], stride, @out8);
+          if mins then
+            for k := 0 to 3 do
+            begin
+              out8[k] := out8[k] + AddMins(0, o + k, r);
+              if pair then
+                out8[4 + k] := out8[4 + k] + AddMins(0, o + k, r + 1);
+            end;
           for k := 0 to 3 do
             aJob.Y^[r * aJob.OutCount + o + k] := Bias(o + k) + out8[k];
           if pair then
@@ -2134,6 +2260,13 @@ begin
               @acc8)
           else
             Rows4(r, 0);
+          if mins then
+            for k := 0 to 3 do
+            begin
+              acc8[k] := AddMins(acc8[k], o + k, r);
+              if pair then
+                acc8[4 + k] := AddMins(acc8[4 + k], o + k, r + 1);
+            end;
           for k := 0 to 3 do
             aJob.Y^[r * aJob.OutCount + o + k] := acc8[k];
           if pair then
@@ -2204,11 +2337,12 @@ var
   xk: array of TInferBlockQ8_K;
   dx: TDoubleDynArray;
   dxs: TSingleDynArray;
+  sx: TDoubleDynArray;
   r, t, n: PtrInt;
   kq: boolean;
 begin
   if not (w.DType in [idtF32, idtQ8_0, idtQ4_0, idtQ5_0, idtQ4_K, idtQ6_K,
-     idtMXFP4]) or
+     idtMXFP4, idtQ5_1]) or
      ((w.DType <> idtF32) and (aIn mod INFER_DTYPE_BLOCK[w.DType] <> 0)) then
   begin
     inherited Linear(x, aRows, aIn, w, aOut, bias, y); // raises
@@ -2252,9 +2386,12 @@ begin
         SetLength(fDx, aRows * job.Blocks);
         SetLength(fDxs, aRows * job.Blocks);
       end;
+      if (w.DType = idtQ5_1) and (length(fSx) < aRows * job.Blocks) then
+        SetLength(fSx, aRows * job.Blocks);
       job.Xq := pointer(fXq);
       job.Dx := pointer(fDx);
       job.Dxs := pointer(fDxs);
+      job.Sx := pointer(fSx);
     end;
     fJob := job;
     if w.DType <> idtF32 then
@@ -2278,9 +2415,12 @@ begin
     SetLength(xq, aRows * job.Blocks);
     SetLength(dx, aRows * job.Blocks);
     SetLength(dxs, aRows * job.Blocks);
+    if w.DType = idtQ5_1 then
+      SetLength(sx, aRows * job.Blocks);
     job.Xq := pointer(xq);
     job.Dx := pointer(dx);
     job.Dxs := pointer(dxs);
+    job.Sx := pointer(sx);
     for r := 0 to aRows - 1 do
       LinearQuantizeRow(job, r);
   end;
