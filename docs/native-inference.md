@@ -1820,6 +1820,38 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B16 Q5_0/Q5_1 mit NEON und AVX2 ausgepackt (2026-11-17).** Anlass: Abschluss Inferenz,
+Punkt 7c; Übernahme nur mit Messung.
+
+- *Befund vorher:* `LinearTileWork` packt Q4_0, Q5_0, Q5_1 und MXFP4 je Kachel (16
+  Gewichtszeilen) und Aufruf nach Q8_0 aus. Im Prefill zählt das kaum (eine Kachel für alle
+  Token-Zeilen), im Decode packt jeder Token das ganze Modell aus. Q4_0 und MXFP4 hatten schon
+  Kernel (NEON; MXFP4 auch AVX2), Q5_0 und Q5_1 nur die Pascal-Form mit 64-Bit-Wörtern und
+  einer Tabelle für die fünften Bits. Snapdragon X: CPU-Decode Qwen3-0.6B Q5_1 52-63 gegen
+  Q8_0 65-68 Tokens/s, obwohl Q5_1 ein Drittel weniger Bytes liest; Qwen3.5 Q4_0 (NEON)
+  dagegen schneller als Q8_0.
+- *Änderung:* `InferQ5Unpack`, `InferQ51Unpack` (`mormot.ai.infer.kernels`, Typ
+  `TInferQ4Unpack`), in `LinearTileWork` statt `InferQ5ToQ8`/`InferQ51ToQ8`, wenn gesetzt.
+  aarch64 (`Q5UnpackNeon`, `Q51UnpackNeon`, Opcodes aus GNU as 2.42): die vier qh-Bytes per
+  `tbl` auf die 32 Lanes (Byte j shr 3 nach Lane j), `cmtst` gegen die Bits 1 .. 128, auf 16
+  maskiert, zu den Nibbles geodert, bei Q5_0 minus 16. x86_64 (`Q5UnpackAvx2`,
+  `Q51UnpackAvx2`, FPC und Delphi): dasselbe mit `vpbroadcastd`/`vpshufb`/`vpcmpeqb`, Nibbles
+  als eine 32-Byte-Zeile (`vinserti128`), nur flüchtige Register, `vzeroupper`. Q5_1 lässt m
+  aus (der m-Anteil kommt wie bisher aus den Quellblöcken).
+- *Messung (CPU-Decode, `llm-bench` 16/128, alt = HEAD gegen neu, abwechselnd):* M5 Pro
+  (viermal): Qwen2.5-0.5B Q4_K_M (Q5_0-Matrizen) 132-141 → 166-174 Tokens/s, Qwen3-0.6B Q5_1
+  105-115 → 131-138; Q8_0 als Kontrolle unverändert, Prefill unverändert. i9-14900K (dreimal,
+  Pascal gegen AVX2): Qwen2.5 103-104 → 113-114, Qwen3 Q5_1 84-87 → 88-89.
+- *Nebenbefund:* Q5_1-Prefill auf der CPU halb so schnell wie Q8_0 - `AddMins` skalar in
+  double; als Punkt unter B16 im Backlog.
+- *Tests:* `LinearQ5MatchesReference` und `LinearQ51MatchesReference` vergleichen den Kernel
+  Byte für Byte mit der Pascal-Form (jedes Nibble, qh 0, alle Bits, Muster); die Exact-Vergleiche
+  mit der Referenz laufen über den Kernel.
+- *Gegenprobe:* NEON (Q5_0 obere fünfte Bits aus den unteren qh-Bytes, Q5_1 m nicht
+  übersprungen) und AVX2 (Q5_0 ohne Versatz, Q5_1 qh aus m gelesen): je 26 / 663 bzw.
+  26 / 652, jeweils in beiden Tests; echt 0.
+- *Läufe:* RTX 5090 FPC 0 / 18.645, Delphi 13 0 / 18.645, Delphi 7 0 / 7.244; Mac M5 Pro (MoltenVK) 0 / 9.433 und LLM 0 / 740; Snapdragon X (FPC 3.3.1 aarch64) Fast-Suite 0 / 663, GGUF 0 / 277, `Qwen3GgufQ51` 0 / 25.
+
 **B16/B2 `matvec8` für Q4_0, Q5_0 und Q5_1 erledigt (2026-11-17).** Anlass: Abschluss
 Inferenz, Punkt 7b; Übernahme nur mit mindestens 1 % Gewinn je Typ und Backend.
 

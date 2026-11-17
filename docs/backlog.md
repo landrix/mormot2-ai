@@ -207,8 +207,13 @@ Nur bei Bedarf:
 
 - **Q5_K** (für Q5_K_M-Dateien, in denen llama.cpp Q5_1 als Ersatz schreibt): Q5_1 kann die
   Engine seit 2026-11-17, Q5_K nicht.
-- **Auspacken mit NEON/AVX2** wie `InferQ4Unpack`: Prefill auf der CPU 4 % langsamer als
-  Q8_0 (891 / 931 Tokens/s).
+- **Q5_1-Prefill auf der CPU halb so schnell wie Q8_0** (gefunden 2026-11-17 bei 7c, M5 Pro:
+  470 gegen 940 Tokens/s bei 512 Tokens): `AddMins` in `LinearTileWork` rechnet den m-Anteil
+  je Token-Zeile, Ausgabe und Block skalar in double (Tabelle `INFER_HALF`, Minima im Abstand
+  von 24 Bytes) - ein Zweiunddreißigstel der Multiplikationen, aber ohne SIMD. Nächster
+  Schritt: im Float-Pfad die Minima je Kachel einmal als float auspacken und den m-Anteil als
+  vektorisiertes Skalarprodukt mit `Sx` rechnen; Exact bleibt bei der Referenzreihenfolge.
+  Nur bei Bedarf (offizielle Q5_1-Dateien sind selten).
 
 ---
 

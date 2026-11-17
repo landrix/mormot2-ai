@@ -135,6 +135,14 @@ var
   /// the Q4_0 to Q8_0 unpacking of this CPU (see TInferQ4Unpack), nil without
   // a kernel: the caller then uses the Pascal InferQ4ToQ8
   InferQ4Unpack: TInferQ4Unpack;
+  /// the Q5_0 to Q8_0 unpacking of this CPU (as TInferQ4Unpack: q - 16 as the
+  // signed value), nil without a kernel: the caller then uses the Pascal
+  // InferQ5ToQ8
+  InferQ5Unpack: TInferQ4Unpack;
+  /// the Q5_1 to Q8_0 unpacking of this CPU (as TInferQ4Unpack: d and q, the
+  // minimum left out), nil without a kernel: the caller then uses the Pascal
+  // InferQ51ToQ8
+  InferQ51Unpack: TInferQ4Unpack;
   /// the MXFP4 to Q8_0 unpacking of this CPU (see TInferMxfp4Unpack), nil
   // without a kernel: the caller then uses the Pascal InferMxfp4ToQ8
   InferMxfp4Unpack: TInferMxfp4Unpack;
@@ -1343,6 +1351,90 @@ asm
 .Lq4u_0:
 end;
 
+/// Q5_0 -> Q8_0 (backlog B16): per block the scale copied, value j = the low
+// (j < 16) or high nibble of qs[j and 15] with bit j of qh as its fifth bit,
+// minus 16, as 32 int8 (plain NEON): the four qh bytes spread to the 32 lanes
+// by tbl (byte j shr 3 to lane j), tested against the bits 1 .. 128 (cmtst),
+// masked to 16; x0 = aSrc (22-byte blocks), x1 = aBlocks, x2 = aDst (34-byte
+// blocks); the opcodes from GNU as 2.42
+procedure Q5UnpackNeon(aSrc: pointer; aBlocks: PtrInt; aDst: pointer);
+  assembler; nostackframe;
+asm
+  cbz x1, .Lq5u_0
+  .long 0x4f00e5ff // movi v31.16b, #0xf
+  .long 0x4f00e61e // movi v30.16b, #0x10
+  .long 0xd2804029 // mov x9, #0x201
+  .long 0xf2a10089 // movk x9, #0x804, lsl #16
+  .long 0xf2c40209 // movk x9, #0x2010, lsl #32
+  .long 0xf2f00809 // movk x9, #0x8040, lsl #48
+  .long 0x4e080d3d // dup v29.2d, x9 (the bits 1, 2, 4 .. 128 per byte)
+  .long 0x4f00e43c // movi v28.16b, #0x1
+  .long 0x4e081ffc // mov v28.d[0], xzr (tbl: byte 0 x 8, byte 1 x 8)
+  .long 0x4f00e45b // movi v27.16b, #0x2
+  .long 0x4e3c877b // add v27.16b, v27.16b, v28.16b (byte 2 x 8, byte 3 x 8)
+.Lq5u_1:
+  .long 0x78402409 // ldrh w9, [x0], #2 (d)
+  .long 0xbc404400 // ldr s0, [x0], #4 (qh)
+  .long 0x4cdf7001 // ld1 {v1.16b}, [x0], #16 (qs)
+  .long 0x4e1c0002 // tbl v2.16b, {v0.16b}, v28.16b
+  .long 0x4e1b0003 // tbl v3.16b, {v0.16b}, v27.16b
+  .long 0x4e3d8c42 // cmtst v2.16b, v2.16b, v29.16b
+  .long 0x4e3d8c63 // cmtst v3.16b, v3.16b, v29.16b
+  .long 0x4e3e1c42 // and v2.16b, v2.16b, v30.16b
+  .long 0x4e3e1c63 // and v3.16b, v3.16b, v30.16b
+  .long 0x4e3f1c24 // and v4.16b, v1.16b, v31.16b
+  .long 0x6f0c0425 // ushr v5.16b, v1.16b, #4
+  .long 0x4ea21c84 // orr v4.16b, v4.16b, v2.16b
+  .long 0x4ea31ca5 // orr v5.16b, v5.16b, v3.16b
+  .long 0x6e3e8484 // sub v4.16b, v4.16b, v30.16b
+  .long 0x6e3e84a5 // sub v5.16b, v5.16b, v30.16b
+  .long 0x78002449 // strh w9, [x2], #2
+  .long 0x4c9fa044 // st1 {v4.16b-v5.16b}, [x2], #32
+  subs x1, x1, #1
+  b.ne .Lq5u_1
+.Lq5u_0:
+end;
+
+/// Q5_1 -> Q8_0 (backlog B16): as Q5UnpackNeon without the offset (q stays
+// 0..31) and with the minimum m skipped (the caller adds m * sum(x) per
+// block, see InferQ51ToQ8); x0 = aSrc (24-byte blocks), x1 = aBlocks, x2 =
+// aDst (34-byte blocks); the opcodes from GNU as 2.42
+procedure Q51UnpackNeon(aSrc: pointer; aBlocks: PtrInt; aDst: pointer);
+  assembler; nostackframe;
+asm
+  cbz x1, .Lq51u_0
+  .long 0x4f00e5ff // movi v31.16b, #0xf
+  .long 0x4f00e61e // movi v30.16b, #0x10
+  .long 0xd2804029 // mov x9, #0x201
+  .long 0xf2a10089 // movk x9, #0x804, lsl #16
+  .long 0xf2c40209 // movk x9, #0x2010, lsl #32
+  .long 0xf2f00809 // movk x9, #0x8040, lsl #48
+  .long 0x4e080d3d // dup v29.2d, x9 (the bits 1, 2, 4 .. 128 per byte)
+  .long 0x4f00e43c // movi v28.16b, #0x1
+  .long 0x4e081ffc // mov v28.d[0], xzr (tbl: byte 0 x 8, byte 1 x 8)
+  .long 0x4f00e45b // movi v27.16b, #0x2
+  .long 0x4e3c877b // add v27.16b, v27.16b, v28.16b (byte 2 x 8, byte 3 x 8)
+.Lq51u_1:
+  .long 0x78404409 // ldrh w9, [x0], #4 (d, m skipped)
+  .long 0xbc404400 // ldr s0, [x0], #4 (qh)
+  .long 0x4cdf7001 // ld1 {v1.16b}, [x0], #16 (qs)
+  .long 0x4e1c0002 // tbl v2.16b, {v0.16b}, v28.16b
+  .long 0x4e1b0003 // tbl v3.16b, {v0.16b}, v27.16b
+  .long 0x4e3d8c42 // cmtst v2.16b, v2.16b, v29.16b
+  .long 0x4e3d8c63 // cmtst v3.16b, v3.16b, v29.16b
+  .long 0x4e3e1c42 // and v2.16b, v2.16b, v30.16b
+  .long 0x4e3e1c63 // and v3.16b, v3.16b, v30.16b
+  .long 0x4e3f1c24 // and v4.16b, v1.16b, v31.16b
+  .long 0x6f0c0425 // ushr v5.16b, v1.16b, #4
+  .long 0x4ea21c84 // orr v4.16b, v4.16b, v2.16b
+  .long 0x4ea31ca5 // orr v5.16b, v5.16b, v3.16b
+  .long 0x78002449 // strh w9, [x2], #2
+  .long 0x4c9fa044 // st1 {v4.16b-v5.16b}, [x2], #32
+  subs x1, x1, #1
+  b.ne .Lq51u_1
+.Lq51u_0:
+end;
+
 /// MXFP4 -> Q8_0: per block the FP16 scale of the exponent from the table x3,
 // the low and the high nibbles through the 16-byte table x4 (tbl) as 32 int8
 // (plain NEON); x0 = aSrc (17-byte blocks), x1 = aBlocks, x2 = aDst (34-byte
@@ -1886,6 +1978,135 @@ begin
   args.A[3] := PtrInt(aHalf);
   args.A[4] := PtrInt(aValues);
   Mxfp4UnpackAvx2Asm(args);
+end;
+
+/// Q5UnpackAvx2 body: A = aSrc, aBlocks, aDst - per block the scale copied,
+// the low and the high nibbles of qs as one 32-byte row, the fifth bits of
+// qh spread to the 32 lanes (vpshufb: qh byte j shr 3 to lane j), tested
+// against the bits 1 .. 128 (vpcmpeqb) and masked to 16, minus 16 (backlog
+// B16); only volatile registers
+procedure Q5UnpackAvx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     r8, qword ptr [r11]
+        mov     rcx, qword ptr [r11 + 8]
+        mov     r10, qword ptr [r11 + 16]
+        test    rcx, rcx
+        jz      @done
+        mov     eax, 0F0F0F0FH
+        vmovd   xmm2, eax
+        vpbroadcastd ymm2, xmm2          // the nibble mask
+        mov     eax, 10101010H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3          // 16 per byte
+        mov     rax, 8040201008040201H
+        vmovq   xmm4, rax
+        vpbroadcastq ymm4, xmm4          // the bits 1 .. 128 per byte
+        mov     rax, 0101010101010101H
+        vmovq   xmm5, rax
+        vpslldq xmm5, xmm5, 8            // byte 0 x 8, byte 1 x 8
+        mov     eax, 02020202H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        vperm2i128 ymm1, ymm1, ymm1, 08H // 0 in the low lane, 2 in the high
+        vinserti128 ymm5, ymm5, xmm5, 1
+        vpaddb  ymm5, ymm5, ymm1         // high lane: byte 2 x 8, byte 3 x 8
+@block: movzx   eax, word ptr [r8]
+        mov     word ptr [r10], ax
+        vmovdqu xmm1, oword ptr [r8 + 6]
+        vpsrlw  xmm0, xmm1, 4
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpand   ymm1, ymm1, ymm2         // low nibbles, then the high ones
+        vpbroadcastd ymm0, dword ptr [r8 + 2]
+        vpshufb ymm0, ymm0, ymm5         // qh byte j shr 3 in lane j
+        vpand   ymm0, ymm0, ymm4
+        vpcmpeqb ymm0, ymm0, ymm4        // bit j set: 0FFH
+        vpand   ymm0, ymm0, ymm3
+        vpor    ymm1, ymm1, ymm0
+        vpsubb  ymm1, ymm1, ymm3         // q - 16
+        vmovdqu yword ptr [r10 + 2], ymm1
+        add     r8, 22
+        add     r10, 34
+        sub     rcx, 1
+        jnz     @block
+@done:  vzeroupper
+end;
+
+procedure Q5UnpackAvx2(aSrc: pointer; aBlocks: PtrInt; aDst: pointer);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(aSrc);
+  args.A[1] := aBlocks;
+  args.A[2] := PtrInt(aDst);
+  Q5UnpackAvx2Asm(args);
+end;
+
+/// Q51UnpackAvx2 body: as Q5UnpackAvx2 for 24-byte Q5_1 blocks (d, m, qh, qs),
+// without the offset (q stays 0..31) and with m left out (the caller adds
+// m * sum(x) per block)
+procedure Q51UnpackAvx2Asm(var aArgs: TInferAvx2Args);
+  {$ifdef FPC} nostackframe; assembler; asm {$else} asm .noframe {$endif}
+        {$ifdef ABIWINX64}
+        mov     r11, rcx
+        {$else}
+        mov     r11, rdi
+        {$endif ABIWINX64}
+        mov     r8, qword ptr [r11]
+        mov     rcx, qword ptr [r11 + 8]
+        mov     r10, qword ptr [r11 + 16]
+        test    rcx, rcx
+        jz      @done
+        mov     eax, 0F0F0F0FH
+        vmovd   xmm2, eax
+        vpbroadcastd ymm2, xmm2          // the nibble mask
+        mov     eax, 10101010H
+        vmovd   xmm3, eax
+        vpbroadcastd ymm3, xmm3          // 16 per byte
+        mov     rax, 8040201008040201H
+        vmovq   xmm4, rax
+        vpbroadcastq ymm4, xmm4          // the bits 1 .. 128 per byte
+        mov     rax, 0101010101010101H
+        vmovq   xmm5, rax
+        vpslldq xmm5, xmm5, 8            // byte 0 x 8, byte 1 x 8
+        mov     eax, 02020202H
+        vmovd   xmm1, eax
+        vpbroadcastd ymm1, xmm1
+        vperm2i128 ymm1, ymm1, ymm1, 08H // 0 in the low lane, 2 in the high
+        vinserti128 ymm5, ymm5, xmm5, 1
+        vpaddb  ymm5, ymm5, ymm1         // high lane: byte 2 x 8, byte 3 x 8
+@block: movzx   eax, word ptr [r8]
+        mov     word ptr [r10], ax
+        vmovdqu xmm1, oword ptr [r8 + 8]
+        vpsrlw  xmm0, xmm1, 4
+        vinserti128 ymm1, ymm1, xmm0, 1
+        vpand   ymm1, ymm1, ymm2         // low nibbles, then the high ones
+        vpbroadcastd ymm0, dword ptr [r8 + 4]
+        vpshufb ymm0, ymm0, ymm5         // qh byte j shr 3 in lane j
+        vpand   ymm0, ymm0, ymm4
+        vpcmpeqb ymm0, ymm0, ymm4        // bit j set: 0FFH
+        vpand   ymm0, ymm0, ymm3
+        vpor    ymm1, ymm1, ymm0
+        vmovdqu yword ptr [r10 + 2], ymm1
+        add     r8, 24
+        add     r10, 34
+        sub     rcx, 1
+        jnz     @block
+@done:  vzeroupper
+end;
+
+procedure Q51UnpackAvx2(aSrc: pointer; aBlocks: PtrInt; aDst: pointer);
+var
+  args: TInferAvx2Args;
+begin
+  args.A[0] := PtrInt(aSrc);
+  args.A[1] := aBlocks;
+  args.A[2] := PtrInt(aDst);
+  Q51UnpackAvx2Asm(args);
 end;
 
 /// Q8BlockDotsAvx2 body: A = w, x, aBlocks, aSums - exact, as the 4-row one
@@ -3233,6 +3454,8 @@ begin
   InferDeltaRowsF32 := TInferDeltaRowsF32(@DeltaRowsF32Neon);
   InferQ8QuantizeRow := TInferQ8QuantizeRow(@Q8QuantizeRowNeon);
   InferQ4Unpack := TInferQ4Unpack(@Q4UnpackNeon);
+  InferQ5Unpack := TInferQ4Unpack(@Q5UnpackNeon);
+  InferQ51Unpack := TInferQ4Unpack(@Q51UnpackNeon);
   InferMxfp4Unpack := TInferMxfp4Unpack(@Mxfp4UnpackNeon);
   if HasArmDotProd then
   begin
@@ -3269,6 +3492,8 @@ begin
     InferQ4KSums2 := Q4KSums2Avx2;
     InferQ6KSums2 := Q6KSums2Avx2;
     InferMxfp4Unpack := Mxfp4UnpackAvx2;
+    InferQ5Unpack := Q5UnpackAvx2;
+    InferQ51Unpack := Q51UnpackAvx2;
     InferQ8KernelName := 'avx2';
   end;
   {$endif INFERAVX2}

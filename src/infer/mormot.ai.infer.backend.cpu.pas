@@ -2167,11 +2167,23 @@ begin
         wbase := pointer(unpackedHeap);
       end;
       if aJob.W.DType = idtQ5_0 then
-        InferQ5ToQ8(@PInferBlockQ5_0Array(aJob.W.Data)^[wfirst * nb],
-          (oEnd - wfirst + 1) * nb, @wbase^[0])
+      begin
+        if Assigned(InferQ5Unpack) then
+          InferQ5Unpack(@PInferBlockQ5_0Array(aJob.W.Data)^[wfirst * nb],
+            (oEnd - wfirst + 1) * nb, @wbase^[0])
+        else
+          InferQ5ToQ8(@PInferBlockQ5_0Array(aJob.W.Data)^[wfirst * nb],
+            (oEnd - wfirst + 1) * nb, @wbase^[0]);
+      end
       else if mins then
-        InferQ51ToQ8(@PInferBlockQ5_1Array(aJob.W.Data)^[wfirst * nb],
-          (oEnd - wfirst + 1) * nb, @wbase^[0])
+      begin
+        if Assigned(InferQ51Unpack) then
+          InferQ51Unpack(@PInferBlockQ5_1Array(aJob.W.Data)^[wfirst * nb],
+            (oEnd - wfirst + 1) * nb, @wbase^[0])
+        else
+          InferQ51ToQ8(@PInferBlockQ5_1Array(aJob.W.Data)^[wfirst * nb],
+            (oEnd - wfirst + 1) * nb, @wbase^[0]);
+      end
       else if aJob.W.DType = idtMXFP4 then
       begin
         if Assigned(InferMxfp4Unpack) then

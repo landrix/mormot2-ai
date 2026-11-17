@@ -9,6 +9,15 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-17 - B16: Q5_0 and Q5_1 unpacked with NEON and AVX2.** The CPU unpacks these
+  blocks to Q8_0 for every call of a tile, so a decode step unpacks the whole model:
+  `InferQ5Unpack` / `InferQ51Unpack` (aarch64 NEON: tbl spreads the fifth bits, cmtst tests
+  them; x86_64 AVX2: vpshufb and vpcmpeqb), byte-identical to the Pascal form. CPU decode on
+  an M5 Pro: Qwen2.5-0.5B Q4_K_M (Q5_0 matrices) from 137 to 171 tokens/s, Qwen3-0.6B Q5_1
+  from 108 to 134; on the i9-14900K 104 to 113 and 86 to 89. Prefill unchanged (a tile is
+  unpacked once for all rows). Four mutants caught; RTX 5090 FPC and
+  Delphi 13 0 / 18,645, Delphi 7 0 / 7,244, Mac M5 Pro 0 / 9,433, Snapdragon X 0 / 663.
+
 - **2026-11-17 - B16/B2: one decode row of Q4_0, Q5_0 and Q5_1 through `matvec8`.** CUDA
   and Vulkan read these 32-value blocks a block per lane, the quants as whole words, instead
   of through `linear8`. Matrix products of a decode step (`linear-bench`): Gemma 4 12B Q4_0

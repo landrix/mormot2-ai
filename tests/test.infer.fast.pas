@@ -842,7 +842,7 @@ var
   wq: RawByteString;
   e: double;
   q5: array[0..15] of TInferBlockQ5_0;
-  q8: array[0..15] of TInferBlockQ8_0;
+  q8, q8b: array[0..15] of TInferBlockQ8_0;
   qh: cardinal;
   ok: boolean;
 begin
@@ -887,6 +887,13 @@ begin
         ok := false;
   end;
   Check(ok, 'InferQ5ToQ8 and InferRowToF32 = d * (q - 16) for all values');
+  // the unpacking kernel of this CPU (backlog B16) gives the same bytes
+  if Assigned(InferQ5Unpack) then
+  begin
+    FillCharFast(q8b, SizeOf(q8b), 0);
+    InferQ5Unpack(@q5, 16, @q8b);
+    Check(CompareMem(@q8, @q8b, SizeOf(q8)), 'Q5_0 unpack kernel = Pascal');
+  end;
   for i := 0 to high(SHAPES) do
   begin
     rows := SHAPES[i, 0];
@@ -927,7 +934,7 @@ var
   wq: RawByteString;
   e, acc, worst: double;
   q51: array[0..15] of TInferBlockQ5_1;
-  q8: array[0..15] of TInferBlockQ8_0;
+  q8, q8b: array[0..15] of TInferBlockQ8_0;
   qh: cardinal;
   want: single;
   ok: boolean;
@@ -979,6 +986,13 @@ begin
     end;
   end;
   Check(ok, 'InferQ51ToQ8 and InferRowToF32 = d * q + m for all values');
+  // the unpacking kernel of this CPU (backlog B16) gives the same bytes
+  if Assigned(InferQ51Unpack) then
+  begin
+    FillCharFast(q8b, SizeOf(q8b), 0);
+    InferQ51Unpack(@q51, 16, @q8b);
+    Check(CompareMem(@q8, @q8b, SizeOf(q8)), 'Q5_1 unpack kernel = Pascal');
+  end;
   for i := 0 to high(SHAPES) do
   begin
     rows := SHAPES[i, 0];
