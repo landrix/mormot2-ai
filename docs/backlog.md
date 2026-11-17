@@ -26,6 +26,23 @@ CHANGELOG nennt den erledigten Teil, hier steht der offene Rest unter derselben 
 
 ---
 
+## B21 — Vektorisiertes SiLU (und Exp) im Fast-Backend (aufgenommen 2026-11-17)
+
+Anlass: SysV-Lauf (`native-inference.md`, „Linux x86_64: SysV-Lauf der AVX2-Kernel“). SwiGLU
+rechnet im Fast-Backend die Referenz-Arithmetik über `System.Exp`, je Element skalar
+(`TInferCpuBackend.SwiGlu`, parallel in Stücken zu 1024). Mit einem Thread kostet das unter
+Windows rund 8 ns je Element, unter Linux x86_64 rund 32 ns (gleiche Quelle, FPC 3.2.2); im
+Prefill von Qwen3-0.6B Q4_K_M sind das unter Linux 10 % der Zeit, im Decode 12 %.
+
+*Vorhaben:* im Fast-Backend (nicht `Exact`) ein vektorisiertes SiLU nach ggml
+(`ggml_v_expf`/`ggml_v_silu`, MIT; AVX2 und NEON), mit Toleranz gegen die Referenz wie die
+übrigen Fast-Ops; `Exact` bleibt bitgleich. Dieselbe Exp-Näherung danach für Softmax
+(Attention) und GELU prüfen.
+*Gate:* Toleranztests (relativer Fehler, Randwerte: ±Inf, NaN, große |x|, Denormale),
+Gegenprobe, Tempo unter Linux und Windows mit einem und 16 Threads, Modelle end-to-end.
+
+---
+
 ## B20 — Decode großer Modelle unter der Bandbreite der GPU (aufgenommen 2026-11-13, Teile 1 bis 5 erledigt)
 
 Anlass: B19. Erledigt (`CHANGELOG.md`, `native-inference.md`): Teil 1 (2026-11-13) - die

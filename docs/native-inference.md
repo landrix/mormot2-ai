@@ -899,7 +899,8 @@ Speicherbandbreite, nicht gemessen); `llm-bench` misst den Speicher-Peak jetzt a
   - AVX2 (2026-10-17): `Q4KSums2Avx2Asm` und `Q6KSums2Avx2Asm`, Nibbles bzw. 6-Bit-Werte
     und Skalen-Broadcast einmal für beide Zeilen (ymm0..ymm7, xmm6/7 unter Win64 im
     X-Bereich gesichert). i9-14900K, Q4_K_M-Prefill bei 200 Tokens: 462 → 579 Tokens/s.
-    Der SysV-Einsprung (Linux x86_64) ist nur statisch geprüft.
+    Der SysV-Einsprung (Linux x86_64) war zunächst nur statisch geprüft; echter Lauf am
+    2026-11-17, siehe „Linux x86_64: SysV-Lauf der AVX2-Kernel“.
 
 - *B16 erledigt (2026-10-19): Q5_0.* llama.cpp schreibt Q5_0, wo eine K-Quant-Zeile kein
   Vielfaches von 256 ist: Qwens `qwen2.5-0.5b-instruct-q4_k_m.gguf` (Hidden 896) hat 133
@@ -1818,6 +1819,29 @@ wörtlich, Assistent mit Aufrufen als Text, `<tool_response>` als Id, Parser hä
 Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und nie die
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
+
+**Linux x86_64: SysV-Lauf der AVX2-Kernel (2026-11-17).** Anlass: Seit dem letzten Lauf unter
+Linux x86_64 (2026-10-14, `ab03023`) war der SysV-Einsprung nur statisch geprüft.
+
+- *Inventar:* 12 AVX2-Kernel in `mormot.ai.infer.kernels`, je ein gemeinsamer Körper mit
+  ABI-Prolog (`ABIWINX64`: `rcx`, sonst `rdi`). Seit `ab03023` neu: `Mxfp4UnpackAvx2Asm`,
+  `DeltaRowsF32Avx2Asm`, `Q4KSumsAvx2Asm`, `Q6KSumsAvx2Asm`, `Q4KSums2Avx2Asm`,
+  `Q6KSums2Avx2Asm`. Von den unter SysV zu erhaltenden Registern nutzt unter diesen sechs nur
+  `DeltaRowsF32Avx2Asm` eines (`rbx`); es wird unabhängig vom ABI gesichert und geladen.
+- *Lauf:* RTX-Rechner, WSL Ubuntu 24.04 (Konto sh), FPC 3.2.2 (Docker-Compiler), 32 Threads,
+  frischer Stand per `git archive` mit den kleinen Modellen auf ext4: `infer.tests` 0 / 10.057,
+  `Q8_0 kernel: avx2`. Übersprungen nur die großen Modelle und die Geräte-Tests (llvmpipe).
+- *Gegenprobe:* je Kernel ein Rechenfehler nur im SysV-Zweig des Prologs (Quellzeiger um
+  1 Byte bzw. Aktivierung um 4 Bytes verschoben), je ein Lauf `-t TTestInferFast`: es scheitern
+  genau die Backend-Vergleiche des Kernels (MXFP4 13, Delta 16, Q4_K/Q6_K je 14, die
+  Zweizeilen-Kernel je 16 Assertions); sauber wieder 0 / 631.
+- *Tempo (`llm-bench`, Qwen3-0.6B Q4_K_M, 200/32, 16 Threads, gleiche Maschine):* Linux
+  384 / 65 Tokens/s, Windows (FPC 3.2.2, gleiche Quelle) rund 500 / 79. Die Matrizen sind
+  unter WSL rund 15 % langsamer (wie 2026-10-14). **Auffällig: SwiGLU** braucht unter Linux mit
+  einem Thread 138 ms statt 35 ms (50 Tokens; 32 statt 8 ns je Element). `System.Exp` allein
+  ist auf beiden Systemen gleich schnell (Mikrotest rund 30 ns, auch mit Single-Ergebnis);
+  die Ursache ist nicht eingegrenzt (Vermutung: ein Pfad der RTL, der nur bei den echten
+  Werteverteilungen greift). Abhilfe ohne RTL: ein vektorisiertes SiLU im Fast-Backend (Backlog).
 
 **B20, Teil 5 erledigt (2026-11-16): Q4_K in `matvec8` mit 16-Byte-Ladevorgängen.** Anlass war
 das Decode-Profil nach Teil 4.

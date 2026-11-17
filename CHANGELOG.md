@@ -9,6 +9,15 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-17 - The AVX2 kernels run on Linux x86_64 (SysV).** The SysV entry of the AVX2
+  kernels had only been checked by reading since the last Linux run (2026-10-14); six kernels
+  came after it (`Mxfp4UnpackAvx2Asm`, `DeltaRowsF32Avx2Asm`, `Q4KSumsAvx2Asm`,
+  `Q6KSumsAvx2Asm`, `Q4KSums2Avx2Asm`, `Q6KSums2Avx2Asm`). On the RTX machine (WSL Ubuntu 24.04,
+  FPC 3.2.2, the Docker compiler) `infer.tests` passes with 0 / 10,057 and `Q8_0 kernel: avx2`.
+  Counterproof: a numeric fault in the SysV branch of each kernel alone makes its backend
+  comparison fail (13 to 16 assertions each); clean again 0 / 631. Found on the way: SwiGLU takes
+  about four times as long on Linux as on Windows with the same source and compiler (to be
+  addressed with a vectorised SiLU, see the backlog).
 - **2026-11-16 - LLM clients: a provider call is sent at most once.** mORMot's
   `THttpClientSocket.Request` resent a POST once by itself, on a new connection, when no answer
   came (no headers within the timeout, connection closed while waiting) - the provider may have
