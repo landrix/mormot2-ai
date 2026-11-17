@@ -1820,6 +1820,43 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**B16/B2 `matvec8` für Q4_0, Q5_0 und Q5_1 erledigt (2026-11-17).** Anlass: Abschluss
+Inferenz, Punkt 7b; Übernahme nur mit mindestens 1 % Gewinn je Typ und Backend.
+
+- *Änderung:* `matvec8` (eine Zeile beim Dekodieren) in CUDA (`linear.cu`: `matvec8q40`,
+  `q50`, `q51`, je mit `f2`) und Vulkan (`matvec8.comp`, `-DDTYPE=5/7/8`, je mit `_F2`, `_SG`).
+  Eine Einheit ist ein Block von 32 Werten: Wort k der Quants trägt im unteren Nibble die
+  Werte 4k..4k+3, im oberen 16+4k.. - genau die Aktivierungen `xv[k]` und `xv[k + 4]` der
+  bestehenden Lesart (8 vec4 hintereinander). Q4_0 und Q5_0 beginnen auf einem geraden Byte:
+  die Wörter ab Byte a + 2 wie bei Q8_0 (die Adreno-Formel für den Übertrag), bei Q5_0 zuerst
+  qh, dann die Quants; die fünften Bits verteilt `spread4` auf Bit 4 der vier Bytes. Auf
+  Vulkan nimmt `spread4` zuerst das qh-Byte (wie `linear8.comp`: der Adreno-Treiber rechnete
+  aus dem ganzen verschobenen qh-Wort falsche Bits). Q5_1 (24 Bytes) liegt immer
+  4-ausgerichtet (CUDA prüft die Adresse, Vulkan bindet ab einem ausgerichteten Versatz):
+  d und m ein Wort, dann qh und die Quants; Wert d · Σq·x + m · Σx. Q4_0 und Q5_0 rechnen
+  (q − Versatz) · x je Byte. `MATVEC_TYPES` in beiden Backends, die Felder
+  `[1..2, 2..8]` (6, MXFP4, bleibt leer). `linear-bench` nimmt `LAI_MATVEC=0/1`.
+- *Messung (RTX 5090, `linear-bench`, 20 Runden, je dreimal abwechselnd; alle Matrizen eines
+  Decode-Schritts einmal):* Gemma 4 12B Q4_0 CUDA 9,91 → 6,12 ms, Vulkan 7,36 → 6,58 ms (mit
+  Paaren; ohne Paare 7,78 ms - langsamer als `linear8`, die Paare bleiben); Qwen3-0.6B Q5_1
+  CUDA 1,07 → 0,69 ms, Vulkan 1,09 → 1,03 ms; Q5_0 von Qwen2.5-0.5B (4864 × 896) CUDA 6,72 →
+  4,01 µs, Vulkan 6,25 → 6,14 µs (die kleineren Q5_0-Matrizen liegen auf Vulkan unter der
+  Zeitstempel-Auflösung von 4,1 µs). Decode (`llm-bench` 200/256, nach Aufwärmlauf, zweimal
+  abwechselnd, HEAD gegen neu): Qwen3-0.6B Q5_1 CUDA 419 → 556 Tokens/s, Vulkan 434 → 469;
+  Qwen2.5-0.5B Q4_K_M (Q5_0-Matrizen) CUDA 528 → 644, Vulkan 514 → 546. M2 Pro (MoltenVK,
+  viermal abwechselnd): Qwen3-0.6B Q5_1 57,0 → 95,5, Qwen3.5-0.8B Q4_0 61,7 → 98,4. Gemma
+  lädt `llm-bench` nicht (sein Tokenizer ist kein Byte-Level-BPE); die Logits von
+  `Gemma4OnDevice` sind unverändert (Prefill über `gemm8`). Adreno nimmt `matvec8` weiter
+  nicht von sich aus.
+- *Tests:* `LinearMatchesReference` (CUDA und Vulkan) hatte Q4_0, Q5_0 und Q5_1 schon in allen
+  Formen, darunter fünf Ein-Zeilen-Formen; mit `UseMatvec` laufen sie jetzt über `matvec8` mit
+  einem und zwei Features (Zeilen ungerader Blockzahl nur 2-ausgerichtet: (1, 32, 3)).
+- *Gegenprobe:* (M1) die oberen fünften Bits aus der unteren qh-Hälfte, (M2) Q4_0 ohne
+  Versatz 8 und Q5_1 ohne m - je in CUDA und Vulkan: CUDA 20 / 1.004, Vulkan 40 / 1.718; echt 0.
+- *Review:* Codex und Claude-Finder ohne funktionale Befunde (zwei veraltete Doku-Stellen und
+  ein Kommentar korrigiert).
+- *Läufe:* RTX 5090 FPC 0 / 18.643, Delphi 13 0 / 18.643, Delphi 7 0 / 7.244; Mac M2 (MoltenVK) 0 / 9.427 und LLM 0 / 740; Adreno X1-85 (FPC 3.3.1 aarch64) Vulkan-Linear 0 / 1.718 mit `matvec8`.
+
 **B16 Q5_1 erledigt (2026-11-17).** Anlass: Abschluss Inferenz, Punkt 7a. llama.cpp schreibt Q5_1
 etwa als Ersatz in Q5_K_M-Dateien; offizielle Q5_1-Dateien gibt es kaum.
 
@@ -1838,7 +1875,7 @@ etwa als Ersatz in Q5_K_M-Dateien; offizielle Q5_1-Dateien gibt es kaum.
   bei Werten bis 30, relativ 8e-5).
 - *GPU:* `dtype 8` in CUDA `linear`, `linear8`, `linear8ids`, `gemm8` und Vulkan `linear`,
   `linear8` (auch `-DIDS`), `gemm8` - das qh-Byte wie bei Q5_0 einzeln (Adreno). `matvec8`
-  bleibt bei Q8_0/Q4_K/Q6_K (7b).
+  blieb zunächst bei Q8_0/Q4_K/Q6_K (seit 7b auch Q5_1, siehe dort).
 - *Modell:* Keine offizielle Datei, deshalb `tools/infer-ref/quantize_q5_1.py`: jede Q8_0-Matrix
   von Qwens `qwen3-0.6b-q8_0.gguf` aus den BF16-Gewichten von `model.safetensors` neu nach
   Q5_1 (gguf-py, die numpy-Form von `quantize_row_q5_1_ref`, wie `llama-quantize --pure`),
@@ -1877,7 +1914,8 @@ und CUDA wie Vulkan hatten dafür keinen Kernel - das 12B Q4_0 lief nur auf der 
     `gemm8.comp` (`weights8`, Zeilenlänge).
   - Bytes einzeln bzw. über `bytes8` (jede Ausrichtung): ein Block beginnt nur auf einem geraden
     Byte. `LINEAR_DTYPE` in beiden Backends; Zulassung, Modelle und Decoder fragen generisch.
-  - `matvec8` (eine Zeile) bleibt bei Q8_0/Q4_K/Q6_K; Q4_0 dekodiert über `linear8` (B16).
+  - `matvec8` (eine Zeile) blieb zunächst bei Q8_0/Q4_K/Q6_K; Q4_0 dekodierte über `linear8`
+    (seit 7b über `matvec8`, siehe dort).
   - **CUDA, Ausrichtung (Codex-Review):** `EnqueueLinearAt` nimmt jede Gewichtsadresse; eine
     Q4_0-Matrix hinter einer ungeraden Zahl von Blöcken beginnt nur 2-ausgerichtet, und die
     schnellen Kernel lesen 32-Bit-Wörter. `LinearShape` nimmt deshalb nur bei einer Adresse,

@@ -54,8 +54,8 @@ type
     fLinearModule: TInferCuModule;
     fLinear, fLinear8, fGemm8, fLinear8Ids: TCuHandle;
     // matvec8 with 1 or 2 features per warp, per LINEAR_DTYPE (2 Q8_0, 3 Q4_K,
-    // 4 Q6_K)
-    fMatvec8: array[1..2, 2..4] of TCuHandle;
+    // 4 Q6_K, 5 Q5_0, 7 Q4_0, 8 Q5_1; none for 6 MXFP4)
+    fMatvec8: array[1..2, 2..8] of TCuHandle;
     fFastLinear, fUseMatvec: boolean;
     fMatvecPairsFrom: PtrInt;
     fGpu: TLightLock;
@@ -73,7 +73,7 @@ type
       aBytes: Int64): TInferCuBuffer;
     function Scratch(var aBuffer: TInferCuBuffer; aBytes: Int64): TInferCuBuffer;
     // the kernel and grid of a Linear: gemm8 for GEMM_ROWS rows or more,
-    // matvec8 for one row of Q8_0, Q4_K or Q6_K when UseMatvec (Q4_K only at
+    // matvec8 for one row of MATVEC_TYPES when UseMatvec (Q4_K only at
     // a weight address aWeight that is a multiple of 16: it reads 16-byte
     // words), linear8 when the inputs allow, linear otherwise
     procedure LinearShape(aType: TInferDType; aIn, aRows, aOut: PtrInt;
@@ -138,7 +138,8 @@ type
     /// the fast kernels of tools/cuda/linear.cu (linear8, matvec8, gemm8) - default
     // true; false: the plain linear kernel only (the tests compare both)
     property FastLinear: boolean read fFastLinear write fFastLinear;
-    /// one row of Q8_0, Q4_K or Q6_K weights (decoding) through matvec8
+    /// one row of Q8_0, Q4_0, Q5_0, Q5_1, Q4_K or Q6_K weights (decoding)
+    // through matvec8
     // instead of linear8 - default true (with FastLinear; backlog B20)
     property UseMatvec: boolean read fUseMatvec write fUseMatvec;
     /// from how many output features on matvec8 computes two features per
@@ -167,9 +168,14 @@ const
   // MATVEC_PAIRS_NVIDIA on Vulkan)
   MATVEC_PAIRS = 4096;
   /// the kernels of matvec8 per features and LINEAR_DTYPE
-  MATVEC8_NAME: array[1..2, 2..4] of RawUtf8 = (
-    ('matvec8q8', 'matvec8q4k', 'matvec8q6k'),
-    ('matvec8q8f2', 'matvec8q4kf2', 'matvec8q6kf2'));
+  MATVEC8_NAME: array[1..2, 2..8] of RawUtf8 = (
+    ('matvec8q8', 'matvec8q4k', 'matvec8q6k', 'matvec8q50', '', 'matvec8q40',
+     'matvec8q51'),
+    ('matvec8q8f2', 'matvec8q4kf2', 'matvec8q6kf2', 'matvec8q50f2', '',
+     'matvec8q40f2', 'matvec8q51f2'));
+  /// the weight types matvec8 takes (backlog B20; B16/B2: the 32-value
+  // blocks Q4_0, Q5_0, Q5_1 since 7b)
+  MATVEC_TYPES = [idtQ8_0, idtQ4_0, idtQ5_0, idtQ5_1, idtQ4_K, idtQ6_K];
 
 
 { TInferCudaBackend }
@@ -187,7 +193,8 @@ begin
   fLinear8Ids := fLinearModule.Kernel('linear8ids');
   for f := low(fMatvec8) to high(fMatvec8) do
     for i := low(fMatvec8[f]) to high(fMatvec8[f]) do
-      fMatvec8[f, i] := fLinearModule.Kernel(MATVEC8_NAME[f, i]);
+      if MATVEC8_NAME[f, i] <> '' then
+        fMatvec8[f, i] := fLinearModule.Kernel(MATVEC8_NAME[f, i]);
   fFastLinear := true;
   fUseMatvec := true;
   fMatvecPairsFrom := MATVEC_PAIRS;
@@ -214,7 +221,7 @@ begin
     aBlock := GEMM_BLOCK;
   end
   else if fFastLinear and whole and fUseMatvec and (aRows = 1) and
-          (aType in [idtQ8_0, idtQ4_K, idtQ6_K]) and
+          (aType in MATVEC_TYPES) and
           ((aType <> idtQ4_K) or (aWeight and 15 = 0)) then
   begin
     // f features per warp, 4 warps per block

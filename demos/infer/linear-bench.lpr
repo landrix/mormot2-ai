@@ -18,7 +18,9 @@
 //   host records the batch, which a decode step overlaps (BatchFlush); a
 //   pass over every group first brings the clocks of the GPU up
 // - LAI_PAIRS=<n> in the environment: from how many outputs matvec8 takes two
-//   features per warp (MatvecPairsFrom of either backend; 999999: never)
+//   features per warp (MatvecPairsFrom of either backend; 999999: never);
+//   LAI_MATVEC=0 / 1: one-row products through linear8 / matvec8 (UseMatvec;
+//   unset: the backend's default)
 //
 //   usage: linear-bench file.gguf [vulkan | cuda] [rounds=5]
 //   e.g.   linear-bench qwen3.8-27b-q4_k_m.gguf cuda
@@ -140,6 +142,8 @@ begin
   be := TInferCudaBackend.Create;
   if GetEnvironmentVariable('LAI_PAIRS') <> '' then
     be.MatvecPairsFrom := StrToInt(GetEnvironmentVariable('LAI_PAIRS'));
+  if GetEnvironmentVariable('LAI_MATVEC') <> '' then
+    be.UseMatvec := GetEnvironmentVariable('LAI_MATVEC') = '1';
   x := nil;
   y := nil;
   try
@@ -219,6 +223,8 @@ begin
   be := TInferVulkanBackend.Create;
   if GetEnvironmentVariable('LAI_PAIRS') <> '' then
     be.MatvecPairsFrom := StrToInt(GetEnvironmentVariable('LAI_PAIRS'));
+  if GetEnvironmentVariable('LAI_MATVEC') <> '' then
+    be.UseMatvec := GetEnvironmentVariable('LAI_MATVEC') = '1';
   x := nil;
   y := nil;
   temp := nil;

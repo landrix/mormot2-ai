@@ -50,10 +50,10 @@ for n in addnorm rmsnorm; do
     ARGS+=("SPV_$(echo "$n" | tr a-z A-Z)$g=$TMP/${n}$g.spv")
   done
 done
-# matvec8.comp once per weight type (2 Q8_0, 3 Q4_K, 4 Q6_K), with one or two
-# features per 32 invocations (suffix _F2), with and without subgroup
-# reductions
-for t in 2:Q8 3:Q4K 4:Q6K; do
+# matvec8.comp once per weight type (2 Q8_0, 3 Q4_K, 4 Q6_K, 5 Q5_0, 7 Q4_0,
+# 8 Q5_1), with one or two features per 32 invocations (suffix _F2), with and
+# without subgroup reductions
+for t in 2:Q8 3:Q4K 4:Q6K 5:Q50 7:Q40 8:Q51; do
   d=${t%%:*}
   # Q4_K: the weights as 16-byte words (matvec8.comp, W4)
   w4=

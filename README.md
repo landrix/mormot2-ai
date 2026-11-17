@@ -734,7 +734,8 @@ Next, in this order:
    59.3 tokens/s, Qwen3-0.6B 7 to 9 % faster) and `demos/infer/linear-bench` times the matrix
    products of a GGUF model per shape on CUDA and Vulkan; Q4_K read in 16-byte loads (B20,
    part 5: Qwen3.8-27B Q4_K_M 63.5 tokens/s on CUDA, 61.9 on Vulkan, Qwen3-0.6B Q4_K_M 22 %
-   faster on an M2 Pro).
+   faster on an M2 Pro); one decode row of Q4_0, Q5_0 and Q5_1 through `matvec8` too (B16:
+   Qwen3-0.6B Q5_1 from 419 to 556 tokens/s on CUDA, from 57 to 95.5 on an M2 Pro).
    Plan and order:
    [docs/backlog.md](docs/backlog.md)
    (German); finished items: [CHANGELOG.md](CHANGELOG.md).

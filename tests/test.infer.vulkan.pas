@@ -542,7 +542,7 @@ begin
       AddConsole('Vulkan subgroups: % invocations', [gpu.Vulkan.SubgroupSize])
     else
       AddConsole('Vulkan subgroups: none usable (shared-memory linear8 only)');
-    // and matvec8.comp for one row of Q8_0 / K-quants, gemm8.comp or
+    // and matvec8.comp for one row of the block types but MXFP4, gemm8.comp or
     // linear8.comp for many rows
     // (one and two features per 32 invocations); last the plain linear.comp
     // for every type (PlainLinear)

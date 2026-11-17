@@ -606,18 +606,19 @@ extern "C" __global__ void gemm8(const unsigned int* w, const float* x,
 }
 
 // ---- backlog B20: matvec8, the CUDA port of tools/vk/matvec8.comp - one
-// token row (decoding) of Q8_0, Q4_K or Q6_K weights, same parameters as
-// linear8 (rows is 1), the dequantization of InferRowToF32, another summation
-// order
+// token row (decoding) of Q8_0, Q4_0, Q5_0, Q5_1 (B2/B16 7b), Q4_K or Q6_K
+// weights, same parameters as linear8 (rows is 1), the dequantization of
+// InferRowToF32, another summation order
 // - a block of 128 = 4 warps, FEAT consecutive output features per warp; a
-//   lane takes units of 32 weights - a Q8_0 block, a quarter of a Q6_K half,
-//   both nibbles of 16 Q4_K quant bytes (16 values of two sub-blocks, every
-//   byte read once) - reading their scales once and their quants as whole
-//   words, the activations of a unit loaded once for the FEAT
-//   features
-// - a row starts 2-aligned (Q8_0, Q6_K) or 16-aligned (Q4_K, read as 16-byte
-//   words: blocks of 144 bytes, and LinearShape checks the weight address):
-//   rows of whole blocks, an expert at a multiple of its matrix
+//   lane takes units of 32 weights - a Q8_0, Q4_0, Q5_0 or Q5_1 block, a
+//   quarter of a Q6_K half, both nibbles of 16 Q4_K quant bytes (16 values
+//   of two sub-blocks, every byte read once) - reading their scales once and
+//   their quants as whole words, the activations of a unit loaded once for
+//   the FEAT features
+// - a row starts 2-aligned (Q8_0, Q4_0, Q5_0, Q6_K), 4-aligned (Q5_1:
+//   24-byte blocks) or 16-aligned (Q4_K, read as 16-byte words: blocks of
+//   144 bytes, and LinearShape checks the weight address): rows of whole
+//   blocks, an expert at a multiple of its matrix
 
 // the 4 bytes from bit sh (0 or 16) of word i on (wordAt of matvec8.comp)
 __device__ __forceinline__ unsigned int wordAtMv(const unsigned int* w,
@@ -659,6 +660,27 @@ __device__ __forceinline__ float dot4n(unsigned int v, unsigned int sh, float4 a
 {
   return float((v >> sh) & 15u) * a.x + float((v >> (sh + 8u)) & 15u) * a.y +
          float((v >> (sh + 16u)) & 15u) * a.z + float((v >> (sh + 24u)) & 15u) * a.w;
+}
+
+// the 4 bytes of v (0..255) times a
+__device__ __forceinline__ float dot4u(unsigned int v, float4 a)
+{
+  return float(v & 255u) * a.x + float((v >> 8) & 255u) * a.y +
+         float((v >> 16) & 255u) * a.z + float(v >> 24) * a.w;
+}
+
+// the 4 bytes of v minus off times a
+__device__ __forceinline__ float dot4o(unsigned int v, float off, float4 a)
+{
+  return (float(v & 255u) - off) * a.x + (float((v >> 8) & 255u) - off) * a.y +
+         (float((v >> 16) & 255u) - off) * a.z + (float(v >> 24) - off) * a.w;
+}
+
+// the low 4 bits of b as bit 4 of the 4 bytes of a word (the fifth bits of
+// 4 Q5_0 / Q5_1 values)
+__device__ __forceinline__ unsigned int spread4(unsigned int b)
+{
+  return ((b & 1u) | ((b & 2u) << 7) | ((b & 4u) << 14) | ((b & 8u) << 21)) << 4;
 }
 
 // the 6-bit scale and min of sub-block j of a Q4_K block whose 12 scale
@@ -749,6 +771,63 @@ __device__ __forceinline__ float unitDot(const unsigned int* w,
     return halfBits(h & 65535u) * (float(sc0) * s + float(sc1) * s1v) -
            halfBits(h >> 16) * (float(m0) * sx0 + float(m1) * sx1);
   }
+  else if ((DT == 7u) || (DT == 5u))
+  {
+    // Q4_0 (18 bytes: d, qs[16]; value d * (q - 8)) and Q5_0 (22 bytes: d,
+    // qh[4], qs[16]; value d * (q - 16), the fifth bit of value j bit j of
+    // qh): the low nibbles of quant word k are the values 4k .. 4k + 3
+    // (xv[k]), the high ones 16 + 4k .. (xv[k + 4]). A block starts at an
+    // even byte: the words from byte a + 2 on as for Q8_0 (qh, then the
+    // quants for Q5_0)
+    unsigned long long a = rowBase + u * (DT == 7u ? 18ull : 22ull);
+    float d = halfBits(half16(w, a));
+    unsigned long long qi = (a >> 2) + ((a >> 1) & 1u);
+    unsigned int qs = 16u - (unsigned int)(a & 2u) * 8u;
+    unsigned int qh = 0u;
+    if (DT == 5u)
+    {
+      qh = wordAtMv(w, qi, qs);
+      qi++;
+    }
+    const float off = DT == 7u ? 8.0f : 16.0f;
+    float s1 = 0.0f;
+#pragma unroll
+    for (unsigned int k = 0u; k < 4u; k++)
+    {
+      unsigned int v = wordAtMv(w, qi + k, qs);
+      unsigned int lo = v & 0x0f0f0f0fu;
+      unsigned int hi = (v >> 4) & 0x0f0f0f0fu;
+      if (DT == 5u)
+      {
+        lo |= spread4(qh >> (4u * k));
+        hi |= spread4(qh >> (16u + 4u * k));
+      }
+      s += dot4o(lo, off, xv[k]);
+      s1 += dot4o(hi, off, xv[k + 4u]);
+    }
+    return d * (s + s1);
+  }
+  else if (DT == 8u)
+  {
+    // Q5_1: 24 bytes - d, m, qh[4], qs[16]; value d * q + m, q as for Q5_0.
+    // A row of whole blocks starts at a multiple of 4 (24-byte blocks, a
+    // 4-aligned weight address): d and m one word, then qh, then the quants
+    unsigned long long i = (rowBase + u * 24ull) >> 2;
+    unsigned int dm = w[i];
+    unsigned int qh = w[i + 1u];
+    float sx = 0.0f;
+#pragma unroll
+    for (unsigned int k = 0u; k < 4u; k++)
+    {
+      unsigned int v = w[i + 2u + k];
+      unsigned int lo = (v & 0x0f0f0f0fu) | spread4(qh >> (4u * k));
+      unsigned int hi = ((v >> 4) & 0x0f0f0f0fu) | spread4(qh >> (16u + 4u * k));
+      s += dot4u(lo, xv[k]) + dot4u(hi, xv[k + 4u]);
+      sx += xv[k].x + xv[k].y + xv[k].z + xv[k].w +
+            xv[k + 4u].x + xv[k + 4u].y + xv[k + 4u].z + xv[k + 4u].w;
+    }
+    return halfBits(dm & 65535u) * s + halfBits(dm >> 16) * sx;
+  }
   else
   {
     // Q6_K: 210 bytes per 256 values - ql[128], qh[64], scales[16], d
@@ -838,6 +917,12 @@ extern "C" __global__ void name(const unsigned int* w, const float* x, \
 MATVEC8(matvec8q8, 2u, 1u)
 MATVEC8(matvec8q4k, 3u, 1u)
 MATVEC8(matvec8q6k, 4u, 1u)
+MATVEC8(matvec8q50, 5u, 1u)
+MATVEC8(matvec8q40, 7u, 1u)
+MATVEC8(matvec8q51, 8u, 1u)
 MATVEC8(matvec8q8f2, 2u, 2u)
 MATVEC8(matvec8q4kf2, 3u, 2u)
 MATVEC8(matvec8q6kf2, 4u, 2u)
+MATVEC8(matvec8q50f2, 5u, 2u)
+MATVEC8(matvec8q40f2, 7u, 2u)
+MATVEC8(matvec8q51f2, 8u, 2u)

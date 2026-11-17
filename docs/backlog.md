@@ -207,8 +207,6 @@ Nur bei Bedarf:
 
 - **Q5_K** (für Q5_K_M-Dateien, in denen llama.cpp Q5_1 als Ersatz schreibt): Q5_1 kann die
   Engine seit 2026-11-17, Q5_K nicht.
-- **`matvec8` für Q5_0 und Q4_0** (Vulkan und CUDA): Vulkan dekodiert Q5_0 mit `linear8`, 8 %
-  langsamer als Q8_0 mit `matvec8`; Q4_0 läuft seit B2 (2026-11-17) ebenfalls über `linear8`.
 - **Auspacken mit NEON/AVX2** wie `InferQ4Unpack`: Prefill auf der CPU 4 % langsamer als
   Q8_0 (891 / 931 Tokens/s).
 

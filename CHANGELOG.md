@@ -9,6 +9,16 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-17 - B16/B2: one decode row of Q4_0, Q5_0 and Q5_1 through `matvec8`.** CUDA
+  and Vulkan read these 32-value blocks a block per lane, the quants as whole words, instead
+  of through `linear8`. Matrix products of a decode step (`linear-bench`): Gemma 4 12B Q4_0
+  38 % faster on CUDA, 11 % on Vulkan; Qwen3-0.6B Q5_1 36 % and 5 %. Decode: Qwen3-0.6B Q5_1
+  from 419 to 556 tokens/s on CUDA and from 434 to 469 on Vulkan, Qwen2.5-0.5B Q4_K_M (Q5_0
+  matrices) from 528 to 644 and from 514 to 546; on an M2 Pro (MoltenVK) Qwen3-0.6B Q5_1
+  from 57 to 95.5 and Qwen3.5-0.8B Q4_0 from 61.7 to 98.4 tokens/s. `linear-bench` takes
+  `LAI_MATVEC=0/1`. Two mutants caught; RTX 5090 FPC
+  0/18,643, Delphi 13 0/18,643, Delphi 7 0/7,244; Mac M2 0/9,427; Adreno Vulkan 0/1,718.
+
 - **2026-11-17 - B16: Q5_1 weights.** `idtQ5_1` (GGUF type 7) on the CPU, CUDA and Vulkan.
   The CPU unpacks d and q as Q8_0 for the existing kernels and adds m * dx * sum(qx) per
   block afterwards (exact, so Exact stays bit-identical to the reference); the GPUs read it
