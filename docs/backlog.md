@@ -1,7 +1,7 @@
 # Backlog — native Inferenz und Umfeld
 
 Offene Themen, jedes so beschrieben, dass ein Agent ohne Vorwissen aus dieser Session
-loslegen kann. Reihenfolge = grobe Priorität. Stand 2026-11-17.
+loslegen kann. Reihenfolge = grobe Priorität. Stand 2026-11-19.
 
 Erledigte Einträge stehen mit ihrer Nummer (B…, D…) in [`CHANGELOG.md`](../CHANGELOG.md); die
 ausführlichen Berichte in [`native-inference.md`](native-inference.md). Ein erledigter Eintrag
@@ -26,6 +26,37 @@ erledigter Einträge ohne Termin stehen unter „Weitere Punkte nur bei Bedarf�
   `native-inference.md`); PasLLM (AGPL) und neural-api (LGPL) nicht als Vorlage.
 
 ---
+
+## B22 — Attention bei langem Kontext (aufgenommen 2026-11-19, Abschluss Inferenz Punkt 2)
+
+Erledigt: 2a, CPU-Decode-Attention in Kacheln (`CHANGELOG.md`, Bericht „Langer Kontext 2a“ in
+`native-inference.md` mit allen Messungen). Ausgangsmessung (RTX-Rechner, Qwen3-0.6B Q8_0):
+CPU-Decode bei 8.000 Tokens Kontext jetzt 20,9 Tokens/s (Attention rund 76 %), M5 Pro 44;
+Prefill 8.000 Tokens auf der CPU 80 s (Attention 89 %); GPUs bei rund 60 % der Bandbreite
+(CUDA 188 Tokens/s bei 32.000). Offene Schnitte in dieser Reihenfolge:
+
+- *2d - CPU-Prefill-Attention in Kacheln:* ein Block aus Zeilen (16-32) mal die Q-Köpfe einer
+  Gruppe gegen Schlüsselkacheln, Online-Softmax, Grenzen je Zeile über Zählungen (keine
+  Masken: kein 0 × NaN vor einem Fenster), dieselbe kanonische Arithmetik wie `CausalRows`
+  (Teilsummen je 128 Schlüssel ab dem ersten der Zeile) - in Pascal mit den Zeilen-Kerneln
+  zuerst, ein Mehr-Query-Kernel nur nach Messung. Ziel: die Attention von 71 s auf wenige
+  Sekunden (gesamt 15-20 s bei 8.000).
+- *2b - vektorisiertes Exp zusammen mit B21:* ein Kernel für Softmax und SiLU (ggml
+  `ggml_v_expf`, Herkunft/Lizenz klären), Toleranz gegen double; auf dem i9 kostet die
+  Softmax des Decodes bei 8.000 Schlüsseln 18 ms (System.Exp unter Windows x64 33-80 ns je
+  Wert, M5 Pro 1,5 ms). Erledigt B21 mit.
+- *2c - F16-KV-Cache auf der CPU:* halbiert Speicher und Lesemenge; berührt `Slide`, das
+  Anhängen, `Grow`, `CachedRows` und die Kerne (F16C im AVX2-Dispatch schon geprüft, NEON
+  `fcvtl`); Vorgabe aus, `Exact` immer F32, Umstellung nur mit Messung.
+- *2e - GPU-Reste:* CUDA `SPLIT_KEYS` 64 bei Blöcken von 128 Threads lässt im Score-Teil die
+  halbe Breite leer (Knick 4.000-8.000 Schlüssel bei 0,81 TB/s) - zuerst `SPLIT_KEYS` 128 und
+  `SPLIT_GROUPS` sondieren (Attention plus Merge), dann ein Kernel „ein Warp je
+  Schlüsselzeile“; Vulkan auf NVIDIA `attention.comp` gegen `attndec.comp` bei langem
+  Kontext. M5 Pro (MoltenVK) liest bei 32.000 rund 230 GB/s - dort kein Auftrag.
+- *Nur nach Messung:* Split-K auf der CPU (feste Grenzen, nicht nach Threadzahl), TLB-Last
+  ab 8.000 Schlüsseln auf dem i9 (Leserate fällt auf rund 40 GB/s; große Seiten oder ein
+  Cache-Layout je KV-Kopf), `fBusy`: ein zweiter gleichzeitiger Kontext rechnet die Attention
+  seriell (für das Gateway relevant).
 
 ## B21 — Vektorisiertes SiLU (und Exp) im Fast-Backend (aufgenommen 2026-11-17)
 

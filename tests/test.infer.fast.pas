@@ -88,6 +88,12 @@ type
     /// the decoder operations (phase 3): CausalAttention exact = the reference
     // bit for bit, float within a tolerance; F32 Linear in float lanes
     procedure DecoderOpsMatchReference;
+    /// the float CausalAttention of 1 .. 4 rows over many keys (the decode
+    // path: four passes over key tiles) gives the bits of the same rows
+    // inside a longer chunk (one item per head and row block) - grouped-query
+    // 1 .. 16, head sizes 32 .. 512, windows with NaN before them, rows with
+    // and without a window and with other tile counts in one call, sinks
+    procedure DecodeAttentionMatchesChunk;
     /// RmsNorm, SwiGlu and Rope: every mode bit-identical to the reference
     // (rows or slices over the pool), the reference against the definition
     procedure DecoderNormAndSwiGlu;
@@ -1401,6 +1407,77 @@ begin
         y[(r * aHeads + h) * aDim + t] := acc / sum;
       end;
     end;
+end;
+
+procedure TTestInferFast.DecodeAttentionMatchesChunk;
+const
+  // past keys of the chunk, heads, KV heads, head size, window, sinks
+  // - 251 + 5: the last chunk row sees 256 keys, exactly the decode minimum;
+  // 383 and 1000 cross tiles of 128 at odd places; 252 + 5: the decode rows
+  // see 254 .. 257 keys, two tiles and three (after a case with more, whose
+  // partial sums stay in the unused slots); 297 + 5 with a window of 300: the
+  // first rows see every key, the last ones a window
+  CASES: array[0..9, 0..5] of integer = (
+    (300, 16, 8, 128, 0, 0), (1000, 8, 1, 64, 0, 1), (251, 4, 4, 32, 0, 0),
+    (383, 32, 2, 128, 0, 0), (600, 4, 1, 512, 0, 0), (700, 8, 2, 128, 300, 1),
+    (511, 2, 1, 272, 0, 0), (900, 4, 2, 64, 257, 0), (252, 4, 2, 64, 0, 0),
+    (297, 8, 2, 128, 300, 0));
+  CHUNK = 5; // more rows than the decode path takes
+var
+  i, rows, past, heads, kvh, d, win, total, unseen, n, qw: PtrInt;
+  runs: Int64;
+  q, keys, values, sinks, yc, yd: TSingleDynArray;
+  ps: PSingleArray;
+begin
+  if not Assigned(InferDotsF32) then
+    exit; // no float kernel: both paths are the reference
+  for i := 0 to high(CASES) do
+  begin
+    past := CASES[i, 0];
+    heads := CASES[i, 1];
+    kvh := CASES[i, 2];
+    d := CASES[i, 3];
+    win := CASES[i, 4];
+    qw := heads * d;
+    total := past + CHUNK;
+    Fill(q, CHUNK * qw, 3000 + i, 2);
+    Fill(keys, total * kvh * d, 3100 + i, 2);
+    Fill(values, total * kvh * d, 3200 + i, 2);
+    ps := nil;
+    if CASES[i, 5] <> 0 then
+    begin
+      Fill(sinks, heads, 3300 + i, 3);
+      ps := pointer(sinks);
+    end;
+    if win > 0 then
+    begin
+      // the keys no row sees: NaN (a sliding cache has dropped them)
+      unseen := (past + 1 - win) * kvh * d;
+      for n := 0 to unseen - 1 do
+      begin
+        PCardinal(@keys[n])^ := $7fc00000;
+        PCardinal(@values[n])^ := $7fc00000;
+      end;
+    end;
+    SetLength(yc, CHUNK * qw);
+    runs := fFast.DecodeRuns;
+    fFast.CausalAttention(pointer(q), CHUNK, heads, d, pointer(keys),
+      pointer(values), past, kvh, pointer(yc), win, ps);
+    CheckUtf8(fFast.DecodeRuns = runs, 'the chunk takes the row path, case %', [i]);
+    for rows := 1 to CHUNK - 1 do
+    begin
+      // the last rows of the chunk alone, their keys from the same cache
+      SetLength(yd, rows * qw);
+      runs := fFast.DecodeRuns;
+      fFast.CausalAttention(@q[(CHUNK - rows) * qw], rows, heads, d,
+        pointer(keys), pointer(values), total - rows, kvh, pointer(yd), win, ps);
+      CheckUtf8(SameBits(pointer(yd), @yc[(CHUNK - rows) * qw], rows * qw),
+        'decode path = chunk rows, case %, % rows', [i, rows]);
+      // the path under test ran (a busy pool falls back to the chunk rows)
+      CheckUtf8(fFast.DecodeRuns = runs + 1, 'decode path taken, case %, % rows',
+        [i, rows]);
+    end;
+  end;
 end;
 
 procedure TTestInferFast.DecoderOpsMatchReference;

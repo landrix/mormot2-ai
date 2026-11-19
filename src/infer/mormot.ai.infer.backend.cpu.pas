@@ -241,7 +241,17 @@ type
     fAlpha, fLimit: single; // of the running SwiGlu
     fCausal: TInferCausalJob;
     fDelta: TInferDeltaJob;
+    // the decode path of CausalAttention: the scores of every row and head
+    // ([rows, heads, fDecStride]) and the partial sums of every tile
+    // ([tiles, rows, heads, HeadDim])
+    fDecScores, fDecParts: TSingleDynArray;
+    fDecStride: PtrInt;
+    fDecodeRuns: Int64;
     procedure CausalItem(aItem: integer);
+    procedure DecodeScoreItem(aItem: integer);
+    procedure DecodeSoftmaxItem(aItem: integer);
+    procedure DecodeValueItem(aItem: integer);
+    procedure DecodeSumItem(aItem: integer);
     procedure DeltaItem(aItem: integer);
     procedure LinearTile(aItem: integer);
     procedure QuantizeRow(aItem: integer);
@@ -296,6 +306,10 @@ type
     // attention, a GELU table) - checked against the reference within a tolerance
     property Exact: boolean
       read fExact write fExact;
+    /// how many CausalAttention calls took the decode path (a few rows over
+    // many keys, in parallel passes over key tiles) - for tests and profiles
+    property DecodeRuns: Int64
+      read fDecodeRuns;
   end;
 
 
@@ -1159,17 +1173,72 @@ end;
 const
   /// CausalRows keeps its scores on the stack up to this many keys
   CAUSAL_STACK = 4096;
+  /// the float path sums the weighted values of a row in partial sums of this
+  // many keys, counted from the first key of the row (see CausalRows)
+  CAUSAL_TILE = 128;
+  /// CausalRows keeps a partial sum on the stack up to this head size
+  CAUSAL_PART = 512;
+
+/// y[0 .. aCount) := y + p, element by element (the partial sums of the float
+// path, added in tile order)
+procedure AddPart(y, p: PSingleArray; aCount: PtrInt);
+var
+  i: PtrInt;
+begin
+  for i := 0 to aCount - 1 do
+    y^[i] := y^[i] + p^[i];
+end;
+
+/// the softmax of the float path over the aCount scores of one row of head h,
+// in place: scaled, the maximum (and the sink of the head) taken out, exp and
+// sum in double, multiplied by 1 / sum - CausalRows and the decode items of
+// TInferCpuFastBackend share it, so a row has the same bits on both paths
+procedure CausalSoftmaxF32(const aJob: TInferCausalJob; h: PtrInt; s: PSingleArray;
+  aCount: PtrInt);
+var
+  j: PtrInt;
+  scale, m, sum, a: double;
+begin
+  scale := aJob.Scale;
+  m := s^[0] * scale;
+  for j := 0 to aCount - 1 do
+  begin
+    s^[j] := s^[j] * scale;
+    if s^[j] > m then
+      m := s^[j];
+  end;
+  if (aJob.Sinks <> nil) and (aJob.Sinks^[h] > m) then
+    m := aJob.Sinks^[h];
+  sum := 0;
+  for j := 0 to aCount - 1 do
+  begin
+    a := Exp(s^[j] - m);
+    s^[j] := a;
+    sum := sum + a;
+  end;
+  if aJob.Sinks <> nil then
+    sum := sum + Exp(aJob.Sinks^[h] - m); // a share without a value
+  sum := 1 / sum;
+  for j := 0 to aCount - 1 do
+    s^[j] := s^[j] * sum;
+end;
 
 /// rows aFirst..aLast of head h of a causal attention job
 // - the reference: scores and sums in double, the softmax divided at the end;
-// with aJob.Fast and a float kernel for this CPU and head size, float lanes
+// with aJob.Fast and a float kernel for this CPU and head size, float lanes:
+// the scores per key, CausalSoftmaxF32, the weighted values in partial sums of
+// CAUSAL_TILE keys from the first key of the row, added in order - the
+// canonical float arithmetic, which the decode path of TInferCpuFastBackend
+// computes in other items to the same bits
 procedure CausalRows(const aJob: TInferCausalJob; h, aFirst, aLast: PtrInt);
 var
   r, g, j, t, d, total, first, cnt, kvw, qw: PtrInt;
   scale, m, sum, acc, a: double;
-  q, k, outp: PSingleArray;
+  q, k, outp, part: PSingleArray;
   sc, sums: PDoubleArray;
   s: PSingleArray;
+  partStack: array[0..CAUSAL_PART - 1] of single;
+  partHeap: TSingleDynArray;
   // no heap below CAUSAL_STACK keys: the workers call this for every head and
   // token at once, and a shared memory manager (Delphi's) serializes them
   sStack: array[0..CAUSAL_STACK - 1] of single;
@@ -1191,6 +1260,12 @@ begin
       SetLength(sHeap, aJob.Past + aLast + 1);
       s := pointer(sHeap);
     end;
+    part := @partStack;
+    if d > CAUSAL_PART then
+    begin
+      SetLength(partHeap, d);
+      part := pointer(partHeap);
+    end;
     for r := aFirst to aLast do
     begin
       total := aJob.Past + r + 1; // causal: up to and including this token
@@ -1200,31 +1275,21 @@ begin
       cnt := total - first;
       InferDotsF32(@aJob.Q^[r * qw + h * d], @aJob.Keys^[first * kvw + g * d],
         kvw * SizeOf(single), cnt, d, s);
-      m := s^[0] * scale;
-      for j := 0 to cnt - 1 do
-      begin
-        s^[j] := s^[j] * scale;
-        if s^[j] > m then
-          m := s^[j];
-      end;
-      if (aJob.Sinks <> nil) and (aJob.Sinks^[h] > m) then
-        m := aJob.Sinks^[h];
-      sum := 0;
-      for j := 0 to cnt - 1 do
-      begin
-        a := Exp(s^[j] - m);
-        s^[j] := a;
-        sum := sum + a;
-      end;
-      if aJob.Sinks <> nil then
-        sum := sum + Exp(aJob.Sinks^[h] - m); // a share without a value
-      sum := 1 / sum;
-      for j := 0 to cnt - 1 do
-        s^[j] := s^[j] * sum;
+      CausalSoftmaxF32(aJob, h, s, cnt);
       outp := @aJob.Y^[r * qw + h * d];
       FillCharFast(outp^, d * SizeOf(single), 0);
-      InferAxpyRowsF32(pointer(s), @aJob.Values^[first * kvw + g * d],
-        kvw * SizeOf(single), cnt, d, outp);
+      j := 0;
+      while j < cnt do
+      begin
+        // the canonical sum: per tile of CAUSAL_TILE keys from the first one of
+        // the row a partial sum from 0, the partials added in order
+        t := MinPtrInt(CAUSAL_TILE, cnt - j);
+        FillCharFast(part^, d * SizeOf(single), 0);
+        InferAxpyRowsF32(@s^[j], @aJob.Values^[(first + j) * kvw + g * d],
+          kvw * SizeOf(single), t, d, part);
+        AddPart(outp, part, d);
+        inc(j, t);
+      end;
     end;
     exit;
   end;
@@ -2540,12 +2605,113 @@ begin
   CausalRows(fCausal, h, r, MinPtrInt(r + CAUSAL_ROWS, fCausal.Rows) - 1);
 end;
 
+const
+  /// CausalAttention takes the decode path up to this many rows
+  DECODE_ROWS = 4;
+  /// and from this many keys of its last row on (below, four parallel passes
+  // cost more than the reading they save)
+  DECODE_KEYS = 256;
+
+/// the keys row r of a causal job sees: aFirst .. aTotal - 1
+procedure CausalRange(const aJob: TInferCausalJob; r: PtrInt;
+  out aFirst, aTotal: PtrInt);
+begin
+  aTotal := aJob.Past + r + 1; // causal: up to and including this token
+  aFirst := 0; // a sliding window: the last Window keys only
+  if (aJob.Window > 0) and (aTotal > aJob.Window) then
+    aFirst := aTotal - aJob.Window;
+end;
+
+// the decode path: the canonical float arithmetic of CausalRows in four
+// parallel passes over tiles of CAUSAL_TILE keys - an item reads the key or
+// value rows of its tile for all KV heads (whole cache rows, in order: one
+// stream from memory, the query heads of a group find the tile in the cache),
+// so few rows keep every thread busy; InferDotsF32 computes each score on its own, CausalSoftmaxF32 is
+// shared, and every tile's partial sum starts from 0 as in CausalRows, added in
+// tile order by the last pass - the same bits as the rows inside a chunk
+
+procedure TInferCpuFastBackend.DecodeScoreItem(aItem: integer);
+var
+  g, gs, h, r, a, b, first, total, d, kvw, qw: PtrInt;
+begin
+  // item = tile: keys first + aItem * CAUSAL_TILE .. of every row
+  d := fCausal.HeadDim;
+  kvw := fCausal.KvHeads * d;
+  qw := fCausal.Heads * d;
+  gs := fCausal.Heads div fCausal.KvHeads;
+  for r := 0 to fCausal.Rows - 1 do
+  begin
+    CausalRange(fCausal, r, first, total);
+    a := first + aItem * CAUSAL_TILE;
+    b := MinPtrInt(a + CAUSAL_TILE, total);
+    if a < b then
+      for g := 0 to fCausal.KvHeads - 1 do
+        for h := g * gs to g * gs + gs - 1 do
+          InferDotsF32(@fCausal.Q^[r * qw + h * d], @fCausal.Keys^[a * kvw + g * d],
+            kvw * SizeOf(single), b - a, d,
+            @fDecScores[(r * fCausal.Heads + h) * fDecStride + a - first]);
+  end;
+end;
+
+procedure TInferCpuFastBackend.DecodeSoftmaxItem(aItem: integer);
+var
+  h, r, first, total: PtrInt;
+begin
+  // item = row * heads + head
+  r := aItem div fCausal.Heads;
+  h := aItem mod fCausal.Heads;
+  CausalRange(fCausal, r, first, total);
+  CausalSoftmaxF32(fCausal, h, @fDecScores[aItem * fDecStride], total - first);
+end;
+
+procedure TInferCpuFastBackend.DecodeValueItem(aItem: integer);
+var
+  g, gs, h, r, a, b, first, total, d, kvw: PtrInt;
+  part: PSingleArray;
+begin
+  // item = tile: the partial sums of its keys, per row and head
+  d := fCausal.HeadDim;
+  kvw := fCausal.KvHeads * d;
+  gs := fCausal.Heads div fCausal.KvHeads;
+  for r := 0 to fCausal.Rows - 1 do
+  begin
+    CausalRange(fCausal, r, first, total);
+    a := first + aItem * CAUSAL_TILE;
+    b := MinPtrInt(a + CAUSAL_TILE, total);
+    if a < b then
+      for g := 0 to fCausal.KvHeads - 1 do
+        for h := g * gs to g * gs + gs - 1 do
+        begin
+          part := @fDecParts[((aItem * fCausal.Rows + r) * fCausal.Heads + h) * d];
+          FillCharFast(part^, d * SizeOf(single), 0);
+          InferAxpyRowsF32(@fDecScores[(r * fCausal.Heads + h) * fDecStride + a - first],
+            @fCausal.Values^[a * kvw + g * d], kvw * SizeOf(single), b - a, d, part);
+        end;
+  end;
+end;
+
+procedure TInferCpuFastBackend.DecodeSumItem(aItem: integer);
+var
+  h, r, t, first, total, d: PtrInt;
+  outp: PSingleArray;
+begin
+  // item = row * heads + head: its partial sums from 0, in tile order
+  r := aItem div fCausal.Heads;
+  h := aItem mod fCausal.Heads;
+  d := fCausal.HeadDim;
+  CausalRange(fCausal, r, first, total);
+  outp := @fCausal.Y^[(r * fCausal.Heads + h) * d];
+  FillCharFast(outp^, d * SizeOf(single), 0);
+  for t := 0 to (total - first + CAUSAL_TILE - 1) div CAUSAL_TILE - 1 do
+    AddPart(outp, @fDecParts[((t * fCausal.Rows + r) * fCausal.Heads + h) * d], d);
+end;
+
 procedure TInferCpuFastBackend.CausalAttention(q: PSingleArray; aRows, aHeads,
   aHeadDim: PtrInt; keys, values: PSingleArray; aPast, aKvHeads: PtrInt;
   y: PSingleArray; aWindow: PtrInt; aSinks: PSingleArray; aScale: double);
 var
   job: TInferCausalJob;
-  h: PtrInt;
+  h, first, total, tiles, need: PtrInt;
 begin
   // split by head and row block, never inside one sum: Exact stays
   // bit-identical to the reference
@@ -2555,6 +2721,35 @@ begin
   if fBusy.TryLock then
   try
     fCausal := job;
+    CausalRange(job, aRows - 1, first, total);
+    if job.Fast and Assigned(InferDotsF32) and Assigned(InferAxpyRowsF32) and
+       (aHeadDim and 15 = 0) and (aRows <= DECODE_ROWS) and
+       (total - first >= DECODE_KEYS) then
+    begin
+      // the decode path: the last row sees the most keys
+      fDecStride := total - first;
+      tiles := (fDecStride + CAUSAL_TILE - 1) div CAUSAL_TILE;
+      // both buffers are overwritten before they are read: grown without
+      // copying, with a reserve for the next tokens
+      need := aRows * aHeads * fDecStride;
+      if length(fDecScores) < need then
+      begin
+        fDecScores := nil;
+        SetLength(fDecScores, need + need shr 2);
+      end;
+      need := tiles * aRows * aHeads * aHeadDim;
+      if length(fDecParts) < need then
+      begin
+        fDecParts := nil;
+        SetLength(fDecParts, need + need shr 2);
+      end;
+      inc(fDecodeRuns);
+      RunParallel(DecodeScoreItem, tiles);
+      RunParallel(DecodeSoftmaxItem, aRows * aHeads);
+      RunParallel(DecodeValueItem, tiles);
+      RunParallel(DecodeSumItem, aRows * aHeads);
+      exit;
+    end;
     RunParallel(CausalItem, aHeads * job.RowBlocks);
     exit;
   finally

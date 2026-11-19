@@ -81,9 +81,11 @@ type
     // than aMargin sure of
     // - aGguf: the model from that file instead of quantized at load
     // - aRefName / aFolder: another model's reference and folder (Qwen2.5)
+    // - aToolCos > 0: the bound of the logits cosine of the chat_tool prompt
+    // instead of aCos
     procedure Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs, aMargin: double;
       const aGguf: TFileName = ''; const aRefName: RawUtf8 = 'qwen3';
-      const aFolder: TFileName = '');
+      const aFolder: TFileName = ''; aToolCos: double = 0);
     /// the folder of Qwen2.5-0.5B-Instruct, '' (SKIP, or a failure with
     // LAI_REQUIRE_MODEL=1) when absent or in a 32-bit process
     function Qwen25Folder: TFileName;
@@ -1224,7 +1226,7 @@ end;
 
 procedure TTestInferQwen3.Qwen3Quantized(aType: TInferDType; aCos, aMaxAbs,
   aMargin: double; const aGguf: TFileName; const aRefName: RawUtf8;
-  const aFolder: TFileName);
+  const aFolder: TFileName; aToolCos: double);
 var
   dir, refdir: TFileName;
   ref: TInferRefSet;
@@ -1237,7 +1239,7 @@ var
   prompt, mine: TIntegerDynArray;
   logits: TSingleDynArray;
   cmp: TInferCompare;
-  margin: double;
+  margin, bound: double;
   timer: TPrecisionTimer;
 begin
   dir := aFolder;
@@ -1301,7 +1303,10 @@ begin
         AddConsole(FormatString('% %: logits cos % maxabs %, greedy equal for ' +
           'all % tokens', [p^.U['id'], INFER_DTYPE_NAME[aType], cmp.Cosine,
           cmp.MaxAbs, m]));
-      CheckUtf8(cmp.Cosine >= aCos, '% % logits cosine %',
+      bound := aCos;
+      if (aToolCos > 0) and (p^.U['id'] = 'chat_tool') then
+        bound := aToolCos;
+      CheckUtf8(cmp.Cosine >= bound, '% % logits cosine %',
         [p^.U['id'], INFER_DTYPE_NAME[aType], cmp.Cosine]);
       CheckUtf8(cmp.MaxAbs <= aMaxAbs, '% % logits max error %',
         [p^.U['id'], INFER_DTYPE_NAME[aType], cmp.MaxAbs]);
@@ -1928,7 +1933,12 @@ begin
   // (chat_tool) to 0.990, max error up to 9.0; greedy leaves the reference
   // where it was 1.37 sure (chat_en answers "Paris." with a full stop) - far
   // better than Q4_0, still no greedy condition for a 0.6B model
-  Qwen3Quantized(idtQ4_K, 0.8, 12, 1e9, gguf);
+  // - 2026-11-19: the float attention sums its values in tiles of 128 keys
+  // (another rounding order): chat_tool 0.867 -> 0.799 on NEON while its Q8_0
+  // case went 0.997 -> 0.998 - this case amplifies any rounding, the bound
+  // only catches gross errors (wrong weights give a cosine near 0); the other
+  // prompts are shorter than one tile and keep 0.8
+  Qwen3Quantized(idtQ4_K, 0.8, 12, 1e9, gguf, 'qwen3', '', 0.75);
 end;
 
 procedure TTestInferQwen3.Qwen3GgufQ51;

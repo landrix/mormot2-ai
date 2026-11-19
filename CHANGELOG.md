@@ -9,6 +9,17 @@ RTX 5090 unless stated otherwise.
 
 ## 2026-11
 
+- **2026-11-19 - B22 (long context) 2a: CPU decode attention in key tiles.** The CPU decode
+  step read the KV cache once per query head (grouped-query: twice) in one task per head,
+  4 KB apart per key, and was bound by memory from 8 threads on. Now the float path sums the
+  weighted values in partial sums of 128 keys (a new canonical rounding order, Exact
+  unchanged), and up to 4 rows over 256+ keys run four parallel passes over key tiles that read
+  whole cache rows in order - bit-identical to the same rows inside a chunk. Qwen3-0.6B Q8_0
+  CPU decode at 4,000 / 8,000 tokens of context: M5 Pro 41 -> 66 / 23 -> 44 tokens/s,
+  i9-14900K 21 -> 33 / 14.7 -> 20.9.
+  Runs: RTX FPC 0/18,714, Delphi 13 0/18,714, Delphi 7 0/7,244; M5 Pro 0/9,513 + LLM 0/740;
+  Snapdragon X Fast 0/753, Qwen3 0/4,296, GGUF 0/277, Qwen35 0/1,950, LlmNative 0/299.
+
 - **2026-11-17 - B16: Q5_0 and Q5_1 unpacked with NEON and AVX2.** The CPU unpacks these
   blocks to Q8_0 for every call of a tile, so a decode step unpacks the whole model:
   `InferQ5Unpack` / `InferQ51Unpack` (aarch64 NEON: tbl spreads the fifth bits, cmtst tests

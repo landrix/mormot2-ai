@@ -1820,6 +1820,54 @@ Think-Id, auf Vulkan kein K-Bias und immer die Head-Norm, auf CUDA kein Bias und
 Head-Norm) - alle scheitern. Review: Claude-Finder und Codex ohne Befund; der Finder vermisste den Test
 für leere Argumente (`{}`), jetzt da.
 
+**Langer Kontext 2a: CPU-Decode-Attention in Kacheln (2026-11-19).** Anlass: Abschluss
+Inferenz, Punkt 2 (Konzept mit Review von Codex und Fable, Reihenfolge im Backlog unter B22).
+
+- *Befund vorher (RTX-Rechner, Qwen3-0.6B Q8_0, `llm-bench`):* CPU-Decode 44 / 20 / 14
+  Tokens/s bei 1.000 / 4.000 / 8.000 Tokens Kontext, Attention 48 / 74 / 82 % der Zeit
+  (GPUs dagegen bei rund 60 % der Bandbreite: CUDA 516 → 188 Tokens/s von 1.000 bis 32.000).
+  Mit 4 / 8 / 16 / 24 / 32 Threads bei 8.000: 8,4 / 14,2 / 14,9 / 14,7 / 14,7 - ab 8 Threads
+  begrenzt der Speicher. `CausalRows` las K und V je Q-Kopf (GQA: doppelt), in Aufgaben je
+  Kopf, und eine Schlüsselzeile eines KV-Kopfs liegt 4.096 Byte von der nächsten (je Schlüssel
+  eine Seite, der Prefetcher folgt nicht).
+- *Erster Versuch, verworfen:* Durchgänge je KV-Kopf (Scores für alle Q-Köpfe der Gruppe, die
+  Werte in Stücken der Kopfdimension), bitgleich zum alten Pfad: +16 % bei 1.000 und 4.000,
+  bei 8.000 nichts. Eine Sonde (28 Schichten, Gestalt von Qwen3-0.6B, ohne Modell) zeigte den
+  Werte-Durchgang mit 14 GB/s: 128 Byte je Schlüssel und Seite.
+- *Änderung:* eine neue kanonische Float-Arithmetik und ein Decode-Pfad
+  (`mormot.ai.infer.backend.cpu`):
+  - `CausalRows` (Fast-Pfad) summiert die gewichteten Werte je Kachel von `CAUSAL_TILE` (128)
+    Schlüsseln ab dem ersten Schlüssel der Zeile von 0 an und addiert die Teilsummen in
+    Reihenfolge (`AddPart`); die Softmax steht in `CausalSoftmaxF32`. `Exact` und Referenz
+    bleiben unverändert.
+  - `TInferCpuFastBackend.CausalAttention` nimmt bis 4 Zeilen ab 256 Schlüsseln der letzten
+    Zeile vier parallele Durchgänge: Scores je Kachel über alle KV-Köpfe (ganze Cache-Zeilen
+    in Folge), Softmax je Zeile und Kopf, Teilsummen je Kachel über alle KV-Köpfe, Summe je
+    Zeile und Kopf in Kachelreihenfolge - dieselben Bits wie dieselben Zeilen in einem Chunk.
+    Puffer `fDecScores`/`fDecParts` wachsen ohne Kopie mit Reserve; `DecodeRuns` zählt den
+    Pfad.
+- *Sonde (ms je Token für die Attention, alt → neu):* M5 Pro 4,2 → 3,2 / 18,2 → 8,7 /
+  38,2 → 15,3 / 77,4 → 28,3 bei 1.000 / 4.000 / 8.000 / 16.000 Schlüsseln (bis 130 statt 48
+  GB/s); i9 5,9 → 5,0 / 23,3 → 18,5 / 78,3 → 69,2 / 136 → 115. Auf dem i9 kostet die Softmax
+  bei 8.000 18 ms (M5 Pro 1,5): `System.Exp` unter Windows x64 33-80 ns je Wert - 2b.
+- *Ende zu Ende (`llm-bench` Qwen3-0.6B Q8_0, Decode 64 Tokens, zweimal im Wechsel):* M5 Pro
+  100 → 109 / 41 → 66 / 23 → 44 Tokens/s bei 1.000 / 4.000 / 8.000; i9-14900K 70 → 75 (200),
+  45 → 56 / 21 → 33 / 14,7 → 20,9. Auf dem RTX-Rechner lief dabei `CompatTelRunner` (System,
+  bis 37 % CPU), die Werte streuen dort stärker.
+- *Tests:* `DecodeAttentionMatchesChunk` vergleicht 1-4 Zeilen allein (Decode-Pfad, mit
+  Prüfung über `DecodeRuns`) Bit für Bit mit denselben Zeilen in einem Chunk von 5 (alter
+  Pfad): GQA 1 bis 16, Kopfdimension 32 bis 512, Fenster mit NaN davor, Zeilen mit und ohne
+  Fenster und mit verschiedener Kachelzahl im selben Aufruf, Sinks. Der Q4_K-Fall `chat_tool`
+  von `Qwen3GgufMatchesCpu` (0,6B, 193 Tokens) fiel mit der neuen Rundungsreihenfolge auf NEON
+  von 0,867 auf 0,799 Kosinus gegen BF16 (Q8_0 desselben Falls 0,997 → 0,998): Schranke für `chat_tool` 0,75 (fängt nur grobe Fehler), die kürzeren Prompts bleiben bei 0,8.
+- *Gegenprobe:* Softmax ausgelassen, Kachelanfang um eins verschoben, Werte nur des ersten
+  Kopfs einer Gruppe (35 / 35 / 31 von 695), Decode-Pfad nie genommen (40 / 743),
+  Summe über die Kachelzahl der letzten Zeile (3 / 743); echt 0.
+- *Review:* Claude-Finder und Codex ohne Rechenfehler; umgesetzt: Prüfung, dass der Decode-Pfad (und beim Chunk nicht)
+  läuft, zwei Testfälle (Kachelzahl und Fenster je Zeile verschieden), Puffer ohne Kopie,
+  Kommentare.
+- *Läufe:* RTX (i9-14900K, Windows x64) FPC 0/18.714, Delphi 13 0/18.714, Delphi 7 0/7.244 (die BPE-Suite nach dem Nachlegen fehlender Modelldateien `merges.txt`/`vocab.json` auf der RTX mit FPC und Delphi 13 wiederholt, je 0/281); Mac M5 Pro 0/9.513 und LLM 0/740; Snapdragon X Fast 0/753, Qwen3 0/4.296, GGUF 0/277, Qwen35 0/1.950, LlmNative 0/299.
+
 **B16 Q5_0/Q5_1 mit NEON und AVX2 ausgepackt (2026-11-17).** Anlass: Abschluss Inferenz,
 Punkt 7c; Übernahme nur mit Messung.
 
